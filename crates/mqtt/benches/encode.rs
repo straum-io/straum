@@ -44,6 +44,7 @@ fn mqtt_publish_encode(bencher: divan::Bencher, payload: usize) {
                 Some(packet_id()),
                 divan::black_box(&payload),
                 false,
+                false,
                 &limits,
             )
         });

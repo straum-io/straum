@@ -37,6 +37,7 @@ fn connect(broker: &mut Broker, out: &mut Outbox, session: u64, name: &str) -> S
         Command::Connect(Connect {
             client_id: client(name),
             permissions: Permissions::unrestricted(),
+            resume: false,
         }),
         out,
     );
@@ -147,6 +148,7 @@ fn clients_without_an_identity_do_not_collide() {
             Command::Connect(Connect {
                 client_id: ClientId::new(Bytes::new()).unwrap(),
                 permissions: Permissions::unrestricted(),
+                resume: false,
             }),
             &mut out,
         );
@@ -467,6 +469,7 @@ fn overflow_drops_what_may_be_dropped_and_closes_what_may_not() {
         id: None,
         topic: topic("a/b"),
         payload: Bytes::from_static(b"x"),
+        duplicate: false,
         retain: false,
     });
     broker.on_overflow(session, at_most_once, &mut out);
@@ -481,6 +484,7 @@ fn overflow_drops_what_may_be_dropped_and_closes_what_may_not() {
         id: Some(DeliveryId(1)),
         topic: topic("a/b"),
         payload: Bytes::from_static(b"x"),
+        duplicate: false,
         retain: false,
     });
     broker.on_overflow(session, at_least_once, &mut out);
@@ -794,6 +798,7 @@ mod authorisation {
             Command::Connect(Connect {
                 client_id: client(name),
                 permissions,
+                resume: false,
             }),
             out,
         );
@@ -1130,6 +1135,7 @@ mod retained {
             Command::Connect(Connect {
                 client_id: client("pub"),
                 permissions: Permissions::from_rules(vec![(filter("allowed/#"), true, false)]),
+                resume: false,
             }),
             &mut out,
         );
@@ -1148,4 +1154,309 @@ mod retained {
         assert_eq!(broker.stats().retained_messages, 0);
         assert_eq!(broker.stats().unauthorized_publishes, 1);
     }
+}
+
+/// Sessions that outlive their connection.
+mod persistent {
+    use super::*;
+
+    fn connect_resuming(
+        broker: &mut Broker,
+        out: &mut Outbox,
+        session: u64,
+        name: &str,
+        resume: bool,
+    ) -> SessionId {
+        let session = SessionId(session);
+        broker.handle(
+            session,
+            Command::Connect(Connect {
+                client_id: client(name),
+                permissions: Permissions::unrestricted(),
+                resume,
+            }),
+            out,
+        );
+        session
+    }
+
+    fn disconnect(broker: &mut Broker, out: &mut Outbox, session: SessionId) {
+        broker.handle(
+            session,
+            Command::Disconnect {
+                reason: DisconnectReason::ConnectionLost,
+            },
+            out,
+        );
+        let _ = drain(out);
+    }
+
+    #[test]
+    fn a_session_that_asked_to_be_kept_collects_what_it_missed() {
+        let (mut broker, mut out) = broker();
+        let first = connect_resuming(&mut broker, &mut out, 1, "device", true);
+        subscribe(&mut broker, &mut out, first, "sensors/#", AtLeastOnce);
+        let _ = drain(&mut out);
+
+        disconnect(&mut broker, &mut out, first);
+        assert_eq!(broker.stats().offline_sessions, 1);
+        assert_eq!(broker.stats().active_sessions, 0);
+
+        // Published while nobody is listening on that socket.
+        let publisher = connect(&mut broker, &mut out, 2, "pub");
+        let _ = drain(&mut out);
+        publish(
+            &mut broker,
+            &mut out,
+            publisher,
+            "sensors/eu/temp",
+            b"21",
+            AtLeastOnce,
+        );
+        assert!(
+            deliveries(&mut out).is_empty(),
+            "delivered to a closed socket"
+        );
+
+        // The same identity comes back and asks for its session.
+        let second = connect_resuming(&mut broker, &mut out, 3, "device", true);
+        let effects = drain(&mut out);
+
+        assert!(effects.contains(&(
+            second,
+            Outbound::Reply(Response::Connected {
+                session_present: true
+            })
+        )));
+        let delivered: Vec<_> = effects
+            .into_iter()
+            .filter_map(|(session, effect)| match effect {
+                Outbound::Deliver(delivery) => Some((session, delivery)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delivered.len(), 1, "what was queued did not arrive");
+        assert_eq!(delivered[0].0, second);
+        assert_eq!(delivered[0].1.payload, Bytes::from_static(b"21"));
+        assert_eq!(broker.stats().offline_sessions, 0);
+    }
+
+    #[test]
+    fn a_clean_start_throws_away_what_was_kept() {
+        let (mut broker, mut out) = broker();
+        let first = connect_resuming(&mut broker, &mut out, 1, "device", true);
+        subscribe(&mut broker, &mut out, first, "sensors/#", AtLeastOnce);
+        let _ = drain(&mut out);
+        disconnect(&mut broker, &mut out, first);
+
+        let publisher = connect(&mut broker, &mut out, 2, "pub");
+        publish(
+            &mut broker,
+            &mut out,
+            publisher,
+            "sensors/eu/temp",
+            b"21",
+            AtLeastOnce,
+        );
+        let _ = drain(&mut out);
+
+        // Reconnecting clean: nothing carried over, and no subscription either.
+        let second = connect_resuming(&mut broker, &mut out, 3, "device", false);
+        let effects = drain(&mut out);
+        assert!(effects.contains(&(
+            second,
+            Outbound::Reply(Response::Connected {
+                session_present: false
+            })
+        )));
+        assert!(
+            !effects
+                .iter()
+                .any(|(_, effect)| matches!(effect, Outbound::Deliver(_))),
+            "a clean start received what the old session was owed"
+        );
+
+        publish(
+            &mut broker,
+            &mut out,
+            publisher,
+            "sensors/eu/temp",
+            b"22",
+            AtLeastOnce,
+        );
+        assert!(
+            deliveries(&mut out).is_empty(),
+            "the old subscription survived"
+        );
+        assert_eq!(broker.stats().offline_sessions, 0);
+    }
+
+    #[test]
+    fn what_is_allowed_to_be_lost_is_lost_while_the_session_is_away() {
+        let (mut broker, mut out) = broker();
+        let session = connect_resuming(&mut broker, &mut out, 1, "device", true);
+        subscribe(&mut broker, &mut out, session, "a/#", AtMostOnce);
+        let _ = drain(&mut out);
+        disconnect(&mut broker, &mut out, session);
+
+        let publisher = connect(&mut broker, &mut out, 2, "pub");
+        let _ = drain(&mut out);
+        publish(&mut broker, &mut out, publisher, "a/b", b"x", AtMostOnce);
+        let _ = drain(&mut out);
+
+        assert_eq!(broker.stats().offline_dropped, 1);
+
+        let back = connect_resuming(&mut broker, &mut out, 3, "device", true);
+        let effects = drain(&mut out);
+        assert!(effects.contains(&(
+            back,
+            Outbound::Reply(Response::Connected {
+                session_present: true
+            })
+        )));
+        assert!(
+            !effects
+                .iter()
+                .any(|(_, effect)| matches!(effect, Outbound::Deliver(_))),
+            "an at-most-once message survived an offline session"
+        );
+    }
+
+    #[test]
+    fn what_was_never_acknowledged_is_sent_again() {
+        let (mut broker, mut out) = broker();
+        let subscriber = connect_resuming(&mut broker, &mut out, 1, "device", true);
+        subscribe(&mut broker, &mut out, subscriber, "a/#", AtLeastOnce);
+        let publisher = connect(&mut broker, &mut out, 2, "pub");
+        let _ = drain(&mut out);
+
+        publish(&mut broker, &mut out, publisher, "a/b", b"x", AtLeastOnce);
+        let first = deliveries(&mut out);
+        assert_eq!(first.len(), 1);
+        assert!(!first[0].1.duplicate);
+        let id = first[0].1.id.unwrap();
+
+        // The socket dies before the acknowledgement.
+        disconnect(&mut broker, &mut out, subscriber);
+
+        let back = connect_resuming(&mut broker, &mut out, 3, "device", true);
+        let again = deliveries(&mut out);
+
+        assert_eq!(again.len(), 1, "an unacknowledged message was forgotten");
+        assert_eq!(again[0].0, back);
+        assert_eq!(
+            again[0].1.id,
+            Some(id),
+            "the identifier changed under the client"
+        );
+        assert!(
+            again[0].1.duplicate,
+            "the client was not told it may be a repeat"
+        );
+    }
+
+    #[test]
+    fn the_offline_store_refuses_to_grow_without_a_bound() {
+        let limits = BrokerLimits {
+            max_offline_sessions: 1,
+            ..BrokerLimits::default()
+        };
+        let mut broker = Broker::new(limits);
+        let mut out = Outbox::new();
+
+        let first = connect_resuming(&mut broker, &mut out, 1, "one", true);
+        let second = connect_resuming(&mut broker, &mut out, 2, "two", true);
+        let _ = drain(&mut out);
+        disconnect(&mut broker, &mut out, first);
+        disconnect(&mut broker, &mut out, second);
+
+        assert_eq!(broker.stats().offline_sessions, 1);
+        assert_eq!(broker.stats().offline_refused, 1);
+
+        // The one that was refused comes back to nothing.
+        let back = connect_resuming(&mut broker, &mut out, 3, "two", true);
+        assert!(drain(&mut out).contains(&(
+            back,
+            Outbound::Reply(Response::Connected {
+                session_present: false
+            })
+        )));
+    }
+
+    #[test]
+    fn a_resumed_session_is_authorised_again() {
+        let (mut broker, mut out) = broker();
+        let first = SessionId(1);
+        broker.handle(
+            first,
+            Command::Connect(Connect {
+                client_id: client("device"),
+                permissions: Permissions::unrestricted(),
+                resume: true,
+            }),
+            &mut out,
+        );
+        let _ = drain(&mut out);
+        disconnect(&mut broker, &mut out, first);
+
+        // The rules changed while it was away.
+        let second = SessionId(2);
+        broker.handle(
+            second,
+            Command::Connect(Connect {
+                client_id: client("device"),
+                permissions: Permissions::from_rules(vec![(filter("allowed/#"), true, true)]),
+                resume: true,
+            }),
+            &mut out,
+        );
+        let _ = drain(&mut out);
+
+        publish(
+            &mut broker,
+            &mut out,
+            second,
+            "forbidden/topic",
+            b"x",
+            AtMostOnce,
+        );
+        let _ = drain(&mut out);
+        assert_eq!(
+            broker.stats().unauthorized_publishes,
+            1,
+            "a resumed session kept its old permissions"
+        );
+    }
+}
+
+#[test]
+fn a_session_with_no_name_is_never_kept() {
+    let (mut broker, mut out) = broker();
+    let session = SessionId(1);
+    broker.handle(
+        session,
+        Command::Connect(Connect {
+            client_id: ClientId::new(Bytes::new()).unwrap(),
+            permissions: Permissions::unrestricted(),
+            // The client asked for a session it will never be able to claim.
+            resume: true,
+        }),
+        &mut out,
+    );
+    let _ = drain(&mut out);
+
+    broker.handle(
+        session,
+        Command::Disconnect {
+            reason: DisconnectReason::ConnectionLost,
+        },
+        &mut out,
+    );
+
+    assert_eq!(
+        broker.stats().offline_sessions,
+        0,
+        "a session nobody can name was parked anyway"
+    );
+    assert_eq!(broker.stats().active_sessions, 0);
 }

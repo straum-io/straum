@@ -223,6 +223,7 @@ fn an_at_least_once_delivery_round_trips_through_the_identifier_table() {
         id: Some(DeliveryId(9_000_000_001)),
         topic: topic("a/b"),
         payload: Bytes::from_static(b"payload"),
+        duplicate: false,
         retain: false,
     });
     assert_eq!(
@@ -261,6 +262,7 @@ fn at_most_once_deliveries_take_no_identifier() {
         id: None,
         topic: topic("a/b"),
         payload: Bytes::from_static(b"payload"),
+        duplicate: false,
         retain: false,
     });
     encode_outbound(&delivery, &mut ids, &mut buf, &limits()).unwrap();

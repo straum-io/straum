@@ -558,3 +558,64 @@ async fn a_retained_message_greets_the_next_subscriber() {
 
     broker.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_survives_its_connection() {
+    let broker = start();
+    let addr = broker.local_addr();
+
+    // CleanSession = 0: keep what this identity is owed.
+    let mut options = MqttOptions::new("device", addr.ip().to_string(), addr.port());
+    options.set_clean_session(false);
+    let (device, mut device_loop) = AsyncClient::new(options.clone(), 8);
+    device
+        .subscribe("sensors/#", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    until(&mut device_loop, |incoming| {
+        matches!(incoming, Incoming::SubAck(_))
+    })
+    .await
+    .unwrap();
+    device.disconnect().await.unwrap();
+    // Let the disconnect reach the broker before anything is published.
+    let _ = tokio::time::timeout(Duration::from_millis(200), device_loop.poll()).await;
+    let _ = tokio::time::timeout(Duration::from_millis(200), device_loop.poll()).await;
+
+    // Published while the device is away.
+    let (publisher, mut publisher_loop) = client("publisher", &broker);
+    publisher
+        .publish("sensors/eu/temp", QoS::AtLeastOnce, false, "21")
+        .await
+        .unwrap();
+    until(&mut publisher_loop, |incoming| {
+        matches!(incoming, Incoming::PubAck(_))
+    })
+    .await
+    .unwrap();
+
+    // The device comes back and is told its session was still there.
+    let (_device, mut device_loop) = AsyncClient::new(options, 8);
+    let connected = until(&mut device_loop, |incoming| {
+        matches!(incoming, Incoming::ConnAck(_))
+    })
+    .await
+    .unwrap();
+    let Incoming::ConnAck(ack) = connected else {
+        panic!("expected a CONNACK");
+    };
+    assert!(ack.session_present, "the session was not kept");
+
+    let delivered = until(&mut device_loop, |incoming| {
+        matches!(incoming, Incoming::Publish(_))
+    })
+    .await
+    .unwrap();
+    let Incoming::Publish(publish) = delivered else {
+        panic!("expected a PUBLISH");
+    };
+    assert_eq!(publish.topic, "sensors/eu/temp");
+    assert_eq!(publish.payload.as_ref(), b"21");
+
+    broker.shutdown().await;
+}

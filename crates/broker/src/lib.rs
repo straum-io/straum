@@ -19,6 +19,7 @@ use protocol::{
     Response, SubscribeResult,
 };
 
+use auth::Permissions;
 use index::{Index, Subscriber};
 use session::Session;
 
@@ -31,6 +32,9 @@ pub struct BrokerLimits {
     pub max_inflight: usize,
     /// At-least-once deliveries waiting for room in the inflight window.
     pub session_backlog_messages: usize,
+    /// Sessions kept for a client that asked to be resumed but is not
+    /// connected. A map keyed by client identity needs a bound (§8).
+    pub max_offline_sessions: usize,
     /// Topics that may hold a retained message. A map keyed by remote
     /// data is only bounded if somebody bounds it (CLAUDE.md §8).
     pub max_retained_messages: usize,
@@ -44,6 +48,7 @@ impl Default for BrokerLimits {
             max_subscriptions_per_session: 1024,
             max_inflight: 32,
             session_backlog_messages: 1024,
+            max_offline_sessions: 4096,
             max_retained_messages: 10_000,
             max_retained_bytes: 67_108_864,
         }
@@ -64,6 +69,12 @@ pub struct Stats {
     /// would have meant growing without a bound.
     pub retained_rejected: u64,
     pub retained_messages: u64,
+    /// Sessions kept for clients that are not connected, and sessions
+    /// that could not be kept because the limit was reached.
+    pub offline_sessions: u64,
+    pub offline_refused: u64,
+    /// At-most-once messages dropped because their session was offline.
+    pub offline_dropped: u64,
     pub active_sessions: u64,
 }
 
@@ -206,17 +217,56 @@ impl Broker {
         }
     }
 
-    fn connect(&mut self, session: SessionId, connect: Connect, out: &mut Outbox) {
+    fn connect(&mut self, session: SessionId, mut connect: Connect, out: &mut Outbox) {
         let client = if connect.client_id.is_empty() {
+            // An assigned identity cannot be asked for again: keeping the
+            // session would park it under a name only the broker knows, until
+            // the offline limit filled up with ghosts.
+            connect.resume = false;
             self.assign_client_id()
         } else {
             connect.client_id
         };
 
-        // One identity, one connection: the older one loses (CLAUDE.md §6).
-        if let Some(slot) = self.by_client.get(&client).copied() {
-            if let Some(previous) = self.session_mut(slot).map(|held| held.id) {
-                self.close(previous, Some(CloseReason::SessionTakenOver), out);
+        // What this identity left behind, if anything.
+        let existing = self.by_client.get(&client).copied();
+        let resumable = existing.is_some_and(|slot| {
+            self.sessions
+                .get(slot)
+                .and_then(Option::as_ref)
+                .is_some_and(|held| held.resume)
+        });
+
+        if let Some(slot) = existing {
+            match (connect.resume, resumable) {
+                // One identity, one connection: whoever was here loses the
+                // socket either way (CLAUDE.md §6).
+                (true, true) => {
+                    if let Some(previous) = self.session_mut(slot).map(|held| held.id) {
+                        if self.by_id.contains_key(&previous) {
+                            out.push(previous, Outbound::Close(CloseReason::SessionTakenOver));
+                            self.by_id.remove(&previous);
+                        }
+                    }
+                    self.resume(slot, session, client, connect.permissions, out);
+                    return;
+                }
+                // A clean start throws away whatever was kept, and a session
+                // that was never meant to be resumed cannot be. Either way
+                // this one goes, parked or not — `close` would park it again.
+                _ => {
+                    let online = self
+                        .sessions
+                        .get(slot)
+                        .and_then(Option::as_ref)
+                        .map(|held| (held.id, held.online));
+                    if let Some((previous, true)) = online {
+                        out.push(previous, Outbound::Close(CloseReason::SessionTakenOver));
+                        self.by_id.remove(&previous);
+                        self.stats.active_sessions = self.stats.active_sessions.saturating_sub(1);
+                    }
+                    self.discard(slot);
+                }
             }
         }
 
@@ -232,6 +282,7 @@ impl Broker {
                 session,
                 client.clone(),
                 connect.permissions.clone(),
+                connect.resume,
                 self.limits.session_backlog_messages,
             ));
         }
@@ -239,13 +290,80 @@ impl Broker {
         self.by_client.insert(client, slot);
         self.stats.active_sessions = self.stats.active_sessions.saturating_add(1);
 
-        // No persistent sessions, so a session is never present (§6).
         out.push(
             session,
             Outbound::Reply(Response::Connected {
                 session_present: false,
             }),
         );
+    }
+
+    /// Hands a session that was kept back to a new connection: its
+    /// subscriptions never left the index, so what it was owed is waiting.
+    fn resume(
+        &mut self,
+        slot: usize,
+        session: SessionId,
+        client: ClientId,
+        permissions: Permissions,
+        out: &mut Outbox,
+    ) {
+        let was_offline;
+        {
+            let Some(held) = self.sessions.get_mut(slot).and_then(Option::as_mut) else {
+                return;
+            };
+            was_offline = !held.online;
+            held.id = session;
+            held.online = true;
+            held.resume = true;
+            // Re-authorised on every connect: the rules may have changed
+            // since this session was last here.
+            held.permissions = permissions;
+        }
+
+        self.by_id.insert(session, slot);
+        self.by_client.insert(client, slot);
+        if was_offline {
+            self.stats.offline_sessions = self.stats.offline_sessions.saturating_sub(1);
+            self.stats.active_sessions = self.stats.active_sessions.saturating_add(1);
+        }
+
+        out.push(
+            session,
+            Outbound::Reply(Response::Connected {
+                session_present: true,
+            }),
+        );
+
+        self.redeliver(slot, out);
+    }
+
+    /// Sends again what the session was given and never acknowledged, then
+    /// lets the backlog through.
+    fn redeliver(&mut self, slot: usize, out: &mut Outbox) {
+        let Some(held) = self.sessions.get(slot).and_then(Option::as_ref) else {
+            return;
+        };
+        let session = held.id;
+        let pending: Vec<Delivery> = held
+            .inflight
+            .iter()
+            .map(|held| Delivery {
+                id: Some(held.id),
+                topic: held.topic.clone(),
+                payload: held.payload.clone(),
+                // The client may already have it; that is what DUP says.
+                duplicate: true,
+                retain: false,
+            })
+            .collect();
+
+        for delivery in pending {
+            self.stats.delivered_messages = self.stats.delivered_messages.saturating_add(1);
+            out.push(session, Outbound::Deliver(delivery));
+        }
+        self.drain_backlog(slot, out);
     }
 
     fn publish(
@@ -353,25 +471,38 @@ impl Broker {
         };
         let id = session.id;
 
+        let online = session.online;
+
         let (effect, used_id, dropped) = match guarantee {
+            // A session that is not connected cannot be told; at-most-once
+            // means exactly that this is allowed to be lost (3.1.1 §3.3.1.3).
+            DeliveryGuarantee::AtMostOnce if !online => (None, false, false),
             DeliveryGuarantee::AtMostOnce => (
                 Some(Delivery {
                     id: None,
                     topic: topic.clone(),
                     payload: payload.clone(),
+                    duplicate: false,
                     retain,
                 }),
                 false,
                 false,
             ),
-            DeliveryGuarantee::AtLeastOnce if session.inflight.len() < limits.max_inflight => {
+            DeliveryGuarantee::AtLeastOnce
+                if online && session.inflight.len() < limits.max_inflight =>
+            {
                 let delivery = DeliveryId(delivery_id);
-                session.inflight.push(delivery);
+                session.inflight.push(session::Inflight {
+                    id: delivery,
+                    topic: topic.clone(),
+                    payload: payload.clone(),
+                });
                 (
                     Some(Delivery {
                         id: Some(delivery),
                         topic: topic.clone(),
                         payload: payload.clone(),
+                        duplicate: false,
                         retain,
                     }),
                     true,
@@ -389,9 +520,17 @@ impl Broker {
         if used_id {
             self.next_delivery = self.next_delivery.saturating_add(1);
         }
-        if let Some(delivery) = effect {
-            self.stats.delivered_messages = self.stats.delivered_messages.saturating_add(1);
-            out.push(id, Outbound::Deliver(delivery));
+        match effect {
+            Some(delivery) => {
+                self.stats.delivered_messages = self.stats.delivered_messages.saturating_add(1);
+                out.push(id, Outbound::Deliver(delivery));
+            }
+            // Nothing to send and nothing parked: the session is away and this
+            // message was allowed to be lost.
+            None if !online && guarantee == DeliveryGuarantee::AtMostOnce => {
+                self.stats.offline_dropped = self.stats.offline_dropped.saturating_add(1);
+            }
+            None => {}
         }
         if dropped {
             self.close(id, Some(CloseReason::SlowConsumer), out);
@@ -536,6 +675,21 @@ impl Broker {
         let Some(slot) = self.slot_of(session) else {
             return;
         };
+        let forgotten = self
+            .sessions
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .is_some_and(|held| held.forget(delivery));
+        if !forgotten {
+            return;
+        }
+        // One acknowledgement, one slot free in the window.
+        self.drain_backlog(slot, out);
+    }
+
+    /// Lets waiting at-least-once messages through while the inflight window
+    /// has room. An offline session keeps them where they are.
+    fn drain_backlog(&mut self, slot: usize, out: &mut Outbox) {
         let limits = self.limits;
         let mut next_delivery = self.next_delivery;
         let mut delivered = 0u64;
@@ -543,18 +697,22 @@ impl Broker {
         let Some(held) = self.sessions.get_mut(slot).and_then(Option::as_mut) else {
             return;
         };
-        if !held.forget(delivery) {
+        if !held.online {
             return;
         }
+        let session = held.id;
 
-        // The window has room: let the backlog through in order.
         while held.inflight.len() < limits.max_inflight {
             let Some(waiting) = held.backlog.pop() else {
                 break;
             };
             let id = DeliveryId(next_delivery);
             next_delivery = next_delivery.saturating_add(1);
-            held.inflight.push(id);
+            held.inflight.push(session::Inflight {
+                id,
+                topic: waiting.topic.clone(),
+                payload: waiting.payload.clone(),
+            });
             delivered = delivered.saturating_add(1);
             out.push(
                 session,
@@ -562,6 +720,7 @@ impl Broker {
                     id: Some(id),
                     topic: waiting.topic,
                     payload: waiting.payload,
+                    duplicate: false,
                     // Whatever this was when it arrived, it is live traffic
                     // for this session now.
                     retain: false,
@@ -573,30 +732,64 @@ impl Broker {
         self.stats.delivered_messages = self.stats.delivered_messages.saturating_add(delivered);
     }
 
-    /// Removes a session and everything it owned, in this call (§7).
+    /// Ends a connection. A session that asked to be resumed stays behind
+    /// without one; anything else is removed here and now (§7).
     fn close(&mut self, session: SessionId, reason: Option<CloseReason>, out: &mut Outbox) {
         let Some(slot) = self.by_id.remove(&session) else {
             return;
         };
-        let Some(entry) = self.sessions.get_mut(slot) else {
-            return;
-        };
-        let Some(held) = entry.take() else {
-            return;
-        };
 
-        for filter in &held.filters {
-            self.index.unsubscribe(filter, slot);
+        let keep = self
+            .sessions
+            .get(slot)
+            .and_then(Option::as_ref)
+            .is_some_and(|held| held.resume)
+            && self.stats.offline_sessions < self.limits.max_offline_sessions as u64;
+
+        if keep {
+            if let Some(held) = self.sessions.get_mut(slot).and_then(Option::as_mut) {
+                held.online = false;
+            }
+            self.stats.active_sessions = self.stats.active_sessions.saturating_sub(1);
+            self.stats.offline_sessions = self.stats.offline_sessions.saturating_add(1);
+        } else {
+            if self
+                .sessions
+                .get(slot)
+                .and_then(Option::as_ref)
+                .is_some_and(|held| held.resume)
+            {
+                // Keeping it would mean growing without a bound.
+                self.stats.offline_refused = self.stats.offline_refused.saturating_add(1);
+            }
+            self.discard(slot);
+            self.stats.active_sessions = self.stats.active_sessions.saturating_sub(1);
         }
-        self.by_client.remove(&held.client);
-        self.free.push(slot);
-        self.stats.active_sessions = self.stats.active_sessions.saturating_sub(1);
 
         if let Some(reason) = reason {
             if matches!(reason, CloseReason::SlowConsumer) {
                 self.stats.slow_consumer_closes = self.stats.slow_consumer_closes.saturating_add(1);
             }
             out.push(session, Outbound::Close(reason));
+        }
+    }
+
+    /// Removes everything a session owned: subscriptions, inflight, backlog.
+    fn discard(&mut self, slot: usize) {
+        let Some(entry) = self.sessions.get_mut(slot) else {
+            return;
+        };
+        let Some(held) = entry.take() else {
+            return;
+        };
+        for filter in &held.filters {
+            self.index.unsubscribe(filter, slot);
+        }
+        self.by_client.remove(&held.client);
+        self.by_id.remove(&held.id);
+        self.free.push(slot);
+        if !held.online {
+            self.stats.offline_sessions = self.stats.offline_sessions.saturating_sub(1);
         }
     }
 

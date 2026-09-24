@@ -101,6 +101,7 @@ fn publish_round_trips_through_the_decoder() {
                 packet_id,
                 &payload,
                 false,
+                false,
                 &limits(),
             )
             .unwrap();
@@ -136,7 +137,16 @@ fn encoders_append_to_a_batched_buffer() {
             session_present: false,
         },
     );
-    publish(&mut buf, &topic("a/b"), None, b"one", false, &limits()).unwrap();
+    publish(
+        &mut buf,
+        &topic("a/b"),
+        None,
+        b"one",
+        false,
+        false,
+        &limits(),
+    )
+    .unwrap();
     pingresp(&mut buf);
 
     // The writer hands the whole batch to one write; nothing was overwritten.
@@ -153,7 +163,15 @@ fn oversized_packets_are_refused() {
     };
     let mut buf = BytesMut::new();
     assert_eq!(
-        publish(&mut buf, &topic("a/b"), None, &[b'x'; 64], false, &small),
+        publish(
+            &mut buf,
+            &topic("a/b"),
+            None,
+            &[b'x'; 64],
+            false,
+            false,
+            &small
+        ),
         Err(MqttError::PacketTooLarge)
     );
 
@@ -164,6 +182,7 @@ fn oversized_packets_are_refused() {
             &Topic::new(long).unwrap(),
             None,
             b"",
+            false,
             false,
             &limits()
         ),
@@ -203,7 +222,7 @@ mod properties {
             let packet_id = packet_id.map(|value| PacketId::new(value).unwrap());
 
             let mut buf = BytesMut::new();
-            publish(&mut buf, &topic, packet_id, &payload, false, &limits()).unwrap();
+            publish(&mut buf, &topic, packet_id, &payload, false, false, &limits()).unwrap();
 
             let decoded = decode(&mut buf, &limits()).unwrap().unwrap();
             prop_assert!(buf.is_empty());

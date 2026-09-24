@@ -210,6 +210,9 @@ async fn read(
                     let command = Command::Connect(protocol::Connect {
                         client_id: connect.client_id,
                         permissions,
+                        // CleanSession = 0 asks for whatever this
+                        // identity left behind (3.1.1 §3.1.2.4).
+                        resume: !connect.clean_session,
                     });
                     if events
                         .send(Event::Command {

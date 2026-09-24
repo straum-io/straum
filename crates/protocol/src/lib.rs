@@ -52,6 +52,9 @@ pub struct Connect {
     /// Filled in by whoever checked the credentials. A CONNECT does not
     /// become a command until somebody has (docs/configuration.md).
     pub permissions: Permissions,
+    /// Take over a session this identity left behind, if there is one.
+    /// A protocol that has no such notion always sends `false`.
+    pub resume: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +141,9 @@ pub struct Delivery {
     pub id: Option<DeliveryId>,
     pub topic: Topic,
     pub payload: Bytes,
+    /// This message was handed to the session before and not
+    /// acknowledged; the client may already have it.
+    pub duplicate: bool,
     /// Set when this is a stored message being handed to a new
     /// subscriber, so the client can tell it from live traffic.
     pub retain: bool,
@@ -193,6 +199,7 @@ mod tests {
             id: id.map(DeliveryId),
             topic: Topic::new(Bytes::from_static(b"a/b")).unwrap(),
             payload: Bytes::from_static(b"payload"),
+            duplicate: false,
             retain: false,
         }
     }

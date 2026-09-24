@@ -31,6 +31,7 @@ fn delivery() -> Outbound {
         id: Some(DeliveryId(1)),
         topic,
         payload: Bytes::from_static(&[b'x'; 64]),
+        duplicate: false,
         retain: false,
     })
 }

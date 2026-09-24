@@ -66,8 +66,14 @@ pub struct Session {
     /// one call (CLAUDE.md §7).
     pub filters: Vec<TopicFilter>,
     /// At-least-once deliveries handed out and not yet acknowledged.
-    pub inflight: Vec<DeliveryId>,
+    /// Kept whole, so a session that comes back gets them again.
+    pub inflight: Vec<Inflight>,
     pub backlog: Backlog,
+    /// Whether a connection is attached right now. A session that asked to be
+    /// resumed stays here without one, collecting what it is owed.
+    pub online: bool,
+    /// Whether to keep this session when the connection goes away.
+    pub resume: bool,
     /// Deduplication of overlapping subscriptions without allocating per
     /// publish: the publish stamps its generation, a second match on the same
     /// generation only raises the guarantee (CLAUDE.md §6).
@@ -75,8 +81,24 @@ pub struct Session {
     pub best: DeliveryGuarantee,
 }
 
+/// A message handed to a session and not yet acknowledged. The payload is
+/// kept because an unacknowledged message has to be sent again when the
+/// session comes back (3.1.1 §4.4).
+#[derive(Debug, Clone)]
+pub struct Inflight {
+    pub id: DeliveryId,
+    pub topic: Topic,
+    pub payload: Bytes,
+}
+
 impl Session {
-    pub fn new(id: SessionId, client: ClientId, permissions: Permissions, backlog: usize) -> Self {
+    pub fn new(
+        id: SessionId,
+        client: ClientId,
+        permissions: Permissions,
+        resume: bool,
+        backlog: usize,
+    ) -> Self {
         Self {
             id,
             client,
@@ -84,13 +106,15 @@ impl Session {
             filters: Vec::new(),
             inflight: Vec::new(),
             backlog: Backlog::new(backlog),
+            online: true,
+            resume,
             seen: 0,
             best: DeliveryGuarantee::AtMostOnce,
         }
     }
 
     pub fn forget(&mut self, delivery: DeliveryId) -> bool {
-        match self.inflight.iter().position(|held| *held == delivery) {
+        match self.inflight.iter().position(|held| held.id == delivery) {
             Some(index) => {
                 self.inflight.swap_remove(index);
                 true

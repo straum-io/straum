@@ -208,6 +208,12 @@ impl Settings {
                 1_048_576,
             )?,
             max_inflight: parser.number("STRAUM_MAX_INFLIGHT", 32, 1, 65_534)?,
+            max_offline_sessions: parser.number(
+                "STRAUM_MAX_OFFLINE_SESSIONS",
+                4096,
+                0,
+                1_048_576,
+            )?,
             max_retained_messages: parser.number(
                 "STRAUM_MAX_RETAINED_MESSAGES",
                 10_000,
@@ -951,6 +957,7 @@ mod tests {
             ("STRAUM_MAX_SUBSCRIPTIONS_PER_SESSION", "1024"),
             ("STRAUM_MAX_INFLIGHT", "32"),
             ("STRAUM_SESSION_BACKLOG_MESSAGES", "1024"),
+            ("STRAUM_MAX_OFFLINE_SESSIONS", "4096"),
             ("STRAUM_MAX_RETAINED_MESSAGES", "10000"),
             ("STRAUM_MAX_RETAINED_BYTES", "67108864"),
             ("STRAUM_SESSION_QUEUE_MESSAGES", "1024"),

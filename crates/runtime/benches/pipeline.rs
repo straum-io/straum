@@ -73,6 +73,7 @@ fn broker(subscribers: usize, guarantee: DeliveryGuarantee) -> (Broker, Outbox) 
             Command::Connect(Connect {
                 client_id: client(index),
                 permissions: Permissions::unrestricted(),
+                resume: false,
             }),
             &mut out,
         );
@@ -109,6 +110,7 @@ impl Pipeline {
             Command::Connect(Connect {
                 client_id: client(usize::MAX),
                 permissions: Permissions::unrestricted(),
+                resume: false,
             }),
             &mut out,
         );

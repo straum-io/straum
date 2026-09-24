@@ -50,6 +50,7 @@ fn broker(subscribers: usize, pattern: &str, noise: usize) -> (Broker, Outbox) {
             Command::Connect(Connect {
                 client_id: client(index),
                 permissions: Permissions::unrestricted(),
+                resume: false,
             }),
             &mut out,
         );
@@ -70,6 +71,7 @@ fn broker(subscribers: usize, pattern: &str, noise: usize) -> (Broker, Outbox) {
             Command::Connect(Connect {
                 client_id: client(usize::MAX),
                 permissions: Permissions::unrestricted(),
+                resume: false,
             }),
             &mut out,
         );
@@ -114,6 +116,7 @@ fn bench_route(bencher: divan::Bencher, subscribers: usize, pattern: &str, noise
         Command::Connect(Connect {
             client_id: client(usize::MAX - 1),
             permissions: Permissions::unrestricted(),
+            resume: false,
         }),
         &mut out,
     );
@@ -165,6 +168,7 @@ fn publish_route(bencher: divan::Bencher, subscribers: usize) {
         Command::Connect(Connect {
             client_id: client(usize::MAX - 1),
             permissions: Permissions::unrestricted(),
+            resume: false,
         }),
         &mut out,
     );

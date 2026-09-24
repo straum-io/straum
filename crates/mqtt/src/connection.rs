@@ -218,6 +218,7 @@ fn deliver(
         &delivery.topic,
         id,
         &delivery.payload,
+        delivery.duplicate,
         delivery.retain,
         limits,
     )

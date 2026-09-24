@@ -41,14 +41,14 @@ pub fn connack(buf: &mut BytesMut, ack: ConnAck) {
     buf.put_u8(code);
 }
 
-/// DUP is always 0: nothing is ever resent (§6). RETAIN is set only when the
-/// broker is handing a stored message to a new subscriber, which is what the
-/// flag means on the way out.
+/// RETAIN marks a stored message being handed to a new subscriber; DUP marks
+/// one this session was already given and did not acknowledge.
 pub fn publish(
     buf: &mut BytesMut,
     topic: &Topic,
     id: Option<PacketId>,
     payload: &[u8],
+    duplicate: bool,
     retain: bool,
     limits: &MqttLimits,
 ) -> Result<(), MqttError> {
@@ -65,8 +65,10 @@ pub fn publish(
     let start = reserve(buf, remaining, limits)?;
 
     let qos = if id.is_some() { 0b0010 } else { 0 };
+    // DUP says the client may already have this one (3.1.1 §3.3.1.1).
+    let duplicate = if duplicate { 0b1000 } else { 0 };
     let retain = u8::from(retain);
-    buf.put_u8(PUBLISH | qos | retain);
+    buf.put_u8(PUBLISH | qos | retain | duplicate);
     put_remaining_length(buf, remaining);
     put_string(buf, topic, topic_length);
     if let Some(id) = id {
