@@ -32,6 +32,9 @@ pub struct BrokerLimits {
     pub max_inflight: usize,
     /// At-least-once deliveries waiting for room in the inflight window.
     pub session_backlog_messages: usize,
+    /// Payload bytes those deliveries may hold. A message count is not a
+    /// memory bound on its own — the messages can be a megabyte each (§7).
+    pub session_backlog_bytes: usize,
     /// Sessions kept for a client that asked to be resumed but is not
     /// connected. A map keyed by client identity needs a bound (§8).
     pub max_offline_sessions: usize,
@@ -46,8 +49,9 @@ impl Default for BrokerLimits {
     fn default() -> Self {
         Self {
             max_subscriptions_per_session: 1024,
-            max_inflight: 32,
-            session_backlog_messages: 1024,
+            max_inflight: 256,
+            session_backlog_messages: 16_384,
+            session_backlog_bytes: 8_388_608,
             max_offline_sessions: 4096,
             max_retained_messages: 10_000,
             max_retained_bytes: 67_108_864,
@@ -220,6 +224,7 @@ impl Broker {
             Permissions::from_rules(Vec::new()),
             true,
             self.limits.session_backlog_messages,
+            self.limits.session_backlog_bytes,
         );
         held.online = false;
         held.owes_from = record.owes_from;
@@ -388,6 +393,7 @@ impl Broker {
                 connect.permissions.clone(),
                 connect.resume,
                 self.limits.session_backlog_messages,
+                self.limits.session_backlog_bytes,
             ));
         }
         self.by_id.insert(session, slot);

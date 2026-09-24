@@ -69,6 +69,7 @@ Defaults below are **initial**. They are adjusted by benchmarks, not intuition.
 |---|---|---|
 | `STRAUM_WAL_PATH` | `straum.wal` | Log file. Recovery cuts an incomplete or corrupt tail on open. |
 | `STRAUM_WAL_QUEUE` | `65536` | Records queued from the broker loop to the WAL writer. Full means the submitter waits; nothing is acknowledged early to make room. |
+| `STRAUM_WAL_COMPACT_BYTES` | `67108864` | Rewrite the log at startup once it is at least this large, dropping records nothing needs any more (docs/storage.md §104). `0` never rewrites it. Compaction runs at startup only, so a broker that never restarts never compacts. |
 | `STRAUM_WAL_MAX_RECORD_BYTES` | `1048576` | Largest payload one record may carry. Matches `STRAUM_MAX_PACKET_BYTES`. |
 | `STRAUM_WAL_MIN_BATCH_BYTES` | `65536` | Floor for the adaptive batch bound. |
 | `STRAUM_WAL_MAX_BATCH_BYTES` | `4194304` | Upper safety boundary for one batch — not a size to wait for (docs/storage.md §77). |
@@ -80,8 +81,10 @@ Defaults below are **initial**. They are adjusted by benchmarks, not intuition.
 | Variable | Default | Notes |
 |---|---|---|
 | `STRAUM_MAX_SUBSCRIPTIONS_PER_SESSION` | `1024` | |
-| `STRAUM_MAX_INFLIGHT` | `32` | Unacknowledged at-least-once deliveries per session. Must be < 65,535. |
-| `STRAUM_SESSION_BACKLOG_MESSAGES` | `1024` | At-least-once deliveries waiting for inflight window, per session. |
+| `STRAUM_MAX_INFLIGHT` | `256` | Unacknowledged at-least-once deliveries per session. Must be < 65,535. At-least-once throughput per session is this window divided by the acknowledgement round trip, so it is a rate ceiling as much as a memory bound: at 32 a subscriber could not sustain 20,000/s and was closed as a slow consumer. |
+| `STRAUM_SESSION_BACKLOG_MESSAGES` | `16384` | At-least-once deliveries waiting for inflight window, per session. This is the burst a session may fall behind by before it is closed; 1024 was under a second of it at moderate rates. |
+| `STRAUM_SESSION_BACKLOG_BYTES` | `8388608` | Payload bytes those deliveries may hold. Without it the message count is not a memory bound at all — the messages can be a megabyte each (CLAUDE.md §7). Whichever ceiling is reached first refuses the message. |
+| `STRAUM_MAX_OFFLINE_SESSIONS` | `4096` | Sessions kept for clients that asked to be resumed and are not connected. `0` turns persistent sessions off: a session is then dropped whatever CleanSession said. |
 | `STRAUM_MAX_RETAINED_MESSAGES` | `10000` | Topics that may hold a retained message. `0` disables retention. |
 | `STRAUM_MAX_RETAINED_BYTES` | `67108864` | Payload bytes held across all retained messages. |
 

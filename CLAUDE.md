@@ -512,7 +512,7 @@ Overflow policy **(initial)**:
 | Situation | Action |
 |---|---|
 | At-most-once delivery, session queue full (messages or bytes) | drop, `dropped_messages += 1` |
-| At-least-once delivery, session queue full | `Close(SlowConsumer)` |
+| At-least-once delivery, session backlog full (messages or bytes) | `Close(SlowConsumer)`, counted in `backlog_refused` and logged with the limit that was reached |
 | Reply cannot be enqueued | `Close(SlowConsumer)` |
 | Global queued-bytes budget exceeded | same as a full session queue |
 | Global read-bytes budget exceeded | the growth is refused before it is allocated; the connection is closed |

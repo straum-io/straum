@@ -207,7 +207,7 @@ impl Settings {
                 1,
                 1_048_576,
             )?,
-            max_inflight: parser.number("STRAUM_MAX_INFLIGHT", 32, 1, 65_534)?,
+            max_inflight: parser.number("STRAUM_MAX_INFLIGHT", 256, 1, 65_534)?,
             max_offline_sessions: parser.number(
                 "STRAUM_MAX_OFFLINE_SESSIONS",
                 4096,
@@ -228,9 +228,17 @@ impl Settings {
             )?,
             session_backlog_messages: parser.number(
                 "STRAUM_SESSION_BACKLOG_MESSAGES",
-                1024,
+                16_384,
                 1,
                 1_048_576,
+            )?,
+            // A message count alone is not a memory bound: the messages can
+            // be a megabyte each (CLAUDE.md §7).
+            session_backlog_bytes: parser.number(
+                "STRAUM_SESSION_BACKLOG_BYTES",
+                8_388_608usize,
+                1024,
+                17_179_869_184,
             )?,
         };
 
@@ -649,7 +657,7 @@ mod tests {
         assert_eq!(settings.runtime.transport.listen.port(), 1883);
         assert_eq!(settings.runtime.transport.backlog, 1024);
         assert_eq!(settings.runtime.mqtt.max_packet_bytes, 1_048_576);
-        assert_eq!(settings.runtime.broker.max_inflight, 32);
+        assert_eq!(settings.runtime.broker.max_inflight, 256);
         assert_eq!(settings.runtime.broker_batch, 256);
         assert_eq!(
             settings.runtime.shutdown_grace,
@@ -963,11 +971,12 @@ mod tests {
             ("STRAUM_CONNECT_TIMEOUT_MS", "10000"),
             ("STRAUM_PAYLOAD_COPY_THRESHOLD_BYTES", "512"),
             ("STRAUM_MAX_SUBSCRIPTIONS_PER_SESSION", "1024"),
-            ("STRAUM_MAX_INFLIGHT", "32"),
-            ("STRAUM_SESSION_BACKLOG_MESSAGES", "1024"),
+            ("STRAUM_MAX_INFLIGHT", "256"),
+            ("STRAUM_SESSION_BACKLOG_MESSAGES", "16384"),
             ("STRAUM_MAX_OFFLINE_SESSIONS", "4096"),
             ("STRAUM_MAX_RETAINED_MESSAGES", "10000"),
             ("STRAUM_MAX_RETAINED_BYTES", "67108864"),
+            ("STRAUM_SESSION_BACKLOG_BYTES", "8388608"),
             ("STRAUM_SESSION_QUEUE_MESSAGES", "1024"),
             ("STRAUM_SESSION_QUEUE_BYTES", "8388608"),
             ("STRAUM_TOTAL_QUEUED_BYTES", "1073741824"),

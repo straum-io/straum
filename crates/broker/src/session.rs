@@ -16,6 +16,11 @@ use domain::{ClientId, DeliveryGuarantee, DeliveryId, SessionId, Topic, TopicFil
 pub struct Backlog {
     waiting: VecDeque<Waiting>,
     limit: usize,
+    /// Payload bytes waiting here, and the ceiling on them. A message count
+    /// alone is not a memory bound: a thousand messages is a megabyte or a
+    /// gigabyte depending on what was published (CLAUDE.md §7).
+    bytes: usize,
+    byte_limit: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -27,19 +32,24 @@ pub struct Waiting {
 }
 
 impl Backlog {
-    pub fn new(limit: usize) -> Self {
+    pub fn new(limit: usize, byte_limit: usize) -> Self {
         Self {
             waiting: VecDeque::new(),
             limit,
+            bytes: 0,
+            byte_limit,
         }
     }
 
-    /// `false` means the session is too far behind to keep it.
+    /// `false` means the session is too far behind to keep it — either in
+    /// messages or in bytes, whichever it reaches first.
     #[must_use]
     pub fn push(&mut self, topic: Topic, payload: Bytes, correlation: u64) -> bool {
-        if self.waiting.len() >= self.limit {
+        let weight = payload.len();
+        if self.waiting.len() >= self.limit || self.bytes.saturating_add(weight) > self.byte_limit {
             return false;
         }
+        self.bytes = self.bytes.saturating_add(weight);
         self.waiting.push_back(Waiting {
             topic,
             payload,
@@ -49,7 +59,14 @@ impl Backlog {
     }
 
     pub fn pop(&mut self) -> Option<Waiting> {
-        self.waiting.pop_front()
+        let waiting = self.waiting.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(waiting.payload.len());
+        Some(waiting)
+    }
+
+    /// Payload bytes waiting here.
+    pub fn bytes(&self) -> usize {
+        self.bytes
     }
 
     /// How far behind this session is; the runtime reports it as a gauge.
@@ -121,6 +138,7 @@ impl Session {
         permissions: Permissions,
         resume: bool,
         backlog: usize,
+        backlog_bytes: usize,
     ) -> Self {
         Self {
             id,
@@ -128,7 +146,7 @@ impl Session {
             permissions,
             filters: Vec::new(),
             inflight: Vec::new(),
-            backlog: Backlog::new(backlog),
+            backlog: Backlog::new(backlog, backlog_bytes),
             online: true,
             resume,
             seen: 0,
