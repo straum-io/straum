@@ -302,3 +302,42 @@ fn a_subscription_the_rules_no_longer_allow_does_not_come_back() {
         "a revoked subscription kept delivering"
     );
 }
+
+/// The backlog is a bound, and reaching it loses messages. What must not
+/// happen is losing them silently, or counting an offline session out of
+/// the active ones it was never in.
+#[test]
+fn an_offline_session_that_overflows_is_counted_not_closed() {
+    let mut broker = Broker::new(BrokerLimits {
+        session_backlog_messages: 4,
+        ..BrokerLimits::default()
+    });
+    let mut out = Outbox::new();
+    broker.restore_session(SessionRecord {
+        client: client("device"),
+        filters: vec![(filter("a/#"), AtLeastOnce)],
+        owes_from: 0,
+    });
+
+    let message = Publish {
+        topic: topic("a/b"),
+        payload: Bytes::from_static(b"payload"),
+        guarantee: AtLeastOnce,
+        retain: false,
+    };
+    for correlation in 1..=10 {
+        broker.restore_publish(correlation, &message, &mut out);
+    }
+
+    let stats = broker.stats();
+    assert_eq!(stats.backlog_refused, 6, "the refused messages were silent");
+    assert_eq!(
+        stats.active_sessions, 0,
+        "an offline session was counted active"
+    );
+    assert_eq!(stats.offline_sessions, 1, "the session was thrown away");
+
+    // What fits still comes back.
+    connect(&mut broker, &mut out, 1, "device", true);
+    assert_eq!(deliveries(&mut out).len(), 4);
+}

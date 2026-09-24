@@ -73,6 +73,9 @@ pub struct Stats {
     /// that could not be kept because the limit was reached.
     pub offline_sessions: u64,
     pub offline_refused: u64,
+    /// At-least-once messages a session backlog had no room for. Each one
+    /// is a message the session will never receive.
+    pub backlog_refused: u64,
     /// At-most-once messages dropped because their session was offline.
     pub offline_dropped: u64,
     pub active_sessions: u64,
@@ -677,7 +680,17 @@ impl Broker {
             None => {}
         }
         if dropped {
-            self.close(id, Some(CloseReason::SlowConsumer), out);
+            // The backlog is a bound, and a bound that is reached loses
+            // messages: that is what bounded memory costs (§8). Counted
+            // rather than silent, because an operator who sees this needs
+            // to raise STRAUM_SESSION_BACKLOG_MESSAGES.
+            self.stats.backlog_refused = self.stats.backlog_refused.saturating_add(1);
+            // Only a session with a connection can be closed. An offline
+            // one has nothing to close, and `close` would count it out of
+            // the active sessions it was never in.
+            if online {
+                self.close(id, Some(CloseReason::SlowConsumer), out);
+            }
         }
     }
 

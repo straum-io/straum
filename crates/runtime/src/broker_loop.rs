@@ -120,6 +120,9 @@ impl Loop {
             self.metrics
                 .active_sessions
                 .store(stats.active_sessions, Ordering::Relaxed);
+            self.metrics
+                .backlog_refused
+                .store(stats.backlog_refused, Ordering::Relaxed);
         }
 
         tracing::debug!("broker loop stopped");

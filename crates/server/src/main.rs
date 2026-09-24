@@ -163,13 +163,16 @@ fn report(settings: &Settings, kernel: &KernelLimits) {
             "listening on several sockets; the kernel balances accepts across them"
         );
     }
-    if settings.runtime.durability != Durability::Memory {
-        tracing::warn!(
-            durability = ?settings.runtime.durability,
+    match settings.runtime.durability {
+        Durability::Memory => tracing::warn!(
+            "durability is memory: an acknowledged message is lost if this process dies"
+        ),
+        durability => tracing::info!(
+            ?durability,
             path = %settings.runtime.wal.path.display(),
             queue = settings.runtime.wal.queue,
             max_batch_bytes = settings.runtime.wal.limits.max_batch_bytes,
-            "the WAL is not wired into the runtime yet; messages are held in memory only"
-        );
+            "writing to the log; nothing is acknowledged before its record is durable"
+        ),
     }
 }
