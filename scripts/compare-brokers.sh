@@ -42,6 +42,9 @@ PAYLOAD="${STRAUM_BENCH_PAYLOAD:-64}"
 QOS="${STRAUM_BENCH_QOS:-0}"
 SECONDS_TO_RUN="${STRAUM_BENCH_SECONDS:-10}"
 CONNECTS="${STRAUM_BENCH_CONNECTS:-500}"
+# One round proves nothing here: the spread between rounds is larger than
+# most differences between brokers (docs/benchmarks.md §7).
+ROUNDS="${STRAUM_BENCH_ROUNDS:-5}"
 ONLY="${STRAUM_BENCH_ONLY:-straum mosquitto nanomq}"
 
 run_in_rust() {
@@ -112,6 +115,7 @@ printf '%.0s-' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25
     91 92 93 94 95 96 97 98
 echo
 
+for round in $(seq 1 "$ROUNDS"); do
 for broker in $ONLY; do
     stop_broker "$broker"
     start_broker "$broker"
@@ -121,9 +125,11 @@ for broker in $ONLY; do
         "for i in \$(seq 1 60); do if (exec 3<>/dev/tcp/straum-bench-$broker/1883) 2>/dev/null; then exit 0; fi; sleep 0.5; done; exit 1" \
         || { echo "$broker never started listening"; stop_broker "$broker"; continue; }
 
+    printf "%-7s " "round $round"
     loadgen "$broker" --publishers "$PUBLISHERS" --subscribers "$SUBSCRIBERS" \
         --rate "$RATE" --payload "$PAYLOAD" --qos "$QOS" --seconds "$SECONDS_TO_RUN"
     stop_broker "$broker"
+done
 done
 
 echo
@@ -132,6 +138,7 @@ echo
 printf '%-12s %10s %10s %11s %11s %9s %9s %9s %8s\n' \
     broker attempted connected "conn/s" "-" "p50 ms" "p95 ms" "p99 ms" "-"
 
+for round in $(seq 1 "$ROUNDS"); do
 for broker in $ONLY; do
     stop_broker "$broker"
     start_broker "$broker"
@@ -140,13 +147,20 @@ for broker in $ONLY; do
         "for i in \$(seq 1 60); do if (exec 3<>/dev/tcp/straum-bench-$broker/1883) 2>/dev/null; then exit 0; fi; sleep 0.5; done; exit 1" \
         || { stop_broker "$broker"; continue; }
 
+    printf "%-7s " "round $round"
     loadgen "$broker" --connects --publishers "$CONNECTS"
     stop_broker "$broker"
+done
 done
 
 "$ENGINE" network rm "$NETWORK" >/dev/null 2>&1 || true
 
 cat <<'NOTE'
+
+Compare medians across rounds, never a single row: in this environment the
+spread between rounds is larger than most differences between brokers, and
+one round will happily show a broker as nine times worse than it is
+(docs/benchmarks.md §7).
 
 These numbers were taken inside containers. On a macOS host that means a
 virtualised network and virtualised timing, which docs/benchmarks.md §6 rules
