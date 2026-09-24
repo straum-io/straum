@@ -32,6 +32,7 @@ straum/
 ├── crates/
 │   ├── domain/
 │   ├── protocol/
+│   ├── auth/
 │   ├── mqtt/
 │   ├── transport/
 │   ├── storage/
@@ -115,7 +116,7 @@ belong to no package and cargo does not run them. Cross-crate tests go to
 server
 └── runtime
     ├── broker
-    │   ├── protocol ── domain
+    │   ├── protocol ── domain, auth
     │   └── domain
     ├── mqtt
     │   ├── protocol
@@ -129,11 +130,12 @@ e2e (dev only) → runtime, rumqttc
 | Crate | Internal deps | External deps (baseline) | Forbidden, including transitive |
 |---|---|---|---|
 | domain | — | bytes, thiserror | tokio, every other workspace crate |
-| protocol | domain | bytes, thiserror | tokio, mqtt, transport, broker, runtime, server |
+| auth | domain | bytes, thiserror, argon2 | tokio, every other workspace crate |
+| protocol | domain, auth | bytes, thiserror | tokio, mqtt, transport, broker, runtime, server |
 | mqtt | domain, protocol | bytes, thiserror | tokio, transport, broker, runtime, server |
 | transport | — | bytes, thiserror, tokio, tracing, socket2, tokio-rustls, rustls-pemfile | protocol, mqtt, broker, runtime, server |
 | storage | — | bytes, thiserror, crc32fast | tokio, protocol, mqtt, transport, broker, runtime, server |
-| broker | domain, protocol | bytes, thiserror, tracing | tokio, mqtt, transport, runtime, server, storage |
+| broker | domain, protocol, auth | bytes, thiserror, tracing | tokio, mqtt, transport, runtime, server, storage |
 | runtime | domain, protocol, mqtt, transport, broker, storage | thiserror, tokio, tracing | server |
 | server | runtime | tokio, tracing, tracing-subscriber | — |
 
@@ -255,6 +257,16 @@ offset, recovery of the durable prefix. Rules in `docs/storage.md`.
 It does blocking file I/O and reads the clock, because storage latency is
 the signal the batching adapts to (§95). It owns no threads: the runtime
 gives it one, and `sync_data` never runs inside the broker task.
+
+## auth
+
+Credentials and per-topic authorisation: password hashing (argon2id) and
+the rules a session is allowed to act under. It reads no files and no
+environment — the server parses both and hands over typed values.
+
+`Permissions` travels inside `protocol::Connect`, which is why `protocol`
+depends on this crate: a CONNECT is not a command until somebody has
+checked what it carries.
 
 ---
 
@@ -396,8 +408,9 @@ Semantics:
   `Command::Ack`. At most `STRAUM_MAX_INFLIGHT` per session; further
   at-least-once deliveries wait in the broker's session backlog.
 * `Disconnect { ConnectionLost }` is sent by the runtime when the socket closes.
-  The broker removes the session, its subscriptions and its inflight set
-  (no persistent sessions).
+  A session that asked to be resumed is kept without a connection, collecting
+  what it is owed; anything else is removed with its subscriptions and its
+  inflight set in the same call (§7).
 * `Outbound::Close` makes the runtime close the connection.
 * Keep-alive, PINGREQ and PINGRESP never reach the broker.
 * `Outbox` is owned by the caller and reused across iterations; it is cleared,
@@ -413,8 +426,11 @@ UNSUBACK, PINGREQ, PINGRESP, DISCONNECT. QoS 0 and QoS 1.
 Being built, in this order (the adoption path, not a wish list):
 
 1. TLS, then authentication with per-topic authorisation.
-2. Persistent sessions (retained messages are built; they live in memory and
-   do not survive a restart yet).
+2. Retained messages and persistent sessions are built, and both survive a
+   restart. A kept session is written down as its subscriptions plus the
+   last log record it finished with; what it is owed is replayed from the
+   log rather than stored twice (docs/storage.md §90a). The log cannot yet
+   be trimmed past the oldest such mark — compaction is not built.
 3. Will publishing.
 
 Out of scope: MQTT 5, QoS 2, shared subscriptions, WebSocket. Each needs
@@ -430,9 +446,13 @@ Decisions and documented deviations:
 |---|---|
 | Protocol level ≠ 4 | CONNACK 0x01, close |
 | First packet is not CONNECT, or a second CONNECT | close |
-| CleanSession = 0 | treated as clean; SessionPresent = 0 |
+| CleanSession = 0 | the session is kept when the connection ends and resumed on the next CONNECT from that identity; SessionPresent = 1 |
+| CleanSession = 1 with a kept session | the kept session is discarded; SessionPresent = 0 |
+| Offline session store full | the session is not kept; `offline_refused` counts it |
+| At-most-once for an offline session | dropped (3.1.1 allows it); `offline_dropped` counts it |
+| Unacknowledged at-least-once on resume | sent again with DUP = 1 |
 | Empty ClientId, CleanSession = 1 | broker assigns an id |
-| Empty ClientId, CleanSession = 0 | CONNACK 0x02, close |
+| Empty ClientId, CleanSession = 0 | the broker assigns an id and the session is not kept: nothing names it afterwards (deviation: 3.1.1 says CONNACK 0x02) |
 | ClientId already connected | old session closed (takeover) |
 | Will flag | parsed and validated, not published (deviation) |
 | Username / password | checked against the credential file before the broker sees the session |
@@ -769,14 +789,18 @@ itself a cost: prefer per-task counters aggregated on read where a benchmark
 shows contention.
 
 ```text
-counters: connections_accepted  published_messages  delivered_messages
-          dropped_messages  protocol_errors  transport_errors
-          bytes_in  bytes_out  slow_consumer_closes
+counters: connections_accepted  protocol_errors  transport_errors
+          bytes_in  bytes_out  slow_consumer_closes  backlog_refused
+          authentication_failures  keepalive_closes
           wal_commits  wal_records_committed  wal_bytes_committed
-          wal_sync_nanos  wal_commit_failures
+          wal_sync_nanos  wal_commit_failures  session_records_dropped
 gauges:   active_sessions  queued_messages  queued_bytes
-          wal_durable_sequence  wal_batch_bound
+          wal_durable_sequence
 ```
+
+The broker keeps its own counters (`published_messages`,
+`delivered_messages`, `dropped_messages` and the rest of `broker::Stats`);
+the runtime mirrors out only what an operator acts on.
 
 ---
 
@@ -790,13 +814,17 @@ The runtime coordinates; nothing relies on `Drop` for application shutdown.
 3. let writers drain for STRAUM_SHUTDOWN_GRACE_MS
 4. close sessions
 5. close sockets
-6. commit what the WAL already accepted, then stop its writer
-7. stop the broker loop and remaining tasks
+6. stop the broker loop (it holds a log submitter of its own)
+7. commit what the WAL already accepted, then stop its writer and the
+   remaining tasks
 8. exit
 ```
 
-At-least-once messages still inflight at shutdown are lost (no persistence).
-This is documented behavior, not a bug.
+With `STRAUM_DURABILITY=memory`, at-least-once messages still inflight at
+shutdown are lost — an acknowledgement there means routed, not written. With
+`fsynced`, an acknowledged publish is already in the log and comes back at the
+next start (docs/storage.md §79). What is lost in both cases is a delivery the
+subscriber had not acknowledged: it is sent again with DUP.
 
 ---
 
@@ -898,9 +926,10 @@ A non-obvious optimization carries the measurement that justifies it:
 ```
 
 Public docs state behavior, ownership, errors, blocking/async behavior,
-invariants, limits, and performance-sensitive decisions. No marketing words
-("robust", "seamless", "leveraging", "optimal", "at its core") and no vague
-speed claims (section 11). Short, concrete engineering language.
+invariants, limits, and performance-sensitive decisions. Short, concrete
+engineering language: a word that makes a claim has to be a claim somebody
+measured, which rules out both the vague speed claims of section 11 and the
+adjectives that only sound like one.
 
 ---
 
