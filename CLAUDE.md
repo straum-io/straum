@@ -429,8 +429,9 @@ Being built, in this order (the adoption path, not a wish list):
 2. Retained messages and persistent sessions are built, and both survive a
    restart. A kept session is written down as its subscriptions plus the
    last log record it finished with; what it is owed is replayed from the
-   log rather than stored twice (docs/storage.md §90a). The log cannot yet
-   be trimmed past the oldest such mark — compaction is not built.
+   log rather than stored twice (docs/storage.md §90a). Compaction respects
+   that mark and runs at startup only, so a broker that never restarts never
+   compacts (docs/storage.md §104).
 3. Will publishing.
 
 Out of scope: MQTT 5, QoS 2, shared subscriptions, WebSocket. Each needs
