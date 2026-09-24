@@ -74,6 +74,9 @@ start_broker() {
                 -e STRAUM_LISTEN_ADDR=0.0.0.0:1883 \
                 -e STRAUM_LOG_LEVEL=warn \
                 -e STRAUM_WORKER_THREADS="${STRAUM_BENCH_WORKERS:-auto}" \
+                -v straum-bench-straum-data:/state \
+                -e STRAUM_DURABILITY="${STRAUM_BENCH_DURABILITY:-memory}" \
+                -e STRAUM_WAL_PATH=/state/straum.wal \
                 "$RUST_IMAGE" ./target/release/straum-server >/dev/null
             ;;
         mosquitto)
