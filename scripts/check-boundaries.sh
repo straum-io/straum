@@ -19,11 +19,15 @@ check() {
     done
 }
 
-check domain    tokio protocol mqtt transport broker runtime server storage
+check domain    tokio auth protocol mqtt transport broker runtime server storage
+check auth      tokio protocol mqtt transport broker runtime server storage
 check protocol  tokio mqtt transport broker runtime server storage
+# `auth` is not forbidden to mqtt and broker: it arrives through `protocol`,
+# which carries `Permissions` in its Connect. Forbidding it there would
+# forbid the contract itself.
 check mqtt      tokio transport broker runtime server storage
-check transport protocol mqtt broker runtime server storage
-check storage   tokio protocol mqtt transport broker runtime server
+check transport auth protocol mqtt broker runtime server storage
+check storage   tokio auth protocol mqtt transport broker runtime server
 check broker    tokio mqtt transport runtime server storage
 check runtime   server
 
