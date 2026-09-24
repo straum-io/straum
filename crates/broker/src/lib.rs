@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 
 use bytes::Bytes;
-use domain::{ClientId, DeliveryGuarantee, DeliveryId, SessionId, TopicFilter};
+use domain::{ClientId, DeliveryGuarantee, DeliveryId, SessionId, Topic, TopicFilter};
 use protocol::{
     CloseReason, Command, Connect, Delivery, DurableToken, Outbound, Outbox, Publish, RequestId,
     Response, SubscribeResult,
@@ -31,6 +31,11 @@ pub struct BrokerLimits {
     pub max_inflight: usize,
     /// At-least-once deliveries waiting for room in the inflight window.
     pub session_backlog_messages: usize,
+    /// Topics that may hold a retained message. A map keyed by remote
+    /// data is only bounded if somebody bounds it (CLAUDE.md §8).
+    pub max_retained_messages: usize,
+    /// Payload bytes held across all retained messages.
+    pub max_retained_bytes: usize,
 }
 
 impl Default for BrokerLimits {
@@ -39,6 +44,8 @@ impl Default for BrokerLimits {
             max_subscriptions_per_session: 1024,
             max_inflight: 32,
             session_backlog_messages: 1024,
+            max_retained_messages: 10_000,
+            max_retained_bytes: 67_108_864,
         }
     }
 }
@@ -53,7 +60,18 @@ pub struct Stats {
     /// Publishes and subscriptions refused by the access rules.
     pub unauthorized_publishes: u64,
     pub unauthorized_subscribes: u64,
+    /// Retained messages the store refused to take, because taking them
+    /// would have meant growing without a bound.
+    pub retained_rejected: u64,
+    pub retained_messages: u64,
     pub active_sessions: u64,
+}
+
+/// The last message published to a topic with the retain flag.
+#[derive(Debug, Clone)]
+struct Retained {
+    payload: Bytes,
+    guarantee: DeliveryGuarantee,
 }
 
 pub struct Broker {
@@ -77,6 +95,11 @@ pub struct Broker {
     /// already durable before the broker saw the command is acknowledged
     /// straight away, so the two paths may arrive in any order.
     durable_high_water: u64,
+    /// The last retained message per topic, and what they weigh.
+    retained: HashMap<Topic, Retained>,
+    retained_bytes: usize,
+    /// Reused when a new subscription replays what is stored.
+    replay: Vec<(Topic, Bytes, DeliveryGuarantee)>,
     stats: Stats,
 }
 
@@ -95,6 +118,9 @@ impl Broker {
             next_client: 0,
             pending_durable: VecDeque::new(),
             durable_high_water: 0,
+            retained: HashMap::new(),
+            retained_bytes: 0,
+            replay: Vec::new(),
             stats: Stats::default(),
         }
     }
@@ -240,6 +266,9 @@ impl Broker {
             .is_some_and(|held| held.permissions.may_publish(&publish.topic));
 
         if permitted {
+            if publish.retain {
+                self.retain(&publish);
+            }
             self.route(&publish, out);
         } else {
             // 3.1.1 has no way to tell a publisher it was refused, and
@@ -288,27 +317,49 @@ impl Broker {
             let Some(slot) = self.matched.get(position).copied() else {
                 break;
             };
-            self.deliver(slot, publish, out);
+            // Delivered guarantee is the weaker of asked-for and granted (§6).
+            let guarantee = match self.sessions.get(slot).and_then(Option::as_ref) {
+                Some(session) => publish.guarantee.min(session.best),
+                None => continue,
+            };
+            self.deliver(
+                slot,
+                &publish.topic,
+                &publish.payload,
+                guarantee,
+                false,
+                out,
+            );
         }
     }
 
-    fn deliver(&mut self, slot: usize, publish: &Publish, out: &mut Outbox) {
+    /// Hands one message to one session, or parks it, or gives up on the
+    /// session. `retain` marks a stored message being replayed to a new
+    /// subscriber rather than live traffic.
+    fn deliver(
+        &mut self,
+        slot: usize,
+        topic: &Topic,
+        payload: &Bytes,
+        guarantee: DeliveryGuarantee,
+        retain: bool,
+        out: &mut Outbox,
+    ) {
         let limits = self.limits;
         let delivery_id = self.next_delivery;
 
         let Some(session) = self.session_mut(slot) else {
             return;
         };
-        // Delivered guarantee is the weaker of asked-for and granted (§6).
-        let guarantee = publish.guarantee.min(session.best);
         let id = session.id;
 
         let (effect, used_id, dropped) = match guarantee {
             DeliveryGuarantee::AtMostOnce => (
                 Some(Delivery {
                     id: None,
-                    topic: publish.topic.clone(),
-                    payload: publish.payload.clone(),
+                    topic: topic.clone(),
+                    payload: payload.clone(),
+                    retain,
                 }),
                 false,
                 false,
@@ -319,8 +370,9 @@ impl Broker {
                 (
                     Some(Delivery {
                         id: Some(delivery),
-                        topic: publish.topic.clone(),
-                        payload: publish.payload.clone(),
+                        topic: topic.clone(),
+                        payload: payload.clone(),
+                        retain,
                     }),
                     true,
                     false,
@@ -329,9 +381,7 @@ impl Broker {
             DeliveryGuarantee::AtLeastOnce => {
                 // The window is full: wait in the backlog, or give up on a
                 // session that is too far behind to catch up.
-                let accepted = session
-                    .backlog
-                    .push(publish.topic.clone(), publish.payload.clone());
+                let accepted = session.backlog.push(topic.clone(), payload.clone());
                 (None, false, !accepted)
             }
         };
@@ -346,6 +396,74 @@ impl Broker {
         if dropped {
             self.close(id, Some(CloseReason::SlowConsumer), out);
         }
+    }
+
+    /// Keeps the last retained message for a topic, or forgets it.
+    ///
+    /// An empty payload is how MQTT deletes one (3.1.1 §3.3.1.3). The store
+    /// is bounded in both directions: a client that publishes retained
+    /// messages to endless topics fills it and then gets refused, rather
+    /// than growing it until the broker dies.
+    fn retain(&mut self, publish: &Publish) {
+        if publish.payload.is_empty() {
+            if let Some(gone) = self.retained.remove(&publish.topic) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(gone.payload.len());
+            }
+            self.stats.retained_messages = self.retained.len() as u64;
+            return;
+        }
+
+        let previous = self
+            .retained
+            .get(&publish.topic)
+            .map(|held| held.payload.len())
+            .unwrap_or(0);
+        let would_hold = self
+            .retained_bytes
+            .saturating_sub(previous)
+            .saturating_add(publish.payload.len());
+        let new_topic = previous == 0 && !self.retained.contains_key(&publish.topic);
+
+        if would_hold > self.limits.max_retained_bytes
+            || (new_topic && self.retained.len() >= self.limits.max_retained_messages)
+        {
+            self.stats.retained_rejected = self.stats.retained_rejected.saturating_add(1);
+            return;
+        }
+
+        self.retained.insert(
+            publish.topic.clone(),
+            Retained {
+                payload: publish.payload.clone(),
+                guarantee: publish.guarantee,
+            },
+        );
+        self.retained_bytes = would_hold;
+        self.stats.retained_messages = self.retained.len() as u64;
+    }
+
+    /// Hands a new subscriber whatever is stored for its filter.
+    fn replay_retained(
+        &mut self,
+        slot: usize,
+        filter: &TopicFilter,
+        granted: DeliveryGuarantee,
+        out: &mut Outbox,
+    ) {
+        // Collected first: the delivery path needs the sessions mutably.
+        let mut replay = std::mem::take(&mut self.replay);
+        replay.clear();
+        replay.extend(
+            self.retained
+                .iter()
+                .filter(|(topic, _)| filter.matches(topic))
+                .map(|(topic, held)| (topic.clone(), held.payload.clone(), held.guarantee)),
+        );
+
+        for (topic, payload, stored) in replay.drain(..) {
+            self.deliver(slot, &topic, &payload, stored.min(granted), true, out);
+        }
+        self.replay = replay;
     }
 
     fn subscribe(
@@ -383,6 +501,10 @@ impl Broker {
             self.index
                 .subscribe(&filter, Subscriber { slot, guarantee });
             granted.push(SubscribeResult::Granted(guarantee));
+
+            // A new subscriber hears the stored state of its topics before it
+            // hears anything live (3.1.1 §3.8.4).
+            self.replay_retained(slot, &filter, guarantee, out);
         }
 
         out.push(
@@ -440,6 +562,9 @@ impl Broker {
                     id: Some(id),
                     topic: waiting.topic,
                     payload: waiting.payload,
+                    // Whatever this was when it arrived, it is live traffic
+                    // for this session now.
+                    retain: false,
                 }),
             );
         }

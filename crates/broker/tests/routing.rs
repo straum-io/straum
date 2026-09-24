@@ -76,6 +76,7 @@ fn publish(
                 topic: topic(name),
                 payload: Bytes::from_static(payload),
                 guarantee,
+                retain: false,
             },
         },
         out,
@@ -466,6 +467,7 @@ fn overflow_drops_what_may_be_dropped_and_closes_what_may_not() {
         id: None,
         topic: topic("a/b"),
         payload: Bytes::from_static(b"x"),
+        retain: false,
     });
     broker.on_overflow(session, at_most_once, &mut out);
     assert!(
@@ -479,6 +481,7 @@ fn overflow_drops_what_may_be_dropped_and_closes_what_may_not() {
         id: Some(DeliveryId(1)),
         topic: topic("a/b"),
         payload: Bytes::from_static(b"x"),
+        retain: false,
     });
     broker.on_overflow(session, at_least_once, &mut out);
     assert_eq!(
@@ -519,6 +522,7 @@ fn a_durable_publish_is_acknowledged_only_after_the_wal_says_so() {
                 publish: Publish {
                     topic: topic("a/b"),
                     payload: Bytes::from_static(b"x"),
+                    retain: false,
                     guarantee: AtLeastOnce,
                 },
             },
@@ -565,6 +569,7 @@ fn a_durable_acknowledgement_for_a_session_that_left_goes_nowhere() {
             publish: Publish {
                 topic: topic("a/b"),
                 payload: Bytes::from_static(b"x"),
+                retain: false,
                 guarantee: AtLeastOnce,
             },
         },
@@ -601,6 +606,7 @@ fn a_publisher_keeps_its_order() {
                     topic: topic("a/b"),
                     payload: Bytes::from(vec![index]),
                     guarantee: AtMostOnce,
+                    retain: false,
                 },
             },
             &mut out,
@@ -705,6 +711,7 @@ mod properties {
                         topic: published_topic.clone(),
                         payload: Bytes::from_static(b"x"),
                         guarantee: published,
+                        retain: false,
                     },
                 },
                 &mut out,
@@ -745,6 +752,7 @@ fn a_record_that_was_durable_before_the_command_arrived_is_acknowledged_at_once(
             publish: Publish {
                 topic: topic("a/b"),
                 payload: Bytes::from_static(b"x"),
+                retain: false,
                 guarantee: AtLeastOnce,
             },
         },
@@ -813,6 +821,7 @@ mod authorisation {
                 publish: Publish {
                     topic: topic("secrets/payroll"),
                     payload: Bytes::from_static(b"x"),
+                    retain: false,
                     guarantee: AtLeastOnce,
                 },
             },
@@ -844,6 +853,7 @@ mod authorisation {
                     topic: topic("sensors/eu/temp"),
                     payload: Bytes::from_static(b"21"),
                     guarantee: AtMostOnce,
+                    retain: false,
                 },
             },
             &mut out,
@@ -904,5 +914,238 @@ mod authorisation {
             AtMostOnce,
         );
         assert!(deliveries(&mut out).is_empty());
+    }
+}
+
+/// The last message on a topic, kept for whoever subscribes next.
+mod retained {
+    use super::*;
+
+    fn retain(
+        broker: &mut Broker,
+        out: &mut Outbox,
+        session: SessionId,
+        name: &str,
+        payload: &'static [u8],
+        guarantee: DeliveryGuarantee,
+    ) {
+        broker.handle(
+            session,
+            Command::Publish {
+                ack: None,
+                publish: Publish {
+                    topic: topic(name),
+                    payload: Bytes::from_static(payload),
+                    guarantee,
+                    retain: true,
+                },
+            },
+            out,
+        );
+    }
+
+    #[test]
+    fn a_new_subscriber_hears_what_was_stored() {
+        let (mut broker, mut out) = broker();
+        let publisher = connect(&mut broker, &mut out, 1, "pub");
+        retain(
+            &mut broker,
+            &mut out,
+            publisher,
+            "sensors/eu/temp",
+            b"21",
+            AtMostOnce,
+        );
+        let _ = drain(&mut out);
+        assert_eq!(broker.stats().retained_messages, 1);
+
+        let subscriber = connect(&mut broker, &mut out, 2, "sub");
+        let _ = drain(&mut out);
+        subscribe(&mut broker, &mut out, subscriber, "sensors/#", AtMostOnce);
+
+        let delivered = deliveries(&mut out);
+        assert_eq!(delivered.len(), 1, "the stored message was not replayed");
+        assert_eq!(delivered[0].0, subscriber);
+        assert_eq!(delivered[0].1.payload, Bytes::from_static(b"21"));
+        // The client has to be able to tell stored state from live traffic.
+        assert!(delivered[0].1.retain, "the replay was not marked retained");
+    }
+
+    #[test]
+    fn live_traffic_is_not_marked_retained() {
+        let (mut broker, mut out) = broker();
+        let subscriber = connect(&mut broker, &mut out, 1, "sub");
+        subscribe(&mut broker, &mut out, subscriber, "a/b", AtMostOnce);
+        let _ = drain(&mut out);
+
+        // Published with the flag, but this subscriber is already there.
+        retain(
+            &mut broker,
+            &mut out,
+            subscriber,
+            "a/b",
+            b"live",
+            AtMostOnce,
+        );
+        let delivered = deliveries(&mut out);
+
+        assert_eq!(delivered.len(), 1);
+        assert!(!delivered[0].1.retain);
+    }
+
+    #[test]
+    fn the_last_one_wins_and_an_empty_payload_forgets_it() {
+        let (mut broker, mut out) = broker();
+        let publisher = connect(&mut broker, &mut out, 1, "pub");
+        retain(
+            &mut broker,
+            &mut out,
+            publisher,
+            "a/b",
+            b"first",
+            AtMostOnce,
+        );
+        retain(
+            &mut broker,
+            &mut out,
+            publisher,
+            "a/b",
+            b"second",
+            AtMostOnce,
+        );
+        let _ = drain(&mut out);
+        assert_eq!(broker.stats().retained_messages, 1);
+
+        let subscriber = connect(&mut broker, &mut out, 2, "sub");
+        subscribe(&mut broker, &mut out, subscriber, "a/b", AtMostOnce);
+        let delivered = deliveries(&mut out);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].1.payload, Bytes::from_static(b"second"));
+
+        // 3.1.1 §3.3.1.3: retained with an empty payload deletes the message.
+        retain(&mut broker, &mut out, publisher, "a/b", b"", AtMostOnce);
+        let _ = drain(&mut out);
+        assert_eq!(broker.stats().retained_messages, 0);
+
+        let late = connect(&mut broker, &mut out, 3, "late");
+        subscribe(&mut broker, &mut out, late, "a/b", AtMostOnce);
+        assert!(
+            deliveries(&mut out).is_empty(),
+            "a deleted message came back"
+        );
+    }
+
+    #[test]
+    fn the_stored_guarantee_is_capped_by_the_grant() {
+        let (mut broker, mut out) = broker();
+        let publisher = connect(&mut broker, &mut out, 1, "pub");
+        retain(&mut broker, &mut out, publisher, "a/b", b"x", AtLeastOnce);
+        let _ = drain(&mut out);
+
+        let weak = connect(&mut broker, &mut out, 2, "weak");
+        subscribe(&mut broker, &mut out, weak, "a/b", AtMostOnce);
+        assert_eq!(deliveries(&mut out)[0].1.id, None);
+
+        let strong = connect(&mut broker, &mut out, 3, "strong");
+        subscribe(&mut broker, &mut out, strong, "a/b", AtLeastOnce);
+        assert!(deliveries(&mut out)[0].1.id.is_some());
+    }
+
+    #[test]
+    fn the_store_refuses_to_grow_without_a_bound() {
+        let limits = BrokerLimits {
+            max_retained_messages: 2,
+            ..BrokerLimits::default()
+        };
+        let mut broker = Broker::new(limits);
+        let mut out = Outbox::new();
+        let publisher = connect(&mut broker, &mut out, 1, "pub");
+
+        for index in 0..5 {
+            broker.handle(
+                publisher,
+                Command::Publish {
+                    ack: None,
+                    publish: Publish {
+                        topic: topic(&format!("topic/{index}")),
+                        payload: Bytes::from_static(b"x"),
+                        guarantee: AtMostOnce,
+                        retain: true,
+                    },
+                },
+                &mut out,
+            );
+        }
+        let _ = drain(&mut out);
+
+        assert_eq!(broker.stats().retained_messages, 2);
+        assert_eq!(broker.stats().retained_rejected, 3);
+
+        // Replacing one that is already stored still works: the store is not
+        // frozen, it is bounded.
+        retain(
+            &mut broker,
+            &mut out,
+            publisher,
+            "topic/0",
+            b"fresh",
+            AtMostOnce,
+        );
+        let _ = drain(&mut out);
+        assert_eq!(broker.stats().retained_messages, 2);
+        assert_eq!(broker.stats().retained_rejected, 3);
+    }
+
+    #[test]
+    fn a_byte_budget_bounds_it_too() {
+        let limits = BrokerLimits {
+            max_retained_bytes: 8,
+            ..BrokerLimits::default()
+        };
+        let mut broker = Broker::new(limits);
+        let mut out = Outbox::new();
+        let publisher = connect(&mut broker, &mut out, 1, "pub");
+
+        retain(
+            &mut broker,
+            &mut out,
+            publisher,
+            "a",
+            b"12345678",
+            AtMostOnce,
+        );
+        retain(&mut broker, &mut out, publisher, "b", b"9", AtMostOnce);
+        let _ = drain(&mut out);
+
+        assert_eq!(broker.stats().retained_messages, 1);
+        assert_eq!(broker.stats().retained_rejected, 1);
+    }
+
+    #[test]
+    fn a_publish_the_rules_refuse_is_not_stored_either() {
+        let (mut broker, mut out) = broker();
+        let publisher = SessionId(1);
+        broker.handle(
+            publisher,
+            Command::Connect(Connect {
+                client_id: client("pub"),
+                permissions: Permissions::from_rules(vec![(filter("allowed/#"), true, false)]),
+            }),
+            &mut out,
+        );
+        let _ = drain(&mut out);
+
+        retain(
+            &mut broker,
+            &mut out,
+            publisher,
+            "secrets/key",
+            b"x",
+            AtMostOnce,
+        );
+        let _ = drain(&mut out);
+
+        assert_eq!(broker.stats().retained_messages, 0);
+        assert_eq!(broker.stats().unauthorized_publishes, 1);
     }
 }

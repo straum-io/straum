@@ -413,7 +413,8 @@ UNSUBACK, PINGREQ, PINGRESP, DISCONNECT. QoS 0 and QoS 1.
 Being built, in this order (the adoption path, not a wish list):
 
 1. TLS, then authentication with per-topic authorisation.
-2. Persistent sessions and retained messages, both on top of the WAL.
+2. Persistent sessions (retained messages are built; they live in memory and
+   do not survive a restart yet).
 3. Will publishing.
 
 Out of scope: MQTT 5, QoS 2, shared subscriptions, WebSocket. Each needs
@@ -441,7 +442,8 @@ Decisions and documented deviations:
 | Subscribe outside the access rules | SUBACK 0x80 for that filter |
 | PUBLISH with QoS 2 | close |
 | SUBSCRIBE requesting QoS 2 | granted QoS 1 |
-| RETAIN = 1 on PUBLISH | delivered normally, not stored, retain flag cleared (deviation) |
+| RETAIN = 1 on PUBLISH | stored as the last message for that topic and replayed to the next subscriber; an empty payload deletes it |
+| Retained store full | the message is delivered but not stored; `retained_rejected` counts it |
 | Overlapping subscriptions of one session | one delivery, maximum granted QoS |
 | Delivered QoS | min(publish QoS, granted QoS) |
 | Topics starting with `$` | not matched by `#` or `+` at the first level |

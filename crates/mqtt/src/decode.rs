@@ -221,9 +221,14 @@ fn publish(flags: u8, mut reader: Reader, limits: &MqttLimits) -> Result<Packet,
         qos => return Err(MqttError::InvalidQos(qos)),
     };
 
-    // RETAIN is accepted and dropped: nothing is stored (§6).
+    let retain = flags & 0b0001 != 0;
     let payload = payload(reader.rest(), limits);
-    Ok(Packet::Publish(Publish { topic, id, payload }))
+    Ok(Packet::Publish(Publish {
+        topic,
+        id,
+        payload,
+        retain,
+    }))
 }
 
 fn subscribe(mut reader: Reader, limits: &MqttLimits) -> Result<Packet, MqttError> {

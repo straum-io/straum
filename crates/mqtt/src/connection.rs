@@ -92,6 +92,7 @@ impl Connection {
                         topic: publish.topic,
                         payload: publish.payload,
                         guarantee,
+                        retain: publish.retain,
                     },
                 }))
             }
@@ -212,7 +213,14 @@ fn deliver(
         Some(delivery_id) => Some(ids.assign(delivery_id)?),
         None => None,
     };
-    publish(buf, &delivery.topic, id, &delivery.payload, limits)
+    publish(
+        buf,
+        &delivery.topic,
+        id,
+        &delivery.payload,
+        delivery.retain,
+        limits,
+    )
 }
 
 /// MQTT packet identifiers are what this connection correlates by, so a

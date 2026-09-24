@@ -94,6 +94,7 @@ fn nothing_precedes_connect() {
             topic: topic("a"),
             id: None,
             payload: Bytes::new(),
+            retain: false,
         }),
     ] {
         let mut connection = Connection::new(Instant::now(), &limits());
@@ -112,6 +113,7 @@ fn publish_carries_its_guarantee_and_acknowledgement() {
         topic: topic("a/b"),
         id: None,
         payload: Bytes::from_static(b"x"),
+        retain: false,
     });
     let Reaction::Forward(Command::Publish { ack, publish }) = connection
         .on_packet(at_most_once, Instant::now(), &mut ids)
@@ -127,6 +129,7 @@ fn publish_carries_its_guarantee_and_acknowledgement() {
         topic: topic("a/b"),
         id: Some(id(77)),
         payload: Bytes::from_static(b"x"),
+        retain: false,
     });
     let Reaction::Forward(Command::Publish { ack, publish }) = connection
         .on_packet(at_least_once, Instant::now(), &mut ids)
@@ -220,6 +223,7 @@ fn an_at_least_once_delivery_round_trips_through_the_identifier_table() {
         id: Some(DeliveryId(9_000_000_001)),
         topic: topic("a/b"),
         payload: Bytes::from_static(b"payload"),
+        retain: false,
     });
     assert_eq!(
         encode_outbound(&delivery, &mut ids, &mut buf, &limits()).unwrap(),
@@ -257,6 +261,7 @@ fn at_most_once_deliveries_take_no_identifier() {
         id: None,
         topic: topic("a/b"),
         payload: Bytes::from_static(b"payload"),
+        retain: false,
     });
     encode_outbound(&delivery, &mut ids, &mut buf, &limits()).unwrap();
 

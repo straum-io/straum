@@ -82,6 +82,8 @@ Defaults below are **initial**. They are adjusted by benchmarks, not intuition.
 | `STRAUM_MAX_SUBSCRIPTIONS_PER_SESSION` | `1024` | |
 | `STRAUM_MAX_INFLIGHT` | `32` | Unacknowledged at-least-once deliveries per session. Must be < 65,535. |
 | `STRAUM_SESSION_BACKLOG_MESSAGES` | `1024` | At-least-once deliveries waiting for inflight window, per session. |
+| `STRAUM_MAX_RETAINED_MESSAGES` | `10000` | Topics that may hold a retained message. `0` disables retention. |
+| `STRAUM_MAX_RETAINED_BYTES` | `67108864` | Payload bytes held across all retained messages. |
 
 ## Runtime (owner: runtime; policy in broker)
 

@@ -48,6 +48,9 @@ pub struct Publish {
     /// `Some` for QoS 1: the identifier a PUBACK has to carry.
     pub id: Option<PacketId>,
     pub payload: Bytes,
+    /// The broker keeps the last retained message per topic and hands
+    /// it to whoever subscribes next (§6).
+    pub retain: bool,
 }
 
 impl Publish {

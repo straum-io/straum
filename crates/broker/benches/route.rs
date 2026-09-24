@@ -100,6 +100,7 @@ fn publish() -> Publish {
         topic: topic(TOPIC),
         payload: Bytes::from_static(&[b'x'; 64]),
         guarantee: DeliveryGuarantee::AtMostOnce,
+        retain: false,
     }
 }
 

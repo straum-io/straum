@@ -59,8 +59,10 @@ pub struct Publish {
     pub topic: Topic,
     pub payload: Bytes,
     pub guarantee: DeliveryGuarantee,
+    /// Keep this as the last message for its topic, and hand it to
+    /// whoever subscribes next. An empty payload forgets it instead.
+    pub retain: bool,
 }
-
 /// Why a session ended. `Client` is a clean goodbye, the other two are not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectReason {
@@ -136,6 +138,9 @@ pub struct Delivery {
     pub id: Option<DeliveryId>,
     pub topic: Topic,
     pub payload: Bytes,
+    /// Set when this is a stored message being handed to a new
+    /// subscriber, so the client can tell it from live traffic.
+    pub retain: bool,
 }
 
 impl Delivery {
@@ -188,6 +193,7 @@ mod tests {
             id: id.map(DeliveryId),
             topic: Topic::new(Bytes::from_static(b"a/b")).unwrap(),
             payload: Bytes::from_static(b"payload"),
+            retain: false,
         }
     }
 

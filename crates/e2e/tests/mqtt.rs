@@ -516,3 +516,45 @@ mod authentication {
         broker.shutdown().await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retained_message_greets_the_next_subscriber() {
+    let broker = start();
+
+    // Publish the state, then go away.
+    let (publisher, mut publisher_loop) = client("publisher", &broker);
+    publisher
+        .publish("sensors/eu/temp", QoS::AtLeastOnce, true, "21")
+        .await
+        .unwrap();
+    until(&mut publisher_loop, |incoming| {
+        matches!(incoming, Incoming::PubAck(_))
+    })
+    .await
+    .unwrap();
+    publisher.disconnect().await.unwrap();
+
+    // A subscriber that was never there hears the last value anyway.
+    let (subscriber, mut subscriber_loop) = client("subscriber", &broker);
+    subscriber
+        .subscribe("sensors/#", QoS::AtMostOnce)
+        .await
+        .unwrap();
+    let delivered = until(&mut subscriber_loop, |incoming| {
+        matches!(incoming, Incoming::Publish(_))
+    })
+    .await
+    .unwrap();
+    let Incoming::Publish(publish) = delivered else {
+        panic!("expected a PUBLISH");
+    };
+
+    assert_eq!(publish.topic, "sensors/eu/temp");
+    assert_eq!(publish.payload.as_ref(), b"21");
+    assert!(
+        publish.retain,
+        "the client could not tell it was stored state"
+    );
+
+    broker.shutdown().await;
+}
