@@ -100,26 +100,28 @@ impl Runtime {
         // Read back before anything is served: the log is the recovery
         // boundary, so what it held is state again before the first
         // client can ask for it.
+        let mut state = broker::Broker::new(config.broker);
         let restored = match config.durability {
-            Durability::Memory => Vec::new(),
-            _ => wal::restore(&config.wal, config.broker)?,
+            Durability::Memory => 0,
+            _ => wal::restore(&config.wal, config.broker, &mut state)?,
         };
 
         let (wal, wal_writer) = match config.durability {
             Durability::Memory => (None, None),
             _ => {
                 let (submitter, writer) =
-                    wal::start(&config.wal, events.clone(), Arc::clone(&metrics))?;
+                    wal::start(&config.wal, restored, events.clone(), Arc::clone(&metrics))?;
                 (Some(submitter), Some(writer))
             }
         };
 
         let brokering = tokio::spawn(
             Loop::new(
+                state,
                 config.clone(),
                 Arc::clone(&metrics),
                 Arc::clone(&global_queued),
-                restored,
+                wal.clone(),
             )
             .run(commands),
         );
@@ -173,14 +175,19 @@ impl Runtime {
             let _ = accepting.await;
         }
 
-        // Every submitter is gone with the connections, so the writer
-        // drains what it has, commits it and stops.
+        // The last command sender: the broker loop ends when it is gone. It
+        // goes before the log is joined, because the loop holds a submitter
+        // of its own — joining first would wait for a sender that is waiting
+        // for the join.
+        drop(self.events);
+        let _ = self.brokering.await;
+
+        // Every submitter is gone now, so the writer drains what it has —
+        // the session records the last closes produced included — commits it
+        // and stops.
         if let Some(writer) = self.wal_writer {
             let _ = tokio::task::spawn_blocking(move || writer.join()).await;
         }
-        // The last command sender: the broker loop ends when it is gone.
-        drop(self.events);
-        let _ = self.brokering.await;
         tracing::info!("stopped");
     }
 }

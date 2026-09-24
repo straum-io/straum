@@ -78,6 +78,36 @@ pub struct Stats {
     pub active_sessions: u64,
 }
 
+/// What has to be written down so a session survives a restart.
+///
+/// Not the messages it is owed: those are already in the log as publishes,
+/// and `owes_from` says where to start reading them again
+/// (docs/storage.md §103).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub client: ClientId,
+    pub filters: Vec<(TopicFilter, DeliveryGuarantee)>,
+    /// The last log record this session had finished with.
+    pub owes_from: u64,
+}
+
+/// A change to what is kept for a client across restarts. The runtime writes
+/// these to the log; the broker never does I/O itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEvent {
+    Kept(SessionRecord),
+    /// This identity keeps nothing any more.
+    Gone(ClientId),
+}
+
+/// One message on its way to one session, and the log record it came from.
+/// `correlation` is `0` for anything that was never logged.
+struct Outgoing<'a> {
+    topic: &'a Topic,
+    payload: &'a Bytes,
+    correlation: u64,
+}
+
 /// The last message published to a topic with the retain flag.
 #[derive(Debug, Clone)]
 struct Retained {
@@ -111,6 +141,9 @@ pub struct Broker {
     retained_bytes: usize,
     /// Reused when a new subscription replays what is stored.
     replay: Vec<(Topic, Bytes, DeliveryGuarantee)>,
+    /// What the runtime still has to write to the log. Drained every batch;
+    /// only a session that asked to be resumed ever puts anything here.
+    session_events: Vec<SessionEvent>,
     stats: Stats,
 }
 
@@ -132,8 +165,14 @@ impl Broker {
             retained: HashMap::new(),
             retained_bytes: 0,
             replay: Vec::new(),
+            session_events: Vec::new(),
             stats: Stats::default(),
         }
+    }
+
+    /// Hands over what has to reach the log, and clears it.
+    pub fn drain_session_events(&mut self, into: &mut Vec<SessionEvent>) {
+        into.append(&mut self.session_events);
     }
 
     pub fn stats(&self) -> Stats {
@@ -152,6 +191,60 @@ impl Broker {
             guarantee,
             retain: true,
         });
+    }
+
+    /// Puts back a session that survived a restart, offline and with its
+    /// subscriptions in place.
+    ///
+    /// Only the runtime calls this, before the loop starts. Nothing is
+    /// delivered here: the messages this session is owed come back from the
+    /// log afterwards, through [`Broker::restore_publish`].
+    ///
+    /// `false` when the offline limit is already full — the same bound that
+    /// applies while running applies on the way back in (CLAUDE.md §8).
+    pub fn restore_session(&mut self, record: SessionRecord) -> bool {
+        if self.stats.offline_sessions >= self.limits.max_offline_sessions as u64
+            || self.by_client.contains_key(&record.client)
+        {
+            return false;
+        }
+        let slot = self.free_slot();
+        // Nothing is allowed until the next CONNECT re-authorises it: the
+        // rules may have changed while this session was gone.
+        let mut held = Session::new(
+            SessionId(0),
+            record.client.clone(),
+            Permissions::from_rules(Vec::new()),
+            true,
+            self.limits.session_backlog_messages,
+        );
+        held.online = false;
+        held.owes_from = record.owes_from;
+        for (filter, guarantee) in record.filters {
+            if held.filters.len() >= self.limits.max_subscriptions_per_session {
+                break;
+            }
+            self.index
+                .subscribe(&filter, Subscriber { slot, guarantee });
+            held.filters.push((filter, guarantee));
+        }
+        if let Some(entry) = self.sessions.get_mut(slot) {
+            *entry = Some(held);
+        }
+        self.by_client.insert(record.client, slot);
+        self.stats.offline_sessions = self.stats.offline_sessions.saturating_add(1);
+        true
+    }
+
+    /// Routes one logged publish back to the restored sessions that had not
+    /// finished with it.
+    ///
+    /// Only the runtime calls this, after [`Broker::restore_session`] and
+    /// before the loop starts. No session is connected yet, so this only
+    /// fills backlogs.
+    pub fn restore_publish(&mut self, correlation: u64, publish: &Publish, out: &mut Outbox) {
+        self.route(publish, correlation, out);
+        out.take().for_each(drop);
     }
 
     /// Handles one command from one session.
@@ -284,13 +377,7 @@ impl Broker {
             }
         }
 
-        let slot = match self.free.pop() {
-            Some(slot) => slot,
-            None => {
-                self.sessions.push(None);
-                self.sessions.len().saturating_sub(1)
-            }
-        };
+        let slot = self.free_slot();
         if let Some(entry) = self.sessions.get_mut(slot) {
             *entry = Some(Session::new(
                 session,
@@ -331,9 +418,33 @@ impl Broker {
             held.id = session;
             held.online = true;
             held.resume = true;
+            // Everything the log had to replay has been replayed by now.
+            held.owes_from = 0;
             // Re-authorised on every connect: the rules may have changed
             // since this session was last here.
             held.permissions = permissions;
+        }
+
+        // And so are its subscriptions. A filter the rules no longer allow
+        // goes, rather than keeping a grant nobody would be given today.
+        let mut revoked = Vec::new();
+        if let Some(held) = self.sessions.get_mut(slot).and_then(Option::as_mut) {
+            // Split borrows: the rules are read while the list is rewritten.
+            let Session {
+                filters,
+                permissions,
+                ..
+            } = held;
+            filters.retain(|(filter, _)| {
+                let allowed = permissions.may_subscribe(filter);
+                if !allowed {
+                    revoked.push(filter.clone());
+                }
+                allowed
+            });
+        }
+        for filter in &revoked {
+            self.index.unsubscribe(filter, slot);
         }
 
         self.by_id.insert(session, slot);
@@ -401,7 +512,9 @@ impl Broker {
             if publish.retain {
                 self.retain(&publish);
             }
-            self.route(&publish, out);
+            // The log record this came from, so a session that never
+            // acknowledges it can be told where to resume from.
+            self.route(&publish, durable.map_or(0, |token| token.0), out);
         } else {
             // 3.1.1 has no way to tell a publisher it was refused, and
             // withholding the acknowledgement would only stall it (§6).
@@ -418,7 +531,7 @@ impl Broker {
         }
     }
 
-    fn route(&mut self, publish: &Publish, out: &mut Outbox) {
+    fn route(&mut self, publish: &Publish, correlation: u64, out: &mut Outbox) {
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
 
@@ -456,8 +569,11 @@ impl Broker {
             };
             self.deliver(
                 slot,
-                &publish.topic,
-                &publish.payload,
+                Outgoing {
+                    topic: &publish.topic,
+                    payload: &publish.payload,
+                    correlation,
+                },
                 guarantee,
                 false,
                 out,
@@ -471,12 +587,16 @@ impl Broker {
     fn deliver(
         &mut self,
         slot: usize,
-        topic: &Topic,
-        payload: &Bytes,
+        message: Outgoing<'_>,
         guarantee: DeliveryGuarantee,
         retain: bool,
         out: &mut Outbox,
     ) {
+        let Outgoing {
+            topic,
+            payload,
+            correlation,
+        } = message;
         let limits = self.limits;
         let delivery_id = self.next_delivery;
 
@@ -484,6 +604,13 @@ impl Broker {
             return;
         };
         let id = session.id;
+
+        // A session read back from the log already accounted for everything
+        // up to its mark before the restart; replaying it again would be a
+        // duplicate nobody asked for.
+        if session.owes_from != 0 && correlation <= session.owes_from {
+            return;
+        }
 
         let online = session.online;
 
@@ -510,6 +637,7 @@ impl Broker {
                     id: delivery,
                     topic: topic.clone(),
                     payload: payload.clone(),
+                    correlation,
                 });
                 (
                     Some(Delivery {
@@ -526,7 +654,9 @@ impl Broker {
             DeliveryGuarantee::AtLeastOnce => {
                 // The window is full: wait in the backlog, or give up on a
                 // session that is too far behind to catch up.
-                let accepted = session.backlog.push(topic.clone(), payload.clone());
+                let accepted = session
+                    .backlog
+                    .push(topic.clone(), payload.clone(), correlation);
                 (None, false, !accepted)
             }
         };
@@ -614,7 +744,19 @@ impl Broker {
         );
 
         for (topic, payload, stored) in replay.drain(..) {
-            self.deliver(slot, &topic, &payload, stored.min(granted), true, out);
+            // A retained message is state, not a log record: it already sits
+            // in the log under its own publish.
+            self.deliver(
+                slot,
+                Outgoing {
+                    topic: &topic,
+                    payload: &payload,
+                    correlation: 0,
+                },
+                stored.min(granted),
+                true,
+                out,
+            );
         }
         self.replay = replay;
     }
@@ -643,13 +785,22 @@ impl Broker {
                     self.stats.unauthorized_subscribes.saturating_add(1);
                 continue;
             }
-            let known = held.filters.contains(&filter);
-            if !known && held.filters.len() >= limit {
-                granted.push(SubscribeResult::Failure);
-                continue;
-            }
-            if !known {
-                held.filters.push(filter.clone());
+            let known = held
+                .filters
+                .iter()
+                .position(|(existing, _)| *existing == filter);
+            match known {
+                // Re-subscribing replaces the grant (3.1.1 §3.8.4).
+                Some(position) => {
+                    if let Some((_, held_guarantee)) = held.filters.get_mut(position) {
+                        *held_guarantee = guarantee;
+                    }
+                }
+                None if held.filters.len() >= limit => {
+                    granted.push(SubscribeResult::Failure);
+                    continue;
+                }
+                None => held.filters.push((filter.clone(), guarantee)),
             }
             self.index
                 .subscribe(&filter, Subscriber { slot, guarantee });
@@ -659,6 +810,10 @@ impl Broker {
             // hears anything live (3.1.1 §3.8.4).
             self.replay_retained(slot, &filter, guarantee, out);
         }
+
+        // What this session is subscribed to changed, so what a restart
+        // would put back changed with it.
+        self.note_session(slot);
 
         out.push(
             session,
@@ -679,9 +834,10 @@ impl Broker {
         for filter in filters {
             self.index.unsubscribe(&filter, slot);
             if let Some(held) = self.sessions.get_mut(slot).and_then(Option::as_mut) {
-                held.filters.retain(|existing| *existing != filter);
+                held.filters.retain(|(existing, _)| *existing != filter);
             }
         }
+        self.note_session(slot);
         out.push(session, Outbound::Reply(Response::Unsubscribed(request)));
     }
 
@@ -726,6 +882,7 @@ impl Broker {
                 id,
                 topic: waiting.topic.clone(),
                 payload: waiting.payload.clone(),
+                correlation: waiting.correlation,
             });
             delivered = delivered.saturating_add(1);
             out.push(
@@ -766,6 +923,9 @@ impl Broker {
             }
             self.stats.active_sessions = self.stats.active_sessions.saturating_sub(1);
             self.stats.offline_sessions = self.stats.offline_sessions.saturating_add(1);
+            // The one moment the mark is exactly right: nothing is being
+            // handed out any more, so what it still owes is what it owes.
+            self.note_session(slot);
         } else {
             if self
                 .sessions
@@ -796,8 +956,14 @@ impl Broker {
         let Some(held) = entry.take() else {
             return;
         };
-        for filter in &held.filters {
+        for (filter, _) in &held.filters {
             self.index.unsubscribe(filter, slot);
+        }
+        // Nothing is kept for this identity any more, and a restart has to
+        // agree with that.
+        if held.resume {
+            self.session_events
+                .push(SessionEvent::Gone(held.client.clone()));
         }
         self.by_client.remove(&held.client);
         self.by_id.remove(&held.id);
@@ -805,6 +971,32 @@ impl Broker {
         if !held.online {
             self.stats.offline_sessions = self.stats.offline_sessions.saturating_sub(1);
         }
+    }
+
+    fn free_slot(&mut self) -> usize {
+        match self.free.pop() {
+            Some(slot) => slot,
+            None => {
+                self.sessions.push(None);
+                self.sessions.len().saturating_sub(1)
+            }
+        }
+    }
+
+    /// Notes that what is kept for this session changed, so the runtime can
+    /// write it down. Only a session that asked to be resumed is kept.
+    fn note_session(&mut self, slot: usize) {
+        let Some(held) = self.sessions.get(slot).and_then(Option::as_ref) else {
+            return;
+        };
+        if !held.resume {
+            return;
+        }
+        self.session_events.push(SessionEvent::Kept(SessionRecord {
+            client: held.client.clone(),
+            filters: held.filters.clone(),
+            owes_from: held.watermark(self.durable_high_water),
+        }));
     }
 
     fn slot_of(&self, session: SessionId) -> Option<usize> {

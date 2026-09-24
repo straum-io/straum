@@ -18,6 +18,9 @@ pub struct Metrics {
     pub wal_records_committed: AtomicU64,
     pub wal_bytes_committed: AtomicU64,
     pub wal_commit_failures: AtomicU64,
+    /// Session records the log queue could not take. Each one is a session
+    /// that will not come back after a restart.
+    pub session_records_dropped: AtomicU64,
     /// Latest sync, not an average: the average of a bimodal latency is
     /// a number that never happened.
     pub wal_sync_nanos: AtomicU64,
@@ -45,6 +48,7 @@ impl Metrics {
             wal_records_committed: self.wal_records_committed.load(Ordering::Relaxed),
             wal_bytes_committed: self.wal_bytes_committed.load(Ordering::Relaxed),
             wal_commit_failures: self.wal_commit_failures.load(Ordering::Relaxed),
+            session_records_dropped: self.session_records_dropped.load(Ordering::Relaxed),
             wal_sync_nanos: self.wal_sync_nanos.load(Ordering::Relaxed),
             wal_durable_sequence: self.wal_durable_sequence.load(Ordering::Relaxed),
         }
@@ -67,6 +71,7 @@ pub struct Snapshot {
     pub wal_records_committed: u64,
     pub wal_bytes_committed: u64,
     pub wal_commit_failures: u64,
+    pub session_records_dropped: u64,
     pub wal_sync_nanos: u64,
     pub wal_durable_sequence: u64,
 }

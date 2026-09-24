@@ -22,6 +22,8 @@ pub struct Backlog {
 pub struct Waiting {
     pub topic: Topic,
     pub payload: Bytes,
+    /// Which log record this came from, `0` when it came from no log.
+    pub correlation: u64,
 }
 
 impl Backlog {
@@ -34,11 +36,15 @@ impl Backlog {
 
     /// `false` means the session is too far behind to keep it.
     #[must_use]
-    pub fn push(&mut self, topic: Topic, payload: Bytes) -> bool {
+    pub fn push(&mut self, topic: Topic, payload: Bytes, correlation: u64) -> bool {
         if self.waiting.len() >= self.limit {
             return false;
         }
-        self.waiting.push_back(Waiting { topic, payload });
+        self.waiting.push_back(Waiting {
+            topic,
+            payload,
+            correlation,
+        });
         true
     }
 
@@ -54,6 +60,16 @@ impl Backlog {
     pub fn is_empty(&self) -> bool {
         self.waiting.is_empty()
     }
+
+    /// The oldest log record still waiting here, ignoring messages that were
+    /// never logged.
+    pub fn oldest_correlation(&self) -> Option<u64> {
+        self.waiting
+            .iter()
+            .filter(|waiting| waiting.correlation != 0)
+            .map(|waiting| waiting.correlation)
+            .min()
+    }
 }
 
 #[derive(Debug)]
@@ -62,9 +78,10 @@ pub struct Session {
     pub client: ClientId,
     /// What this session was authorised to do when it connected.
     pub permissions: Permissions,
-    /// What this session subscribed to, so closing it can undo all of it in
-    /// one call (CLAUDE.md §7).
-    pub filters: Vec<TopicFilter>,
+    /// What this session subscribed to and what was granted, so closing it
+    /// can undo all of it in one call (CLAUDE.md §7) and a restart can put
+    /// all of it back.
+    pub filters: Vec<(TopicFilter, DeliveryGuarantee)>,
     /// At-least-once deliveries handed out and not yet acknowledged.
     /// Kept whole, so a session that comes back gets them again.
     pub inflight: Vec<Inflight>,
@@ -79,6 +96,10 @@ pub struct Session {
     /// generation only raises the guarantee (CLAUDE.md §6).
     pub seen: u64,
     pub best: DeliveryGuarantee,
+    /// Non-zero only for a session read back from the log and not yet
+    /// resumed: everything up to this record was already accounted for
+    /// before the restart, so replay starts after it.
+    pub owes_from: u64,
 }
 
 /// A message handed to a session and not yet acknowledged. The payload is
@@ -89,6 +110,8 @@ pub struct Inflight {
     pub id: DeliveryId,
     pub topic: Topic,
     pub payload: Bytes,
+    /// Which log record this came from, `0` when it came from no log.
+    pub correlation: u64,
 }
 
 impl Session {
@@ -110,7 +133,32 @@ impl Session {
             resume,
             seen: 0,
             best: DeliveryGuarantee::AtMostOnce,
+            owes_from: 0,
         }
+    }
+
+    /// The last log record this session has finished with, or `fallback`
+    /// when it owes nothing.
+    ///
+    /// This one number is the whole of what has to be written down for a
+    /// session: replaying the log from after it rebuilds everything the
+    /// session was owed, so no payload is ever written twice
+    /// (docs/storage.md §103).
+    pub fn watermark(&self, fallback: u64) -> u64 {
+        let inflight = self
+            .inflight
+            .iter()
+            .filter(|held| held.correlation != 0)
+            .map(|held| held.correlation)
+            .min();
+        let oldest = match (inflight, self.backlog.oldest_correlation()) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => return fallback,
+        };
+        // The oldest record it still owes has to come back, so the mark sits
+        // one before it.
+        oldest.saturating_sub(1)
     }
 
     pub fn forget(&mut self, delivery: DeliveryId) -> bool {

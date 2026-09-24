@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use broker::Broker;
+use broker::{Broker, SessionEvent};
 use domain::SessionId;
 use protocol::{Command, DurableToken, Outbound, Outbox};
 use tokio::sync::mpsc;
@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use crate::config::RuntimeConfig;
 use crate::metrics::Metrics;
 use crate::session::{Egress, Sink, weight};
+use crate::wal::Submitter;
 
 /// An overflow decision produces at most a close, and a close never
 /// overflows, so the flush settles in two rounds. The bound is here to make
@@ -37,35 +38,43 @@ pub(crate) struct Loop {
     config: RuntimeConfig,
     metrics: Arc<Metrics>,
     global_queued: Arc<AtomicUsize>,
+    /// `None` when durability is `memory`: there is nothing to write to.
+    wal: Option<Submitter>,
     sinks: HashMap<SessionId, Sink>,
     out: Outbox,
     ready: Vec<(SessionId, Outbound)>,
     rejected: Vec<(SessionId, Outbound)>,
+    /// Session state the log has not taken yet. Reused, and bounded: a log
+    /// that cannot keep up must not turn session churn into memory growth.
+    session_events: Vec<SessionEvent>,
 }
 
+/// Session records waiting for room in the log queue. Reaching this means
+/// the log is far behind; the oldest go, and the sessions they describe are
+/// not restored after a restart. State is lost, never corrupted.
+const MAX_PENDING_SESSION_RECORDS: usize = 1024;
+
 impl Loop {
+    /// `broker` arrives with whatever the log held already restored, so a
+    /// client that reconnects sees what it left behind.
     pub(crate) fn new(
+        broker: Broker,
         config: RuntimeConfig,
         metrics: Arc<Metrics>,
         global_queued: Arc<AtomicUsize>,
-        restored: Vec<crate::wal::Recorded>,
+        wal: Option<Submitter>,
     ) -> Self {
-        let mut broker = Broker::new(config.broker);
-        // Whatever the log held becomes state again before the first command
-        // is handled, so a client that reconnects sees what it left behind.
-        for record in restored {
-            broker.restore_retained(record.topic, record.payload, record.guarantee);
-        }
-
         Self {
             broker,
             config,
             metrics,
             global_queued,
+            wal,
             sinks: HashMap::new(),
             out: Outbox::new(),
             ready: Vec::new(),
             rejected: Vec::new(),
+            session_events: Vec::new(),
         }
     }
 
@@ -106,6 +115,7 @@ impl Loop {
             }
 
             self.flush();
+            self.persist_sessions();
             let stats = self.broker.stats();
             self.metrics
                 .active_sessions
@@ -113,6 +123,39 @@ impl Loop {
         }
 
         tracing::debug!("broker loop stopped");
+    }
+
+    /// Hands what is kept for each session to the log.
+    ///
+    /// Never awaits. The WAL thread reports back through this loop's own
+    /// channel, so a loop that waited on a full log queue would be waiting on
+    /// itself; what does not fit is tried again next wakeup.
+    fn persist_sessions(&mut self) {
+        let Some(wal) = &self.wal else {
+            self.broker.drain_session_events(&mut self.session_events);
+            self.session_events.clear();
+            return;
+        };
+        self.broker.drain_session_events(&mut self.session_events);
+
+        let mut sent = 0usize;
+        for event in &self.session_events {
+            if !wal.try_submit_session(event) {
+                break;
+            }
+            sent = sent.saturating_add(1);
+        }
+        self.session_events.drain(..sent);
+
+        if self.session_events.len() > MAX_PENDING_SESSION_RECORDS {
+            let over = self
+                .session_events
+                .len()
+                .saturating_sub(MAX_PENDING_SESSION_RECORDS);
+            self.session_events.drain(..over);
+            Metrics::increment(&self.metrics.session_records_dropped, over as u64);
+            tracing::warn!(dropped = over, "the log is behind; session state was lost");
+        }
     }
 
     /// Moves everything the broker produced into the session queues, and lets

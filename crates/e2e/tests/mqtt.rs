@@ -29,6 +29,25 @@ fn client(name: &str, broker: &Runtime) -> (AsyncClient, rumqttc::EventLoop) {
     AsyncClient::new(options, 16)
 }
 
+/// CleanSession = 0: keep what this identity is owed.
+fn durable_client(name: &str, broker: &Runtime) -> (AsyncClient, rumqttc::EventLoop) {
+    let addr = broker.local_addr();
+    let mut options = MqttOptions::new(name, addr.ip().to_string(), addr.port());
+    options.set_keep_alive(Duration::from_secs(5));
+    options.set_clean_session(false);
+    AsyncClient::new(options, 16)
+}
+
+/// Polls until the connection is actually gone, so what happens next
+/// happens to a broker that already knows about it.
+async fn closed(eventloop: &mut rumqttc::EventLoop) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::timeout_at(deadline, eventloop.poll())
+        .await
+        .is_ok_and(|polled| polled.is_ok())
+    {}
+}
+
 /// Polls until `wanted` says yes, or gives up rather than hanging a test.
 async fn until(
     eventloop: &mut rumqttc::EventLoop,
@@ -749,6 +768,119 @@ mod restart {
             panic!("expected a PUBLISH");
         };
         assert_eq!(publish.payload.as_ref(), b"third");
+
+        broker.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A durable client that was not connected when the message was
+    /// published, and not connected when the broker stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_kept_session_outlives_the_process() {
+        let path = scratch("session");
+
+        let broker = durable(&path);
+        {
+            let (device, mut device_loop) = durable_client("device", &broker);
+            device
+                .subscribe("sensors/+/temp", QoS::AtLeastOnce)
+                .await
+                .unwrap();
+            until(&mut device_loop, |incoming| {
+                matches!(incoming, Incoming::SubAck(_))
+            })
+            .await
+            .unwrap();
+            device.disconnect().await.unwrap();
+            closed(&mut device_loop).await;
+        }
+
+        // Published while the device is away, and while it is away the
+        // broker stops. Only the log connects the two.
+        let (publisher, mut publisher_loop) = client("publisher", &broker);
+        publisher
+            .publish("sensors/eu/temp", QoS::AtLeastOnce, false, "21")
+            .await
+            .unwrap();
+        until(&mut publisher_loop, |incoming| {
+            matches!(incoming, Incoming::PubAck(_))
+        })
+        .await
+        .unwrap();
+        broker.shutdown().await;
+
+        let broker = durable(&path);
+        let (_device, mut device_loop) = durable_client("device", &broker);
+        let connected = until(&mut device_loop, |incoming| {
+            matches!(incoming, Incoming::ConnAck(_))
+        })
+        .await
+        .unwrap();
+        let Incoming::ConnAck(ack) = connected else {
+            panic!("expected a CONNACK");
+        };
+        assert!(
+            ack.session_present,
+            "the session did not survive the restart"
+        );
+
+        let delivered = until(&mut device_loop, |incoming| {
+            matches!(incoming, Incoming::Publish(_))
+        })
+        .await
+        .unwrap();
+        let Incoming::Publish(publish) = delivered else {
+            panic!("expected a PUBLISH");
+        };
+        assert_eq!(publish.topic, "sensors/eu/temp");
+        assert_eq!(publish.payload.as_ref(), b"21");
+
+        broker.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A clean start says the old session is gone, and a restart has to
+    /// agree with that rather than resurrect it from the log.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_discarded_session_stays_discarded() {
+        let path = scratch("discarded");
+
+        let broker = durable(&path);
+        {
+            let (device, mut device_loop) = durable_client("device", &broker);
+            device.subscribe("a/b", QoS::AtLeastOnce).await.unwrap();
+            until(&mut device_loop, |incoming| {
+                matches!(incoming, Incoming::SubAck(_))
+            })
+            .await
+            .unwrap();
+            device.disconnect().await.unwrap();
+            closed(&mut device_loop).await;
+        }
+        {
+            // CleanSession = 1 throws away what was kept.
+            let (device, mut device_loop) = client("device", &broker);
+            until(&mut device_loop, |incoming| {
+                matches!(incoming, Incoming::ConnAck(_))
+            })
+            .await
+            .unwrap();
+            device.disconnect().await.unwrap();
+            closed(&mut device_loop).await;
+        }
+        broker.shutdown().await;
+
+        let broker = durable(&path);
+        let (_device, mut device_loop) = durable_client("device", &broker);
+        let connected = until(&mut device_loop, |incoming| {
+            matches!(incoming, Incoming::ConnAck(_))
+        })
+        .await
+        .unwrap();
+        let Incoming::ConnAck(ack) = connected else {
+            panic!("expected a CONNACK");
+        };
+        assert!(!ack.session_present, "a discarded session came back");
 
         broker.shutdown().await;
         let _ = std::fs::remove_file(&path);
