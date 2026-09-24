@@ -314,6 +314,14 @@ impl Settings {
                         "a path",
                     )?),
                     queue: parser.number("STRAUM_WAL_QUEUE", 65_536, 1, 16_777_216)?,
+                    // 0 disables it; the floor above that is a size where a
+                    // rewrite is worth its own I/O.
+                    compact_bytes: parser.number(
+                        "STRAUM_WAL_COMPACT_BYTES",
+                        67_108_864u64,
+                        0,
+                        1_099_511_627_776,
+                    )?,
                     limits: wal,
                 },
             },
@@ -967,6 +975,7 @@ mod tests {
             ("STRAUM_BROKER_BATCH", "256"),
             ("STRAUM_WRITER_BATCH", "64"),
             ("STRAUM_WAL_PATH", "straum.wal"),
+            ("STRAUM_WAL_COMPACT_BYTES", "67108864"),
             ("STRAUM_WAL_QUEUE", "65536"),
             ("STRAUM_WAL_MAX_RECORD_BYTES", "1048576"),
             ("STRAUM_WAL_MIN_BATCH_BYTES", "65536"),

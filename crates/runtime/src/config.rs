@@ -67,6 +67,9 @@ pub struct WalSettings {
     pub path: PathBuf,
     /// Records queued between the connections and the writer thread.
     pub queue: usize,
+    /// Rewrite the log at startup once it is at least this large, dropping
+    /// records nothing needs any more. `0` never rewrites it.
+    pub compact_bytes: u64,
     pub limits: WalLimits,
 }
 
@@ -75,6 +78,7 @@ impl Default for WalSettings {
         Self {
             path: PathBuf::from("straum.wal"),
             queue: 65_536,
+            compact_bytes: 67_108_864,
             limits: WalLimits::default(),
         }
     }

@@ -253,10 +253,10 @@ fn decode(record: &[u8]) -> Option<Recorded> {
 
 /// What the first pass over the log found.
 struct Found {
-    /// The last retained message per topic.
-    retained: HashMap<Topic, (Bytes, DeliveryGuarantee)>,
+    /// The last retained message per topic, and which record said so.
+    retained: HashMap<Topic, (u64, Bytes, DeliveryGuarantee)>,
     /// What is kept for each identity; the last word in the log wins.
-    sessions: HashMap<ClientId, SessionRecord>,
+    sessions: HashMap<ClientId, (u64, SessionRecord)>,
     /// The highest correlation any record carried, so the next one written
     /// continues rather than repeats.
     correlation: u64,
@@ -281,14 +281,19 @@ fn scan(settings: &WalSettings, limits: BrokerLimits) -> Result<Found, StorageEr
         };
         found.correlation = found.correlation.max(recorded.correlation());
         match recorded {
-            Recorded::Session { record, .. } => {
+            Recorded::Session {
+                correlation,
+                record,
+            } => {
                 // Bounded by the same limit the live store has: a log full of
                 // session records must not use more memory on the way back in
                 // than it was allowed to on the way out (CLAUDE.md §8).
                 if found.sessions.contains_key(&record.client)
                     || found.sessions.len() < limits.max_offline_sessions
                 {
-                    found.sessions.insert(record.client.clone(), record);
+                    found
+                        .sessions
+                        .insert(record.client.clone(), (correlation, record));
                 } else {
                     found.refused = found.refused.saturating_add(1);
                 }
@@ -297,16 +302,16 @@ fn scan(settings: &WalSettings, limits: BrokerLimits) -> Result<Found, StorageEr
                 found.sessions.remove(&client);
             }
             Recorded::Publish {
+                correlation,
                 topic,
                 payload,
                 guarantee,
                 retain: true,
-                ..
             } => {
                 // The log is replayed in commit order, so the last word wins —
                 // an empty payload is how a retained message was deleted.
                 if payload.is_empty() {
-                    if let Some((gone, _)) = found.retained.remove(&topic) {
+                    if let Some((_, gone, _)) = found.retained.remove(&topic) {
                         bytes = bytes.saturating_sub(gone.len());
                     }
                     return;
@@ -314,7 +319,7 @@ fn scan(settings: &WalSettings, limits: BrokerLimits) -> Result<Found, StorageEr
                 let previous = found
                     .retained
                     .get(&topic)
-                    .map(|(held, _)| held.len())
+                    .map(|(_, held, _)| held.len())
                     .unwrap_or(0);
                 let would_hold = bytes.saturating_sub(previous).saturating_add(payload.len());
                 if would_hold > limits.max_retained_bytes
@@ -324,7 +329,9 @@ fn scan(settings: &WalSettings, limits: BrokerLimits) -> Result<Found, StorageEr
                     return;
                 }
                 bytes = would_hold;
-                found.retained.insert(topic, (payload, guarantee));
+                found
+                    .retained
+                    .insert(topic, (correlation, payload, guarantee));
             }
             Recorded::Publish { .. } => {}
         }
@@ -353,8 +360,18 @@ pub(crate) fn restore(
     broker: &mut Broker,
 ) -> Result<u64, StorageError> {
     let found = scan(settings, limits)?;
+    let correlation = found.correlation;
 
-    for (topic, (payload, guarantee)) in found.retained {
+    // Which single record is the current word on each topic and each
+    // identity. Everything else the log says about them is history, and
+    // compaction below is what makes that a size rather than a comment.
+    let mut current: std::collections::HashSet<u64> = std::collections::HashSet::with_capacity(
+        found.retained.len().saturating_add(found.sessions.len()),
+    );
+    current.extend(found.retained.values().map(|(at, _, _)| *at));
+    current.extend(found.sessions.values().map(|(at, _)| *at));
+
+    for (topic, (_, payload, guarantee)) in found.retained {
         broker.restore_retained(topic, payload, guarantee);
     }
 
@@ -362,14 +379,15 @@ pub(crate) fn restore(
     // is where the second pass has to start paying attention.
     let mut from = u64::MAX;
     let mut sessions = 0usize;
-    for (_, record) in found.sessions {
+    for (_, (_, record)) in found.sessions {
         from = from.min(record.owes_from);
         if broker.restore_session(record) {
             sessions = sessions.saturating_add(1);
         }
     }
-    if sessions == 0 || from >= found.correlation {
-        return Ok(found.correlation);
+    if sessions == 0 || from >= correlation {
+        compact(settings, &current, from)?;
+        return Ok(correlation);
     }
 
     // Second pass: the publishes themselves, streamed rather than held. They
@@ -405,7 +423,65 @@ pub(crate) fn restore(
     })?;
 
     tracing::info!(sessions, replayed, from, "restored kept sessions");
-    Ok(found.correlation)
+    compact(settings, &current, from)?;
+    Ok(correlation)
+}
+
+/// Drops everything the log no longer needs: superseded session records,
+/// tombstoned identities, overwritten retained messages, and publishes every
+/// session has finished with.
+///
+/// Runs at startup, where nothing is appending and the broker's state came
+/// from this same log a moment ago. `current` names the one record that is
+/// the present word on each topic and identity; `floor` is the oldest mark
+/// any session still owes from, so publishes at or below it are owed to
+/// nobody (docs/storage.md §104).
+fn compact(
+    settings: &WalSettings,
+    current: &std::collections::HashSet<u64>,
+    floor: u64,
+) -> Result<(), StorageError> {
+    if settings.compact_bytes == 0 {
+        return Ok(());
+    }
+    let size = std::fs::metadata(&settings.path)
+        .map(|held| held.len())
+        .unwrap_or(0);
+    if size < settings.compact_bytes {
+        return Ok(());
+    }
+
+    let outcome = storage::compact(&settings.path, settings.limits, &mut |payload| {
+        let Some(recorded) = decode(payload) else {
+            // A record this version cannot read is a record it cannot keep
+            // a promise about either.
+            return false;
+        };
+        match recorded {
+            // The tombstone did its work in the pass above; carrying it
+            // forward would only ask the next startup to do it again.
+            Recorded::SessionGone { .. } => false,
+            Recorded::Session { correlation, .. } => current.contains(&correlation),
+            Recorded::Publish {
+                correlation,
+                guarantee,
+                ..
+            } => {
+                current.contains(&correlation)
+                    || (guarantee == DeliveryGuarantee::AtLeastOnce && correlation > floor)
+            }
+        }
+    })?;
+
+    tracing::info!(
+        path = %settings.path.display(),
+        records_before = outcome.records_before,
+        records_after = outcome.records_after,
+        bytes_before = outcome.bytes_before,
+        bytes_after = outcome.bytes_after,
+        "compacted the write-ahead log"
+    );
+    Ok(())
 }
 
 /// Opens the log, recovers its durable prefix and starts the writer thread.

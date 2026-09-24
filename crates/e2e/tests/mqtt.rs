@@ -48,6 +48,46 @@ async fn closed(eventloop: &mut rumqttc::EventLoop) {
     {}
 }
 
+/// Publishes `count` numbered messages at QoS 1 and waits for every
+/// acknowledgement.
+///
+/// The event loop is driven while the publishes go out, not after them. A
+/// client's request channel is small, so publishing more than fits without
+/// polling blocks in the client and never reaches the broker at all — which
+/// looks exactly like a broker that stopped answering.
+async fn publish_many(broker: &Runtime, topic: &str, count: u32) {
+    let (publisher, mut publisher_loop) = client("publisher", broker);
+    let acknowledged = tokio::spawn(async move {
+        let mut seen = 0u32;
+        while seen < count {
+            match tokio::time::timeout(Duration::from_secs(10), publisher_loop.poll()).await {
+                Ok(Ok(Event::Incoming(Incoming::PubAck(_)))) => seen += 1,
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        seen
+    });
+
+    let topic = topic.to_owned();
+    for sequence in 0..count {
+        publisher
+            .publish(
+                topic.clone(),
+                QoS::AtLeastOnce,
+                false,
+                sequence.to_be_bytes().to_vec(),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        acknowledged.await.unwrap(),
+        count,
+        "the broker did not acknowledge every publish"
+    );
+}
+
 /// Polls until `wanted` says yes, or gives up rather than hanging a test.
 async fn until(
     eventloop: &mut rumqttc::EventLoop,
@@ -646,6 +686,12 @@ mod restart {
     use runtime::{Durability, WalSettings};
 
     fn durable(path: &std::path::Path) -> Runtime {
+        with_compaction(path, 0)
+    }
+
+    /// `compact_bytes` of 0 never rewrites the log, which is what most of
+    /// these tests want: they are about what survives, not about size.
+    fn with_compaction(path: &std::path::Path, compact_bytes: u64) -> Runtime {
         let config = RuntimeConfig {
             transport: TransportConfig {
                 listen: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -654,6 +700,7 @@ mod restart {
             durability: Durability::Fsynced,
             wal: WalSettings {
                 path: path.to_path_buf(),
+                compact_bytes,
                 ..WalSettings::default()
             },
             ..RuntimeConfig::default()
@@ -885,4 +932,139 @@ mod restart {
         broker.shutdown().await;
         let _ = std::fs::remove_file(&path);
     }
+
+    /// A log that records every version of every retained message grows
+    /// without a bound. Compaction is what makes the old versions a size
+    /// rather than a comment — and it has to keep the current one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compaction_drops_history_and_keeps_the_present() {
+        let path = scratch("compaction");
+
+        let broker = durable(&path);
+        // The same topic over and over: every version but the last is
+        // history the moment the next one lands.
+        for version in 0..200 {
+            publish_retained(&broker, "a/b", &format!("value-{version}")).await;
+        }
+        broker.shutdown().await;
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        // A threshold below the current size, so this start rewrites it.
+        let broker = with_compaction(&path, 1);
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            after < before / 10,
+            "the log did not shrink: {before} -> {after}"
+        );
+
+        // And the present survived the rewrite.
+        let (subscriber, mut eventloop) = client("subscriber", &broker);
+        subscriber.subscribe("a/b", QoS::AtMostOnce).await.unwrap();
+        let delivered = until(&mut eventloop, |incoming| {
+            matches!(incoming, Incoming::Publish(_))
+        })
+        .await
+        .unwrap();
+        let Incoming::Publish(publish) = delivered else {
+            panic!("expected a PUBLISH");
+        };
+        assert_eq!(publish.payload.as_ref(), b"value-199");
+        broker.shutdown().await;
+
+        // A second restart reads back what the rewrite wrote, which is the
+        // half that a rewrite gets wrong when it gets anything wrong.
+        let broker = durable(&path);
+        let (subscriber, mut eventloop) = client("again", &broker);
+        subscriber.subscribe("a/b", QoS::AtMostOnce).await.unwrap();
+        let delivered = until(&mut eventloop, |incoming| {
+            matches!(incoming, Incoming::Publish(_))
+        })
+        .await
+        .unwrap();
+        let Incoming::Publish(publish) = delivered else {
+            panic!("expected a PUBLISH");
+        };
+        assert_eq!(publish.payload.as_ref(), b"value-199");
+
+        broker.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Compaction must not drop what an offline session has not received.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compaction_keeps_what_a_kept_session_is_still_owed() {
+        let path = scratch("compaction-session");
+
+        let broker = durable(&path);
+        {
+            let (device, mut device_loop) = durable_client("device", &broker);
+            device.subscribe("a/b", QoS::AtLeastOnce).await.unwrap();
+            until(&mut device_loop, |incoming| {
+                matches!(incoming, Incoming::SubAck(_))
+            })
+            .await
+            .unwrap();
+            device.disconnect().await.unwrap();
+            closed(&mut device_loop).await;
+        }
+
+        publish_many(&broker, "a/b", 50).await;
+        broker.shutdown().await;
+
+        // Rewrite, then make the device come back and count what it gets.
+        let broker = with_compaction(&path, 1);
+        let (device, mut device_loop) = durable_client("device", &broker);
+        let mut seen = std::collections::HashSet::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while seen.len() < 50 {
+            let Ok(Ok(event)) = tokio::time::timeout_at(deadline, device_loop.poll()).await else {
+                break;
+            };
+            if let Event::Incoming(Incoming::Publish(publish)) = event {
+                if let Ok(bytes) = <[u8; 4]>::try_from(publish.payload.as_ref()) {
+                    seen.insert(u32::from_be_bytes(bytes));
+                }
+            }
+        }
+        assert_eq!(seen.len(), 50, "compaction dropped messages still owed");
+
+        device.disconnect().await.unwrap();
+        closed(&mut device_loop).await;
+        broker.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Shutting down under a client that stopped reading mid-delivery used to
+/// hang forever. The accept loop aborts the connection task at the end of
+/// the grace period, but the reader and writer it had spawned were detached
+/// and survived it — and the reader holds a command sender, which is the one
+/// thing keeping the broker loop from ending (§16).
+///
+/// The broker has to stop even while a subscriber has stopped reading with
+/// deliveries in flight — the case where the accept loop runs out of grace
+/// and aborts a connection that is still busy.
+///
+/// The timeout is the assertion: without it a regression is an unkillable
+/// test rather than a failing one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broker_stops_under_a_client_that_went_silent() {
+    let broker = start();
+    let (subscriber, mut subscriber_loop) = client("silent", &broker);
+    subscriber.subscribe("a/b", QoS::AtLeastOnce).await.unwrap();
+    until(&mut subscriber_loop, |incoming| {
+        matches!(incoming, Incoming::SubAck(_))
+    })
+    .await
+    .unwrap();
+
+    publish_many(&broker, "a/b", 40).await;
+
+    // From here nobody polls the subscriber: deliveries are in flight, and
+    // its socket stays open with nothing reading it.
+    drop(subscriber_loop);
+
+    tokio::time::timeout(Duration::from_secs(20), broker.shutdown())
+        .await
+        .expect("the broker did not stop");
 }

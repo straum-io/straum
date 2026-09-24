@@ -293,6 +293,99 @@ fn read_some(file: &mut File, buf: &mut [u8], from: usize) -> Result<usize, Stor
     Ok(filled)
 }
 
+/// What a compaction removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Compaction {
+    pub records_before: u64,
+    pub records_after: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+/// Rewrites the log, keeping only the records `keep` accepts, in order.
+///
+/// The log is a byte log: which records still matter is a question only the
+/// caller can answer, so this does the mechanical half and nothing else.
+///
+/// Nothing may be appending while this runs. The rewrite goes to a second
+/// file that is made durable before it replaces the original, so a crash at
+/// any point leaves either the whole old log or the whole new one — never a
+/// half-rewritten log (docs/storage.md §104).
+pub fn compact(
+    path: &Path,
+    limits: WalLimits,
+    keep: &mut impl FnMut(&[u8]) -> bool,
+) -> Result<Compaction, StorageError> {
+    let mut file = match OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Compaction::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let length = file.metadata()?.len();
+    if length == 0 {
+        return Ok(Compaction::default());
+    }
+
+    let mut target = path.as_os_str().to_owned();
+    target.push(".compacting");
+    let target = std::path::PathBuf::from(target);
+    let mut out = std::io::BufWriter::new(
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&target)?,
+    );
+    out.write_all(&MAGIC)?;
+
+    // `scan` hands records over with no way to report a write failure, so
+    // the first one is kept here and returned once the walk is done.
+    let mut failure: Option<std::io::Error> = None;
+    let mut kept = 0u64;
+    let mut buffer: Vec<u8> = Vec::new();
+    let recovery = scan(&mut file, &limits, length, &mut |payload| {
+        if failure.is_some() || !keep(payload) {
+            return;
+        }
+        buffer.clear();
+        record::encode(payload, &mut buffer);
+        if let Err(error) = out.write_all(&buffer) {
+            failure = Some(error);
+            return;
+        }
+        kept = kept.saturating_add(1);
+    })?;
+    if let Some(error) = failure {
+        let _ = std::fs::remove_file(&target);
+        return Err(error.into());
+    }
+
+    let out = out.into_inner().map_err(|error| error.into_error())?;
+    out.sync_all()?;
+    let bytes_after = out.metadata()?.len();
+    drop(out);
+
+    // The rename is the commit point: until it returns, the old log is
+    // still the log.
+    std::fs::rename(&target, path)?;
+    // The rename itself has to reach the disk, or a crash can leave the
+    // directory pointing at a file that is gone.
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+
+    Ok(Compaction {
+        records_before: recovery.records,
+        records_after: kept,
+        bytes_before: length,
+        bytes_after,
+    })
+}
+
 /// Reads the durable prefix of a log without opening it for writing.
 ///
 /// Every complete, checksum-clean record is handed to `visit` in the order it

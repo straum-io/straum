@@ -13,6 +13,7 @@ use bytes::BytesMut;
 use domain::SessionId;
 use mqtt::{Connection as Protocol, Disposition, PacketIds, Reaction, decode, encode_outbound};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 
 use crate::broker_loop::Event;
 use crate::config::RuntimeConfig;
@@ -62,17 +63,23 @@ pub(crate) async fn run(accepted: transport::Accepted, session: SessionId, wirin
         }
     };
 
-    let (reader, writer) = spawn(connection, session, wiring);
-    let _ = tokio::join!(reader, writer);
+    // A set rather than two loose handles: this task is aborted when the
+    // accept loop gives up waiting at shutdown, and detached children would
+    // outlive it still holding a command sender — which is the one thing
+    // keeping the broker loop from ending (§16).
+    let mut tasks = JoinSet::new();
+    spawn(&mut tasks, connection, session, wiring);
+    while tasks.join_next().await.is_some() {}
 }
 
 /// Starts the two tasks. They are separate so a client that stops reading
 /// cannot stop us from reading its packets (§4).
 fn spawn(
+    tasks: &mut JoinSet<()>,
     connection: transport::Connection,
     session: SessionId,
     wiring: Wiring,
-) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+) {
     let (tx, rx) = mpsc::channel(wiring.config.session_queue_messages);
     let queued = Arc::new(AtomicUsize::new(0));
     let ids = Arc::new(Mutex::new(PacketIds::with_capacity(
@@ -84,7 +91,7 @@ fn spawn(
         queued: Arc::clone(&queued),
     };
 
-    let reader = tokio::spawn(read(
+    tasks.spawn(read(
         connection.reader,
         session,
         sink,
@@ -97,7 +104,7 @@ fn spawn(
         wiring.wal,
         wiring.authority,
     ));
-    let writer = tokio::spawn(write(
+    tasks.spawn(write(
         connection.writer,
         rx,
         ids,
@@ -106,7 +113,6 @@ fn spawn(
         queued,
         wiring.global_queued,
     ));
-    (reader, writer)
 }
 
 #[expect(
