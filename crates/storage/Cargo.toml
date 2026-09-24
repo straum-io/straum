@@ -1,0 +1,23 @@
+[package]
+name = "storage"
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1"
+crc32fast = "1"
+thiserror = "2"
+
+[dev-dependencies]
+divan = "0.1"
+
+[[bench]]
+name = "record"
+harness = false
+
+[[bench]]
+name = "commit"
+harness = false

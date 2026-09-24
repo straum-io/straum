@@ -1,0 +1,32 @@
+[package]
+name = "runtime"
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+domain = { path = "../domain" }
+auth = { path = "../auth" }
+protocol = { path = "../protocol" }
+mqtt = { path = "../mqtt" }
+transport = { path = "../transport" }
+broker = { path = "../broker" }
+storage = { path = "../storage" }
+bytes = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+divan = "0.1"
+
+[[bench]]
+name = "queue"
+harness = false
+
+[[bench]]
+name = "pipeline"
+harness = false

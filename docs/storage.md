@@ -1,0 +1,318 @@
+# Durable Storage
+
+Rules for the write-ahead log, adaptive group commit and durable
+acknowledgement. Section numbers are the ones these rules were issued under
+and are referenced from code comments.
+
+`straum-storage` implements §73–§84 and §91–§99. Sections §85–§90 describe
+architecture that is not built yet; they are recorded so the parts that exist
+do not foreclose them.
+
+---
+
+## 0. Conflicts with CLAUDE.md, resolved
+
+These rules arrived after the broker design was fixed. Where they disagreed
+with it, the resolution is below and the affected section of `CLAUDE.md` was
+updated in the same change.
+
+| Conflict | Resolution |
+|---|---|
+| §15 says at-least-once messages inflight at shutdown are lost, "no persistence". §79 requires a durable acknowledgement. | Both stand. Durability is opt-in per `Durability`; with `memory` the old behavior is unchanged. `fsynced` changes when the acknowledgement is sent, not what the broker routes. |
+| §5 emits `PublishAccepted` once routing completed. §79 forbids acknowledging before the durability operation completes. | With `fsynced`, routing completing is no longer sufficient: the reply is withheld until the durable boundary covers the record. `Command::Publish` carries no new field; the runtime passes a `DurableToken` alongside the command and the broker releases it on `Broker::on_durable`. |
+| §4 makes the broker a single synchronous task that must never block. `sync_data()` blocks for milliseconds. | The WAL never runs inside `Broker::handle`. It owns a dedicated thread, and its completions enter the broker loop as events. This is why the durable acknowledgement is a second entry point rather than a return value. |
+| §2 gives every crate a layer. A WAL is neither transport (TCP only) nor broker (no I/O). | A new crate, `storage`. It does blocking file I/O and reads the clock to measure storage latency; it owns no threads. |
+| §7 bounds memory globally. Recovery of a large log would read it whole. | Recovery scans in a window: memory is the window plus one record, never the log. |
+| `DeliveryGuarantee` (`AtMostOnce`/`AtLeastOnce`) and `Durability` (`memory`/`written`/`fsynced`) both sound like "how safe is this message". | They are orthogonal axes and must never be conflated. Delivery guarantee is about redelivery to a subscriber; durability is about surviving a crash. MQTT 3.1.1 has no wire representation for the second, so it is configuration, not a protocol field. |
+
+---
+
+## 73. Adaptive group commit
+
+The completion of the previous durability operation is the primary batching
+boundary. Neither a fixed timer nor a fixed record count is the normal reason
+to flush.
+
+```text
+receive first record → start a batch → take everything currently available
+→ write → sync_data() → the disk is free again → take what accumulated → ...
+```
+
+The batch size adapts to real storage latency and the real arrival rate.
+
+## 74. The commit cycle
+
+```rust
+loop {
+    let first = rx.recv()?;
+    let mut batch = Batch::new(first);
+    while batch.bytes() < max_batch_bytes {
+        match rx.try_recv() {
+            Ok(record) => batch.push(record),
+            Err(_) => break,
+        }
+    }
+    write_batch(&mut file, &batch)?;
+    file.sync_data()?;
+    acknowledge_fsynced(&batch);
+}
+```
+
+A conceptual model, not a mandatory implementation; a different data structure
+or I/O strategy is allowed with a benchmark behind it. The invariant is:
+
+> A completed `sync_data()` releases the writer to consume the records
+> accumulated while the previous sync was in progress.
+
+Never "wait 1 ms, flush" or "wait for 100 messages, flush" as the primary
+mechanism.
+
+## 75. Low load
+
+One record available means one record committed. No waiting for a timer, a
+count, a size threshold or another producer. The natural batch size at low
+load approaches one.
+
+## 76. High load
+
+The next batch consumes what accumulated during the previous storage
+operation. No durability operation per message when messages naturally pile up
+during a sync. The batching factor emerges from `incoming rate × storage
+latency`.
+
+## 77. Batch limits
+
+`max_batch_bytes` and `max_linger` are upper safety boundaries, not the
+primary mechanism. `max_batch_bytes` means "take what is available while the
+batch stays below this", never "wait until this is reached". `max_linger` must
+never delay an otherwise committable batch.
+
+Straum has no linger at all: nothing in the commit path waits, so there is no
+artificial delay to bound.
+
+## 78. Adaptive batch sizing
+
+A useful starting model is `target_batch_bytes ≈ throughput × sync_latency`
+(1 GB/s × 1 ms ≈ 1 MB). It is an estimate, not a law; real behavior is
+measured. Signals: sync latency, write throughput, batch size, queue depth,
+bytes and messages committed.
+
+An EWMA may estimate storage latency. Do not resize on every operation.
+Adaptation must be stable and bounded; reacting to individual measurements
+oscillates.
+
+Straum estimates throughput as `bytes / write time`, so the target reduces to
+`bytes × sync_ns / write_ns` — integer arithmetic, no assumed device speed —
+recomputed every 32 commits and clamped to `[min_batch_bytes,
+max_batch_bytes]`.
+
+## 79. Durable acknowledgement
+
+```text
+message → WAL write → sync_data() → durable offset advances → fsynced ack
+```
+
+Never acknowledge before the sync for `durability = fsynced`. A failed
+`sync_data()` is a durability failure for that commit cycle and is never
+silently ignored.
+
+## 80. Durability modes
+
+| Mode | Meaning |
+|---|---|
+| `memory` | The message exists in broker memory. No persistence guarantee. |
+| `written` | The WAL record was submitted to the operating system. It may not survive a machine or storage failure. |
+| `fsynced` | The durability operation covering the record completed. Only this advances the durable acknowledgement boundary. |
+
+Vague words — "safe", "saved", "persistent" — are not used without naming the
+event that establishes the guarantee.
+
+What `fsynced` costs is platform-dependent and must be stated, not assumed:
+Rust's `File::sync_data` is `fdatasync` on Linux and `F_FULLFSYNC` on macOS,
+which flushes the drive cache. The 4 ms sync latency measured on the
+development Mac is a full flush, not a lie the OS told us.
+
+## 81. Durable offset
+
+The WAL maintains a durable offset. A record beyond it is not durably
+persisted and must never be represented as such. It is the recovery boundary.
+
+Durability is never inferred from queue state, acknowledgement state, memory
+state, or file length alone.
+
+## 82. Visibility is not durability
+
+A message may be visible in memory before its record is durable. If consumers
+can observe non-durable messages, that is explicit, documented and tested.
+Durable consumer semantics expose data only up to the durable boundary.
+
+## 83. Architecture
+
+```text
+producers → WAL queue → sequential WAL writer → sync_data() → durable offset
+```
+
+One WAL for all topics. The primary durable write path stays sequential.
+
+## 84. No fsync per topic
+
+Per-topic durability operations produce many syncs, randomized I/O and poor
+batching. Topics share one WAL batch; the durability boundary is global to it.
+
+## 85. Per-topic memory tail (not built)
+
+A bounded in-memory tail per topic lets subscribers near the write head read
+without touching storage. It must be bounded and must never become a second
+copy of the WAL.
+
+## 86. Per-topic materialized segments (not built)
+
+Per-topic segments are materialized asynchronously from the WAL. The
+materializer never blocks the commit path and is never a prerequisite for an
+`fsynced` acknowledgement. The WAL owns durability; segments are a read and
+retention optimization.
+
+## 87. Retention (not built)
+
+Retention operates on whole segments that can be removed atomically. Avoid
+rewriting large files to drop expired records.
+
+## 88. Segment size (not built)
+
+Segments are bounded by bytes, not message count: 1000 × 64 B and 1000 × 1 MB
+are different workloads. A record larger than the segment size must not break
+rotation.
+
+## 89. Large messages (not built)
+
+Large payloads may live outside the WAL, with the record carrying metadata and
+a blob reference. The ordering is then `blob durability → WAL reference
+durability`; a durable reference to a missing blob is never allowed unless the
+protocol explicitly permits it. Requires dedicated crash-recovery tests.
+
+## 90. Large message threshold (not built)
+
+`inline_threshold` is a policy boundary, not an assumption. Benchmark 64 KiB,
+256 KiB, 1 MiB and others; the default must be justified by measurement for
+the intended workload.
+
+## 90a. Record layout (this implementation)
+
+The log is a byte log; the runtime decides what a record contains:
+
+```text
+[ topic length: u16 BE ][ topic ][ payload ]
+```
+
+Framing, checksum and ordering are the log's (`record.rs`); the meaning
+of the bytes is the runtime's. One copy is made per durable publish to
+put the two pieces in one buffer, and one more when the batch is built.
+Collapsing those two is a measurable change, not an obvious one.
+
+## 91. Ordering
+
+Every committed record has a position, and `WAL order == commit order`. The
+representation (offset, sequence number, logical position) is an
+implementation detail. Concurrent writers must not create ambiguous ordering:
+the WAL writer is the authoritative ordering point.
+
+Straum uses a per-record sequence number plus the byte offset; both advance
+under the single writer.
+
+## 92. Crash recovery
+
+Every change to the WAL format or the durability path requires crash-recovery
+tests. At minimum: crash before write, during write, before sync, during sync,
+after sync; partial final record; truncated WAL; invalid record length;
+corrupted checksum; a blob reference without its blob.
+
+Recovery distinguishes the valid durable prefix from an incomplete or corrupt
+tail, and never treats the file length as that boundary.
+
+## 93. WAL benchmarks
+
+Workloads: single message, low rate, sustained high rate, bursts, mixed sizes,
+large messages, multiple producers, slow and fast storage.
+
+Measure: messages/sec, bytes/sec, fsyncs/sec, **messages per sync**, **bytes
+per sync**, p50/p95/p99 latency, allocation rate, CPU. Throughput alone is not
+an evaluation.
+
+## 94. Adaptive batching benchmarks
+
+The suite must show batching adapting: idle, low, moderate, high, burst during
+fsync. Expected: small batches and low latency when idle; larger batches and
+roughly one durability operation per storage cycle under load. A fixed target
+batch size chosen because it looked good on one machine is not a result.
+
+## 95. Storage latency
+
+Measured, never assumed: write duration, sync duration, total commit duration,
+batch size. The broker must expose enough to tell CPU, WAL encoding, memory
+copies, storage write, sync latency and queue contention apart. Do not
+optimize the broker while the device is the limit.
+
+## 96. CPU efficiency
+
+Minimize record copying, temporary allocations, repeated length and checksum
+work, buffer growth, per-record syscalls, synchronization and queue
+operations. Prefer one batch, one sequential write, one durability operation,
+many acknowledgements. A record is never an independent asynchronous task.
+
+## 97. CPU and batching together
+
+Do not optimize only the fsync count. Track cycles per message, cycles per
+byte, messages per sync, bytes per sync. A batching algorithm that saves syncs
+while burning CPU on batch construction is not automatically an improvement.
+
+## 98. Batch construction
+
+Avoid unnecessary copies; a batch should reference or own records without
+rebuilding their payloads. Where vectored I/O is used, build the vectors
+without first copying payloads into a contiguous temporary. Vectored I/O is
+not assumed to be faster: benchmark one contiguous write against a vectored
+write against several writes for the real workload.
+
+## 99. Invariants
+
+1. No message acknowledged as `fsynced` exists beyond the durable boundary.
+2. A successful durability operation advances the boundary monotonically.
+3. Records accumulated during the previous durability operation are eligible
+   for the next batch.
+4. An idle broker never waits for an artificial timer before committing.
+5. One slow topic does not force every other topic into its own cycle.
+6. The WAL stays globally ordered.
+7. A failed durability operation never produces successful `fsynced`
+   acknowledgements.
+
+## 100. Separation of concerns
+
+```text
+WAL           durability
+memory tail   low-latency reads
+segments      read locality and retention
+blob store    large payloads
+```
+
+No component owns more than one of these.
+
+## 101. Definition of done for storage performance
+
+Adaptive group commit preserved; low-load latency, high-load throughput,
+messages per sync, bytes per sync, sync latency and CPU cost measured;
+allocation behavior checked; crash recovery still correct; durable
+acknowledgement semantics still correct; benchmarks repeated and compared
+against the previous baseline; regressions checked under several workloads.
+One high-throughput number is not evidence.
+
+## 102. The design question
+
+> "What caused the previous sync to complete, and what accumulated while it
+> was running?"
+
+not
+
+> "Has enough time passed?" or "Have enough messages accumulated?"
+
+The storage device provides the pacing signal. The algorithm adapts to it
+instead of imposing a cadence on it.

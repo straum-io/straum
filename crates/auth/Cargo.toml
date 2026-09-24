@@ -1,0 +1,24 @@
+[package]
+name = "auth"
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+domain = { path = "../domain" }
+bytes = "1"
+thiserror = "2"
+# Password hashing is not something to hand-roll. argon2 is the current
+# recommendation, pure Rust, and each stored hash carries its own cost
+# parameters, so an operator can trade verification time for resistance
+# without a code change.
+argon2 = { version = "0.5", features = ["std"] }
+
+[dev-dependencies]
+divan = "0.1"
+
+[[bench]]
+name = "verify"
+harness = false

@@ -1,0 +1,39 @@
+[package]
+name = "fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace: fuzzing needs nightly, the broker builds on stable.
+[workspace]
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1"
+libfuzzer-sys = "0.4"
+domain = { path = "../crates/domain" }
+mqtt = { path = "../crates/mqtt" }
+
+[[bin]]
+name = "decode_packet"
+path = "fuzz_targets/decode_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_stream"
+path = "fuzz_targets/decode_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "topic_filter"
+path = "fuzz_targets/topic_filter.rs"
+test = false
+doc = false
+bench = false

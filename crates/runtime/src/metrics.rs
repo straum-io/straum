@@ -1,0 +1,72 @@
+//! Plain atomics, `Relaxed`: they order nothing but themselves (CLAUDE.md §14).
+
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+#[derive(Debug, Default)]
+pub struct Metrics {
+    pub connections_accepted: AtomicU64,
+    pub protocol_errors: AtomicU64,
+    pub transport_errors: AtomicU64,
+    pub bytes_in: AtomicU64,
+    pub bytes_out: AtomicU64,
+    pub keepalive_closes: AtomicU64,
+    pub authentication_failures: AtomicU64,
+    pub active_sessions: AtomicU64,
+    pub queued_messages: AtomicUsize,
+    pub queued_bytes: AtomicUsize,
+    pub wal_commits: AtomicU64,
+    pub wal_records_committed: AtomicU64,
+    pub wal_bytes_committed: AtomicU64,
+    pub wal_commit_failures: AtomicU64,
+    /// Latest sync, not an average: the average of a bimodal latency is
+    /// a number that never happened.
+    pub wal_sync_nanos: AtomicU64,
+    pub wal_durable_sequence: AtomicU64,
+}
+
+impl Metrics {
+    pub fn increment(counter: &AtomicU64, by: u64) {
+        counter.fetch_add(by, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            connections_accepted: self.connections_accepted.load(Ordering::Relaxed),
+            protocol_errors: self.protocol_errors.load(Ordering::Relaxed),
+            transport_errors: self.transport_errors.load(Ordering::Relaxed),
+            bytes_in: self.bytes_in.load(Ordering::Relaxed),
+            bytes_out: self.bytes_out.load(Ordering::Relaxed),
+            keepalive_closes: self.keepalive_closes.load(Ordering::Relaxed),
+            authentication_failures: self.authentication_failures.load(Ordering::Relaxed),
+            active_sessions: self.active_sessions.load(Ordering::Relaxed),
+            queued_messages: self.queued_messages.load(Ordering::Relaxed),
+            queued_bytes: self.queued_bytes.load(Ordering::Relaxed),
+            wal_commits: self.wal_commits.load(Ordering::Relaxed),
+            wal_records_committed: self.wal_records_committed.load(Ordering::Relaxed),
+            wal_bytes_committed: self.wal_bytes_committed.load(Ordering::Relaxed),
+            wal_commit_failures: self.wal_commit_failures.load(Ordering::Relaxed),
+            wal_sync_nanos: self.wal_sync_nanos.load(Ordering::Relaxed),
+            wal_durable_sequence: self.wal_durable_sequence.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Snapshot {
+    pub connections_accepted: u64,
+    pub protocol_errors: u64,
+    pub transport_errors: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub keepalive_closes: u64,
+    pub authentication_failures: u64,
+    pub active_sessions: u64,
+    pub queued_messages: usize,
+    pub queued_bytes: usize,
+    pub wal_commits: u64,
+    pub wal_records_committed: u64,
+    pub wal_bytes_committed: u64,
+    pub wal_commit_failures: u64,
+    pub wal_sync_nanos: u64,
+    pub wal_durable_sequence: u64,
+}
