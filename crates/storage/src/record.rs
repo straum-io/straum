@@ -15,7 +15,10 @@
 use crate::crc::checksum;
 
 /// Identifies the file and its format. A format change changes the version.
-pub const MAGIC: [u8; 8] = *b"STRAUMW1";
+/// Identifies the file and its format. The record body is the caller's, so a
+/// change to what a record means is a change to this version too: an older
+/// log is then refused rather than misread.
+pub const MAGIC: [u8; 8] = *b"STRAUMW2";
 
 pub const HEADER_BYTES: usize = 8;
 

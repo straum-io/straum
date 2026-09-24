@@ -78,7 +78,7 @@ impl Wal {
                 discarded_bytes: 0,
             }
         } else {
-            scan(&mut file, &limits, length)?
+            scan(&mut file, &limits, length, &mut |_| {})?
         };
 
         // Appends continue at the end of the durable prefix: the tail is gone.
@@ -213,7 +213,12 @@ fn header_len() -> u64 {
 
 /// Walks the log from the start and stops at the first thing that is not a
 /// complete record. Everything before that point is the durable prefix.
-fn scan(file: &mut File, limits: &WalLimits, length: u64) -> Result<Recovery, StorageError> {
+fn scan(
+    file: &mut File,
+    limits: &WalLimits,
+    length: u64,
+    visit: &mut impl FnMut(&[u8]),
+) -> Result<Recovery, StorageError> {
     file.seek(SeekFrom::Start(0))?;
     let mut magic = [0u8; MAGIC.len()];
     if file.read_exact(&mut magic).is_err() || magic != MAGIC {
@@ -231,7 +236,16 @@ fn scan(file: &mut File, limits: &WalLimits, length: u64) -> Result<Recovery, St
     loop {
         let rest = buf.get(start..).unwrap_or_default();
         match record::read(rest, limits.max_record_bytes) {
-            Frame::Record { total, .. } => {
+            Frame::Record {
+                start: from,
+                end,
+                total,
+            } => {
+                // Only records inside the durable prefix are handed over: the
+                // tail is not a record, it is whatever the crash left.
+                if let Some(payload) = rest.get(from..end) {
+                    visit(payload);
+                }
                 records = records.saturating_add(1);
                 offset = offset.saturating_add(u64::try_from(total).unwrap_or(0));
                 start = start.saturating_add(total);
@@ -277,4 +291,38 @@ fn read_some(file: &mut File, buf: &mut [u8], from: usize) -> Result<usize, Stor
         }
     }
     Ok(filled)
+}
+
+/// Reads the durable prefix of a log without opening it for writing.
+///
+/// Every complete, checksum-clean record is handed to `visit` in the order it
+/// was committed; whatever follows the first broken one is not a record and
+/// is not offered (docs/storage.md §92).
+pub fn replay(
+    path: &Path,
+    limits: WalLimits,
+    visit: &mut impl FnMut(&[u8]),
+) -> Result<Recovery, StorageError> {
+    let mut file = match OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        // Nothing written yet is not a failure to recover.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Recovery {
+                records: 0,
+                durable_offset: 0,
+                discarded_bytes: 0,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let length = file.metadata()?.len();
+    if length == 0 {
+        return Ok(Recovery {
+            records: 0,
+            durable_offset: 0,
+            discarded_bytes: 0,
+        });
+    }
+    scan(&mut file, &limits, length, visit)
 }

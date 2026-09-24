@@ -14,7 +14,7 @@ mod record;
 mod wal;
 
 pub use commit::{Commit, Committer, RecordSource, WalRecord};
-pub use wal::{Committed, Recovery, Wal};
+pub use wal::{Committed, Recovery, Wal, replay};
 
 /// Limits of the write-ahead log. Defaults are the ones documented in
 /// `docs/configuration.md`; changing one is a behavior change.

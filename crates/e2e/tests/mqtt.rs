@@ -297,7 +297,7 @@ async fn a_durable_publish_reaches_the_disk_before_it_is_acknowledged() {
 
     // And it is on the disk, in a log that identifies itself.
     let bytes = std::fs::read(&path).unwrap();
-    assert!(bytes.starts_with(b"STRAUMW1"));
+    assert!(bytes.starts_with(b"STRAUMW2"));
     assert!(
         bytes.windows(15).any(|window| window == b"durable-payload"),
         "the payload never reached the file"
@@ -618,4 +618,139 @@ async fn a_session_survives_its_connection() {
     assert_eq!(publish.payload.as_ref(), b"21");
 
     broker.shutdown().await;
+}
+
+/// What the log is for: state that outlives the process.
+mod restart {
+    use super::*;
+
+    use runtime::{Durability, WalSettings};
+
+    fn durable(path: &std::path::Path) -> Runtime {
+        let config = RuntimeConfig {
+            transport: TransportConfig {
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+                ..TransportConfig::default()
+            },
+            durability: Durability::Fsynced,
+            wal: WalSettings {
+                path: path.to_path_buf(),
+                ..WalSettings::default()
+            },
+            ..RuntimeConfig::default()
+        };
+        Runtime::start(config).unwrap()
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("straum-restart-{name}-{}.wal", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    async fn publish_retained(broker: &Runtime, topic: &str, payload: &str) {
+        let (client, mut eventloop) = client("publisher", broker);
+        client
+            .publish(topic, QoS::AtLeastOnce, true, payload)
+            .await
+            .unwrap();
+        until(&mut eventloop, |incoming| {
+            matches!(incoming, Incoming::PubAck(_))
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retained_state_outlives_the_process() {
+        let path = scratch("retained");
+
+        let broker = durable(&path);
+        publish_retained(&broker, "sensors/eu/temp", "21").await;
+        broker.shutdown().await;
+
+        // A different broker, the same log.
+        let broker = durable(&path);
+        let (subscriber, mut eventloop) = client("subscriber", &broker);
+        subscriber
+            .subscribe("sensors/#", QoS::AtMostOnce)
+            .await
+            .unwrap();
+
+        let delivered = until(&mut eventloop, |incoming| {
+            matches!(incoming, Incoming::Publish(_))
+        })
+        .await
+        .unwrap();
+        let Incoming::Publish(publish) = delivered else {
+            panic!("expected a PUBLISH");
+        };
+        assert_eq!(publish.topic, "sensors/eu/temp");
+        assert_eq!(publish.payload.as_ref(), b"21");
+        assert!(publish.retain);
+
+        broker.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deleted_state_stays_deleted() {
+        let path = scratch("deleted");
+
+        let broker = durable(&path);
+        publish_retained(&broker, "a/b", "value").await;
+        // An empty payload is how the last value is forgotten.
+        publish_retained(&broker, "a/b", "").await;
+        broker.shutdown().await;
+
+        let broker = durable(&path);
+        let (subscriber, mut eventloop) = client("subscriber", &broker);
+        subscriber.subscribe("a/#", QoS::AtMostOnce).await.unwrap();
+        until(&mut eventloop, |incoming| {
+            matches!(incoming, Incoming::SubAck(_))
+        })
+        .await
+        .unwrap();
+
+        let resurrected = tokio::time::timeout(Duration::from_millis(400), async {
+            loop {
+                if let Ok(Event::Incoming(Incoming::Publish(publish))) = eventloop.poll().await {
+                    return publish.topic;
+                }
+            }
+        })
+        .await;
+        assert!(resurrected.is_err(), "a deleted retained message came back");
+
+        broker.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_last_value_is_the_one_that_comes_back() {
+        let path = scratch("last");
+
+        let broker = durable(&path);
+        publish_retained(&broker, "a/b", "first").await;
+        publish_retained(&broker, "a/b", "second").await;
+        publish_retained(&broker, "a/b", "third").await;
+        broker.shutdown().await;
+
+        let broker = durable(&path);
+        let (subscriber, mut eventloop) = client("subscriber", &broker);
+        subscriber.subscribe("a/b", QoS::AtMostOnce).await.unwrap();
+        let delivered = until(&mut eventloop, |incoming| {
+            matches!(incoming, Incoming::Publish(_))
+        })
+        .await
+        .unwrap();
+        let Incoming::Publish(publish) = delivered else {
+            panic!("expected a PUBLISH");
+        };
+        assert_eq!(publish.payload.as_ref(), b"third");
+
+        broker.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -48,7 +48,7 @@ fn a_fresh_log_starts_empty_and_identifiable() {
 
     assert_eq!(recovery.records, 0);
     assert_eq!(recovery.discarded_bytes, 0);
-    assert_eq!(fs::read(&path).unwrap(), b"STRAUMW1");
+    assert_eq!(fs::read(&path).unwrap(), b"STRAUMW2");
     let _ = fs::remove_file(&path);
 }
 
@@ -195,5 +195,68 @@ fn the_durable_offset_only_moves_forward() {
         assert_eq!(committed.durable_sequence, round + 1);
         previous = committed.durable_offset;
     }
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn replay_hands_over_the_durable_prefix_in_order() {
+    let path = scratch("replay");
+    log_with(&path, 5);
+
+    let mut seen = Vec::new();
+    let recovery = storage::replay(&path, WalLimits::default(), &mut |record| {
+        seen.push(String::from_utf8_lossy(record).into_owned());
+    })
+    .unwrap();
+
+    assert_eq!(recovery.records, 5);
+    assert_eq!(
+        seen,
+        (0..5).map(|i| format!("record-{i}")).collect::<Vec<_>>(),
+        "the log was not replayed in commit order"
+    );
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn replay_stops_where_recovery_stops() {
+    let path = scratch("replay-tail");
+    let mut bytes = log_with(&path, 4);
+    // A crash left half a record and some noise behind.
+    bytes.truncate(bytes.len() - 2);
+    bytes.extend_from_slice(b"garbage");
+    fs::write(&path, &bytes).unwrap();
+
+    let mut seen = 0;
+    let recovery = storage::replay(&path, WalLimits::default(), &mut |_| seen += 1).unwrap();
+
+    assert_eq!(recovery.records, 3);
+    assert_eq!(seen, 3, "the tail was offered as if it were a record");
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn replay_of_nothing_is_not_a_failure() {
+    let path = scratch("replay-missing");
+    let recovery = storage::replay(&path, WalLimits::default(), &mut |_| {}).unwrap();
+    assert_eq!(recovery.records, 0);
+}
+
+#[test]
+fn a_log_in_the_previous_format_is_refused() {
+    let path = scratch("old-format");
+    let mut bytes = log_with(&path, 3);
+    // Only the version differs; every record would still parse.
+    bytes[..8].copy_from_slice(b"STRAUMW1");
+    fs::write(&path, &bytes).unwrap();
+
+    assert!(matches!(
+        storage::replay(&path, WalLimits::default(), &mut |_| {}),
+        Err(StorageError::NotAWal)
+    ));
+    assert!(matches!(
+        Wal::open(&path, WalLimits::default()),
+        Err(StorageError::NotAWal)
+    ));
     let _ = fs::remove_file(&path);
 }

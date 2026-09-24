@@ -239,7 +239,13 @@ async fn read(
                                 publish,
                             },
                         ) if config.durability == Durability::Fsynced => {
-                            wal.submit(&publish.topic, &publish.payload).await
+                            wal.submit(
+                                &publish.topic,
+                                &publish.payload,
+                                publish.guarantee,
+                                publish.retain,
+                            )
+                            .await
                         }
                         _ => None,
                     };

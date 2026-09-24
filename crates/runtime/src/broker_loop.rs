@@ -48,9 +48,17 @@ impl Loop {
         config: RuntimeConfig,
         metrics: Arc<Metrics>,
         global_queued: Arc<AtomicUsize>,
+        restored: Vec<crate::wal::Recorded>,
     ) -> Self {
+        let mut broker = Broker::new(config.broker);
+        // Whatever the log held becomes state again before the first command
+        // is handled, so a client that reconnects sees what it left behind.
+        for record in restored {
+            broker.restore_retained(record.topic, record.payload, record.guarantee);
+        }
+
         Self {
-            broker: Broker::new(config.broker),
+            broker,
             config,
             metrics,
             global_queued,

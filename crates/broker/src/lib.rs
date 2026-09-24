@@ -140,6 +140,20 @@ impl Broker {
         self.stats
     }
 
+    /// Puts back a retained message that survived a restart.
+    ///
+    /// Only the runtime calls this, once, before the loop starts: the log is
+    /// the recovery boundary, and this is how what it held becomes state
+    /// again (docs/storage.md §81).
+    pub fn restore_retained(&mut self, topic: Topic, payload: Bytes, guarantee: DeliveryGuarantee) {
+        self.retain(&Publish {
+            topic,
+            payload,
+            guarantee,
+            retain: true,
+        });
+    }
+
     /// Handles one command from one session.
     pub fn handle(&mut self, session: SessionId, command: Command, out: &mut Outbox) {
         self.dispatch(session, command, None, out);

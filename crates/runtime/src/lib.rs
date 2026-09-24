@@ -97,6 +97,14 @@ impl Runtime {
             config.auth.allow_anonymous,
         )?);
 
+        // Read back before anything is served: the log is the recovery
+        // boundary, so what it held is state again before the first
+        // client can ask for it.
+        let restored = match config.durability {
+            Durability::Memory => Vec::new(),
+            _ => wal::restore(&config.wal, config.broker)?,
+        };
+
         let (wal, wal_writer) = match config.durability {
             Durability::Memory => (None, None),
             _ => {
@@ -111,6 +119,7 @@ impl Runtime {
                 config.clone(),
                 Arc::clone(&metrics),
                 Arc::clone(&global_queued),
+                restored,
             )
             .run(commands),
         );
