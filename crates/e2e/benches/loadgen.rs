@@ -167,7 +167,15 @@ async fn throughput(settings: Settings) {
                         }
                     }
                     Ok(Ok(_)) => {}
-                    Ok(Err(_)) | Err(_) => break,
+                    // A subscriber that stops counting is the loudest thing
+                    // this generator can observe, so it says why. Breaking
+                    // quietly here once hid a broker dropping connections as
+                    // a broker that had gone slow.
+                    Ok(Err(error)) => {
+                        eprintln!("subscriber {index} lost its connection: {error}");
+                        break;
+                    }
+                    Err(_) => break,
                 }
             }
         }));

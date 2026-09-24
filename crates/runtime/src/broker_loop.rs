@@ -123,6 +123,9 @@ impl Loop {
             self.metrics
                 .backlog_refused
                 .store(stats.backlog_refused, Ordering::Relaxed);
+            self.metrics
+                .slow_consumer_closes
+                .store(stats.slow_consumer_closes, Ordering::Relaxed);
         }
 
         tracing::debug!("broker loop stopped");
@@ -198,6 +201,20 @@ impl Loop {
     /// `Some` means it did not fit and the broker has to decide.
     fn enqueue(&mut self, session: SessionId, outbound: Outbound) -> Option<Outbound> {
         let closing = matches!(outbound, Outbound::Close(_));
+        if let Outbound::Close(protocol::CloseReason::SlowConsumer) = &outbound {
+            // Once per session, at the moment the broker gives up on it —
+            // not the hot path. Dropping a subscriber is the thing an
+            // operator most needs told, and 3.1.1 has no way to tell the
+            // client: it gets a closed socket and no reason (§6). Silent
+            // here once looked exactly like a broker that had gone slow.
+            tracing::warn!(
+                ?session,
+                inflight = self.config.broker.max_inflight,
+                backlog = self.config.broker.session_backlog_messages,
+                "closing a subscriber the broker cannot keep up with; \
+                 STRAUM_MAX_INFLIGHT bounds how much it may have in flight"
+            );
+        }
         let egress = Egress::Out(outbound);
         let bytes = weight(&egress);
 
