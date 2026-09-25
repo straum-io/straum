@@ -122,6 +122,10 @@ pub enum ConnectRejectReason {
     NotAuthorized,
     /// The broker is at capacity.
     ServerUnavailable,
+    /// The identity the client offered cannot be used. 3.1.1 allows an
+    /// empty one only with CleanSession = 1, because a session nobody can
+    /// name again cannot be resumed (§3.1.3.1).
+    IdentifierRejected,
 }
 
 /// One entry per filter of a [`Command::Subscribe`], in the same order.

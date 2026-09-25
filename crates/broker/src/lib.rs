@@ -15,8 +15,8 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 use domain::{ClientId, DeliveryGuarantee, DeliveryId, SessionId, Topic, TopicFilter};
 use protocol::{
-    CloseReason, Command, Connect, Delivery, DisconnectReason, DurableToken, Outbound, Outbox,
-    Publish, RequestId, Response, SubscribeResult,
+    CloseReason, Command, Connect, ConnectRejectReason, Delivery, DisconnectReason, DurableToken,
+    Outbound, Outbox, Publish, RequestId, Response, SubscribeResult,
 };
 
 use auth::Permissions;
@@ -357,12 +357,22 @@ impl Broker {
         }
     }
 
-    fn connect(&mut self, session: SessionId, mut connect: Connect, out: &mut Outbox) {
+    fn connect(&mut self, session: SessionId, connect: Connect, out: &mut Outbox) {
         let client = if connect.client_id.is_empty() {
-            // An assigned identity cannot be asked for again: keeping the
-            // session would park it under a name only the broker knows, until
-            // the offline limit filled up with ghosts.
-            connect.resume = false;
+            // An assigned identity cannot be asked for again, so asking for
+            // it to be kept is a request the broker cannot honour (3.1.1
+            // §3.1.3.1). Refused rather than quietly downgraded: a client
+            // that expects its session back should hear that it will not
+            // get it.
+            if connect.resume {
+                out.push(
+                    session,
+                    Outbound::Reply(Response::ConnectRejected(
+                        ConnectRejectReason::IdentifierRejected,
+                    )),
+                );
+                return;
+            }
             self.assign_client_id()
         } else {
             connect.client_id

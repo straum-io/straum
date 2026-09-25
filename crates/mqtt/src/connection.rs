@@ -173,6 +173,7 @@ pub fn encode_outbound(
                 ConnectRejectReason::ServerUnavailable => ConnectRejected::ServerUnavailable,
                 ConnectRejectReason::BadCredentials => ConnectRejected::BadCredentials,
                 ConnectRejectReason::NotAuthorized => ConnectRejected::NotAuthorized,
+                ConnectRejectReason::IdentifierRejected => ConnectRejected::IdentifierRejected,
             };
             connack(buf, ConnAck::Rejected(reason));
             Ok(Disposition::CloseAfterWrite)

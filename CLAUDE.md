@@ -453,7 +453,7 @@ Decisions and documented deviations:
 | At-most-once for an offline session | dropped (3.1.1 allows it); `offline_dropped` counts it |
 | Unacknowledged at-least-once on resume | sent again with DUP = 1 |
 | Empty ClientId, CleanSession = 1 | broker assigns an id |
-| Empty ClientId, CleanSession = 0 | the broker assigns an id and the session is not kept: nothing names it afterwards (deviation: 3.1.1 says CONNACK 0x02) |
+| Empty ClientId, CleanSession = 0 | CONNACK 0x02, close — a session nobody can name again cannot be asked for (3.1.1 §3.1.3.1) |
 | ClientId already connected | old session closed (takeover) |
 | Will flag | published when the connection ends any way but a DISCONNECT (3.1.1 §3.1.2.5); a clean goodbye takes it with it |
 | Will on a kept session | replaced by whatever the next CONNECT carries; it belongs to the connection, not the session |

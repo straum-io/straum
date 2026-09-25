@@ -486,3 +486,66 @@ fn the_will_is_published_at_most_once() {
 
     assert_eq!(deliveries(&mut out).len(), 1, "the will went out twice");
 }
+
+/// 3.1.1 §3.1.3.1: an empty identifier is only allowed with
+/// CleanSession = 1, because a session nobody can name again cannot be
+/// asked for. Refusing beats quietly handing back a clean session.
+#[test]
+fn an_unnameable_session_is_refused_rather_than_downgraded() {
+    let (mut broker, mut out) = broker();
+    broker.handle(
+        SessionId(1),
+        Command::Connect(Connect {
+            client_id: ClientId::new(Bytes::new()).unwrap(),
+            permissions: Permissions::unrestricted(),
+            resume: true,
+            will: None,
+        }),
+        &mut out,
+    );
+
+    let produced: Vec<_> = out.take().collect();
+    assert!(
+        produced.iter().any(|(_, outbound)| matches!(
+            outbound,
+            Outbound::Reply(Response::ConnectRejected(
+                protocol::ConnectRejectReason::IdentifierRejected
+            ))
+        )),
+        "expected CONNACK 0x02, got {produced:?}"
+    );
+    assert_eq!(
+        broker.stats().active_sessions,
+        0,
+        "a refused connection still made a session"
+    );
+}
+
+/// An empty identifier with CleanSession = 1 is still fine: the broker
+/// names it and nobody ever needs that name again.
+#[test]
+fn an_empty_identifier_is_fine_for_a_clean_session() {
+    let (mut broker, mut out) = broker();
+    broker.handle(
+        SessionId(1),
+        Command::Connect(Connect {
+            client_id: ClientId::new(Bytes::new()).unwrap(),
+            permissions: Permissions::unrestricted(),
+            resume: false,
+            will: None,
+        }),
+        &mut out,
+    );
+
+    let produced: Vec<_> = out.take().collect();
+    assert!(
+        produced.iter().any(|(_, outbound)| matches!(
+            outbound,
+            Outbound::Reply(Response::Connected {
+                session_present: false
+            })
+        )),
+        "expected an accepted connection, got {produced:?}"
+    );
+    assert_eq!(broker.stats().active_sessions, 1);
+}
