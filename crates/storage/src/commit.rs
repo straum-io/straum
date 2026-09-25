@@ -7,6 +7,7 @@
 //! is not. The batching factor is `incoming rate × storage latency`, and
 //! neither term is ours to choose.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 /// Where the writer takes records from.
@@ -59,11 +60,15 @@ pub struct WalRecord {
 pub struct Commit {
     pub durable_sequence: u64,
     pub durable_offset: u64,
-    /// Everything submitted up to and including this correlation is durable.
-    /// Monotonic: it is the highest correlation the log has committed, not
-    /// the last one of this batch, so submission order does not have to
-    /// match correlation order (docs/storage.md §81).
-    pub last_correlation: u64,
+    /// The contiguous durable prefix: every correlation up to and including
+    /// this one has been committed.
+    ///
+    /// Deliberately not the highest correlation seen. A submitter takes its
+    /// correlation and then queues the record, so a higher correlation can
+    /// reach the log first; a maximum would then report a record that is
+    /// still sitting in the channel as durable (docs/replication.md §110).
+    /// Monotonic, and never ahead of what `sync_data` covered.
+    pub durable_correlation: u64,
     pub records: usize,
     pub bytes: usize,
     pub write: Duration,
@@ -83,7 +88,13 @@ pub struct Committer {
     write_nanos_ewma: u64,
     sync_nanos_ewma: u64,
     commits: u64,
-    highest_correlation: u64,
+    /// The contiguous durable prefix (see [`Commit::durable_correlation`]).
+    durable_correlation: u64,
+    /// Committed correlations that sit above a gap, waiting for it to close.
+    /// Empty whenever submission order matched correlation order, which is
+    /// the ordinary case: it does not allocate until one record overtakes
+    /// another.
+    ahead: BTreeSet<u64>,
 }
 
 impl Committer {
@@ -91,7 +102,12 @@ impl Committer {
     /// what `Durability::Written` means (docs/storage.md §80). The
     /// adaptation still runs: without a sync to measure, the write latency
     /// is the signal it paces against.
-    pub fn new(wal: Wal, limits: WalLimits, sync: bool) -> Self {
+    ///
+    /// `durable_correlation` is what the recovered log already covers: the
+    /// next record submitted is expected to carry the correlation after it.
+    /// A value that is too low stalls acknowledgement until the gap closes,
+    /// which is the safe direction to be wrong in.
+    pub fn new(wal: Wal, limits: WalLimits, sync: bool, durable_correlation: u64) -> Self {
         Self {
             sync,
             wal,
@@ -101,7 +117,31 @@ impl Committer {
             write_nanos_ewma: 0,
             sync_nanos_ewma: 0,
             commits: 0,
-            highest_correlation: 0,
+            durable_correlation,
+            ahead: BTreeSet::new(),
+        }
+    }
+
+    /// Folds one committed correlation into the contiguous prefix.
+    ///
+    /// Correlations form a dense sequence — one is taken only once its record
+    /// is certain to be queued — so a gap means "not committed yet", never
+    /// "will never arrive" (docs/replication.md §110).
+    fn cover(&mut self, correlation: u64) {
+        if correlation != self.durable_correlation.saturating_add(1) {
+            if correlation > self.durable_correlation {
+                self.ahead.insert(correlation);
+            }
+            return;
+        }
+        self.durable_correlation = correlation;
+        // This record may have been the gap a whole run was waiting behind.
+        while let Some(next) = self.ahead.first().copied() {
+            if next != self.durable_correlation.saturating_add(1) {
+                break;
+            }
+            self.ahead.pop_first();
+            self.durable_correlation = next;
         }
     }
 
@@ -129,8 +169,10 @@ impl Committer {
             return Ok(None);
         };
 
-        self.highest_correlation = self.highest_correlation.max(first.correlation);
+        // Staged first, covered second: a record the log refused is not part
+        // of any prefix.
         self.wal.stage(&first.payload)?;
+        self.cover(first.correlation);
 
         // Everything currently available, not everything that might arrive:
         // an idle broker commits a batch of one without waiting for anybody.
@@ -138,8 +180,8 @@ impl Committer {
             let Some(record) = records.try_recv() else {
                 break;
             };
-            self.highest_correlation = self.highest_correlation.max(record.correlation);
             self.wal.stage(&record.payload)?;
+            self.cover(record.correlation);
         }
 
         let (committed, write, sync) = self.wal.commit_with(self.sync)?;
@@ -148,7 +190,7 @@ impl Committer {
         Ok(Some(Commit {
             durable_sequence: committed.durable_sequence,
             durable_offset: committed.durable_offset,
-            last_correlation: self.highest_correlation,
+            durable_correlation: self.durable_correlation,
             records: committed.records,
             bytes: committed.bytes,
             write,
@@ -242,7 +284,7 @@ mod tests {
         let path = scratch(name);
         let (wal, _) = Wal::open(&path, WalLimits::default()).unwrap();
         let (tx, rx) = channel();
-        (Committer::new(wal, WalLimits::default(), true), tx, rx)
+        (Committer::new(wal, WalLimits::default(), true, 0), tx, rx)
     }
 
     fn record(correlation: u64, size: usize) -> WalRecord {
@@ -261,7 +303,7 @@ mod tests {
 
         // No timer, no threshold, no second producer: one record, one sync.
         assert_eq!(commit.records, 1);
-        assert_eq!(commit.last_correlation, 1);
+        assert_eq!(commit.durable_correlation, 1);
         assert_eq!(commit.durable_sequence, 1);
     }
 
@@ -276,7 +318,7 @@ mod tests {
 
         // One durability operation for all of them, not 64 of them.
         assert_eq!(commit.records, 64);
-        assert_eq!(commit.last_correlation, 64);
+        assert_eq!(commit.durable_correlation, 64);
     }
 
     #[test]
@@ -293,8 +335,67 @@ mod tests {
         let second = committer.commit_available(&mut rx).unwrap().unwrap();
 
         assert_eq!(second.records, 8);
-        assert_eq!(second.last_correlation, 9);
+        assert_eq!(second.durable_correlation, 9);
         assert!(second.durable_sequence > first.durable_sequence);
+    }
+
+    #[test]
+    fn a_correlation_that_overtook_another_acknowledges_neither_early() {
+        let (mut committer, tx, mut rx) = committer("overtake");
+        // 99 was numbered first but blocked on a full queue; 100 and 101 went
+        // past it. Nothing below 99 may be called durable, because 99 is not
+        // in the log yet (docs/replication.md §110).
+        for correlation in [100, 101] {
+            tx.send(record(correlation, 64)).unwrap();
+        }
+
+        let commit = committer.commit_available(&mut rx).unwrap().unwrap();
+
+        assert_eq!(commit.records, 2);
+        assert_eq!(
+            commit.durable_correlation, 0,
+            "a maximum would have reported 101 and acknowledged 99 with it"
+        );
+    }
+
+    #[test]
+    fn the_prefix_jumps_the_whole_run_when_the_gap_closes() {
+        let (mut committer, tx, mut rx) = committer("gapclose");
+        for correlation in [2, 3, 5] {
+            tx.send(record(correlation, 64)).unwrap();
+        }
+        assert_eq!(
+            committer
+                .commit_available(&mut rx)
+                .unwrap()
+                .unwrap()
+                .durable_correlation,
+            0
+        );
+
+        // 1 arrives: 2 and 3 were only ever waiting for it. 5 still is not,
+        // because 4 has not been committed.
+        tx.send(record(1, 64)).unwrap();
+        let commit = committer.commit_available(&mut rx).unwrap().unwrap();
+        assert_eq!(commit.durable_correlation, 3);
+
+        tx.send(record(4, 64)).unwrap();
+        let commit = committer.commit_available(&mut rx).unwrap().unwrap();
+        assert_eq!(commit.durable_correlation, 5);
+    }
+
+    #[test]
+    fn a_recovered_log_continues_its_prefix_rather_than_restarting_it() {
+        let path = scratch("recovered");
+        let (wal, _) = Wal::open(&path, WalLimits::default()).unwrap();
+        // 500 records were already durable before this process started.
+        let mut committer = Committer::new(wal, WalLimits::default(), true, 500);
+        let (tx, mut rx) = channel();
+        tx.send(record(501, 64)).unwrap();
+
+        let commit = committer.commit_available(&mut rx).unwrap().unwrap();
+
+        assert_eq!(commit.durable_correlation, 501);
     }
 
     #[test]
@@ -312,7 +413,7 @@ mod tests {
         let path = scratch("failure");
         let (mut wal, _) = Wal::open(&path, WalLimits::default()).unwrap();
         wal.fail_next_sync();
-        let mut committer = Committer::new(wal, WalLimits::default(), true);
+        let mut committer = Committer::new(wal, WalLimits::default(), true, 0);
         let (tx, mut rx) = channel();
         tx.send(record(1, 64)).unwrap();
 

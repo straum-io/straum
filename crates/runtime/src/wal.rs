@@ -49,12 +49,16 @@ impl Submitter {
         guarantee: DeliveryGuarantee,
         retain: bool,
     ) -> Option<DurableToken> {
+        // The queue slot first, the number second. A correlation taken before
+        // the record is certain to be queued leaves a hole the durable
+        // watermark can never close, and the watermark is what an
+        // acknowledgement rests on (docs/replication.md §110).
+        let permit = self.records.reserve().await.ok()?;
         let correlation = self.next.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-        let record = WalRecord {
+        permit.send(WalRecord {
             correlation,
             payload: encode(correlation, topic, payload, guarantee, retain),
-        };
-        self.records.send(record).await.ok()?;
+        });
         Some(DurableToken(correlation))
     }
 
@@ -66,12 +70,18 @@ impl Submitter {
     ///
     /// `false` means the queue was full and the caller should try again.
     pub(crate) fn try_submit_session(&self, event: &SessionEvent) -> bool {
+        // Same order as `submit`, and here it is the whole point: this call
+        // is expected to fail and be retried, and a correlation burned on
+        // every refusal would stall the watermark permanently.
+        let Ok(permit) = self.records.try_reserve() else {
+            return false;
+        };
         let correlation = self.next.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-        let record = WalRecord {
+        permit.send(WalRecord {
             correlation,
             payload: encode_session(correlation, event),
-        };
-        self.records.try_send(record).is_ok()
+        });
+        true
     }
 }
 
@@ -86,9 +96,10 @@ impl Submitter {
 /// ```
 ///
 /// The correlation is written down rather than derived from the record's
-/// position, because publishes are submitted from many connection tasks at
-/// once: numbering them in step with the queue would need a lock on the
-/// publish path, and eight bytes a record is the cheaper of the two.
+/// position: compaction rewrites the log, so a position is where a record
+/// happens to sit today and a correlation is what it is. Eight bytes a
+/// record is what that costs.
+///
 /// `FLAG_GONE` on a session record means the identity keeps nothing.
 const KIND_PUBLISH: u8 = 1;
 const KIND_SESSION: u8 = 2;
@@ -538,7 +549,7 @@ pub(crate) fn start(
         "recovered the write-ahead log"
     );
     let (records, queue) = mpsc::channel(settings.queue);
-    let committer = Committer::new(wal, settings.limits, sync);
+    let committer = Committer::new(wal, settings.limits, sync, restored);
 
     let owned = settings.clone();
     // A weak sender on purpose, and downgraded here rather than inside the
@@ -644,7 +655,7 @@ fn report(commit: &storage::Commit, events: &mpsc::WeakSender<Event>, metrics: &
     // The broker may acknowledge everything up to here, and not one
     // record more (docs/storage.md §99, invariant 1).
     if let Some(events) = events.upgrade() {
-        let _ = events.blocking_send(Event::Durable(DurableToken(commit.last_correlation)));
+        let _ = events.blocking_send(Event::Durable(DurableToken(commit.durable_correlation)));
     }
 }
 
@@ -658,5 +669,35 @@ impl RecordSource for Queue {
 
     fn try_recv(&mut self) -> Option<WalRecord> {
         self.0.try_recv().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(name: &str) -> ClientId {
+        ClientId::new(Bytes::copy_from_slice(name.as_bytes())).unwrap()
+    }
+
+    #[test]
+    fn a_refused_session_record_does_not_consume_a_correlation() {
+        let (records, mut queue) = mpsc::channel(1);
+        let submitter = Submitter {
+            records,
+            next: Arc::new(AtomicU64::new(0)),
+        };
+
+        assert!(submitter.try_submit_session(&SessionEvent::Gone(client("a"))));
+
+        // The queue is full. This refusal is an ordinary, expected outcome —
+        // the broker loop retries — and it must cost nothing: a correlation
+        // burned here is a hole no commit can ever fill, and the durable
+        // watermark would stop advancing for good (docs/replication.md §110).
+        assert!(!submitter.try_submit_session(&SessionEvent::Gone(client("b"))));
+
+        assert_eq!(queue.try_recv().unwrap().correlation, 1);
+        assert!(submitter.try_submit_session(&SessionEvent::Gone(client("b"))));
+        assert_eq!(queue.try_recv().unwrap().correlation, 2);
     }
 }

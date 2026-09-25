@@ -48,7 +48,7 @@ fn run(
 ) -> Run {
     let path = scratch(name);
     let (wal, _) = ok(Wal::open(&path, WalLimits::default()));
-    let mut committer = Committer::new(wal, WalLimits::default(), true);
+    let mut committer = Committer::new(wal, WalLimits::default(), true, 0);
 
     let (tx, mut rx) = channel::<WalRecord>();
     let (commit_tx, commit_rx): (Sender<Commit>, Receiver<Commit>) = channel();
@@ -112,7 +112,7 @@ fn report(run: &Run) {
     let mut latencies: Vec<u64> = Vec::with_capacity(run.records);
     let mut next = 0usize;
     for (commit, finished) in &run.commits {
-        let last = commit.last_correlation as usize;
+        let last = commit.durable_correlation as usize;
         while next < last {
             if let Some(submitted) = run.submitted.get(next) {
                 latencies.push(finished.duration_since(*submitted).as_nanos() as u64);
