@@ -11,7 +11,7 @@ use std::time::Instant;
 use auth::Permissions;
 use broker::{Broker, BrokerLimits};
 use bytes::{Bytes, BytesMut};
-use domain::{ClientId, DeliveryGuarantee, SessionId, TopicFilter};
+use domain::{ClientId, DeliveryGuarantee, DeliveryId, SessionId, TopicFilter};
 use mqtt::{Connection, MqttLimits, PacketIds, Reaction, decode, encode_outbound};
 use protocol::{Command, Connect, Outbox, RequestId};
 
@@ -99,6 +99,8 @@ struct Pipeline {
     limits: MqttLimits,
     write: BytesMut,
     publisher: SessionId,
+    /// Reused: the acknowledgement loop must not allocate per message.
+    acked: Vec<(SessionId, DeliveryId)>,
 }
 
 impl Pipeline {
@@ -135,7 +137,32 @@ impl Pipeline {
             limits,
             write: BytesMut::with_capacity(64 * 1024),
             publisher,
+            acked: Vec::new(),
         }
+    }
+
+    /// One message, all the way through, and acknowledged.
+    ///
+    /// The acknowledgement is the difference between measuring at-least-once
+    /// delivery and measuring a window that filled up once and then sent
+    /// everything to the backlog.
+    fn run_acked(&mut self, buf: BytesMut) -> usize {
+        let delivered = self.run(buf);
+        let mut acks = std::mem::take(&mut self.acked);
+        for (session, delivery) in acks.drain(..) {
+            if let Ok(mut ids) = self.ids.lock() {
+                // Production releases by packet identifier off the wire;
+                // here the delivery identifier is what the bench has.
+                let _ = ids.release_for_benchmarks(delivery);
+            }
+            self.broker
+                .handle(session, Command::Ack(delivery), &mut self.out);
+        }
+        self.acked = acks;
+        // Draining the backlog produces more deliveries; they are part of
+        // the same steady state.
+        let _ = self.out.take();
+        delivered
     }
 
     /// One message, all the way through.
@@ -159,7 +186,13 @@ impl Pipeline {
 
         self.write.clear();
         let mut delivered = 0usize;
-        for (_, outbound) in self.out.take() {
+        self.acked.clear();
+        for (session, outbound) in self.out.take() {
+            if let protocol::Outbound::Deliver(delivery) = &outbound {
+                if let Some(id) = delivery.id {
+                    self.acked.push((session, id));
+                }
+            }
             if encode_outbound(&outbound, &mut ids, &mut self.write, &self.limits).is_err() {
                 panic!("encoding a delivery failed");
             }
@@ -196,8 +229,12 @@ fn publish_consume(bencher: divan::Bencher, workload: (usize, usize)) {
         .bench_local_values(|buf| divan::black_box(pipeline.run(buf)));
 }
 
-/// The same path with at-least-once delivery: identifiers are assigned and
-/// the inflight window is touched.
+/// The same path with at-least-once delivery, acknowledged each time.
+///
+/// Without the acknowledgement the inflight window fills once and every
+/// later message goes to the backlog, so the benchmark stops measuring the
+/// path it is named after — which is what it did while `max_inflight` was
+/// 32 and got worse when it became 256.
 #[divan::bench(args = [1, 100])]
 fn publish_consume_at_least_once(bencher: divan::Bencher, subscribers: usize) {
     let packet = publish_packet(64);
@@ -205,5 +242,5 @@ fn publish_consume_at_least_once(bencher: divan::Bencher, subscribers: usize) {
 
     bencher
         .with_inputs(|| BytesMut::from(packet.as_slice()))
-        .bench_local_values(|buf| divan::black_box(pipeline.run(buf)));
+        .bench_local_values(|buf| divan::black_box(pipeline.run_acked(buf)));
 }

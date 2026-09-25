@@ -286,6 +286,19 @@ impl PacketIds {
         Err(MqttError::InflightFull)
     }
 
+    /// Exposed for `runtime/benches/pipeline.rs`, which has to close the
+    /// at-least-once loop to measure it: without an acknowledgement the
+    /// window fills and the benchmark silently stops measuring delivery.
+    /// Production releases by packet identifier, which is what arrives.
+    #[doc(hidden)]
+    pub fn release_for_benchmarks(&mut self, delivery: DeliveryId) -> Option<PacketId> {
+        let index = self
+            .inflight
+            .iter()
+            .position(|(_, held)| *held == delivery)?;
+        Some(self.inflight.swap_remove(index).0)
+    }
+
     /// Returns what the acknowledged identifier stood for, or `None` if the
     /// client acknowledged something it was never sent.
     pub fn release(&mut self, id: PacketId) -> Option<DeliveryId> {
