@@ -535,15 +535,7 @@ impl Parser {
         };
         let parsed = match raw.as_str() {
             "memory" => Durability::Memory,
-            // Accepting it would mean promising a guarantee nothing provides.
-            "written" => {
-                return Err(ConfigError::Malformed {
-                    name,
-                    value: raw,
-                    expected: "`memory` or `fsynced`; `written` is not implemented yet",
-                });
-            }
-
+            "written" => Durability::Written,
             "fsynced" => Durability::Fsynced,
             _ => {
                 return Err(ConfigError::Malformed {
@@ -856,9 +848,17 @@ mod tests {
     }
 
     #[test]
-    fn written_is_refused_rather_than_pretended() {
-        // Accepting it would promise a guarantee nothing provides.
-        let error = parse(&[("STRAUM_DURABILITY", "written")]).unwrap_err();
+    fn every_durability_level_parses_and_nothing_else_does() {
+        for (raw, expected) in [
+            ("memory", Durability::Memory),
+            ("written", Durability::Written),
+            ("fsynced", Durability::Fsynced),
+        ] {
+            let settings = parse(&[("STRAUM_DURABILITY", raw)]).unwrap();
+            assert_eq!(settings.runtime.durability, expected, "{raw}");
+        }
+
+        let error = parse(&[("STRAUM_DURABILITY", "maybe")]).unwrap_err();
         assert!(matches!(
             error,
             ConfigError::Malformed {
@@ -866,9 +866,6 @@ mod tests {
                 ..
             }
         ));
-        assert!(error.to_string().contains("not implemented"));
-
-        assert!(parse(&[("STRAUM_DURABILITY", "fsynced")]).is_ok());
     }
 
     #[test]

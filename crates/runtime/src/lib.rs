@@ -109,8 +109,13 @@ impl Runtime {
         let (wal, wal_writer) = match config.durability {
             Durability::Memory => (None, None),
             _ => {
-                let (submitter, writer) =
-                    wal::start(&config.wal, restored, events.clone(), Arc::clone(&metrics))?;
+                let (submitter, writer) = wal::start(
+                    &config.wal,
+                    restored,
+                    config.durability == Durability::Fsynced,
+                    events.clone(),
+                    Arc::clone(&metrics),
+                )?;
                 (Some(submitter), Some(writer))
             }
         };

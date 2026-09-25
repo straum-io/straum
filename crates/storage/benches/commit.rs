@@ -48,7 +48,7 @@ fn run(
 ) -> Run {
     let path = scratch(name);
     let (wal, _) = ok(Wal::open(&path, WalLimits::default()));
-    let mut committer = Committer::new(wal, WalLimits::default());
+    let mut committer = Committer::new(wal, WalLimits::default(), true);
 
     let (tx, mut rx) = channel::<WalRecord>();
     let (commit_tx, commit_rx): (Sender<Commit>, Receiver<Commit>) = channel();

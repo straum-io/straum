@@ -829,9 +829,11 @@ The runtime coordinates; nothing relies on `Drop` for application shutdown.
 
 With `STRAUM_DURABILITY=memory`, at-least-once messages still inflight at
 shutdown are lost — an acknowledgement there means routed, not written. With
-`fsynced`, an acknowledged publish is already in the log and comes back at the
-next start (docs/storage.md §79). What is lost in both cases is a delivery the
-subscriber had not acknowledged: it is sent again with DUP.
+`written` the record reached the operating system, so it survives this
+process but not the machine. With `fsynced` an acknowledged publish is
+already on the device and comes back at the next start (docs/storage.md §79).
+What is lost at every level is a delivery the subscriber had not
+acknowledged: it is sent again with DUP.
 
 ---
 

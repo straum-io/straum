@@ -250,7 +250,11 @@ async fn read(
                                 ack: Some(_),
                                 publish,
                             },
-                        ) if config.durability == Durability::Fsynced => {
+                            // Both logging levels submit; what differs is when the
+                            // committer calls the record durable — after the
+                            // write for `written`, after the sync for `fsynced`
+                            // (docs/storage.md §80).
+                        ) if config.durability != Durability::Memory => {
                             wal.submit(
                                 &publish.topic,
                                 &publish.payload,

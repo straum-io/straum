@@ -74,7 +74,7 @@ Defaults below are **initial**. They are adjusted by benchmarks, not intuition.
 | `STRAUM_WAL_MIN_BATCH_BYTES` | `65536` | Floor for the adaptive batch bound. |
 | `STRAUM_WAL_MAX_BATCH_BYTES` | `4194304` | Upper safety boundary for one batch — not a size to wait for (docs/storage.md §77). |
 | `STRAUM_WAL_INITIAL_BATCH_BYTES` | `1048576` | Where adaptation starts, before any storage latency is known: the §78 estimate of 1 GB/s × 1 ms. |
-| `STRAUM_DURABILITY` | `memory` | `memory` or `fsynced` (docs/storage.md §80). Only `fsynced` delays the acknowledgement, and it is the only mode that writes to the log. `written` is defined but not implemented; setting it is a startup error rather than a quiet promotion to one of the others. |
+| `STRAUM_DURABILITY` | `memory` | `memory`, `written` or `fsynced` (docs/storage.md §80). `memory` never writes to the log. `written` writes but does not sync: the acknowledgement waits for `write(2)`, so a process crash keeps the message and a machine or storage failure may not. `fsynced` waits for the storage device. Measured here, 1 publisher and 1 subscriber unthrottled at QoS 1: 183,912 / 180,997 / 11,313 msg/s — writing costs almost nothing, syncing costs 16x. |
 
 ## Broker (owner: broker)
 

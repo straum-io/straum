@@ -72,6 +72,8 @@ pub struct Commit {
 
 /// Drives one WAL through commit cycles.
 pub struct Committer {
+    /// Whether a commit waits for the storage device.
+    sync: bool,
     wal: Wal,
     limits: WalLimits,
     /// Upper bound for the batch currently being built. Not a target to wait
@@ -85,8 +87,13 @@ pub struct Committer {
 }
 
 impl Committer {
-    pub fn new(wal: Wal, limits: WalLimits) -> Self {
+    /// `sync` false commits without asking the storage device, which is
+    /// what `Durability::Written` means (docs/storage.md §80). The
+    /// adaptation still runs: without a sync to measure, the write latency
+    /// is the signal it paces against.
+    pub fn new(wal: Wal, limits: WalLimits, sync: bool) -> Self {
         Self {
+            sync,
             wal,
             batch_bound: limits.initial_batch_bytes,
             limits,
@@ -135,7 +142,7 @@ impl Committer {
             self.wal.stage(&record.payload)?;
         }
 
-        let (committed, write, sync) = self.wal.commit()?;
+        let (committed, write, sync) = self.wal.commit_with(self.sync)?;
         self.observe(committed.bytes, write, sync);
 
         Ok(Some(Commit {
@@ -221,7 +228,7 @@ mod tests {
         let path = scratch(name);
         let (wal, _) = Wal::open(&path, WalLimits::default()).unwrap();
         let (tx, rx) = channel();
-        (Committer::new(wal, WalLimits::default()), tx, rx)
+        (Committer::new(wal, WalLimits::default(), true), tx, rx)
     }
 
     fn record(correlation: u64, size: usize) -> WalRecord {
@@ -291,7 +298,7 @@ mod tests {
         let path = scratch("failure");
         let (mut wal, _) = Wal::open(&path, WalLimits::default()).unwrap();
         wal.fail_next_sync();
-        let mut committer = Committer::new(wal, WalLimits::default());
+        let mut committer = Committer::new(wal, WalLimits::default(), true);
         let (tx, mut rx) = channel();
         tx.send(record(1, 64)).unwrap();
 

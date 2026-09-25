@@ -119,12 +119,21 @@ impl Wal {
         Ok(self.sequence)
     }
 
-    /// Writes the staged batch and makes it durable.
+    /// Writes the staged batch out.
     ///
-    /// Returns what became durable together with how long the two halves took:
-    /// the storage device is the pacing signal, so its latency is not a
-    /// diagnostic afterthought (docs/storage.md §95).
-    pub fn commit(&mut self) -> Result<(Committed, Duration, Duration), StorageError> {
+    /// Returns what became durable together with how long the two halves
+    /// took: the storage device is the pacing signal, so its latency is not
+    /// a diagnostic afterthought (docs/storage.md §95).
+    ///
+    /// With `sync` false the batch reaches the operating system and no
+    /// further: the caller is saying it wants the write ordered but not the
+    /// storage device asked about it (docs/storage.md §80, `written`).
+    /// Nothing else changes — the durable offset still advances, because
+    /// what "durable" promises is the caller's choice to make.
+    pub fn commit_with(
+        &mut self,
+        sync: bool,
+    ) -> Result<(Committed, Duration, Duration), StorageError> {
         if self.failed {
             return Err(StorageError::Poisoned);
         }
@@ -141,7 +150,9 @@ impl Wal {
         let write = started.elapsed();
 
         let started = Instant::now();
-        self.sync()?;
+        if sync {
+            self.sync()?;
+        }
         let sync = started.elapsed();
 
         self.batch.clear();
@@ -159,6 +170,11 @@ impl Wal {
             write,
             sync,
         ))
+    }
+
+    /// Writes the staged batch and waits for the storage device.
+    pub fn commit(&mut self) -> Result<(Committed, Duration, Duration), StorageError> {
+        self.commit_with(true)
     }
 
     pub fn staged_bytes(&self) -> usize {

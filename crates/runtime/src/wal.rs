@@ -488,6 +488,9 @@ fn compact(
 pub(crate) fn start(
     settings: &WalSettings,
     restored: u64,
+    // Whether a commit waits for the storage device: `fsynced` does,
+    // `written` does not (docs/storage.md §80).
+    sync: bool,
     events: mpsc::Sender<Event>,
     metrics: Arc<Metrics>,
 ) -> Result<(Submitter, std::thread::JoinHandle<()>), StorageError> {
@@ -500,7 +503,7 @@ pub(crate) fn start(
         "recovered the write-ahead log"
     );
     let (records, queue) = mpsc::channel(settings.queue);
-    let committer = Committer::new(wal, settings.limits);
+    let committer = Committer::new(wal, settings.limits, sync);
 
     // A weak sender on purpose, and downgraded here rather than inside the
     // closure so the strong one is not carried along by the move. The broker
