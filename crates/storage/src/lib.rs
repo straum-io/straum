@@ -54,6 +54,10 @@ pub enum StorageError {
     /// have been written to a file about to be replaced.
     #[error("the log cannot be rewritten while a batch is staged")]
     StagedDuringCompaction,
+    /// A replicated run did not decompose into whole records. Appending it
+    /// would leave a half record where truncation cannot reach it.
+    #[error("the bytes are not a whole number of framed records")]
+    NotFramedRecords,
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }

@@ -45,6 +45,39 @@ pub fn encode(payload: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(payload);
 }
 
+/// Counts the records in a run of already-encoded ones, or `None` if the
+/// bytes are not exactly a whole number of them.
+///
+/// Checksums are deliberately **not** recomputed. These bytes arrive under a
+/// checksum of their own that covered all of them at once
+/// (docs/replication.md §114), and the per-record CRC32s inside are what the
+/// next reader of this log will check — recomputing them here would be the
+/// third pass over the same bytes. What is verified is the structure, because
+/// appending a run that does not decompose cleanly would put a half record in
+/// the middle of a log, where truncation cannot reach it.
+pub fn count(bytes: &[u8], max_record_bytes: usize) -> Option<usize> {
+    let mut at = 0usize;
+    let mut records = 0usize;
+    while at < bytes.len() {
+        let header = at.checked_add(HEADER_BYTES)?;
+        let length = bytes
+            .get(at..header)
+            .and_then(|slice| slice.get(..4))
+            .and_then(|slice| <[u8; 4]>::try_from(slice).ok())
+            .map(u32::from_le_bytes)?;
+        let length = usize::try_from(length).ok()?;
+        if length == 0 || length > max_record_bytes {
+            return None;
+        }
+        at = header.checked_add(length)?;
+        if at > bytes.len() {
+            return None;
+        }
+        records = records.checked_add(1)?;
+    }
+    Some(records)
+}
+
 /// Reads the record at the start of `bytes`.
 pub fn read(bytes: &[u8], max_record_bytes: usize) -> Frame {
     let Some(header) = bytes.get(..HEADER_BYTES) else {
@@ -128,6 +161,28 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
         assert_eq!(read(&bytes, MAX), Frame::Invalid);
+    }
+
+    #[test]
+    fn counting_a_run_walks_framing_and_nothing_else() {
+        let mut run = framed(b"one");
+        run.extend_from_slice(&framed(b"two"));
+        assert_eq!(count(&run, MAX), Some(2));
+        assert_eq!(count(&[], MAX), Some(0));
+
+        // Past the per-record limit: refused here rather than written and
+        // found unreadable later.
+        let big = framed(&[0u8; 64]);
+        assert_eq!(count(&big, 64), Some(1));
+        assert_eq!(count(&big, 63), None);
+
+        // A flipped payload byte is not this function's business: the run
+        // arrived under a checksum of its own, and the record's own CRC32 is
+        // what the next reader of the log checks.
+        let mut flipped = framed(b"one");
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0x01;
+        assert_eq!(count(&flipped, MAX), Some(1));
     }
 
     #[test]

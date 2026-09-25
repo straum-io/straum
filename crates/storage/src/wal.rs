@@ -122,6 +122,32 @@ impl Wal {
         Ok(self.sequence)
     }
 
+    /// Adds a run of already-encoded records to the batch, as a follower does
+    /// with a replication frame. Returns how many records it held.
+    ///
+    /// The bytes go in untouched: they were framed by the log that produced
+    /// them, checksums and all, and re-staging them through [`Wal::stage`]
+    /// would recompute every one of those checksums to arrive at the same
+    /// bytes (docs/replication.md §114). The framing is walked to count them,
+    /// because the log's own sequence is a record count and taking the
+    /// caller's word for it would let a wrong number travel over the network
+    /// into this node's idea of where it is.
+    pub fn stage_framed(&mut self, records: &[u8]) -> Result<usize, StorageError> {
+        if self.failed {
+            return Err(StorageError::Poisoned);
+        }
+        let count = record::count(records, self.limits.max_record_bytes)
+            .filter(|count| *count > 0)
+            .ok_or(StorageError::NotFramedRecords)?;
+
+        self.batch.extend_from_slice(records);
+        self.batch_records = self.batch_records.saturating_add(count);
+        self.sequence = self
+            .sequence
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        Ok(count)
+    }
+
     /// Writes the staged batch out.
     ///
     /// Returns what became durable together with how long the two halves
