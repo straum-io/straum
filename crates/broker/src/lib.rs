@@ -35,6 +35,10 @@ pub struct BrokerLimits {
     /// Payload bytes those deliveries may hold. A message count is not a
     /// memory bound on its own — the messages can be a megabyte each (§7).
     pub session_backlog_bytes: usize,
+    /// Payload bytes every session backlog may hold together. A per-session
+    /// limit times the session count is a product, not a bound (§8), so the
+    /// backlogs get a budget the way the writer queues do.
+    pub total_backlog_bytes: usize,
     /// Sessions kept for a client that asked to be resumed but is not
     /// connected. A map keyed by client identity needs a bound (§8).
     pub max_offline_sessions: usize,
@@ -52,6 +56,7 @@ impl Default for BrokerLimits {
             max_inflight: 256,
             session_backlog_messages: 16_384,
             session_backlog_bytes: 8_388_608,
+            total_backlog_bytes: 1_073_741_824,
             max_offline_sessions: 4096,
             max_retained_messages: 10_000,
             max_retained_bytes: 67_108_864,
@@ -82,6 +87,8 @@ pub struct Stats {
     pub backlog_refused: u64,
     /// At-most-once messages dropped because their session was offline.
     pub offline_dropped: u64,
+    /// Payload bytes waiting across every session backlog.
+    pub backlog_bytes: u64,
     pub active_sessions: u64,
 }
 
@@ -146,6 +153,9 @@ pub struct Broker {
     /// The last retained message per topic, and what they weigh.
     retained: HashMap<Topic, Retained>,
     retained_bytes: usize,
+    /// Payload bytes waiting in every session backlog. A plain counter, not
+    /// an atomic: the broker is one task and owns all of them.
+    backlog_bytes: usize,
     /// Reused when a new subscription replays what is stored.
     replay: Vec<(Topic, Bytes, DeliveryGuarantee)>,
     /// What the runtime still has to write to the log. Drained every batch;
@@ -171,6 +181,7 @@ impl Broker {
             durable_high_water: 0,
             retained: HashMap::new(),
             retained_bytes: 0,
+            backlog_bytes: 0,
             replay: Vec::new(),
             session_events: Vec::new(),
             stats: Stats::default(),
@@ -183,7 +194,10 @@ impl Broker {
     }
 
     pub fn stats(&self) -> Stats {
-        self.stats
+        Stats {
+            backlog_bytes: self.backlog_bytes as u64,
+            ..self.stats
+        }
     }
 
     /// Puts back a retained message that survived a restart.
@@ -608,6 +622,13 @@ impl Broker {
         } = message;
         let limits = self.limits;
         let delivery_id = self.next_delivery;
+        // Read before the session is borrowed. A per-session limit times the
+        // session count is a product, not a bound (§8), so the backlogs get
+        // a budget of their own the way the writer queues do — a plain
+        // counter, because the broker is one task and owns all of them.
+        let room = limits
+            .total_backlog_bytes
+            .saturating_sub(self.backlog_bytes);
 
         let Some(session) = self.session_mut(slot) else {
             return;
@@ -623,10 +644,10 @@ impl Broker {
 
         let online = session.online;
 
-        let (effect, used_id, dropped) = match guarantee {
+        let (effect, used_id, dropped, backlogged) = match guarantee {
             // A session that is not connected cannot be told; at-most-once
             // means exactly that this is allowed to be lost (3.1.1 §3.3.1.3).
-            DeliveryGuarantee::AtMostOnce if !online => (None, false, false),
+            DeliveryGuarantee::AtMostOnce if !online => (None, false, false, 0),
             DeliveryGuarantee::AtMostOnce => (
                 Some(Delivery {
                     id: None,
@@ -637,6 +658,7 @@ impl Broker {
                 }),
                 false,
                 false,
+                0,
             ),
             DeliveryGuarantee::AtLeastOnce
                 if online && session.inflight.len() < limits.max_inflight =>
@@ -658,21 +680,25 @@ impl Broker {
                     }),
                     true,
                     false,
+                    0,
                 )
             }
             DeliveryGuarantee::AtLeastOnce => {
                 // The window is full: wait in the backlog, or give up on a
                 // session that is too far behind to catch up.
-                let accepted = session
-                    .backlog
-                    .push(topic.clone(), payload.clone(), correlation);
-                (None, false, !accepted)
+                let weight = payload.len();
+                let accepted = weight <= room
+                    && session
+                        .backlog
+                        .push(topic.clone(), payload.clone(), correlation);
+                (None, false, !accepted, if accepted { weight } else { 0 })
             }
         };
 
         if used_id {
             self.next_delivery = self.next_delivery.saturating_add(1);
         }
+        self.backlog_bytes = self.backlog_bytes.saturating_add(backlogged);
         match effect {
             Some(delivery) => {
                 self.stats.delivered_messages = self.stats.delivered_messages.saturating_add(1);
@@ -882,6 +908,8 @@ impl Broker {
         let limits = self.limits;
         let mut next_delivery = self.next_delivery;
         let mut delivered = 0u64;
+        // What leaves the backlog stops counting against the budget.
+        let mut released = 0usize;
 
         let Some(held) = self.sessions.get_mut(slot).and_then(Option::as_mut) else {
             return;
@@ -897,6 +925,7 @@ impl Broker {
             };
             let id = DeliveryId(next_delivery);
             next_delivery = next_delivery.saturating_add(1);
+            released = released.saturating_add(waiting.payload.len());
             held.inflight.push(session::Inflight {
                 id,
                 topic: waiting.topic.clone(),
@@ -919,6 +948,7 @@ impl Broker {
         }
 
         self.next_delivery = next_delivery;
+        self.backlog_bytes = self.backlog_bytes.saturating_sub(released);
         self.stats.delivered_messages = self.stats.delivered_messages.saturating_add(delivered);
     }
 
@@ -975,6 +1005,9 @@ impl Broker {
         let Some(held) = entry.take() else {
             return;
         };
+        // Whatever it was still owed stops counting against the budget with
+        // it; a session that is gone holds nothing.
+        self.backlog_bytes = self.backlog_bytes.saturating_sub(held.backlog.bytes());
         for (filter, _) in &held.filters {
             self.index.unsubscribe(filter, slot);
         }

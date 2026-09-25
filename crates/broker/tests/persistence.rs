@@ -341,3 +341,57 @@ fn an_offline_session_that_overflows_is_counted_not_closed() {
     connect(&mut broker, &mut out, 1, "device", true);
     assert_eq!(deliveries(&mut out).len(), 4);
 }
+
+/// A per-session limit times the session count is a product, not a bound
+/// (CLAUDE.md §8). The backlogs get a budget of their own, and reaching it
+/// must refuse further messages rather than grow.
+#[test]
+fn the_backlog_budget_bounds_every_session_together() {
+    // Room for four payloads across the whole broker, however many sessions
+    // ask for them.
+    let mut broker = Broker::new(BrokerLimits {
+        total_backlog_bytes: 4 * 7,
+        session_backlog_messages: 1024,
+        session_backlog_bytes: 1024,
+        ..BrokerLimits::default()
+    });
+    let mut out = Outbox::new();
+    for name in ["a", "b", "c", "d"] {
+        assert!(broker.restore_session(SessionRecord {
+            client: client(name),
+            filters: vec![(filter("a/#"), AtLeastOnce)],
+            owes_from: 0,
+        }));
+    }
+
+    // Seven bytes each, four sessions: the first publish alone fills the
+    // budget, because every session backlogs a copy.
+    let message = Publish {
+        topic: topic("a/b"),
+        payload: Bytes::from_static(b"payload"),
+        guarantee: AtLeastOnce,
+        retain: false,
+    };
+    for correlation in 1..=10 {
+        broker.restore_publish(correlation, &message, &mut out);
+    }
+
+    let stats = broker.stats();
+    assert_eq!(
+        stats.backlog_bytes, 28,
+        "the budget was exceeded: {} bytes held",
+        stats.backlog_bytes
+    );
+    assert!(
+        stats.backlog_refused >= 36,
+        "further messages were taken anyway: only {} refused",
+        stats.backlog_refused
+    );
+
+    // And a session that goes stops holding its share.
+    connect(&mut broker, &mut out, 1, "a", false);
+    assert!(
+        broker.stats().backlog_bytes < 28,
+        "a discarded session kept its bytes against the budget"
+    );
+}

@@ -240,6 +240,14 @@ impl Settings {
                 1024,
                 17_179_869_184,
             )?,
+            // Per-session times the session count is a product, not a
+            // bound (§8).
+            total_backlog_bytes: parser.number(
+                "STRAUM_TOTAL_BACKLOG_BYTES",
+                1_073_741_824usize,
+                1024,
+                17_179_869_184,
+            )?,
         };
 
         let session_queue_bytes =
@@ -977,6 +985,7 @@ mod tests {
             ("STRAUM_MAX_RETAINED_MESSAGES", "10000"),
             ("STRAUM_MAX_RETAINED_BYTES", "67108864"),
             ("STRAUM_SESSION_BACKLOG_BYTES", "8388608"),
+            ("STRAUM_TOTAL_BACKLOG_BYTES", "1073741824"),
             ("STRAUM_SESSION_QUEUE_MESSAGES", "1024"),
             ("STRAUM_SESSION_QUEUE_BYTES", "8388608"),
             ("STRAUM_TOTAL_QUEUED_BYTES", "1073741824"),

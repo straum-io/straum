@@ -484,7 +484,10 @@ per publish (for example, a generation counter per session entry).
   each subscriber in publish order. Any concurrency change must preserve this.
 * **Memory is bounded** under any input: per connection, per session, and
   globally: `STRAUM_TOTAL_QUEUED_BYTES` on the way out,
-  `STRAUM_TOTAL_READ_BYTES` on the way in.
+  `STRAUM_TOTAL_READ_BYTES` on the way in, and `STRAUM_TOTAL_BACKLOG_BYTES`
+  for what the broker holds on behalf of sessions that are behind. Each
+  global budget exists because a per-session limit times the session count
+  is a product, not a bound.
 * **Malformed input never panics**, never reads out of bounds, never allocates
   from an unchecked remote length, never loops without progress.
 * **Fan-out does not copy payloads** in broker-held memory: N subscribers share
@@ -515,6 +518,7 @@ Overflow policy **(initial)**:
 | At-least-once delivery, session backlog full (messages or bytes) | `Close(SlowConsumer)`, counted in `backlog_refused` and logged with the limit that was reached |
 | Reply cannot be enqueued | `Close(SlowConsumer)` |
 | Global queued-bytes budget exceeded | same as a full session queue |
+| Global backlog-bytes budget exceeded | same as a full session backlog |
 | Global read-bytes budget exceeded | the growth is refused before it is allocated; the connection is closed |
 | Broker command queue full | reader awaits; nothing dropped |
 | WAL queue full | the submitter awaits; a publish is never acknowledged early to make room |
@@ -795,7 +799,7 @@ counters: connections_accepted  protocol_errors  transport_errors
           authentication_failures  keepalive_closes
           wal_commits  wal_records_committed  wal_bytes_committed
           wal_sync_nanos  wal_commit_failures  session_records_dropped
-gauges:   active_sessions  queued_messages  queued_bytes
+gauges:   active_sessions  queued_messages  queued_bytes  backlog_bytes
           wal_durable_sequence
 ```
 

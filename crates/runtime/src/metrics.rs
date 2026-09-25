@@ -23,6 +23,8 @@ pub struct Metrics {
     pub session_records_dropped: AtomicU64,
     /// At-least-once messages a session backlog had no room for.
     pub backlog_refused: AtomicU64,
+    /// Payload bytes the broker is holding for sessions that are behind.
+    pub backlog_bytes: AtomicU64,
     /// Subscribers the broker gave up on. Each one is a client that saw a
     /// closed socket and no reason for it.
     pub slow_consumer_closes: AtomicU64,
@@ -55,6 +57,7 @@ impl Metrics {
             wal_commit_failures: self.wal_commit_failures.load(Ordering::Relaxed),
             session_records_dropped: self.session_records_dropped.load(Ordering::Relaxed),
             backlog_refused: self.backlog_refused.load(Ordering::Relaxed),
+            backlog_bytes: self.backlog_bytes.load(Ordering::Relaxed),
             slow_consumer_closes: self.slow_consumer_closes.load(Ordering::Relaxed),
             wal_sync_nanos: self.wal_sync_nanos.load(Ordering::Relaxed),
             wal_durable_sequence: self.wal_durable_sequence.load(Ordering::Relaxed),
@@ -80,6 +83,7 @@ pub struct Snapshot {
     pub wal_commit_failures: u64,
     pub session_records_dropped: u64,
     pub backlog_refused: u64,
+    pub backlog_bytes: u64,
     pub slow_consumer_closes: u64,
     pub wal_sync_nanos: u64,
     pub wal_durable_sequence: u64,

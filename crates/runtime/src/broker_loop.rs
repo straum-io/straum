@@ -124,6 +124,9 @@ impl Loop {
                 .backlog_refused
                 .store(stats.backlog_refused, Ordering::Relaxed);
             self.metrics
+                .backlog_bytes
+                .store(stats.backlog_bytes, Ordering::Relaxed);
+            self.metrics
                 .slow_consumer_closes
                 .store(stats.slow_consumer_closes, Ordering::Relaxed);
         }

@@ -84,6 +84,7 @@ Defaults below are **initial**. They are adjusted by benchmarks, not intuition.
 | `STRAUM_MAX_INFLIGHT` | `256` | Unacknowledged at-least-once deliveries per session. Must be < 65,535. At-least-once throughput per session is this window divided by the acknowledgement round trip, so it is a rate ceiling as much as a memory bound: at 32 a subscriber could not sustain 20,000/s and was closed as a slow consumer. |
 | `STRAUM_SESSION_BACKLOG_MESSAGES` | `16384` | At-least-once deliveries waiting for inflight window, per session. This is the burst a session may fall behind by before it is closed; 1024 was under a second of it at moderate rates. |
 | `STRAUM_SESSION_BACKLOG_BYTES` | `8388608` | Payload bytes those deliveries may hold. Without it the message count is not a memory bound at all — the messages can be a megabyte each (CLAUDE.md §7). Whichever ceiling is reached first refuses the message. |
+| `STRAUM_TOTAL_BACKLOG_BYTES` | `1073741824` | Global budget across every session backlog, the counterpart of `STRAUM_TOTAL_QUEUED_BYTES` for the broker side. Per-session caps times the session count is a product, not a bound (CLAUDE.md §8). |
 | `STRAUM_MAX_OFFLINE_SESSIONS` | `4096` | Sessions kept for clients that asked to be resumed and are not connected. `0` turns persistent sessions off: a session is then dropped whatever CleanSession said. |
 | `STRAUM_MAX_RETAINED_MESSAGES` | `10000` | Topics that may hold a retained message. `0` disables retention. |
 | `STRAUM_MAX_RETAINED_BYTES` | `67108864` | Payload bytes held across all retained messages. |
