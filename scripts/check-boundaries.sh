@@ -19,17 +19,20 @@ check() {
     done
 }
 
-check domain    tokio auth protocol mqtt transport broker runtime server storage
-check auth      tokio protocol mqtt transport broker runtime server storage
-check protocol  tokio mqtt transport broker runtime server storage
+check domain      tokio auth protocol mqtt transport storage replication broker runtime server
+check auth        tokio protocol mqtt transport storage replication broker runtime server
+check protocol    tokio mqtt transport storage replication broker runtime server
 # `auth` is not forbidden to mqtt and broker: it arrives through `protocol`,
 # which carries `Permissions` in its Connect. Forbidding it there would
 # forbid the contract itself.
-check mqtt      tokio transport broker runtime server storage
-check transport auth protocol mqtt broker runtime server storage
-check storage   tokio auth protocol mqtt transport broker runtime server
-check broker    tokio mqtt transport runtime server storage
-check runtime   server
+check mqtt        tokio transport storage replication broker runtime server
+check transport   auth protocol mqtt storage replication broker runtime server
+check storage     tokio auth protocol mqtt transport broker runtime server replication
+# `replication` is the wire format only: no tokio, no sockets, and no
+# workspace crate at all. What it frames is opaque bytes.
+check replication tokio domain auth protocol mqtt transport storage broker runtime server
+check broker      tokio mqtt transport storage replication runtime server
+check runtime     server
 
 if [ "$fail" -eq 0 ]; then
     echo "crate boundaries: ok"
