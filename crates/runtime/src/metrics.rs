@@ -18,6 +18,8 @@ pub struct Metrics {
     pub wal_records_committed: AtomicU64,
     pub wal_bytes_committed: AtomicU64,
     pub wal_commit_failures: AtomicU64,
+    /// Times the log was rewritten beside the writer.
+    pub wal_compactions: AtomicU64,
     /// Session records the log queue could not take. Each one is a session
     /// that will not come back after a restart.
     pub session_records_dropped: AtomicU64,
@@ -55,6 +57,7 @@ impl Metrics {
             wal_records_committed: self.wal_records_committed.load(Ordering::Relaxed),
             wal_bytes_committed: self.wal_bytes_committed.load(Ordering::Relaxed),
             wal_commit_failures: self.wal_commit_failures.load(Ordering::Relaxed),
+            wal_compactions: self.wal_compactions.load(Ordering::Relaxed),
             session_records_dropped: self.session_records_dropped.load(Ordering::Relaxed),
             backlog_refused: self.backlog_refused.load(Ordering::Relaxed),
             backlog_bytes: self.backlog_bytes.load(Ordering::Relaxed),
@@ -81,6 +84,7 @@ pub struct Snapshot {
     pub wal_records_committed: u64,
     pub wal_bytes_committed: u64,
     pub wal_commit_failures: u64,
+    pub wal_compactions: u64,
     pub session_records_dropped: u64,
     pub backlog_refused: u64,
     pub backlog_bytes: u64,

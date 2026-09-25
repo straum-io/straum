@@ -50,6 +50,10 @@ pub enum StorageError {
     /// A durability operation failed. Nothing may be acknowledged afterwards.
     #[error("the log failed a durability operation and cannot be trusted")]
     Poisoned,
+    /// Compaction was asked for with a batch still staged. The batch would
+    /// have been written to a file about to be replaced.
+    #[error("the log cannot be rewritten while a batch is staged")]
+    StagedDuringCompaction,
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }

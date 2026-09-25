@@ -43,6 +43,8 @@ pub struct Recovery {
 
 pub struct Wal {
     file: File,
+    /// Kept so the log can be reopened after it is rewritten underneath.
+    path: std::path::PathBuf,
     limits: WalLimits,
     write_offset: u64,
     durable_offset: u64,
@@ -88,6 +90,7 @@ impl Wal {
         Ok((
             Self {
                 file,
+                path: path.to_path_buf(),
                 limits,
                 write_offset: recovery.durable_offset,
                 durable_offset: recovery.durable_offset,
@@ -170,6 +173,38 @@ impl Wal {
             write,
             sync,
         ))
+    }
+
+    /// Rewrites the log in place, keeping only the records `keep` accepts,
+    /// and continues writing to the result.
+    ///
+    /// Nothing may be staged: the batch would be written to a file that is
+    /// about to be replaced. The sequence carries across — it numbers
+    /// records that were submitted, not records that survived, and a
+    /// sequence that went backwards would make an old number mean two
+    /// different records (docs/storage.md §104).
+    pub fn compact(
+        &mut self,
+        keep: &mut impl FnMut(&[u8]) -> bool,
+    ) -> Result<Compaction, StorageError> {
+        if self.failed {
+            return Err(StorageError::Poisoned);
+        }
+        if !self.batch.is_empty() {
+            return Err(StorageError::StagedDuringCompaction);
+        }
+
+        let outcome = compact(&self.path, self.limits, keep)?;
+
+        // The file the handle refers to has been replaced; reopen or every
+        // later write lands in an unlinked inode.
+        let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let end = file.metadata()?.len();
+        file.seek(SeekFrom::End(0))?;
+        self.file = file;
+        self.write_offset = end;
+        self.durable_offset = end;
+        Ok(outcome)
     }
 
     /// Writes the staged batch and waits for the storage device.

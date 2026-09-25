@@ -196,18 +196,108 @@ protocol explicitly permits it. Requires dedicated crash-recovery tests.
 256 KiB, 1 MiB and others; the default must be justified by measurement for
 the intended workload.
 
-## 90a. Record layout (this implementation)
+## 90a. Record layout and replay (this implementation)
 
 The log is a byte log; the runtime decides what a record contains:
 
 ```text
-[ topic length: u16 BE ][ topic ][ payload ]
+publish: [ 1 ][ flags ][ correlation: u64 BE ][ topic len: u16 BE ][ topic ][ payload ]
+session: [ 2 ][ flags ][ correlation: u64 BE ][ client len: u16 BE ][ client ]
+         [ owes from: u64 BE ][ (filter len: u16 BE)(filter)(guarantee: u8) ... ]
 ```
 
-Framing, checksum and ordering are the log's (`record.rs`); the meaning
-of the bytes is the runtime's. One copy is made per durable publish to
-put the two pieces in one buffer, and one more when the batch is built.
-Collapsing those two is a measurable change, not an obvious one.
+`kind` is 1 for a publish and 2 for session state, and exists so the log
+can carry more later; `flags` holds the retain bit, the delivery
+guarantee, and — on a session record — whether the identity keeps
+nothing any more. Framing, checksum and ordering are the log's
+(`record.rs`); the meaning of the bytes is the runtime's. One copy is
+made per durable publish to put the two pieces in one buffer, and one
+more when the batch is built. Collapsing those two is a measurable
+change, not an obvious one.
+
+The correlation is written into the record rather than derived from the
+record's position, and costs eight bytes each. The alternative is a lock
+on the publish path: publishes are submitted from many connection tasks
+at once, so numbering them in step with the queue means serialising them
+at a second point. Eight bytes is the cheaper of the two, and a later
+change can win them back by delta-encoding within a batch.
+
+On startup the durable prefix is replayed before anything is served, and
+the retained messages it holds become state again — last word per topic
+wins, an empty payload deletes, and the same bounds apply on the way in
+as on the way out.
+
+## 90a. Sessions
+
+A session that asked to be resumed is written down by what it subscribed
+to and one number: the last record it had finished with. The messages it
+is owed are **not** written a second time — they are already in the log
+as publishes, and the mark says where to start reading them again. A
+restart restores the session offline with its subscriptions, then replays
+the at-least-once publishes after its mark through the ordinary routing
+path, so they land in its backlog exactly as they did live.
+
+A record is written when the session's subscriptions change and when it
+goes offline. Going offline is the moment the mark is exactly right:
+nothing is being handed out any more, so what it still owes is what it
+owes. A crash while the session was online replays from its last
+subscription change instead, which redelivers messages it had already
+acknowledged — allowed at least-once, and the cost of not writing a
+record per acknowledgement.
+
+Two consequences worth stating plainly:
+
+* **The log cannot be trimmed past the oldest mark.** Compaction respects
+  it — see §104.
+* **Session records can be dropped under pressure.** The broker loop
+  submits them without waiting, because the log thread reports back
+  through that same loop — waiting there would be waiting on itself.
+  What does not fit is retried next wakeup, and beyond a bounded backlog
+  the oldest go and `session_records_dropped` counts them. A dropped
+  record means that session is not restored. State is lost, never
+  corrupted.
+
+A change to what these bytes mean changes the file magic with them
+(`STRAUMW2`), so a log from an older format is refused rather than
+misread.
+
+## 104. Compaction
+
+An append-only log that records every version of everything grows without a
+bound. Compaction rewrites it keeping only what is still the present word:
+
+* the one session record that is current for each identity, and nothing for
+  an identity whose tombstone says it keeps nothing;
+* the one publish that is the current retained message for each topic;
+* publishes above the oldest session mark — those are still owed.
+
+Everything else is history. A retained message that was overwritten two
+hundred times leaves one record; a session that subscribed, unsubscribed and
+resubscribed leaves one record.
+
+`storage::compact` does the mechanical half and knows nothing about what a
+record means: it is handed a predicate and rewrites the file in order. What
+to keep is the runtime's answer, computed from the same scan that restores
+state at startup, so the two can never disagree about which record is
+current.
+
+The rewrite goes to a second file that is made durable before `rename`
+replaces the original, and the directory entry is synced after. A crash at
+any point leaves either the whole old log or the whole new one — a
+half-rewritten log is not a state this can produce.
+
+**It runs at startup only**, when nothing is appending and the broker's
+state came from this same log a moment before. `STRAUM_WAL_COMPACT_BYTES`
+is the size it starts bothering (default 64 MiB, `0` disables it). The
+limitation that follows is real and worth stating: a broker that never
+restarts never compacts. Closing that needs the rewrite to run while the
+writer thread is appending — either by pausing it between commits or by
+segmenting the log — and neither is built.
+
+Correlations are preserved across a rewrite, because session marks refer to
+them. The numbering continues from the highest correlation the log ever
+held, not the highest that survived: a reused correlation would make a
+session's mark point at a different record than the one it meant.
 
 ## 91. Ordering
 

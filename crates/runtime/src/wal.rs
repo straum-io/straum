@@ -436,6 +436,58 @@ pub(crate) fn restore(
 /// the present word on each topic and identity; `floor` is the oldest mark
 /// any session still owes from, so publishes at or below it are owed to
 /// nobody (docs/storage.md §104).
+/// Whether one record is still the present word, or still owed to somebody.
+///
+/// `current` names the single record that is current for each topic and each
+/// identity; `floor` is the oldest mark any session still owes from.
+fn should_keep(payload: &[u8], current: &std::collections::HashSet<u64>, floor: u64) -> bool {
+    let Some(recorded) = decode(payload) else {
+        // A record this version cannot read is a record it cannot keep a
+        // promise about either.
+        return false;
+    };
+    match recorded {
+        // The tombstone did its work when the live set was computed;
+        // carrying it forward only asks the next pass to do it again.
+        Recorded::SessionGone { .. } => false,
+        Recorded::Session { correlation, .. } => current.contains(&correlation),
+        Recorded::Publish {
+            correlation,
+            guarantee,
+            ..
+        } => {
+            current.contains(&correlation)
+                || (guarantee == DeliveryGuarantee::AtLeastOnce && correlation > floor)
+        }
+    }
+}
+
+/// What the log still needs, read from the log itself.
+///
+/// The writer thread can work this out alone: session records carry their
+/// own mark, and a stale one is conservative — an older mark keeps more,
+/// never less. That is what lets compaction run beside the writer without
+/// asking the broker anything.
+fn live_set(
+    settings: &WalSettings,
+    limits: BrokerLimits,
+) -> Result<(std::collections::HashSet<u64>, u64), StorageError> {
+    let found = scan(settings, limits)?;
+    let mut current: std::collections::HashSet<u64> = std::collections::HashSet::with_capacity(
+        found.retained.len().saturating_add(found.sessions.len()),
+    );
+    current.extend(found.retained.values().map(|(at, _, _)| *at));
+    current.extend(found.sessions.values().map(|(at, _)| *at));
+
+    let floor = found
+        .sessions
+        .values()
+        .map(|(_, record)| record.owes_from)
+        .min()
+        .unwrap_or(u64::MAX);
+    Ok((current, floor))
+}
+
 fn compact(
     settings: &WalSettings,
     current: &std::collections::HashSet<u64>,
@@ -452,25 +504,7 @@ fn compact(
     }
 
     let outcome = storage::compact(&settings.path, settings.limits, &mut |payload| {
-        let Some(recorded) = decode(payload) else {
-            // A record this version cannot read is a record it cannot keep
-            // a promise about either.
-            return false;
-        };
-        match recorded {
-            // The tombstone did its work in the pass above; carrying it
-            // forward would only ask the next startup to do it again.
-            Recorded::SessionGone { .. } => false,
-            Recorded::Session { correlation, .. } => current.contains(&correlation),
-            Recorded::Publish {
-                correlation,
-                guarantee,
-                ..
-            } => {
-                current.contains(&correlation)
-                    || (guarantee == DeliveryGuarantee::AtLeastOnce && correlation > floor)
-            }
-        }
+        should_keep(payload, current, floor)
     })?;
 
     tracing::info!(
@@ -487,6 +521,7 @@ fn compact(
 /// Opens the log, recovers its durable prefix and starts the writer thread.
 pub(crate) fn start(
     settings: &WalSettings,
+    limits: BrokerLimits,
     restored: u64,
     // Whether a commit waits for the storage device: `fsynced` does,
     // `written` does not (docs/storage.md §80).
@@ -505,6 +540,7 @@ pub(crate) fn start(
     let (records, queue) = mpsc::channel(settings.queue);
     let committer = Committer::new(wal, settings.limits, sync);
 
+    let owned = settings.clone();
     // A weak sender on purpose, and downgraded here rather than inside the
     // closure so the strong one is not carried along by the move. The broker
     // loop holds a submitter of its own for session records, so a strong
@@ -515,7 +551,7 @@ pub(crate) fn start(
 
     let writer = std::thread::Builder::new()
         .name("straum-wal".to_owned())
-        .spawn(move || write(committer, Queue(queue), weak, metrics))
+        .spawn(move || write(committer, Queue(queue), owned, limits, weak, metrics))
         .map_err(StorageError::Io)?;
 
     Ok((
@@ -532,27 +568,29 @@ pub(crate) fn start(
 fn write(
     mut committer: Committer,
     mut queue: Queue,
+    settings: WalSettings,
+    limits: BrokerLimits,
     events: mpsc::WeakSender<Event>,
     metrics: Arc<Metrics>,
 ) {
-    let outcome = committer.run(&mut queue, |commit| {
-        Metrics::increment(&metrics.wal_commits, 1);
-        Metrics::increment(&metrics.wal_records_committed, commit.records as u64);
-        Metrics::increment(&metrics.wal_bytes_committed, commit.bytes as u64);
-        metrics.wal_sync_nanos.store(
-            u64::try_from(commit.sync.as_nanos()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        metrics
-            .wal_durable_sequence
-            .store(commit.durable_sequence, Ordering::Relaxed);
+    // The loop is here rather than `Committer::run` because compaction needs
+    // a point between two commits, and `run` does not offer one: the log is
+    // rewritten while nothing is staged and nothing else holds the file.
+    let outcome = loop {
+        let commit = match committer.commit_available(&mut queue) {
+            // The source is gone; every submitter has dropped.
+            Ok(None) => break Ok(()),
+            Ok(Some(commit)) => commit,
+            Err(error) => break Err(error),
+        };
+        report(&commit, &events, &metrics);
 
-        // The broker may acknowledge everything up to here, and not one
-        // record more (docs/storage.md §99, invariant 1).
-        if let Some(events) = events.upgrade() {
-            let _ = events.blocking_send(Event::Durable(DurableToken(commit.last_correlation)));
+        if let Err(error) = shrink(&mut committer, &settings, limits, &metrics) {
+            // A log that cannot be rewritten is still a log that works; it
+            // only grows. Nothing is acknowledged differently because of it.
+            tracing::warn!(%error, "could not compact the log; it keeps growing");
         }
-    });
+    };
 
     if let Err(error) = outcome {
         Metrics::increment(&metrics.wal_commit_failures, 1);
@@ -561,6 +599,53 @@ fn write(
         tracing::error!(%error, "the write-ahead log failed; no further publish will be acknowledged");
     }
     tracing::debug!("wal writer stopped");
+}
+
+/// Rewrites the log if it has grown past the threshold.
+///
+/// Called between commits, where nothing is staged: the alternative is
+/// writing a batch into a file that is about to be replaced.
+fn shrink(
+    committer: &mut Committer,
+    settings: &WalSettings,
+    limits: BrokerLimits,
+    metrics: &Metrics,
+) -> Result<(), StorageError> {
+    if settings.compact_bytes == 0 || committer.log_bytes() < settings.compact_bytes {
+        return Ok(());
+    }
+
+    let (current, floor) = live_set(settings, limits)?;
+    let outcome = committer.compact(&mut |payload| should_keep(payload, &current, floor))?;
+    Metrics::increment(&metrics.wal_compactions, 1);
+
+    tracing::info!(
+        records_before = outcome.records_before,
+        records_after = outcome.records_after,
+        bytes_before = outcome.bytes_before,
+        bytes_after = outcome.bytes_after,
+        "compacted the write-ahead log beside the writer"
+    );
+    Ok(())
+}
+
+fn report(commit: &storage::Commit, events: &mpsc::WeakSender<Event>, metrics: &Metrics) {
+    Metrics::increment(&metrics.wal_commits, 1);
+    Metrics::increment(&metrics.wal_records_committed, commit.records as u64);
+    Metrics::increment(&metrics.wal_bytes_committed, commit.bytes as u64);
+    metrics.wal_sync_nanos.store(
+        u64::try_from(commit.sync.as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    metrics
+        .wal_durable_sequence
+        .store(commit.durable_sequence, Ordering::Relaxed);
+
+    // The broker may acknowledge everything up to here, and not one
+    // record more (docs/storage.md §99, invariant 1).
+    if let Some(events) = events.upgrade() {
+        let _ = events.blocking_send(Event::Durable(DurableToken(commit.last_correlation)));
+    }
 }
 
 /// The runtime's channel, seen the way the writer thread needs it.

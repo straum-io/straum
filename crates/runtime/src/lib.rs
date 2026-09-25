@@ -111,6 +111,7 @@ impl Runtime {
             _ => {
                 let (submitter, writer) = wal::start(
                     &config.wal,
+                    config.broker,
                     restored,
                     config.durability == Durability::Fsynced,
                     events.clone(),

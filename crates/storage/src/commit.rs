@@ -165,6 +165,20 @@ impl Committer {
         self.wal.durable_sequence()
     }
 
+    /// Bytes the log occupies right now.
+    pub fn log_bytes(&self) -> u64 {
+        self.wal.durable_offset()
+    }
+
+    /// Rewrites the log, keeping only the records `keep` accepts. Safe to
+    /// call between commits and nowhere else (docs/storage.md §104).
+    pub fn compact(
+        &mut self,
+        keep: &mut impl FnMut(&[u8]) -> bool,
+    ) -> Result<crate::Compaction, StorageError> {
+        self.wal.compact(keep)
+    }
+
     /// Folds one cycle into the estimates and, occasionally, into the bound.
     fn observe(&mut self, bytes: usize, write: Duration, sync: Duration) {
         self.bytes_ewma = ewma(self.bytes_ewma, u64::try_from(bytes).unwrap_or(u64::MAX));

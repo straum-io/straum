@@ -69,7 +69,7 @@ Defaults below are **initial**. They are adjusted by benchmarks, not intuition.
 |---|---|---|
 | `STRAUM_WAL_PATH` | `straum.wal` | Log file. Recovery cuts an incomplete or corrupt tail on open. |
 | `STRAUM_WAL_QUEUE` | `65536` | Records queued from the broker loop to the WAL writer. Full means the submitter waits; nothing is acknowledged early to make room. |
-| `STRAUM_WAL_COMPACT_BYTES` | `67108864` | Rewrite the log at startup once it is at least this large, dropping records nothing needs any more (docs/storage.md §104). `0` never rewrites it. Compaction runs at startup only, so a broker that never restarts never compacts. |
+| `STRAUM_WAL_COMPACT_BYTES` | `67108864` | Rewrite the log once it is at least this large, dropping records nothing needs any more (docs/storage.md §104). `0` never rewrites it. Checked at startup and again after every commit, so a broker that never restarts compacts too; the rewrite runs on the writer thread and commits wait for it. |
 | `STRAUM_WAL_MAX_RECORD_BYTES` | `1048576` | Largest payload one record may carry. Matches `STRAUM_MAX_PACKET_BYTES`. |
 | `STRAUM_WAL_MIN_BATCH_BYTES` | `65536` | Floor for the adaptive batch bound. |
 | `STRAUM_WAL_MAX_BATCH_BYTES` | `4194304` | Upper safety boundary for one batch — not a size to wait for (docs/storage.md §77). |

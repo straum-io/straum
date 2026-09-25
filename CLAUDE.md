@@ -430,8 +430,8 @@ Being built, in this order (the adoption path, not a wish list):
    restart. A kept session is written down as its subscriptions plus the
    last log record it finished with; what it is owed is replayed from the
    log rather than stored twice (docs/storage.md §90a). Compaction respects
-   that mark and runs at startup only, so a broker that never restarts never
-   compacts (docs/storage.md §104).
+   that mark and runs both at startup and beside the writer once the log
+   passes STRAUM_WAL_COMPACT_BYTES (docs/storage.md §104).
 3. Will publishing is built.
 
 Out of scope: MQTT 5, QoS 2, shared subscriptions, WebSocket. Each needs
@@ -801,6 +801,7 @@ counters: connections_accepted  protocol_errors  transport_errors
           authentication_failures  keepalive_closes
           wal_commits  wal_records_committed  wal_bytes_committed
           wal_sync_nanos  wal_commit_failures  session_records_dropped
+          wal_compactions
 gauges:   active_sessions  queued_messages  queued_bytes  backlog_bytes
           wal_durable_sequence
 ```

@@ -1033,6 +1033,56 @@ mod restart {
         broker.shutdown().await;
         let _ = std::fs::remove_file(&path);
     }
+
+    /// The gap that made compaction a half-measure: a broker that never
+    /// restarts never compacted. The log is rewritten beside the writer now.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_log_shrinks_without_a_restart() {
+        let path = scratch("online-compaction");
+        let threshold = 8 * 1024;
+        let broker = with_compaction(&path, threshold);
+
+        // The same topic over and over: every version but the last is
+        // history the moment the next one lands, so a log nobody rewrites
+        // grows without bound while the live set stays at one message.
+        let size = || std::fs::metadata(&path).map(|held| held.len()).unwrap_or(0);
+        let mut peak = 0;
+        for version in 0..1200 {
+            publish_retained(&broker, "a/b", &format!("value-{version}")).await;
+            peak = peak.max(size());
+        }
+
+        assert!(
+            peak > threshold,
+            "the workload never crossed the threshold, so nothing is proved: peak {peak} bytes"
+        );
+        assert!(
+            broker.metrics().wal_compactions >= 1,
+            "the log passed {threshold} bytes and was never rewritten"
+        );
+        assert!(
+            size() < peak,
+            "the log never came back down: {peak} bytes at its peak, {} now",
+            size()
+        );
+
+        // And the present survived every rewrite.
+        publish_retained(&broker, "a/b", "final").await;
+        let (subscriber, mut eventloop) = client("subscriber", &broker);
+        subscriber.subscribe("a/b", QoS::AtMostOnce).await.unwrap();
+        let delivered = until(&mut eventloop, |incoming| {
+            matches!(incoming, Incoming::Publish(_))
+        })
+        .await
+        .unwrap();
+        let Incoming::Publish(publish) = delivered else {
+            panic!("expected a PUBLISH");
+        };
+        assert_eq!(publish.payload.as_ref(), b"final");
+
+        broker.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// Shutting down under a client that stopped reading mid-delivery used to
