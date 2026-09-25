@@ -40,13 +40,14 @@ fn id(value: u16) -> PacketId {
 }
 
 fn connect_packet() -> Packet {
-    Packet::Connect(mqtt::Connect {
+    Packet::Connect(Box::new(mqtt::Connect {
         client_id: client_id("client"),
         clean_session: true,
         keep_alive_secs: 60,
         username: None,
         password: None,
-    })
+        will: None,
+    }))
 }
 
 /// A connection past the handshake.
@@ -70,13 +71,14 @@ fn connect_is_handed_over_once_and_not_as_a_command() {
         connection
             .on_packet(connect_packet(), Instant::now(), &mut ids)
             .unwrap(),
-        Reaction::Connect(mqtt::Connect {
+        Reaction::Connect(Box::new(mqtt::Connect {
             client_id: client_id("client"),
             clean_session: true,
             keep_alive_secs: 60,
             username: None,
             password: None,
-        })
+            will: None,
+        }))
     );
     assert_eq!(
         connection.on_packet(connect_packet(), Instant::now(), &mut ids),
@@ -379,13 +381,14 @@ fn identifiers_are_bounded_reused_and_never_zero() {
 }
 
 fn connect_with_keep_alive(keep_alive_secs: u16) -> Packet {
-    Packet::Connect(mqtt::Connect {
+    Packet::Connect(Box::new(mqtt::Connect {
         client_id: client_id("client"),
         clean_session: true,
         keep_alive_secs,
         username: None,
         password: None,
-    })
+        will: None,
+    }))
 }
 
 #[test]

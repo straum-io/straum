@@ -7,7 +7,10 @@ use std::num::NonZeroU16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet {
-    Connect(Connect),
+    /// Boxed because it is the largest variant by far and `Packet` is moved
+    /// once per packet: an unboxed CONNECT makes every PUBLISH move cost
+    /// what a CONNECT costs. One allocation per connection, not per message.
+    Connect(Box<Connect>),
     Publish(Publish),
     PubAck(PacketId),
     Subscribe(Subscribe),
@@ -37,11 +40,23 @@ pub struct Connect {
     pub client_id: ClientId,
     pub clean_session: bool,
     pub keep_alive_secs: u16,
+    /// What to publish if this connection ends any way but a DISCONNECT
+    /// (3.1.1 §3.1.2.5).
+    pub will: Option<Will>,
     /// Carried through to the runtime, which is where credentials are
     /// checked; the broker never sees them.
     pub username: Option<Bytes>,
     pub password: Option<Bytes>,
 }
+/// A client's last words, held until the connection ends badly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Will {
+    pub topic: Topic,
+    pub payload: Bytes,
+    pub guarantee: DeliveryGuarantee,
+    pub retain: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Publish {
     pub topic: Topic,

@@ -56,6 +56,7 @@ fn connect_as(
             client_id: client(name),
             permissions,
             resume,
+            will: None,
         }),
         out,
     );
@@ -394,4 +395,94 @@ fn the_backlog_budget_bounds_every_session_together() {
         broker.stats().backlog_bytes < 28,
         "a discarded session kept its bytes against the budget"
     );
+}
+
+fn with_will(broker: &mut Broker, out: &mut Outbox, session: u64, name: &str, topic_name: &str) {
+    broker.handle(
+        SessionId(session),
+        Command::Connect(Connect {
+            client_id: client(name),
+            permissions: Permissions::unrestricted(),
+            resume: false,
+            will: Some(protocol::Will {
+                topic: topic(topic_name),
+                payload: Bytes::from_static(b"gone"),
+                guarantee: AtMostOnce,
+                retain: false,
+            }),
+        }),
+        out,
+    );
+}
+
+fn end(broker: &mut Broker, out: &mut Outbox, session: u64, reason: DisconnectReason) {
+    broker.handle(SessionId(session), Command::Disconnect { reason }, out);
+}
+
+/// 3.1.1 §3.1.2.5: the will is published when the connection ends any way
+/// but a DISCONNECT.
+#[test]
+fn a_lost_connection_publishes_the_will() {
+    let (mut broker, mut out) = broker();
+    connect(&mut broker, &mut out, 1, "watcher", false);
+    subscribe(&mut broker, &mut out, 1, "gone/#");
+    out.take().for_each(drop);
+
+    with_will(&mut broker, &mut out, 2, "device", "gone/device");
+    end(&mut broker, &mut out, 2, DisconnectReason::ConnectionLost);
+
+    let sent = deliveries(&mut out);
+    assert_eq!(sent.len(), 1, "the will was not published: {sent:?}");
+    assert_eq!(sent[0], (SessionId(1), topic("gone/device")));
+}
+
+/// And it is taken with a clean goodbye, not published.
+#[test]
+fn a_clean_disconnect_takes_the_will_with_it() {
+    let (mut broker, mut out) = broker();
+    connect(&mut broker, &mut out, 1, "watcher", false);
+    subscribe(&mut broker, &mut out, 1, "gone/#");
+    out.take().for_each(drop);
+
+    with_will(&mut broker, &mut out, 2, "device", "gone/device");
+    end(&mut broker, &mut out, 2, DisconnectReason::Client);
+
+    assert!(
+        deliveries(&mut out).is_empty(),
+        "a client that said goodbye still had its will published"
+    );
+}
+
+/// A protocol violation is not a goodbye either.
+#[test]
+fn a_protocol_violation_publishes_the_will() {
+    let (mut broker, mut out) = broker();
+    connect(&mut broker, &mut out, 1, "watcher", false);
+    subscribe(&mut broker, &mut out, 1, "gone/#");
+    out.take().for_each(drop);
+
+    with_will(&mut broker, &mut out, 2, "device", "gone/device");
+    end(
+        &mut broker,
+        &mut out,
+        2,
+        DisconnectReason::ProtocolViolation,
+    );
+
+    assert_eq!(deliveries(&mut out).len(), 1, "the will was not published");
+}
+
+/// It is published once, not once per way the session can end.
+#[test]
+fn the_will_is_published_at_most_once() {
+    let (mut broker, mut out) = broker();
+    connect(&mut broker, &mut out, 1, "watcher", false);
+    subscribe(&mut broker, &mut out, 1, "gone/#");
+    out.take().for_each(drop);
+
+    with_will(&mut broker, &mut out, 2, "device", "gone/device");
+    end(&mut broker, &mut out, 2, DisconnectReason::ConnectionLost);
+    end(&mut broker, &mut out, 2, DisconnectReason::ConnectionLost);
+
+    assert_eq!(deliveries(&mut out).len(), 1, "the will went out twice");
 }

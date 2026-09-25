@@ -15,8 +15,8 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 use domain::{ClientId, DeliveryGuarantee, DeliveryId, SessionId, Topic, TopicFilter};
 use protocol::{
-    CloseReason, Command, Connect, Delivery, DurableToken, Outbound, Outbox, Publish, RequestId,
-    Response, SubscribeResult,
+    CloseReason, Command, Connect, Delivery, DisconnectReason, DurableToken, Outbound, Outbox,
+    Publish, RequestId, Response, SubscribeResult,
 };
 
 use auth::Permissions;
@@ -342,7 +342,18 @@ impl Broker {
                 self.unsubscribe(session, request, filters, out);
             }
             Command::Ack(delivery) => self.acknowledge(session, delivery, out),
-            Command::Disconnect { .. } => self.close(session, None, out),
+            // A DISCONNECT is the one ending that takes the will with it;
+            // every other way out publishes it (3.1.1 §3.1.2.5).
+            Command::Disconnect { reason } => {
+                if reason == DisconnectReason::Client {
+                    if let Some(slot) = self.slot_of(session) {
+                        if let Some(held) = self.session_mut(slot) {
+                            held.will = None;
+                        }
+                    }
+                }
+                self.close(session, None, out);
+            }
         }
     }
 
@@ -377,7 +388,14 @@ impl Broker {
                             self.by_id.remove(&previous);
                         }
                     }
-                    self.resume(slot, session, client, connect.permissions, out);
+                    self.resume(
+                        slot,
+                        session,
+                        client,
+                        connect.permissions,
+                        connect.will,
+                        out,
+                    );
                     return;
                 }
                 // A clean start throws away whatever was kept, and a session
@@ -410,6 +428,10 @@ impl Broker {
                 self.limits.session_backlog_bytes,
             ));
         }
+        // Held until this connection ends, one way or the other.
+        if let Some(held) = self.session_mut(slot) {
+            held.will = connect.will.clone();
+        }
         self.by_id.insert(session, slot);
         self.by_client.insert(client, slot);
         self.stats.active_sessions = self.stats.active_sessions.saturating_add(1);
@@ -430,6 +452,7 @@ impl Broker {
         session: SessionId,
         client: ClientId,
         permissions: Permissions,
+        will: Option<protocol::Will>,
         out: &mut Outbox,
     ) {
         let was_offline;
@@ -444,8 +467,10 @@ impl Broker {
             // Everything the log had to replay has been replayed by now.
             held.owes_from = 0;
             // Re-authorised on every connect: the rules may have changed
-            // since this session was last here.
+            // since this session was last here, and so is the will — the
+            // new connection brings its own last words.
             held.permissions = permissions;
+            held.will = will;
         }
 
         // And so are its subscriptions. A filter the rules no longer allow
@@ -952,12 +977,44 @@ impl Broker {
         self.stats.delivered_messages = self.stats.delivered_messages.saturating_add(delivered);
     }
 
+    /// Publishes a client's last words on its behalf.
+    ///
+    /// Routed like any other message, so retain, wildcards and the delivery
+    /// guarantee all behave the same way. It is not written to the log: the
+    /// broker is synchronous and the connection that would have carried a
+    /// durable token is the one that just went away, so a will survives a
+    /// restart only in the sense that the retained store does.
+    fn publish_will(&mut self, will: protocol::Will, out: &mut Outbox) {
+        let publish = Publish {
+            topic: will.topic,
+            payload: will.payload,
+            guarantee: will.guarantee,
+            retain: will.retain,
+        };
+        self.stats.published_messages = self.stats.published_messages.saturating_add(1);
+        if publish.retain {
+            self.retain(&publish);
+        }
+        self.route(&publish, 0, out);
+    }
+
     /// Ends a connection. A session that asked to be resumed stays behind
     /// without one; anything else is removed here and now (§7).
     fn close(&mut self, session: SessionId, reason: Option<CloseReason>, out: &mut Outbox) {
         let Some(slot) = self.by_id.remove(&session) else {
             return;
         };
+
+        // Taken, not read: the will is published once or not at all, and the
+        // session may live on offline with the same field.
+        let will = self
+            .sessions
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .and_then(|held| held.will.take());
+        if let Some(will) = will {
+            self.publish_will(will, out);
+        }
 
         let keep = self
             .sessions

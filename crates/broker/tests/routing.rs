@@ -38,6 +38,7 @@ fn connect(broker: &mut Broker, out: &mut Outbox, session: u64, name: &str) -> S
             client_id: client(name),
             permissions: Permissions::unrestricted(),
             resume: false,
+            will: None,
         }),
         out,
     );
@@ -149,6 +150,7 @@ fn clients_without_an_identity_do_not_collide() {
                 client_id: ClientId::new(Bytes::new()).unwrap(),
                 permissions: Permissions::unrestricted(),
                 resume: false,
+                will: None,
             }),
             &mut out,
         );
@@ -799,6 +801,7 @@ mod authorisation {
                 client_id: client(name),
                 permissions,
                 resume: false,
+                will: None,
             }),
             out,
         );
@@ -1136,6 +1139,7 @@ mod retained {
                 client_id: client("pub"),
                 permissions: Permissions::from_rules(vec![(filter("allowed/#"), true, false)]),
                 resume: false,
+                will: None,
             }),
             &mut out,
         );
@@ -1174,6 +1178,7 @@ mod persistent {
                 client_id: client(name),
                 permissions: Permissions::unrestricted(),
                 resume,
+                will: None,
             }),
             out,
         );
@@ -1393,6 +1398,7 @@ mod persistent {
                 client_id: client("device"),
                 permissions: Permissions::unrestricted(),
                 resume: true,
+                will: None,
             }),
             &mut out,
         );
@@ -1407,6 +1413,7 @@ mod persistent {
                 client_id: client("device"),
                 permissions: Permissions::from_rules(vec![(filter("allowed/#"), true, true)]),
                 resume: true,
+                will: None,
             }),
             &mut out,
         );
@@ -1440,6 +1447,7 @@ fn a_session_with_no_name_is_never_kept() {
             permissions: Permissions::unrestricted(),
             // The client asked for a session it will never be able to claim.
             resume: true,
+            will: None,
         }),
         &mut out,
     );

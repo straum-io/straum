@@ -51,6 +51,7 @@ fn broker(subscribers: usize, pattern: &str, noise: usize) -> (Broker, Outbox) {
                 client_id: client(index),
                 permissions: Permissions::unrestricted(),
                 resume: false,
+                will: None,
             }),
             &mut out,
         );
@@ -72,6 +73,7 @@ fn broker(subscribers: usize, pattern: &str, noise: usize) -> (Broker, Outbox) {
                 client_id: client(usize::MAX),
                 permissions: Permissions::unrestricted(),
                 resume: false,
+                will: None,
             }),
             &mut out,
         );
@@ -117,6 +119,7 @@ fn bench_route(bencher: divan::Bencher, subscribers: usize, pattern: &str, noise
             client_id: client(usize::MAX - 1),
             permissions: Permissions::unrestricted(),
             resume: false,
+            will: None,
         }),
         &mut out,
     );
@@ -169,6 +172,7 @@ fn publish_route(bencher: divan::Bencher, subscribers: usize) {
             client_id: client(usize::MAX - 1),
             permissions: Permissions::unrestricted(),
             resume: false,
+            will: None,
         }),
         &mut out,
     );

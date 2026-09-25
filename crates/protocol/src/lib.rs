@@ -55,6 +55,18 @@ pub struct Connect {
     /// Take over a session this identity left behind, if there is one.
     /// A protocol that has no such notion always sends `false`.
     pub resume: bool,
+    /// Published if this connection ends any way but a clean goodbye.
+    pub will: Option<Will>,
+}
+
+/// What a session asked to have published on its behalf if it goes away
+/// without saying goodbye (3.1.1 §3.1.2.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Will {
+    pub topic: Topic,
+    pub payload: Bytes,
+    pub guarantee: DeliveryGuarantee,
+    pub retain: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

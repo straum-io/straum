@@ -219,6 +219,12 @@ async fn read(
                         // CleanSession = 0 asks for whatever this
                         // identity left behind (3.1.1 §3.1.2.4).
                         resume: !connect.clean_session,
+                        will: connect.will.map(|will| protocol::Will {
+                            topic: will.topic,
+                            payload: will.payload,
+                            guarantee: will.guarantee,
+                            retain: will.retain,
+                        }),
                     });
                     if events
                         .send(Event::Command {

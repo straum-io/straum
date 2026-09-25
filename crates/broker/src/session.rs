@@ -108,6 +108,10 @@ pub struct Session {
     pub online: bool,
     /// Whether to keep this session when the connection goes away.
     pub resume: bool,
+    /// Published if this connection ends any way but a DISCONNECT. Taken
+    /// when it is published or when the client says goodbye, so it can
+    /// never be published twice (3.1.1 §3.1.2.5).
+    pub will: Option<protocol::Will>,
     /// Deduplication of overlapping subscriptions without allocating per
     /// publish: the publish stamps its generation, a second match on the same
     /// generation only raises the guarantee (CLAUDE.md §6).
@@ -149,6 +153,7 @@ impl Session {
             backlog: Backlog::new(backlog, backlog_bytes),
             online: true,
             resume,
+            will: None,
             seen: 0,
             best: DeliveryGuarantee::AtMostOnce,
             owes_from: 0,

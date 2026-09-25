@@ -22,7 +22,9 @@ pub enum Reaction {
     Forward(Command),
     /// A CONNECT. Not a command yet: it becomes one once somebody has
     /// checked the credentials it carries (docs/configuration.md).
-    Connect(Connect),
+    /// Boxed for the same reason as `Packet::Connect`: this is returned
+    /// once per packet.
+    Connect(Box<Connect>),
     /// Answer PINGRESP here; keep-alive never reaches the broker (§5).
     Pong,
 }

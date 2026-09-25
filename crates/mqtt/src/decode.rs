@@ -180,11 +180,23 @@ fn connect(mut reader: Reader, limits: &MqttLimits) -> Result<Packet, MqttError>
     }
     let client_id = ClientId::new(client_id)?;
 
-    if has_will {
-        // Validated and dropped: the will is never published (§6).
-        let _will_topic = topic(reader.string()?, limits)?;
-        let _will_payload = reader.binary()?;
-    }
+    let will = if has_will {
+        let will_topic = topic(reader.string()?, limits)?;
+        let will_payload = reader.binary()?;
+        Some(crate::packet::Will {
+            topic: will_topic,
+            payload: will_payload,
+            // QoS 2 is refused above, so anything left is 0 or 1.
+            guarantee: if will_qos == 0 {
+                DeliveryGuarantee::AtMostOnce
+            } else {
+                DeliveryGuarantee::AtLeastOnce
+            },
+            retain: will_retain,
+        })
+    } else {
+        None
+    };
     // Kept, not dropped: the runtime checks them (docs/configuration.md).
     let username = if has_username {
         Some(reader.string()?)
@@ -200,13 +212,14 @@ fn connect(mut reader: Reader, limits: &MqttLimits) -> Result<Packet, MqttError>
     // Nothing may follow the fields the flags announced.
     reader.finish()?;
 
-    Ok(Packet::Connect(Connect {
+    Ok(Packet::Connect(Box::new(Connect {
         client_id,
         clean_session: flags & 0b0000_0010 != 0,
         keep_alive_secs,
+        will,
         username,
         password,
-    }))
+    })))
 }
 
 fn publish(flags: u8, mut reader: Reader, limits: &MqttLimits) -> Result<Packet, MqttError> {

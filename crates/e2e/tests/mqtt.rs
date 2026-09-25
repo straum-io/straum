@@ -1068,3 +1068,49 @@ async fn a_broker_stops_under_a_client_that_went_silent() {
         .await
         .expect("the broker did not stop");
 }
+
+/// A will is the client's last words, and 3.1.1 §3.1.2.5 says they are
+/// spoken when the connection ends any way but a DISCONNECT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_will_reaches_subscribers_when_the_client_vanishes() {
+    let broker = start();
+    let (watcher, mut watcher_loop) = client("watcher", &broker);
+    watcher.subscribe("gone/#", QoS::AtMostOnce).await.unwrap();
+    until(&mut watcher_loop, |incoming| {
+        matches!(incoming, Incoming::SubAck(_))
+    })
+    .await
+    .unwrap();
+
+    {
+        let addr = broker.local_addr();
+        let mut options = MqttOptions::new("doomed", addr.ip().to_string(), addr.port());
+        options.set_keep_alive(Duration::from_secs(5));
+        options.set_last_will(rumqttc::LastWill::new(
+            "gone/doomed",
+            "offline",
+            QoS::AtMostOnce,
+            false,
+        ));
+        let (_doomed, mut doomed_loop) = AsyncClient::new(options, 8);
+        until(&mut doomed_loop, |incoming| {
+            matches!(incoming, Incoming::ConnAck(_))
+        })
+        .await
+        .unwrap();
+        // Dropped without a DISCONNECT: the socket just goes.
+    }
+
+    let delivered = until(&mut watcher_loop, |incoming| {
+        matches!(incoming, Incoming::Publish(_))
+    })
+    .await
+    .unwrap();
+    let Incoming::Publish(publish) = delivered else {
+        panic!("expected a PUBLISH");
+    };
+    assert_eq!(publish.topic, "gone/doomed");
+    assert_eq!(publish.payload.as_ref(), b"offline");
+
+    broker.shutdown().await;
+}

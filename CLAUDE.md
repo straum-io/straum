@@ -432,7 +432,7 @@ Being built, in this order (the adoption path, not a wish list):
    log rather than stored twice (docs/storage.md §90a). Compaction respects
    that mark and runs at startup only, so a broker that never restarts never
    compacts (docs/storage.md §104).
-3. Will publishing.
+3. Will publishing is built.
 
 Out of scope: MQTT 5, QoS 2, shared subscriptions, WebSocket. Each needs
 a concrete requirement before it moves out of this line.
@@ -455,7 +455,9 @@ Decisions and documented deviations:
 | Empty ClientId, CleanSession = 1 | broker assigns an id |
 | Empty ClientId, CleanSession = 0 | the broker assigns an id and the session is not kept: nothing names it afterwards (deviation: 3.1.1 says CONNACK 0x02) |
 | ClientId already connected | old session closed (takeover) |
-| Will flag | parsed and validated, not published (deviation) |
+| Will flag | published when the connection ends any way but a DISCONNECT (3.1.1 §3.1.2.5); a clean goodbye takes it with it |
+| Will on a kept session | replaced by whatever the next CONNECT carries; it belongs to the connection, not the session |
+| Will and durability | routed like any other message but never written to the log: the connection that would carry a durable token is the one that just went away |
 | Username / password | checked against the credential file before the broker sees the session |
 | Bad user name or password | CONNACK 0x04, close |
 | Anonymous where it is not allowed | CONNACK 0x05, close |

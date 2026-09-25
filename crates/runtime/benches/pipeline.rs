@@ -74,6 +74,7 @@ fn broker(subscribers: usize, guarantee: DeliveryGuarantee) -> (Broker, Outbox) 
                 client_id: client(index),
                 permissions: Permissions::unrestricted(),
                 resume: false,
+                will: None,
             }),
             &mut out,
         );
@@ -111,6 +112,7 @@ impl Pipeline {
                 client_id: client(usize::MAX),
                 permissions: Permissions::unrestricted(),
                 resume: false,
+                will: None,
             }),
             &mut out,
         );
