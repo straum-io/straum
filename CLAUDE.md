@@ -13,6 +13,7 @@ docs/configuration.md   every setting, env var, default and limit
 docs/testing.md         test layers, MQTT conformance, fuzzing
 docs/benchmarks.md      harness, workload matrix, measurement protocol, reporting
 docs/profiling.md       which tool answers which question, per platform
+docs/cluster.md         architecture for clustering; nothing in it is built yet
 docs/linux-tuning.md    kernel parameters and socket options for production hosts
 docs/baselines/         recorded benchmark baselines, one file per machine
 ```
