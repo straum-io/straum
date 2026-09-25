@@ -980,6 +980,59 @@ mod retained {
     }
 
     #[test]
+    fn the_replay_order_is_the_same_in_two_brokers_that_stored_the_same_thing() {
+        // Same messages, opposite insertion order. A follower reconstructing
+        // this state from the log must hand it to a subscriber in the same
+        // order the leader did, and "the order the hash map felt like" is not
+        // a property either of them can agree on (docs/replication.md §108).
+        let names = [
+            "sensors/eu/temp",
+            "sensors/us/temp",
+            "sensors/eu/humidity",
+            "sensors/ap/temp",
+            "sensors/us/humidity",
+            "sensors/ap/humidity",
+        ];
+
+        let replayed = |reverse: bool| {
+            let (mut broker, mut out) = broker();
+            let publisher = connect(&mut broker, &mut out, 1, "pub");
+            let mut order: Vec<&str> = names.to_vec();
+            if reverse {
+                order.reverse();
+            }
+            for name in order {
+                retain(&mut broker, &mut out, publisher, name, b"v", AtMostOnce);
+            }
+            let _ = drain(&mut out);
+
+            let subscriber = connect(&mut broker, &mut out, 2, "sub");
+            let _ = drain(&mut out);
+            subscribe(&mut broker, &mut out, subscriber, "sensors/#", AtMostOnce);
+            deliveries(&mut out)
+                .into_iter()
+                .map(|(_, delivery)| delivery.topic)
+                .collect::<Vec<_>>()
+        };
+
+        let forwards = replayed(false);
+        let backwards = replayed(true);
+
+        assert_eq!(forwards.len(), names.len());
+        assert_eq!(forwards, backwards);
+
+        // And the order is the one the state implies, not the one the first
+        // publisher happened to use.
+        let mut expected: Vec<&str> = names.to_vec();
+        expected.sort_unstable();
+        let actual: Vec<String> = forwards
+            .iter()
+            .map(|held| String::from_utf8_lossy(held.as_bytes()).into_owned())
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn live_traffic_is_not_marked_retained() {
         let (mut broker, mut out) = broker();
         let subscriber = connect(&mut broker, &mut out, 1, "sub");

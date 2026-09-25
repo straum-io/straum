@@ -823,6 +823,17 @@ impl Broker {
                 .map(|(topic, held)| (topic.clone(), held.payload.clone(), held.guarantee)),
         );
 
+        // A hash map iterates in whatever order its seed produced, so without
+        // this the replay order is a property of the process rather than of
+        // the state. Sorted by topic it is a function of what is stored and
+        // nothing else: two brokers holding the same retained messages hand
+        // them over in the same order, however they came to hold them
+        // (docs/replication.md §108, C6). Sorting the matches rather than
+        // keeping the store ordered leaves the publish path untouched, and
+        // nothing measures that path yet.
+        replay
+            .sort_unstable_by(|(left, _, _), (right, _, _)| left.as_bytes().cmp(right.as_bytes()));
+
         for (topic, payload, stored) in replay.drain(..) {
             // A retained message is state, not a log record: it already sits
             // in the log under its own publish.
