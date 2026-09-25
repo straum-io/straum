@@ -4,7 +4,7 @@ use replication::{DURABLE_BYTES, Limits, Message, RECORDS_HEADER_BYTES, Replicat
 
 fn records(previous: u64, last: u64, batch: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    replication::encode_records_header(previous, last, batch.len(), &mut out);
+    replication::encode_records_header(previous, last, batch, &mut out);
     out.extend_from_slice(batch);
     out
 }
@@ -80,20 +80,61 @@ fn frames_are_read_one_at_a_time_out_of_a_stream() {
 
 #[test]
 fn a_flipped_header_byte_is_refused_rather_than_believed() {
-    // The header is the part nothing else protects: the records inside the
-    // batch carry their own checksums, the fields around them do not.
     let clean = records(10, 12, b"payload");
     for at in 0..RECORDS_HEADER_BYTES {
         let mut dirty = clean.clone();
         *dirty.get_mut(at).unwrap() ^= 0x01;
         match decode(&dirty, Limits::default()) {
             Err(ReplicationError::Checksum) => {}
-            // Flipping a bit of the kind byte makes it a different frame
-            // kind, which is refused just as hard.
+            // The kind byte selects the decoder, so it is refused under its
+            // own name.
             Err(ReplicationError::UnknownKind(_)) if at == 0 => {}
+            // The length is the one field that has to be acted on before the
+            // checksum can be computed, because it says where the batch ends.
+            // Corrupted upwards it is either past the limit, or it makes the
+            // decoder ask for bytes that have not arrived — which is the same
+            // answer it gives for a frame still in flight, and the checksum
+            // refuses it as soon as that many bytes exist.
+            Err(ReplicationError::FrameTooLarge { .. }) | Ok(None) if (17..21).contains(&at) => {}
             other => panic!("byte {at} flipped and decode returned {other:?}"),
         }
     }
+}
+
+#[test]
+fn a_flipped_batch_byte_is_refused() {
+    // The reason the checksum covers the batch and not only the header. A
+    // per-record CRC32 inside the batch says whether that record is intact;
+    // it cannot say whether these are the records that were sent.
+    let clean = records(10, 12, b"payload");
+    for at in RECORDS_HEADER_BYTES..clean.len() {
+        let mut dirty = clean.clone();
+        *dirty.get_mut(at).unwrap() ^= 0x01;
+        assert_eq!(
+            decode(&dirty, Limits::default()),
+            Err(ReplicationError::Checksum),
+            "batch byte {at}"
+        );
+    }
+}
+
+#[test]
+fn a_whole_record_swapped_for_another_well_formed_one_is_refused() {
+    // The case per-record checksums cannot catch: both batches are made of
+    // records that are individually valid, and only the frame checksum knows
+    // which set the header was written for.
+    let sent = records(10, 12, b"AAAAAAAAAAAAAAAA");
+    let mut tampered = sent.clone();
+    tampered
+        .get_mut(RECORDS_HEADER_BYTES..)
+        .unwrap()
+        .copy_from_slice(b"BBBBBBBBBBBBBBBB");
+
+    assert!(decode(&sent, Limits::default()).is_ok());
+    assert_eq!(
+        decode(&tampered, Limits::default()),
+        Err(ReplicationError::Checksum)
+    );
 }
 
 #[test]
@@ -126,7 +167,7 @@ fn a_frame_larger_than_the_limit_is_refused_before_it_is_buffered() {
     // The bytes themselves are never supplied: the point is that the reader
     // is not asked to collect them first.
     let mut header = Vec::new();
-    replication::encode_records_header(0, 1, 4096, &mut header);
+    replication::encode_records_header(0, 1, &[0; 4096], &mut header);
 
     assert_eq!(
         decode(&header, limits),
@@ -142,7 +183,7 @@ fn a_frame_that_covers_nothing_is_refused() {
     // A commit that wrote no records does not exist, and one frame is one
     // commit.
     let mut empty_range = Vec::new();
-    replication::encode_records_header(5, 5, 8, &mut empty_range);
+    replication::encode_records_header(5, 5, &[0; 8], &mut empty_range);
     empty_range.extend_from_slice(&[0; 8]);
     assert_eq!(
         decode(&empty_range, Limits::default()),
@@ -150,7 +191,7 @@ fn a_frame_that_covers_nothing_is_refused() {
     );
 
     let mut backwards = Vec::new();
-    replication::encode_records_header(9, 4, 8, &mut backwards);
+    replication::encode_records_header(9, 4, &[0; 8], &mut backwards);
     backwards.extend_from_slice(&[0; 8]);
     assert_eq!(
         decode(&backwards, Limits::default()),
@@ -158,7 +199,7 @@ fn a_frame_that_covers_nothing_is_refused() {
     );
 
     let mut no_bytes = Vec::new();
-    replication::encode_records_header(1, 2, 0, &mut no_bytes);
+    replication::encode_records_header(1, 2, &[], &mut no_bytes);
     assert_eq!(
         decode(&no_bytes, Limits::default()),
         Err(ReplicationError::Empty)
