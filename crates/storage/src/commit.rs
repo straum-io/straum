@@ -199,6 +199,12 @@ impl Committer {
     }
 
     /// The bound a batch is currently allowed to reach.
+    /// The batch the last commit wrote, framed as it went to the file.
+    /// Valid until the next commit replaces it (docs/replication.md §112).
+    pub fn committed_batch(&self) -> &[u8] {
+        self.wal.committed_batch()
+    }
+
     pub fn batch_bound(&self) -> usize {
         self.batch_bound
     }

@@ -360,3 +360,29 @@ fn a_run_that_does_not_decompose_is_refused_and_stages_nothing() {
     assert_eq!(wal.stage_framed(&whole).unwrap(), 2);
     let _ = fs::remove_file(&path);
 }
+
+#[test]
+fn the_committed_batch_is_the_bytes_that_went_to_the_file() {
+    let path = scratch("rotate");
+    let (mut wal, _) = Wal::open(&path, WalLimits::default()).unwrap();
+    assert!(wal.committed_batch().is_empty(), "nothing has been written");
+
+    wal.stage(b"one").unwrap();
+    wal.stage(b"two").unwrap();
+    wal.commit().unwrap();
+    let first = wal.committed_batch().to_vec();
+    assert_eq!(first, framed(&[b"one", b"two"]));
+
+    // Staging the next batch does not disturb the one a replica may still be
+    // reading; the buffers rotate at the commit.
+    wal.stage(b"three").unwrap();
+    assert_eq!(wal.committed_batch(), &first[..]);
+    wal.commit().unwrap();
+    assert_eq!(wal.committed_batch(), &framed(&[b"three"])[..]);
+
+    // And what is in the file is those batches, one after the other.
+    drop(wal);
+    let file = fs::read(&path).unwrap();
+    assert_eq!(&file[8..], &framed(&[b"one", b"two", b"three"])[..]);
+    let _ = fs::remove_file(&path);
+}

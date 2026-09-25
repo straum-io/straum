@@ -53,6 +53,10 @@ pub struct Wal {
     /// Reused across batches: one buffer per WAL, not one per record.
     batch: Vec<u8>,
     batch_records: usize,
+    /// The batch the last commit wrote, kept in the buffer it was written
+    /// from until the next one takes its place. A replica is handed these
+    /// bytes rather than a copy of them (docs/replication.md §112).
+    committed: Vec<u8>,
     /// A durability failure is terminal for this log: nothing may be
     /// acknowledged after it (docs/storage.md §99, invariant 7).
     failed: bool,
@@ -97,6 +101,7 @@ impl Wal {
                 sequence: recovery.records,
                 durable_sequence: recovery.records,
                 batch: Vec::new(),
+                committed: Vec::new(),
                 batch_records: 0,
                 failed: false,
                 #[cfg(test)]
@@ -170,11 +175,15 @@ impl Wal {
         let records = self.batch_records;
 
         let started = Instant::now();
-        // The batch buffer is moved out and put back so the write borrows
-        // it without copying it (docs/storage.md §96).
-        let batch = std::mem::take(&mut self.batch);
-        let written = self.write(&batch);
-        self.batch = batch;
+        // Two buffers, rotated: the one just written becomes the one a
+        // replica can be handed without a copy, and the one it held becomes
+        // the next batch with its capacity intact. The inner take-and-return
+        // is what lets the write borrow the bytes rather than copy them
+        // (docs/storage.md §96).
+        std::mem::swap(&mut self.batch, &mut self.committed);
+        let committed = std::mem::take(&mut self.committed);
+        let written = self.write(&committed);
+        self.committed = committed;
         written?;
         let write = started.elapsed();
 
@@ -236,6 +245,18 @@ impl Wal {
     /// Writes the staged batch and waits for the storage device.
     pub fn commit(&mut self) -> Result<(Committed, Duration, Duration), StorageError> {
         self.commit_with(true)
+    }
+
+    /// The batch the last commit wrote, framed exactly as it went to the
+    /// file. Empty before the first commit; replaced by the next one.
+    ///
+    /// Read after `commit_with` returns, so the fork to a replica happens
+    /// after the local durability operation rather than beside it. Moving it
+    /// earlier halves the latency a quorum acknowledgement waits for and is a
+    /// change with a measurement behind it, not a refactor
+    /// (docs/replication.md §112).
+    pub fn committed_batch(&self) -> &[u8] {
+        &self.committed
     }
 
     pub fn staged_bytes(&self) -> usize {
