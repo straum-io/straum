@@ -50,6 +50,9 @@ pub struct Metrics {
     pub replication_shipments_dropped: AtomicU64,
     /// Times the leader had to read its own log to fill a gap.
     pub replication_catchups: AtomicU64,
+    /// Sequences sent to the follower and not yet confirmed. A gauge, stored
+    /// once per report and once per frame — not on any per-record path.
+    pub replication_in_flight: AtomicU64,
 }
 
 impl Metrics {
@@ -90,6 +93,7 @@ impl Metrics {
                 .replication_shipments_dropped
                 .load(Ordering::Relaxed),
             replication_catchups: self.replication_catchups.load(Ordering::Relaxed),
+            replication_in_flight: self.replication_in_flight.load(Ordering::Relaxed),
         }
     }
 }
@@ -125,4 +129,6 @@ pub struct Snapshot {
     pub replication_follower_sequence: u64,
     pub replication_shipments_dropped: u64,
     pub replication_catchups: u64,
+    /// Sequences sent and not yet confirmed.
+    pub replication_in_flight: u64,
 }

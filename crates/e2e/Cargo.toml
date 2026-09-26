@@ -23,3 +23,7 @@ harness = false
 [[bench]]
 name = "survive"
 harness = false
+
+[[bench]]
+name = "replicate"
+harness = false

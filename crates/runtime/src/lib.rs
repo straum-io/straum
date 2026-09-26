@@ -223,6 +223,12 @@ impl Runtime {
     /// The bound address; with port 0 this is the one the kernel picked.
     /// Where this node accepts a leader's replication stream, if it is a
     /// follower. With port 0 this is the one the kernel assigned.
+    /// The counters themselves, for a reader that samples one of them in a
+    /// loop rather than taking a whole snapshot each time.
+    pub fn metrics_handle(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
+    }
+
     pub fn replication_addr(&self) -> Option<SocketAddr> {
         self.replication_addr
     }

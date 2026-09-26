@@ -212,7 +212,7 @@ async fn stream(
                         continue;
                     }
                 }
-                send_frame(&mut connection, &mut header, peer, shipment.previous, shipment.last, &shipment.batch).await?;
+                send_frame(&mut connection, &mut header, peer, shipment.previous, shipment.last, &shipment.batch, &held.metrics).await?;
             }
         }
     }
@@ -226,12 +226,16 @@ async fn send_frame(
     previous: u64,
     last: u64,
     batch: &[u8],
+    metrics: &Metrics,
 ) -> Result<(), LinkError> {
     header.clear();
     replication::encode_records_header(previous, last, batch, header);
     connection.writer.write_all(header).await?;
     connection.writer.write_all(batch).await?;
     peer.on_sent(last);
+    metrics
+        .replication_in_flight
+        .store(peer.in_flight(), Ordering::Relaxed);
     Ok(())
 }
 
@@ -364,6 +368,7 @@ async fn catch_up(
             shipment.previous,
             shipment.last,
             &shipment.batch,
+            &held.metrics,
         )
         .await;
     }
@@ -427,7 +432,11 @@ struct Durability {
 }
 
 impl Durability {
-    fn start(wal: &WalSettings, queue: usize) -> Result<(Self, u64), storage::StorageError> {
+    fn start(
+        wal: &WalSettings,
+        queue: usize,
+        metrics: Arc<Metrics>,
+    ) -> Result<(Self, u64), storage::StorageError> {
         let (log, recovery) = Wal::open(&wal.path, wal.limits)?;
         let (records, queued) = mpsc::channel(queue);
         let (reports, ready) = mpsc::channel(queue);
@@ -445,11 +454,28 @@ impl Durability {
                         // Sent only now: written was not durable, and the
                         // durability operation is what just completed.
                         Ok(Some(commit)) => {
+                            // The same counters the leader's own log keeps. A
+                            // follower whose commits are invisible is a
+                            // follower nobody can tell is keeping up.
+                            Metrics::increment(&metrics.wal_commits, 1);
+                            Metrics::increment(
+                                &metrics.wal_records_committed,
+                                commit.records as u64,
+                            );
+                            Metrics::increment(&metrics.wal_bytes_committed, commit.bytes as u64);
+                            metrics
+                                .wal_durable_sequence
+                                .store(commit.durable_sequence, Ordering::Relaxed);
+                            metrics.wal_sync_nanos.store(
+                                u64::try_from(commit.sync.as_nanos()).unwrap_or(u64::MAX),
+                                Ordering::Relaxed,
+                            );
                             if reports.blocking_send(commit.durable_sequence).is_err() {
                                 break;
                             }
                         }
                         Err(error) => {
+                            Metrics::increment(&metrics.wal_commit_failures, 1);
                             tracing::error!(%error, "the follower's log failed");
                             break;
                         }
@@ -498,7 +524,8 @@ async fn apply(
     mut connection: Connection,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), LinkError> {
-    let (mut durability, recovered) = Durability::start(&held.wal, held.settings.queue)?;
+    let (mut durability, recovered) =
+        Durability::start(&held.wal, held.settings.queue, Arc::clone(&held.metrics))?;
     let mut follower = Follower::resuming_from(recovered);
 
     // The follower speaks first, and says what it actually holds. A batch it

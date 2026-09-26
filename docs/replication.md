@@ -753,3 +753,140 @@ shipments dropped + queue capacity >= commits
 
 every batch the log committed either fitted in the fixed-size queue or was
 counted as dropped, and nothing is holding batches anywhere else.
+
+## 122. What replication costs
+
+**Direction only.** A development Mac, two nodes in one process on one host
+over loopback. That is not a network measurement and nothing here justifies a
+decision on its own (CLAUDE.md §11); a number that does has to come from a
+quiet Linux host with the two nodes on separate machines.
+
+```text
+Machine    Apple M1, 8 logical cores (4 performance, 4 efficiency), no pinning
+Memory     16 GiB
+OS         macOS 26.6.2, Darwin 25.6.0
+Storage    APFS on the internal NVMe; sync_data is F_FULLFSYNC, a full flush
+Toolchain  rustc 1.97.1, bench profile (release + line tables), no RUSTFLAGS
+Straum     STRAUM_DURABILITY=fsynced on both nodes, defaults otherwise
+Harness    crates/e2e/benches/replicate.rs, one process, loopback TCP
+Method     one warm-up run of 200 messages discarded per row, then the
+           measured run; one publisher, QoS 1; metrics taken as deltas across
+           the measured run so the warm-up is not in the averages
+```
+
+Latencies in milliseconds. `ack` is publish to PUBACK, which is what a client
+sees and what this phase must not change. `rep` is publish to the leader
+hearing the follower call it durable — the whole path, not a TCP write.
+`m/lcmt` and `m/fcmt` are messages per leader and per follower commit.
+
+| workload | mode | msg/s | MB/s | ack50 | ack95 | ack99 | rep50 | rep95 | rep99 | m/lcmt | B/lcmt | m/fcmt |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| small 64 B | local | 14 528 | 0.93 | 0.00 | 0.02 | 3.66 | — | — | — | 50.0 | 4 750 | — |
+| small 64 B | replicated | 7 500 | 0.48 | 0.00 | 0.01 | 7.66 | 66.67 | 81.77 | 86.51 | 51.3 | 4 872 | 51.3 |
+| medium 1 KiB | local | 12 702 | 13.01 | 0.00 | 0.03 | 3.84 | — | — | — | 51.3 | 54 103 | — |
+| medium 1 KiB | replicated | 7 621 | 7.80 | 0.00 | 0.02 | 7.63 | 66.00 | 78.75 | 81.86 | 50.0 | 52 750 | 50.0 |
+| large 64 KiB | local | 16 899 | 1 107 | 0.01 | 0.07 | 1.11 | — | — | — | 19.0 | 1 248 895 | — |
+| large 64 KiB | replicated | 14 575 | 955 | 0.01 | 0.06 | 1.05 | 110.19 | 172.20 | 173.64 | 20.0 | 1 311 340 | 20.0 |
+| sustained 64 B | local | 12 304 | 0.79 | 0.00 | 0.03 | 3.68 | — | — | — | 50.0 | 4 750 | — |
+| sustained 64 B | replicated | 6 421 | 0.41 | 0.00 | 0.02 | 7.79 | 69.83 | 78.68 | 82.79 | 50.0 | 4 750 | 50.1 |
+| burst 64 B | local | 12 135 | 0.78 | 0.00 | 0.02 | 0.66 | — | — | — | 50.0 | 4 750 | — |
+| burst 64 B | replicated | 6 555 | 0.42 | 0.00 | 0.01 | 7.75 | 66.81 | 75.85 | 79.78 | 50.0 | 4 750 | 50.0 |
+
+### What the numbers say
+
+**Group commit survives the crossing, which was the thing most at risk.**
+`m/fcmt` tracks `m/lcmt` row for row: 50 messages that became one leader
+durability operation become **one** follower durability operation, not 50.
+A frame is a commit on both sides, so the leader's disk still paces the
+follower's and replication added no second batching policy.
+
+**Throughput roughly halves on small payloads and barely moves on large
+ones** — 14 528 → 7 500 at 64 B, 16 899 → 14 575 at 64 KiB. The shape fits
+two logs doing `F_FULLFSYNC` on the same device: at 64 B the run is one flush
+after another and adding a second log nearly doubles the flushes per message,
+while at 64 KiB each flush already carries 1.2 MB and the second one costs
+proportionally less.
+
+**PUBACK is unchanged, which is the point.** `ack50` stays at 0.00 ms in
+every row: the client is acknowledged from the local log and never waits for
+the follower. `ack99` rising from ~3.7 ms to ~7.7 ms on the small rows is the
+second log competing for the same device, not replication entering the
+acknowledgement path.
+
+**Replication durability costs about 66 ms at p50 on this machine.** That is
+two full flushes of a device whose flush was measured at ~4 ms plus queueing,
+so it is dominated by the second fsync and by this host's flush behaviour
+under load, not by the wire. On 64 KiB it is 110 ms, where each commit is
+1.3 MB.
+
+### CPU and memory, and what was not measured
+
+```text
+650.21 real   52.11 user   4.50 sys      the whole `cargo bench` invocation
+569 MB maximum resident set size
+30.5 MB peak memory footprint
+```
+
+These cover cargo, the compiler and the benchmark process together, so they
+bound the benchmark rather than describe it. **Per-process CPU and RSS for
+the leader and the follower separately were not measured**, because both run
+in one process here; separating them needs two processes, which is the Linux
+two-host setup this baseline is not. Per-message CPU is not reported for the
+same reason. Wall time is twelve times CPU time, which is the expected shape
+for a workload that spends its life in `fsync`.
+
+### Allocation and copying, by audit
+
+Not instrumented — `divan`'s allocation counter does not reach across a
+tokio runtime and two nodes — so this is an inspection of the path, recorded
+as such:
+
+```text
+Wal::committed_batch      no copy. Two buffers rotate at the commit.
+ship                      one Bytes::copy_from_slice per batch, and only
+                          after try_reserve succeeds, so a full queue
+                          costs nothing.
+encode_records_header     25 bytes into a reused Vec. Reads the batch to
+                          checksum it; does not copy it.
+TCP write                 two writes per frame, header then batch. The
+                          batch is written from the Bytes, not copied again.
+follower decode           borrows out of the read buffer.
+take                      one Bytes::copy_from_slice per frame, to hand the
+                          bytes to the WAL thread.
+Wal::stage_framed         extend_from_slice into the batch buffer. No
+                          re-encoding, no checksum recomputed.
+```
+
+So **two full-batch copies per batch**, one on each side, both crossing a
+sync/async boundary. Neither is per record. Whether a rotation of owned
+buffers removes either is still §112.2 and still unmeasured; the numbers
+above do not single it out, since the path is dominated by two fsyncs.
+
+### The slow-follower run did not test what it was meant to
+
+```text
+20000 x 1 KiB, the follower reading the socket and acknowledging nothing
+  leader throughput     667 msg/s
+  in flight             20 000 sequences
+  shipments dropped     0
+  leader commits        400
+```
+
+A follower that is slow to *acknowledge* is not slow to *read*: it drained
+the socket, so the leader's queue never filled and nothing was dropped. The
+scenario that exercises the bound is one that stops reading, and this is not
+it. The assertion the run printed — `dropped + queue >= commits` — is
+therefore false here (`0 + 64 >= 400`) without anything being wrong, which
+makes it the wrong assertion for this scenario rather than a failure.
+
+**So the bounded-queue path is not demonstrated by any test yet.** The
+integration test `a_follower_that_never_answers_is_bounded_and_invisible`
+does stop the bytes at the door, but 200 publishes became fewer than 64
+batches and the queue never filled there either. What is established is that
+the queue has a fixed capacity and that `ship` refuses rather than grows;
+what is not established, by measurement, is the behaviour once it is full.
+
+The 667 msg/s in that run is also **unexplained** and worth a look: it is
+eighteen times slower than the same payload in the table, with the same
+50 messages per commit, and no obvious mechanism in the path accounts for
+it. It is recorded rather than explained.
