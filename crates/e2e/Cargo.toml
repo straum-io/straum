@@ -8,10 +8,12 @@ publish = false
 workspace = true
 
 [dev-dependencies]
+replication = { path = "../replication" }
 storage = { path = "../storage" }
 runtime = { path = "../runtime" }
 rumqttc = { version = "0.24", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
+bytes = "1"
 
 [[bench]]
 name = "loadgen"

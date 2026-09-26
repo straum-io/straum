@@ -83,3 +83,25 @@ traffic at 1.3%. There is no hotspot to remove.
 in straum's code, and the one architectural lever for it — batching — is
 already working as §4 intends. Reported here rather than left out, because a
 pass that finds nothing is a result and the next person should not repeat it.
+
+## 2026-09-25 — contiguous durable watermark
+
+Not an optimization: a correctness fix (docs/replication.md §110) measured to
+see whether it cost anything. `storage/commit`, `high (unpaced)` row, records
+per second, five alternating rounds each with a discarded warm-up run:
+
+```text
+candidate  666521  799052  712507  716152  764345   median 716152
+baseline   556065  799479  707895  666644  669577   median 669577
+```
+
+**No conclusion drawn.** The medians differ by 7%, the candidate spread is
+20% and the baseline spread 44%, and an earlier three-round pass on the same
+machine put the same change 10% the other way. The variance is larger than
+the effect in both directions, which under CLAUDE.md §11 means the
+environment, not the change, is what was measured. Expected, given the fast
+path is a compare-and-store where it used to be a `max` and the out-of-order
+set never allocates while submission order holds.
+
+Recorded so the next person does not repeat it on this machine. A number that
+would justify anything has to come from a quiet Linux host.

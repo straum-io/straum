@@ -81,6 +81,9 @@ storage: checksum  batch_construction
          commit: idle / low / moderate / high / burst, reporting records per
          sync, bytes per sync, sync p50 and commit latency p50/p95/p99
          (docs/storage.md §93, §94)
+         crash survival: acknowledged QoS 1 messages still present after
+         SIGKILL, for an offline durable session (scripts/crash-survival.sh,
+         §6 — the one comparison valid off a Linux host)
 ```
 
 ## 4. Workload matrix
@@ -128,10 +131,34 @@ optimization.
 | codec, topic, router, queue | direction only | direction only | reference numbers |
 | in-memory e2e | direction only | not used | reference numbers |
 | network e2e | not used | not used | reference numbers |
+| crash survival | valid | valid | valid |
 
 Apple Silicon moves threads between performance and efficiency cores and offers
 no portable pinning, so run-to-run spread on macOS is large. Docker Desktop adds
 a VM with virtualized timing and network.
+
+**Crash survival is the exception, and the reason is the unit.**
+`scripts/crash-survival.sh` reports how many acknowledged QoS 1 messages a
+broker still has after `SIGKILL` — an integer, and no amount of virtualised
+timing changes how many messages are on a disk. It is the one comparison
+against other brokers that can be taken here and quoted.
+
+It runs in rounds for a reason that is not noise. A broker that writes the
+record before acknowledging answers the same every round; one that saves on
+a timer answers whatever the timer was doing when the kill landed.
+
+Measured 2026-09-24, 800 QoS 1 messages for an offline durable session,
+three rounds each: straum kept 800/800 every round, with the session and the
+retained message. Mosquitto (`persistence true`, `autosave_interval 1`) kept
+0/800 every round and lost the session with them — and then kept 800/800 in
+both rounds with `STRAUM_BENCH_SETTLE=3`. Its database measured 47 bytes
+immediately after the workload and 88 KB two seconds later.
+
+That pair of runs is the result, not either one alone. Mosquitto is neither
+broken nor misconfigured here: given the time, it restores everything. What
+it does not have is an acknowledgement that means the record is on disk, so
+a crash that does not wait for the timer takes the window with it. Quote
+both rows or the comparison is unfair.
 
 On the Linux benchmark host, before a measurement:
 

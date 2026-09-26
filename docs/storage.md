@@ -140,6 +140,22 @@ persisted and must never be represented as such. It is the recovery boundary.
 Durability is never inferred from queue state, acknowledgement state, memory
 state, or file length alone.
 
+The offset is a position in *this* file, and compaction rewrites the file, so
+it identifies a location and never a record. What identifies a record is its
+correlation, which the record carries in its own body and keeps across a
+rewrite.
+
+Correlations are therefore what an acknowledgement is measured against, and
+the measure is a **contiguous prefix**, not a maximum. A submitter takes its
+correlation and then queues the record, so correlation 100 can reach the log
+while 99 is still in the channel; reporting 100 as the boundary would
+acknowledge 99 along with it. `Commit::durable_correlation` is the highest
+correlation such that every correlation below it has been committed, and
+`Committer` holds the ones that arrived above a gap until the gap closes
+(docs/replication.md §110). A correlation is consumed only once its record is
+certain to be queued, which is what keeps the sequence dense enough for a
+prefix to mean anything.
+
 ## 82. Visibility is not durability
 
 A message may be visible in memory before its record is durable. If consumers
@@ -258,8 +274,10 @@ Two consequences worth stating plainly:
   corrupted.
 
 A change to what these bytes mean changes the file magic with them
-(`STRAUMW2`), so a log from an older format is refused rather than
-misread.
+(`STRAUMW3`), so a log from an older format is refused rather than misread.
+`STRAUMW2` is refused rather than migrated: it carried no allocation state,
+and continuing one would mean inventing the number the header exists to
+remember (§91).
 
 ## 104. Compaction
 
@@ -294,20 +312,58 @@ restarts never compacts. Closing that needs the rewrite to run while the
 writer thread is appending — either by pausing it between commits or by
 segmenting the log — and neither is built.
 
-Correlations are preserved across a rewrite, because session marks refer to
-them. The numbering continues from the highest correlation the log ever
-held, not the highest that survived: a reused correlation would make a
-session's mark point at a different record than the one it meant.
+Correlations and sequences are both preserved across a rewrite. The numbering
+continues from the highest either has ever reached, not the highest that
+survived — the rewrite writes both forward into the new file's header (§91).
+A reused correlation would make a session's mark point at a different record
+than the one it meant, and a reused sequence would make a replication
+position name two records at once.
 
-## 91. Ordering
+## 91. Ordering and identity
 
-Every committed record has a position, and `WAL order == commit order`. The
-representation (offset, sequence number, logical position) is an
-implementation detail. Concurrent writers must not create ambiguous ordering:
-the WAL writer is the authoritative ordering point.
+Every committed record has a position, and `WAL order == commit order`.
+Concurrent writers must not create ambiguous ordering: the WAL writer is the
+authoritative ordering point.
 
-Straum uses a per-record sequence number plus the byte offset; both advance
-under the single writer.
+Three things are easy to confuse and are not the same:
+
+```text
+byte offset       where a record physically sits in this file today
+WAL sequence      which record it is, in the order the writer accepted them
+correlation       what the submitter called it, carried in the record body
+```
+
+The byte offset is a **location**. Compaction rewrites the file, so it means
+nothing across a rewrite and nothing at all to another machine.
+
+The sequence and the correlation are **identities**, and they are independent
+of each other. Neither is derived from the other and neither is derived from
+how many records the file happens to contain. The sequence is the log's own
+count of what it has accepted; the correlation is the submitter's, opaque to
+the log, which only stores it.
+
+**Compaction changes the physical representation and never rewinds a logical
+identity.** After a rewrite the file holds fewer records than were ever
+allocated, and that difference is what the header carries:
+
+```text
+[ STRAUMW3 ][ sequence u64 BE ][ records u64 BE ][ correlation u64 BE ][ crc32 u32 BE ]
+```
+
+`sequence` is the highest sequence allocated when the file was written and
+`records` is how many records it started with, so a reader finding `n` records
+knows the live sequence is `sequence + (n - records)`. `correlation` is a
+floor: the log cannot read record bodies, so the owner writes down its own
+high-water and takes the larger of that and what the surviving records carry.
+The checksum covers the three numbers, because a damaged high-water reads as a
+plausible smaller number and would repeat identifiers in silence.
+
+The header is written when the file is created and when it is rewritten. The
+append path never touches it, so none of this costs a running broker anything.
+
+This was not true before `STRAUMW3`: both values were derived from what
+survived compaction, so a restart after one handed out numbers that had
+already been used (docs/replication.md §116).
 
 ## 92. Crash recovery
 
