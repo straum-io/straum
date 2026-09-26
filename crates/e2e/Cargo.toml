@@ -27,3 +27,7 @@ harness = false
 [[bench]]
 name = "replicate"
 harness = false
+
+[[bench]]
+name = "connhold"
+harness = false

@@ -321,8 +321,11 @@ dependencies = [
 name = "e2e"
 version = "0.0.0"
 dependencies = [
+ "bytes",
+ "replication",
  "rumqttc",
  "runtime",
+ "storage",
  "tokio",
 ]
 
@@ -828,6 +831,7 @@ dependencies = [
  "domain",
  "mqtt",
  "protocol",
+ "replication",
  "storage",
  "thiserror 2.0.20",
  "tokio",
