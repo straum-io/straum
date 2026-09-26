@@ -50,8 +50,37 @@ pub struct WalRecord {
     /// Chosen by the submitter and echoed back once durable. The log does not
     /// interpret it; it is how the broker finds out which publishes it may
     /// acknowledge.
+    ///
+    /// Meaningless for a `framed` record: those arrive from another log,
+    /// whose correlations are inside the bodies and none of this node's
+    /// business. A follower watches `durable_sequence` instead.
     pub correlation: u64,
+    /// One record's body, or — when `framed` — a run of records another log
+    /// already encoded.
     pub payload: Bytes,
+    /// Already framed elsewhere: appended byte for byte instead of being
+    /// encoded again (docs/replication.md §114).
+    pub framed: bool,
+}
+
+impl WalRecord {
+    /// One record this node is writing itself.
+    pub fn local(correlation: u64, payload: Bytes) -> Self {
+        Self {
+            correlation,
+            payload,
+            framed: false,
+        }
+    }
+
+    /// A run of records another log framed, on its way into this one.
+    pub fn replicated(payload: Bytes) -> Self {
+        Self {
+            correlation: 0,
+            payload,
+            framed: true,
+        }
+    }
 }
 
 /// One completed commit cycle: one write, one durability operation, many
@@ -122,6 +151,19 @@ impl Committer {
         }
     }
 
+    /// Puts one record into the batch, whichever kind it is.
+    fn stage(&mut self, record: &WalRecord) -> Result<(), StorageError> {
+        if record.framed {
+            self.wal.stage_framed(&record.payload)?;
+            // No correlation to cover: these bodies belong to another log,
+            // and a follower measures itself in sequences.
+            return Ok(());
+        }
+        self.wal.stage(&record.payload)?;
+        self.cover(record.correlation);
+        Ok(())
+    }
+
     /// Folds one committed correlation into the contiguous prefix.
     ///
     /// Correlations form a dense sequence — one is taken only once its record
@@ -171,8 +213,7 @@ impl Committer {
 
         // Staged first, covered second: a record the log refused is not part
         // of any prefix.
-        self.wal.stage(&first.payload)?;
-        self.cover(first.correlation);
+        self.stage(&first)?;
 
         // Everything currently available, not everything that might arrive:
         // an idle broker commits a batch of one without waiting for anybody.
@@ -180,8 +221,7 @@ impl Committer {
             let Some(record) = records.try_recv() else {
                 break;
             };
-            self.wal.stage(&record.payload)?;
-            self.cover(record.correlation);
+            self.stage(&record)?;
         }
 
         let (committed, write, sync) = self.wal.commit_with(self.sync)?;
@@ -295,10 +335,7 @@ mod tests {
     }
 
     fn record(correlation: u64, size: usize) -> WalRecord {
-        WalRecord {
-            correlation,
-            payload: Bytes::from(vec![b'x'; size]),
-        }
+        WalRecord::local(correlation, Bytes::from(vec![b'x'; size]))
     }
 
     #[test]

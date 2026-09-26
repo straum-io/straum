@@ -33,10 +33,7 @@ fn batch_construction(bencher: divan::Bencher, records: usize) {
             // measured section would measure the allocator instead.
             let buffer = Vec::with_capacity(limits.initial_batch_bytes);
             let records: Vec<WalRecord> = (0..records)
-                .map(|index| WalRecord {
-                    correlation: index as u64,
-                    payload: payload.clone(),
-                })
+                .map(|index| WalRecord::local(index as u64, payload.clone()))
                 .collect();
             (records, buffer)
         })

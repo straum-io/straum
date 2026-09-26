@@ -75,6 +75,8 @@ Defaults below are **initial**. They are adjusted by benchmarks, not intuition.
 | `STRAUM_WAL_MAX_BATCH_BYTES` | `4194304` | Upper safety boundary for one batch — not a size to wait for (docs/storage.md §77). |
 | `STRAUM_WAL_INITIAL_BATCH_BYTES` | `1048576` | Where adaptation starts, before any storage latency is known: the §78 estimate of 1 GB/s × 1 ms. |
 | `STRAUM_DURABILITY` | `memory` | `memory`, `written` or `fsynced` (docs/storage.md §80). `memory` never writes to the log. `written` writes but does not sync: the acknowledgement waits for `write(2)`, so a process crash keeps the message and a machine or storage failure may not. `fsynced` waits for the storage device. Measured here, 1 publisher and 1 subscriber unthrottled at QoS 1: 183,912 / 180,997 / 11,313 msg/s — writing costs almost nothing, syncing costs 16x. |
+| `STRAUM_REPLICATION_LISTEN` | unset | Address to accept a leader's replication stream on. Unset or empty: this node is not a follower. Plaintext, and a different port from the MQTT listener (docs/replication.md §119). |
+| `STRAUM_REPLICATION_FOLLOWER` | unset | Address of the one follower to ship committed batches to. Unset or empty: this node is not a leader. One static follower only; nothing here elects anybody or discovers anybody. |
 
 ## Broker (owner: broker)
 

@@ -68,10 +68,7 @@ fn run(
     for index in 0..records {
         pace(index, &commit_rx);
         submitted.push(Instant::now());
-        ok(tx.send(WalRecord {
-            correlation: index as u64 + 1,
-            payload: body.clone(),
-        }));
+        ok(tx.send(WalRecord::local(index as u64 + 1, body.clone())));
     }
     drop(tx);
     let commits = ok(writer.join().map_err(|_| "writer thread panicked"));

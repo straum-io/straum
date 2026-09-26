@@ -162,3 +162,36 @@ impl Writer {
         Ok(())
     }
 }
+
+/// Dials a peer and hands back the halves.
+///
+/// Plaintext. The replication link between nodes is not the client-facing
+/// listener: it has its own address and its own configuration, and giving it
+/// TLS is a separate decision with its own key material.
+///
+/// The read budget is the same global one the listener uses, so bytes read
+/// from a peer count against the same ceiling as bytes read from a client
+/// (CLAUDE.md §7).
+pub async fn connect(
+    peer: SocketAddr,
+    read_buffer_bytes: usize,
+    budget: Arc<ReadBudget>,
+) -> Result<Connection, TransportError> {
+    let stream = TcpStream::connect(peer).await?;
+    // Small writes go out when they are written; a durability report waiting
+    // on Nagle would be latency added for nothing.
+    stream.set_nodelay(true)?;
+
+    let buffer = ReadBuffer::new(read_buffer_bytes, budget)?;
+    let (read, write) = stream.into_split();
+    Ok(Connection {
+        reader: Reader {
+            half: Half::Plain(read),
+            buffer,
+        },
+        writer: Writer {
+            half: WriteSide::Plain(write),
+        },
+        peer,
+    })
+}

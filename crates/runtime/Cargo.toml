@@ -13,6 +13,7 @@ protocol = { path = "../protocol" }
 mqtt = { path = "../mqtt" }
 transport = { path = "../transport" }
 broker = { path = "../broker" }
+replication = { path = "../replication" }
 storage = { path = "../storage" }
 bytes = "1"
 thiserror = "2"

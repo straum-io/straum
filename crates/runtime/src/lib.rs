@@ -7,6 +7,7 @@ mod broker_loop;
 mod config;
 mod connection;
 mod metrics;
+mod replication;
 mod session;
 mod wal;
 
@@ -21,7 +22,7 @@ use transport::{Listener, ReadBudget};
 
 pub use auth::{Authority, Permissions};
 
-pub use config::{AuthSettings, RuntimeConfig, TlsSettings, WalSettings};
+pub use config::{AuthSettings, ReplicationSettings, RuntimeConfig, TlsSettings, WalSettings};
 pub use metrics::{Metrics, Snapshot};
 // The server composes the runtime out of these, and depends on nothing else.
 pub use broker::BrokerLimits;
@@ -55,6 +56,10 @@ pub struct Runtime {
     events: mpsc::Sender<Event>,
     /// Joined during shutdown so the last batch reaches the disk (§16).
     wal_writer: Option<std::thread::JoinHandle<()>>,
+    /// Leader and follower links, drained after the log stops so what was
+    /// committed is shipped (docs/replication.md §120).
+    replicating: JoinSet<()>,
+    replication_addr: Option<SocketAddr>,
 }
 
 impl Runtime {
@@ -106,20 +111,71 @@ impl Runtime {
             _ => wal::restore(&config.wal, config.broker, &mut state)?,
         };
 
-        let (wal, wal_writer) = match config.durability {
-            Durability::Memory => (None, None),
+        // A leader ships committed batches to one follower. Bounded: a
+        // follower that cannot keep up loses its place here and is caught up
+        // from the log (docs/replication.md §119).
+        let local_sequence = Arc::new(AtomicU64::new(restored));
+        let (shipments, outbound) = match config.replication.follower {
+            Some(_) => {
+                let (tx, rx) = mpsc::channel(config.replication.queue);
+                (Some(tx), Some(rx))
+            }
+            None => (None, None),
+        };
+
+        let (wal, replicated, wal_writer) = match config.durability {
+            Durability::Memory => (None, None, None),
             _ => {
-                let (submitter, writer) = wal::start(
+                let (submitter, replicated, writer) = wal::start(
                     &config.wal,
                     config.broker,
                     restored,
+                    wal::FanOut {
+                        shipments,
+                        local: Arc::clone(&local_sequence),
+                    },
                     config.durability == Durability::Fsynced,
                     events.clone(),
                     Arc::clone(&metrics),
                 )?;
-                (Some(submitter), Some(writer))
+                (Some(submitter), Some(replicated), Some(writer))
             }
         };
+
+        let mut replicating = JoinSet::new();
+        let mut replication_addr = None;
+        if let (Some(peer), Some(outbound), Some(replicated)) =
+            (config.replication.follower, outbound, replicated)
+        {
+            replicating.spawn(replication::lead(
+                replication::Leading {
+                    peer,
+                    settings: config.replication.clone(),
+                    wal: config.wal.clone(),
+                    budget: Arc::clone(&budget),
+                    local: Arc::clone(&local_sequence),
+                    replicated,
+                    metrics: Arc::clone(&metrics),
+                },
+                outbound,
+                stopping.clone(),
+            ));
+        }
+        if let Some(listen) = config.replication.listen {
+            let mut transport = config.transport;
+            transport.listen = listen;
+            let listener = Listener::bind(transport, Arc::clone(&budget), None)?;
+            replication_addr = Some(listener.local_addr()?);
+            replicating.spawn(replication::follow(
+                replication::Following {
+                    settings: config.replication.clone(),
+                    wal: config.wal.clone(),
+                    metrics: Arc::clone(&metrics),
+                },
+                listener,
+                stopping.clone(),
+            ));
+        }
 
         let brokering = tokio::spawn(
             Loop::new(
@@ -159,10 +215,18 @@ impl Runtime {
             brokering,
             events,
             wal_writer,
+            replicating,
+            replication_addr,
         })
     }
 
     /// The bound address; with port 0 this is the one the kernel picked.
+    /// Where this node accepts a leader's replication stream, if it is a
+    /// follower. With port 0 this is the one the kernel assigned.
+    pub fn replication_addr(&self) -> Option<SocketAddr> {
+        self.replication_addr
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
@@ -194,6 +258,15 @@ impl Runtime {
         if let Some(writer) = self.wal_writer {
             let _ = tokio::task::spawn_blocking(move || writer.join()).await;
         }
+
+        // Last, and only now: the writer dropping its end of the shipment
+        // queue is what tells the leader task there is nothing more coming,
+        // so it ships what was committed before it stops. What can still be
+        // left on this node alone is anything the follower never
+        // acknowledged — replication is asynchronous in this phase and a
+        // PUBACK never waited for it (docs/replication.md §120).
+        let mut replicating = self.replicating;
+        while replicating.join_next().await.is_some() {}
         tracing::info!("stopped");
     }
 }

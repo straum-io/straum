@@ -34,6 +34,22 @@ pub struct Metrics {
     /// a number that never happened.
     pub wal_sync_nanos: AtomicU64,
     pub wal_durable_sequence: AtomicU64,
+    /// Replication links established, either direction.
+    pub replication_connections: AtomicU64,
+    /// Links that ended in an error rather than a shutdown.
+    pub replication_errors: AtomicU64,
+    /// 1 while a replication link is up. A gauge: an operator watching a
+    /// follower wants to know it is there, not how often it has been.
+    pub replication_connected: AtomicU64,
+    /// How far the follower is durable. On the follower itself, how far it
+    /// has told the leader it is.
+    pub replication_follower_sequence: AtomicU64,
+    /// Committed batches the live queue had no room for. Not lost — the
+    /// catch-up path reads them back out of the log — but a steady count
+    /// means the follower is not keeping up (docs/replication.md §119).
+    pub replication_shipments_dropped: AtomicU64,
+    /// Times the leader had to read its own log to fill a gap.
+    pub replication_catchups: AtomicU64,
 }
 
 impl Metrics {
@@ -64,6 +80,16 @@ impl Metrics {
             slow_consumer_closes: self.slow_consumer_closes.load(Ordering::Relaxed),
             wal_sync_nanos: self.wal_sync_nanos.load(Ordering::Relaxed),
             wal_durable_sequence: self.wal_durable_sequence.load(Ordering::Relaxed),
+            replication_connections: self.replication_connections.load(Ordering::Relaxed),
+            replication_errors: self.replication_errors.load(Ordering::Relaxed),
+            replication_connected: self.replication_connected.load(Ordering::Relaxed),
+            replication_follower_sequence: self
+                .replication_follower_sequence
+                .load(Ordering::Relaxed),
+            replication_shipments_dropped: self
+                .replication_shipments_dropped
+                .load(Ordering::Relaxed),
+            replication_catchups: self.replication_catchups.load(Ordering::Relaxed),
         }
     }
 }
@@ -91,4 +117,12 @@ pub struct Snapshot {
     pub slow_consumer_closes: u64,
     pub wal_sync_nanos: u64,
     pub wal_durable_sequence: u64,
+    pub replication_connections: u64,
+    pub replication_errors: u64,
+    /// 1 while a replication link is up.
+    pub replication_connected: u64,
+    /// How far the follower is durable, as the leader last heard it.
+    pub replication_follower_sequence: u64,
+    pub replication_shipments_dropped: u64,
+    pub replication_catchups: u64,
 }

@@ -183,7 +183,7 @@ impl Wal {
                 ..Recovery::default()
             }
         } else {
-            scan(&mut file, &limits, length, &mut |_| {})?
+            scan(&mut file, &limits, length, &mut |_, _| {})?
         };
 
         // Appends continue at the end of the durable prefix: the tail is gone.
@@ -415,7 +415,11 @@ fn scan(
     file: &mut File,
     limits: &WalLimits,
     length: u64,
-    visit: &mut impl FnMut(&[u8]),
+    // The record's body, and the same record with its framing. A reader that
+    // is going to hand these bytes to another log wants the second: encoding
+    // the first again would recompute a checksum to arrive at bytes it
+    // already has (docs/replication.md §114).
+    visit: &mut impl FnMut(&[u8], &[u8]),
 ) -> Result<Recovery, StorageError> {
     file.seek(SeekFrom::Start(0))?;
     let mut head = [0u8; HEADER_BYTES];
@@ -442,8 +446,8 @@ fn scan(
             } => {
                 // Only records inside the durable prefix are handed over: the
                 // tail is not a record, it is whatever the crash left.
-                if let Some(payload) = rest.get(from..end) {
-                    visit(payload);
+                if let (Some(payload), Some(framed)) = (rest.get(from..end), rest.get(..total)) {
+                    visit(payload, framed);
                 }
                 records = records.saturating_add(1);
                 offset = offset.saturating_add(u64::try_from(total).unwrap_or(0));
@@ -565,14 +569,13 @@ pub fn compact(
     // the first one is kept here and returned once the walk is done.
     let mut failure: Option<std::io::Error> = None;
     let mut kept = 0u64;
-    let mut buffer: Vec<u8> = Vec::new();
-    let recovery = scan(&mut file, &limits, length, &mut |payload| {
+    let recovery = scan(&mut file, &limits, length, &mut |payload, framed| {
         if failure.is_some() || !keep(payload) {
             return;
         }
-        buffer.clear();
-        record::encode(payload, &mut buffer);
-        if let Err(error) = out.write_all(&buffer) {
+        // The record goes across as it is. Re-encoding it would recompute a
+        // checksum to produce the bytes already in hand.
+        if let Err(error) = out.write_all(framed) {
             failure = Some(error);
             return;
         }
@@ -632,6 +635,26 @@ pub fn replay(
     limits: WalLimits,
     visit: &mut impl FnMut(&[u8]),
 ) -> Result<Recovery, StorageError> {
+    replay_with(path, limits, &mut |payload, _| visit(payload))
+}
+
+/// Like [`replay`], handing over each record with its framing intact.
+///
+/// What a leader sends a follower: the bytes exactly as this log holds them,
+/// so nothing is encoded twice (docs/replication.md §114).
+pub fn replay_frames(
+    path: &Path,
+    limits: WalLimits,
+    visit: &mut impl FnMut(&[u8]),
+) -> Result<Recovery, StorageError> {
+    replay_with(path, limits, &mut |_, framed| visit(framed))
+}
+
+fn replay_with(
+    path: &Path,
+    limits: WalLimits,
+    visit: &mut impl FnMut(&[u8], &[u8]),
+) -> Result<Recovery, StorageError> {
     let mut file = match OpenOptions::new().read(true).open(path) {
         Ok(file) => file,
         // Nothing written yet is not a failure to recover.
@@ -646,4 +669,51 @@ pub fn replay(
         return Ok(Recovery::default());
     }
     scan(&mut file, &limits, length, visit)
+}
+
+/// What a log says it has allocated, read from its header alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Allocated {
+    /// The highest sequence allocated when the file was last written.
+    pub sequence: u64,
+    /// How many records the file held at that moment.
+    pub records: u64,
+    pub correlation: u64,
+}
+
+impl Allocated {
+    /// The sequence of the record before the first one in the file, so the
+    /// `n`th record it holds has sequence `base() + n`.
+    pub fn base(&self) -> u64 {
+        self.sequence.saturating_sub(self.records)
+    }
+}
+
+/// Reads the header and nothing else.
+///
+/// One `read` of 36 bytes. A reader that needs to find a particular sequence
+/// in the file needs the base the records start from, and walking the whole
+/// log to learn it would be a second pass over everything.
+pub fn allocated(path: &Path) -> Result<Allocated, StorageError> {
+    let mut file = match OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Allocated::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if file.metadata()?.len() == 0 {
+        return Ok(Allocated::default());
+    }
+
+    let mut head = [0u8; HEADER_BYTES];
+    if file.read_exact(&mut head).is_err() {
+        return Err(StorageError::NotAWal);
+    }
+    let header = decode_header(&head)?;
+    Ok(Allocated {
+        sequence: header.sequence,
+        records: header.records,
+        correlation: header.correlation,
+    })
 }

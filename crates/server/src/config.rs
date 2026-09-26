@@ -313,6 +313,11 @@ impl Settings {
                 total_queued_bytes,
                 broker_queue: parser.number("STRAUM_BROKER_QUEUE", 65_536, 1, 16_777_216)?,
                 broker_batch: parser.number("STRAUM_BROKER_BATCH", 256, 1, 65_536)?,
+                replication: runtime::ReplicationSettings {
+                    listen: parser.optional_addr("STRAUM_REPLICATION_LISTEN")?,
+                    follower: parser.optional_addr("STRAUM_REPLICATION_FOLLOWER")?,
+                    ..runtime::ReplicationSettings::default()
+                },
                 writer_batch: parser.number("STRAUM_WRITER_BATCH", 64, 1, 65_536)?,
                 shutdown_grace,
                 write_stall_timeout: write_stall,
@@ -450,6 +455,30 @@ impl Parser {
                 })?;
                 self.record(name, parsed.clone(), Source::Env);
                 Ok(parsed)
+            }
+        }
+    }
+
+    /// An address that may be absent. Unset and empty both mean "not
+    /// configured", so an env file can carry the name with nothing after it.
+    fn optional_addr(&mut self, name: &'static str) -> Result<Option<SocketAddr>, ConfigError> {
+        match self.raw(name).map(str::trim).filter(|raw| !raw.is_empty()) {
+            None => {
+                self.used.push(name);
+                self.effective
+                    .push((name, "none".to_owned(), Source::Default));
+                Ok(None)
+            }
+            Some(raw) => {
+                let parsed = raw
+                    .parse::<SocketAddr>()
+                    .map_err(|_| ConfigError::Malformed {
+                        name,
+                        value: raw.to_owned(),
+                        expected: "a socket address",
+                    })?;
+                self.record(name, parsed, Source::Env);
+                Ok(Some(parsed))
             }
         }
     }
@@ -997,6 +1026,8 @@ mod tests {
             ("STRAUM_WAL_MAX_BATCH_BYTES", "4194304"),
             ("STRAUM_WAL_INITIAL_BATCH_BYTES", "1048576"),
             ("STRAUM_DURABILITY", "memory"),
+            ("STRAUM_REPLICATION_LISTEN", ""),
+            ("STRAUM_REPLICATION_FOLLOWER", ""),
         ];
 
         let settings = parse(&documented).unwrap();

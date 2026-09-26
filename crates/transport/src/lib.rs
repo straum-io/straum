@@ -8,7 +8,7 @@ pub mod sys;
 mod tls;
 
 pub use config::TransportConfig;
-pub use connection::{Accepted, Connection, Reader, Writer};
+pub use connection::{Accepted, Connection, Reader, Writer, connect};
 pub use listener::Listener;
 pub use read::{ReadBudget, ReadBuffer, ReadError};
 pub use sys::KernelLimits;

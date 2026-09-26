@@ -55,10 +55,10 @@ impl Submitter {
         // acknowledgement rests on (docs/replication.md §110).
         let permit = self.records.reserve().await.ok()?;
         let correlation = self.next.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-        permit.send(WalRecord {
+        permit.send(WalRecord::local(
             correlation,
-            payload: encode(correlation, topic, payload, guarantee, retain),
-        });
+            encode(correlation, topic, payload, guarantee, retain),
+        ));
         Some(DurableToken(correlation))
     }
 
@@ -77,10 +77,10 @@ impl Submitter {
             return false;
         };
         let correlation = self.next.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-        permit.send(WalRecord {
+        permit.send(WalRecord::local(
             correlation,
-            payload: encode_session(correlation, event),
-        });
+            encode_session(correlation, event),
+        ));
         true
     }
 }
@@ -549,19 +549,34 @@ struct Marks {
     /// How far a replica has been given the log. `u64::MAX` means nobody is
     /// waiting on these bytes, which is what a single node means (§118).
     replicated: Arc<AtomicU64>,
+    /// The live fan-out to a follower, if there is one.
+    shipments: Option<mpsc::Sender<crate::replication::Shipment>>,
+    /// This node's own durable sequence, published for the replication task.
+    local: Arc<AtomicU64>,
 }
 
 /// Opens the log, recovers its durable prefix and starts the writer thread.
+/// Where a committed batch goes besides the disk, if anywhere
+/// (docs/replication.md §119).
+pub(crate) struct FanOut {
+    /// The live queue to a follower.
+    pub(crate) shipments: Option<mpsc::Sender<crate::replication::Shipment>>,
+    /// This node's own durable sequence, published so a reconnecting
+    /// follower can be reconciled against what this log actually holds.
+    pub(crate) local: Arc<AtomicU64>,
+}
+
 pub(crate) fn start(
     settings: &WalSettings,
     limits: BrokerLimits,
     restored: u64,
+    fan_out: FanOut,
     // Whether a commit waits for the storage device: `fsynced` does,
     // `written` does not (docs/storage.md §80).
     sync: bool,
     events: mpsc::Sender<Event>,
     metrics: Arc<Metrics>,
-) -> Result<(Submitter, std::thread::JoinHandle<()>), StorageError> {
+) -> Result<(Submitter, Arc<AtomicU64>, std::thread::JoinHandle<()>), StorageError> {
     let (wal, recovery) = Wal::open(&settings.path, settings.limits)?;
     tracing::info!(
         path = %settings.path.display(),
@@ -588,9 +603,12 @@ pub(crate) fn start(
     let next = Arc::new(AtomicU64::new(restored));
     // The replication task lowers `replicated` once there is a follower;
     // until then nothing is waiting on the bytes.
+    let replicated = Arc::new(AtomicU64::new(u64::MAX));
     let marks = Marks {
         allocated: Arc::clone(&next),
-        replicated: Arc::new(AtomicU64::new(u64::MAX)),
+        replicated: Arc::clone(&replicated),
+        shipments: fan_out.shipments,
+        local: fan_out.local,
     };
 
     let writer = std::thread::Builder::new()
@@ -600,7 +618,7 @@ pub(crate) fn start(
 
     // `next` continues where the recovered log left off: a repeated
     // correlation would make a session's mark mean two records.
-    Ok((Submitter { records, next }, writer))
+    Ok((Submitter { records, next }, replicated, writer))
 }
 
 fn write(
@@ -623,6 +641,23 @@ fn write(
             Err(error) => break Err(error),
         };
         report(&commit, &events, &metrics);
+        marks
+            .local
+            .store(commit.durable_sequence, Ordering::Relaxed);
+        if let Some(shipments) = &marks.shipments {
+            // The fork to a replica, after the local durability operation.
+            // Beside it would halve what a quorum waits for and is a
+            // measurement, not a refactor (docs/replication.md §112).
+            crate::replication::ship(
+                shipments,
+                commit
+                    .durable_sequence
+                    .saturating_sub(u64::try_from(commit.records).unwrap_or(0)),
+                commit.durable_sequence,
+                committer.committed_batch(),
+                &metrics,
+            );
+        }
 
         if let Err(error) = shrink(&mut committer, &settings, limits, &metrics, &marks) {
             // A log that cannot be rewritten is still a log that works; it
@@ -912,6 +947,8 @@ mod tests {
         let behind = Marks {
             allocated: Arc::new(AtomicU64::new(0)),
             replicated: Arc::new(AtomicU64::new(2)),
+            shipments: None,
+            local: Arc::new(AtomicU64::new(0)),
         };
         shrink(&mut committer, &settings, limits, &metrics, &behind).unwrap();
         drop(committer);
@@ -928,6 +965,8 @@ mod tests {
         let caught_up = Marks {
             allocated: Arc::new(AtomicU64::new(0)),
             replicated: Arc::new(AtomicU64::new(u64::MAX)),
+            shipments: None,
+            local: Arc::new(AtomicU64::new(0)),
         };
         shrink(&mut committer, &settings, limits, &metrics, &caught_up).unwrap();
         drop(committer);
