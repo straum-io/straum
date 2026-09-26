@@ -890,3 +890,50 @@ The 667 msg/s in that run is also **unexplained** and worth a look: it is
 eighteen times slower than the same payload in the table, with the same
 50 messages per commit, and no obvious mechanism in the path accounts for
 it. It is recorded rather than explained.
+
+## 123. Backpressure, and the defect it found
+
+A follower that is slow to *acknowledge* still drains its socket, so it puts
+pressure nowhere. Reaching the queue needs one that stops reading: then the
+socket buffers fill, the leader's `write_all` blocks, the task stops taking
+from the queue, and `ship` starts refusing.
+
+`a_follower_that_stops_reading_fills_the_queue_and_still_loses_nothing`
+does that with 3 000 × 16 KiB and `written` durability — the producer has to
+outrun the stalled consumer, and two fsyncs per batch would let the consumer
+keep up by accident. Measured at the stall: **278 commits, 211 refused, the
+queue sitting at its bound of 64.** That is the first time the bound has been
+reached by anything in this repository.
+
+The queue depth is now a gauge (`replication_queued`, one store per batch and
+never per record), so the bound is observed rather than inferred. The
+accounting that looked obvious is wrong and is not asserted: `refused +
+capacity` does not equal `commits`, because batches the task already handed
+to the kernel are in the socket buffer — the kernel's memory, not the
+broker's. What is asserted is that the queue sits at its bound, and that what
+was accepted stays within a small multiple of the capacity rather than
+growing with the producer.
+
+### The defect
+
+The test did not pass. The leader never caught up, and the reason was in the
+production path rather than the test:
+
+```text
+queue overflows      → the 64 batches still in it are the oldest
+reader resumes       → every one of them is stale, last <= sent, skipped
+publishing has ended → no new batch ever arrives
+                     → the gap is never noticed, and the follower stays
+                       behind for as long as the leader is idle
+```
+
+Catch-up was triggered by *an event* — a newly arrived batch whose range did
+not continue — and after an overflow no such batch exists. Being behind is a
+**state**, so the leader now compares `peer.sent()` against its own durable
+sequence at the top of the streaming loop and reads the log back whenever
+they differ. The in-branch trigger is gone; a stale shipment is simply
+skipped, because the top of the loop has already dealt with it.
+
+With that, the run recovers every refused batch out of the log, in order, and
+the follower ends byte for byte identical to the leader — which is the whole
+claim that "dropped is not lost" rests on, and which nothing had tested.

@@ -252,21 +252,23 @@ impl AsFollower {
 
 /// Publishes `count` QoS 1 messages and returns once they are acknowledged.
 async fn publish(broker: &Runtime, name: &str, count: usize) {
+    publish_sized(broker, name, count, 16).await;
+}
+
+/// The same, with a payload large enough to fill a socket buffer.
+async fn publish_sized(broker: &Runtime, name: &str, count: usize, payload: usize) {
     use rumqttc::{AsyncClient, MqttOptions, QoS};
     let addr = broker.local_addr();
     let mut options = MqttOptions::new(name, addr.ip().to_string(), addr.port());
     options.set_keep_alive(Duration::from_secs(5));
-    let (client, mut eventloop) = AsyncClient::new(options, 16);
+    options.set_max_packet_size(payload + 1024, payload + 1024);
+    let (client, mut eventloop) = AsyncClient::new(options, 64);
 
     let driving = tokio::spawn(async move { while eventloop.poll().await.is_ok() {} });
-    for index in 0..count {
+    let body = vec![b'x'; payload];
+    for _ in 0..count {
         client
-            .publish(
-                "matrix/topic",
-                QoS::AtLeastOnce,
-                false,
-                format!("payload-{index}").into_bytes(),
-            )
+            .publish("matrix/topic", QoS::AtLeastOnce, false, body.clone())
             .await
             .unwrap();
     }
@@ -842,4 +844,94 @@ async fn a_leader_that_starts_first_waits_for_the_follower() {
     assert_eq!(body(&follower_log), body(&leader_log));
     let _ = std::fs::remove_file(&leader_log);
     let _ = std::fs::remove_file(&follower_log);
+}
+
+/// Real backpressure: a follower that stops reading, so the socket buffers
+/// fill, the leader's write blocks, and the bounded queue behind it reaches
+/// its bound (docs/replication.md §123).
+///
+/// A follower that is merely slow to acknowledge still drains its socket and
+/// never puts pressure anywhere. This one reads nothing at all after the
+/// handshake, which is the only way to reach the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_that_stops_reading_fills_the_queue_and_still_loses_nothing() {
+    let log = scratch("backpressure");
+    let (listener, at) = AsFollower::listen().await;
+    let mut config = leader_node(&log, at);
+    // The producer has to outrun the stalled consumer, and two fsyncs per
+    // batch would let the consumer keep up by accident. What is under test
+    // is the queue, not the disk.
+    config.durability = Durability::Written;
+    let node = Runtime::start(config).unwrap();
+
+    // Accept, say where we are, and then read nothing ever again.
+    let mut peer = AsFollower::accept(&listener, 0).await;
+
+    let messages = 3_000;
+    let payload = 16 * 1024;
+    publish_sized(&node, "publisher", messages, payload).await;
+
+    let stalled = node.metrics();
+    let capacity = ReplicationSettings::default().queue as u64;
+
+    // The queue reached its bound. Past it, batches were refused rather than
+    // buffered — which is the property, and the earlier tests never got far
+    // enough to show it.
+    assert!(
+        stalled.replication_shipments_dropped > 0,
+        "{} commits and a queue of {capacity}, yet nothing was refused: \
+         the socket absorbed everything and this tested nothing",
+        stalled.wal_commits
+    );
+    assert_eq!(
+        stalled.replication_queued, capacity,
+        "the queue is not sitting at its bound"
+    );
+
+    // And it is not growing with the producer. What was accepted and is no
+    // longer queued went into the kernel's socket buffer, which is not this
+    // process's memory; if the queue were unbounded this difference would be
+    // in the thousands rather than a handful over its capacity.
+    let accepted = stalled
+        .wal_commits
+        .saturating_sub(stalled.replication_shipments_dropped);
+    assert!(
+        accepted <= capacity * 2,
+        "{} of {} commits were accepted with a queue of {capacity}: it grew",
+        accepted,
+        stalled.wal_commits
+    );
+
+    // And none of it reached the client: local durability is untouched.
+    assert_eq!(records(&log), messages as u64);
+    assert_eq!(stalled.replication_follower_sequence, 0);
+
+    // Now start reading. Everything the queue dropped has to come back out
+    // of the log, in order and without a hole.
+    let mut seen: Vec<u8> = Vec::new();
+    let mut reached = 0u64;
+    while reached < messages as u64 {
+        let Some((previous, last, batch)) = peer.frame().await else {
+            panic!("the leader stopped at {reached} of {messages}");
+        };
+        assert_eq!(previous, reached, "a gap opened at {reached}");
+        seen.extend_from_slice(&batch);
+        reached = last;
+        peer.report(reached).await;
+    }
+
+    heard(&node, messages as u64).await;
+    assert_eq!(
+        seen,
+        body(&log),
+        "what came back is not what the leader's log holds"
+    );
+    assert!(
+        node.metrics().replication_catchups > 0,
+        "the gap closed without the log being read back"
+    );
+
+    peer.kill();
+    node.shutdown().await;
+    let _ = std::fs::remove_file(&log);
 }

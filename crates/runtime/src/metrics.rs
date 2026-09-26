@@ -53,6 +53,10 @@ pub struct Metrics {
     /// Sequences sent to the follower and not yet confirmed. A gauge, stored
     /// once per report and once per frame — not on any per-record path.
     pub replication_in_flight: AtomicU64,
+    /// Committed batches waiting in the live queue. Bounded by its capacity
+    /// by construction; this is what lets an operator see it sitting at the
+    /// bound rather than infer it (docs/replication.md §123).
+    pub replication_queued: AtomicU64,
 }
 
 impl Metrics {
@@ -94,6 +98,7 @@ impl Metrics {
                 .load(Ordering::Relaxed),
             replication_catchups: self.replication_catchups.load(Ordering::Relaxed),
             replication_in_flight: self.replication_in_flight.load(Ordering::Relaxed),
+            replication_queued: self.replication_queued.load(Ordering::Relaxed),
         }
     }
 }
@@ -131,4 +136,6 @@ pub struct Snapshot {
     pub replication_catchups: u64,
     /// Sequences sent and not yet confirmed.
     pub replication_in_flight: u64,
+    /// Committed batches waiting in the live queue.
+    pub replication_queued: u64,
 }

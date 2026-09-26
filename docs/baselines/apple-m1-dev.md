@@ -105,3 +105,78 @@ set never allocates while submission order holds.
 
 Recorded so the next person does not repeat it on this machine. A number that
 would justify anything has to come from a quiet Linux host.
+
+## 2026-09-26 — what an idle connection costs
+
+The question was whether this broker could hold a million connections. The
+part that can be measured here is the slope.
+
+Two processes: `straum-server` in release, and `e2e/benches/connhold`, which
+opens TCP connections, sends a CONNECT on each, waits for its CONNACK and
+holds them. RSS is the server's alone, sampled with `ps -o rss=` from a third
+shell — sampling it from inside the process holding the sockets is its own
+experiment, and it was the first thing to fail.
+
+`STRAUM_DURABILITY=memory`, `STRAUM_MAX_CONNECTIONS=20000`,
+`STRAUM_TOTAL_READ_BYTES=2 GiB`, idle RSS ≈ 2.8 MB.
+
+| connections | RSS over idle | per connection |
+|---|---|---|
+| 2 500 | 131 536 KiB | 53 877 B |
+| 5 000 | 262 304 KiB | 53 720 B |
+| 8 860 | 462 112 KiB | 53 409 B |
+| 15 000 | 782 448 KiB | 53 415 B |
+
+Linear, with a marginal cost of **53.3 KB per idle connection** between the
+first and last points. Nothing about the curve bends in this range.
+
+**The read buffer is 30% of it.** `STRAUM_READ_BUFFER_BYTES` is 16 KiB, and
+the connection costs 53.4 KB. Dropping the setting to 4 KiB gives:
+
+```text
+read_buffer 4096, 10 000 connections: 32 838 B per connection
+```
+
+which is 20.6 KB less. That is close to the 24 KB two 12 KiB reductions would
+give, so **the setting sizes two buffers, not one**: `connection.rs:318`
+allocates the writer's encode buffer with `read_buffer_bytes` as well. An
+operator halving "the read buffer" halves the write buffer with it, and
+`docs/configuration.md` has no entry for a write buffer at all.
+
+That leaves roughly **25 KB per connection that is neither buffer**. Not
+attributed here: the candidates are the two tokio task futures, the
+per-session channel's first block, `Arc<Mutex<PacketIds>>`, the broker's
+`Session` with its two map entries, and allocator rounding — Apple Silicon
+uses 16 KiB pages, which flatters a 16 KiB allocation and penalises a 4 KiB
+one. Attributing it needs a heap profile, which this was not.
+
+### What it implies, and what it does not
+
+```text
+at 16 KiB buffers   100 000 connections ≈ 5.3 GB      1 000 000 ≈ 53 GB
+at  4 KiB buffers   100 000 connections ≈ 3.3 GB      1 000 000 ≈ 33 GB
+```
+
+Extrapolation from 15 000, so it assumes the line stays straight for two more
+orders of magnitude, which nothing here shows.
+
+**`STRAUM_TOTAL_READ_BYTES` bounds a third of the cost.** It counts read
+buffers only, so its 1 GiB default stops new connections at 65 536 while the
+process is holding about 3.5 GB. The global budget exists precisely because
+per-connection limits times the connection count are a product and not a
+bound (CLAUDE.md §7); it is bounding the wrong product by a factor of three.
+
+### Why 50 000 and 100 000 are absent
+
+Not reachable on this machine without root:
+
+```text
+net.inet.ip.portrange  49152–65535   16 384 ephemeral ports to one address
+kern.maxfilesperproc   61 440
+kern.maxfiles          122 880       two descriptors per connection
+```
+
+Widening the port range or adding a loopback alias both need `sudo`, and the
+runs above already had to wait for TIME_WAIT to drain between them — two
+consecutive runs exhaust the pool. Those counts belong on a Linux host with
+several client addresses.

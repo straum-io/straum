@@ -83,7 +83,10 @@ fn main() {
     }
 
     let idle = rss(settings.pid);
-    println!("{:>12} {:>12} {:>14} {:>16}", "connections", "RSS KiB", "over idle KiB", "B/connection");
+    println!(
+        "{:>12} {:>12} {:>14} {:>16}",
+        "connections", "RSS KiB", "over idle KiB", "B/connection"
+    );
     println!("{:>12} {:>12} {:>14} {:>16}", 0, idle, 0, "-");
 
     // Held for the life of the run: dropping one would close it.
@@ -143,5 +146,4 @@ fn main() {
     let mut line = String::new();
     let _ = std::io::stdin().read_line(&mut line);
     drop(held);
-
 }

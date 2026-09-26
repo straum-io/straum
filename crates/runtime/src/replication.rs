@@ -52,6 +52,10 @@ pub(crate) fn ship(
     let Ok(permit) = to.try_reserve() else {
         // Checked before the copy, so a full queue costs nothing.
         Metrics::increment(&metrics.replication_shipments_dropped, 1);
+        metrics.replication_queued.store(
+            u64::try_from(to.max_capacity()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         return;
     };
     permit.send(Shipment {
@@ -59,6 +63,11 @@ pub(crate) fn ship(
         last,
         batch: Bytes::copy_from_slice(batch),
     });
+    // One store per batch, never per record.
+    metrics.replication_queued.store(
+        u64::try_from(to.max_capacity().saturating_sub(to.capacity())).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 }
 
 /// Everything the leader task needs that is not its own state.
@@ -185,6 +194,16 @@ async fn stream(
 ) -> Result<(), LinkError> {
     let mut header = Vec::with_capacity(replication::RECORDS_HEADER_BYTES);
     loop {
+        // Behind is a state, not an event. Waiting for the next commit to
+        // reveal a gap leaves a follower behind for as long as the leader is
+        // idle, and after the live queue has overflowed everything still in
+        // it is stale — skipped, revealing nothing (docs/replication.md §123).
+        let local = held.local.load(Ordering::Relaxed);
+        if peer.sent() < local {
+            Metrics::increment(&held.metrics.replication_catchups, 1);
+            catch_up(held, &mut connection, peer, peer.sent().saturating_add(1)).await?;
+        }
+
         tokio::select! {
             biased;
             filled = connection.reader.fill() => {
@@ -202,15 +221,10 @@ async fn stream(
                     continue;
                 }
                 if shipment.previous != peer.sent() {
-                    // A gap, because this queue dropped something while the
-                    // follower was slow. The log still has it, so the answer
-                    // is to read it back rather than to send a frame the
-                    // follower would rightly refuse (§119).
-                    Metrics::increment(&held.metrics.replication_catchups, 1);
-                    catch_up(held, &mut connection, peer, peer.sent().saturating_add(1)).await?;
-                    if shipment.last <= peer.sent() {
-                        continue;
-                    }
+                    // A gap the queue left behind. The top of the loop reads
+                    // it back out of the log, so this frame is simply not
+                    // the one to send now.
+                    continue;
                 }
                 send_frame(&mut connection, &mut header, peer, shipment.previous, shipment.last, &shipment.batch, &held.metrics).await?;
             }
