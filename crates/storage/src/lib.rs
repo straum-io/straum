@@ -14,7 +14,7 @@ mod record;
 mod wal;
 
 pub use commit::{Commit, Committer, RecordSource, WalRecord};
-pub use wal::{Committed, Compaction, Recovery, Wal, compact, replay};
+pub use wal::{Committed, Compaction, HEADER_BYTES, Recovery, Wal, compact, replay};
 
 /// Limits of the write-ahead log. Defaults are the ones documented in
 /// `docs/configuration.md`; changing one is a behavior change.
@@ -45,6 +45,11 @@ impl Default for WalLimits {
 pub enum StorageError {
     #[error("the log is not a straum WAL")]
     NotAWal,
+    /// The magic is ours but the state after it does not check out. The
+    /// header carries the allocation high-water, and a damaged one reads as
+    /// a plausible number that would repeat identifiers silently.
+    #[error("the log header is damaged")]
+    CorruptHeader,
     #[error("record is empty or larger than the configured maximum")]
     RecordTooLarge,
     /// A durability operation failed. Nothing may be acknowledged afterwards.
@@ -73,4 +78,11 @@ pub fn checksum_for_benchmarks(bytes: &[u8]) -> u32 {
 #[doc(hidden)]
 pub fn encode_for_benchmarks(payload: &[u8], out: &mut Vec<u8>) {
     record::encode(payload, out);
+}
+
+/// The header a fresh log starts with, for tests and benchmarks that build a
+/// log file by hand instead of through [`Wal::open`].
+#[doc(hidden)]
+pub fn empty_header_for_benchmarks() -> Vec<u8> {
+    wal::empty_header()
 }

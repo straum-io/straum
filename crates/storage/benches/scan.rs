@@ -33,7 +33,7 @@ fn log(records: usize, payload: usize) -> PathBuf {
     let mut file = ok(std::fs::File::create(&path));
     // The magic the scanner expects, then framed records through the same
     // encoder the writer uses.
-    ok(file.write_all(b"STRAUMW2"));
+    ok(file.write_all(&storage::empty_header_for_benchmarks()));
 
     let mut body = Vec::with_capacity(12 + 8 + payload);
     let mut framed = Vec::new();

@@ -14,11 +14,16 @@
 
 use crate::crc::checksum;
 
-/// Identifies the file and its format. A format change changes the version.
 /// Identifies the file and its format. The record body is the caller's, so a
 /// change to what a record means is a change to this version too: an older
 /// log is then refused rather than misread.
-pub const MAGIC: [u8; 8] = *b"STRAUMW2";
+///
+/// `STRAUMW3` added the logical allocation state to the header. `STRAUMW2`
+/// logs carried no such state and their sequence can only be guessed at from
+/// what compaction left behind, which is the guess that made identifiers
+/// repeat (docs/replication.md §116), so they are refused rather than
+/// migrated.
+pub const MAGIC: [u8; 8] = *b"STRAUMW3";
 
 pub const HEADER_BYTES: usize = 8;
 

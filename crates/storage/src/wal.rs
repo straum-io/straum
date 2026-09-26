@@ -33,12 +33,112 @@ pub struct Committed {
 }
 
 /// What recovery found in an existing log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The physical and the logical are separate answers, and telling them apart
+/// is the point: `records` is what the file holds, `sequence` and
+/// `correlation` are what the log has ever handed out. Compaction changes the
+/// first and never the other two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Recovery {
+    /// Complete records physically present in the file.
     pub records: u64,
+    /// The highest sequence ever allocated in this log's history.
+    ///
+    /// Not the record count. Compaction removes records, so after one this is
+    /// larger than `records` — which is exactly the case the log used to get
+    /// wrong, handing out numbers it had already used
+    /// (docs/replication.md §116).
+    pub sequence: u64,
+    /// The correlation high-water the header carried when the file was last
+    /// written.
+    ///
+    /// A floor, not the answer. The log does not read record bodies, so it
+    /// cannot see the correlations in them; the owner of those bodies takes
+    /// the larger of this and whatever the surviving records carry.
+    pub correlation: u64,
     pub durable_offset: u64,
     /// Bytes of incomplete or corrupt tail that were cut off.
     pub discarded_bytes: u64,
+}
+
+/// The logical state written into the file header.
+///
+/// ```text
+/// [ magic 8 ][ sequence u64 BE ][ records u64 BE ][ correlation u64 BE ][ crc32 u32 BE ]
+/// ```
+///
+/// `sequence` is the highest sequence allocated when this file was written and
+/// `records` is how many records it started with, so a reader finding `n`
+/// records now knows the live sequence is `sequence + (n - records)`. A fresh
+/// log writes zeroes; compaction writes both forward. Two fields rather than
+/// one base, because a log that says what it started with can be checked.
+///
+/// `correlation` is opaque: the log never reads a record body, so the owner of
+/// those bodies writes down its own high-water and gets it back.
+///
+/// The header is written when the file is created and when it is rewritten,
+/// and at no other time. Nothing on the append path touches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Header {
+    sequence: u64,
+    records: u64,
+    correlation: u64,
+}
+
+/// Magic, three `u64`s and a checksum.
+pub const HEADER_BYTES: usize = 36;
+
+/// The header a log starts life with: nothing allocated yet.
+pub(crate) fn empty_header() -> Vec<u8> {
+    encode_header(Header::default())
+}
+
+fn encode_header(header: Header) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEADER_BYTES);
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&header.sequence.to_be_bytes());
+    out.extend_from_slice(&header.records.to_be_bytes());
+    out.extend_from_slice(&header.correlation.to_be_bytes());
+    // Covers the numbers, not the magic: a damaged high-water reads as a
+    // plausible number and would silently repeat identifiers, which is the
+    // one failure this header exists to prevent.
+    let sum = crate::crc::checksum(out.get(MAGIC.len()..).unwrap_or_default());
+    out.extend_from_slice(&sum.to_be_bytes());
+    out
+}
+
+fn decode_header(bytes: &[u8]) -> Result<Header, StorageError> {
+    let checksummed = HEADER_BYTES.saturating_sub(4);
+    if bytes.get(..MAGIC.len()) != Some(&MAGIC[..]) {
+        return Err(StorageError::NotAWal);
+    }
+    let (Some(body), Some(expected)) = (
+        bytes.get(MAGIC.len()..checksummed),
+        bytes
+            .get(checksummed..HEADER_BYTES)
+            .and_then(|slice| <[u8; 4]>::try_from(slice).ok())
+            .map(u32::from_be_bytes),
+    ) else {
+        return Err(StorageError::CorruptHeader);
+    };
+    if crate::crc::checksum(body) != expected {
+        return Err(StorageError::CorruptHeader);
+    }
+
+    let field = |at: usize| -> Option<u64> {
+        let end = at.checked_add(8)?;
+        body.get(at..end)
+            .and_then(|slice| <[u8; 8]>::try_from(slice).ok())
+            .map(u64::from_be_bytes)
+    };
+    let (Some(sequence), Some(records), Some(correlation)) = (field(0), field(8), field(16)) else {
+        return Err(StorageError::CorruptHeader);
+    };
+    Ok(Header {
+        sequence,
+        records,
+        correlation,
+    })
 }
 
 pub struct Wal {
@@ -76,12 +176,11 @@ impl Wal {
 
         let length = file.metadata()?.len();
         let recovery = if length == 0 {
-            file.write_all(&MAGIC)?;
+            file.write_all(&encode_header(Header::default()))?;
             file.sync_data()?;
             Recovery {
-                records: 0,
                 durable_offset: header_len(),
-                discarded_bytes: 0,
+                ..Recovery::default()
             }
         } else {
             scan(&mut file, &limits, length, &mut |_| {})?
@@ -98,8 +197,8 @@ impl Wal {
                 limits,
                 write_offset: recovery.durable_offset,
                 durable_offset: recovery.durable_offset,
-                sequence: recovery.records,
-                durable_sequence: recovery.records,
+                sequence: recovery.sequence,
+                durable_sequence: recovery.sequence,
                 batch: Vec::new(),
                 committed: Vec::new(),
                 batch_records: 0,
@@ -220,6 +319,7 @@ impl Wal {
     /// different records (docs/storage.md §104).
     pub fn compact(
         &mut self,
+        correlation: u64,
         keep: &mut impl FnMut(&[u8]) -> bool,
     ) -> Result<Compaction, StorageError> {
         if self.failed {
@@ -229,7 +329,7 @@ impl Wal {
             return Err(StorageError::StagedDuringCompaction);
         }
 
-        let outcome = compact(&self.path, self.limits, keep)?;
+        let outcome = compact(&self.path, self.limits, correlation, keep)?;
 
         // The file the handle refers to has been replaced; reopen or every
         // later write lands in an unlinked inode.
@@ -306,7 +406,7 @@ impl Wal {
 }
 
 fn header_len() -> u64 {
-    u64::try_from(MAGIC.len()).unwrap_or(0)
+    u64::try_from(HEADER_BYTES).unwrap_or(0)
 }
 
 /// Walks the log from the start and stops at the first thing that is not a
@@ -318,10 +418,11 @@ fn scan(
     visit: &mut impl FnMut(&[u8]),
 ) -> Result<Recovery, StorageError> {
     file.seek(SeekFrom::Start(0))?;
-    let mut magic = [0u8; MAGIC.len()];
-    if file.read_exact(&mut magic).is_err() || magic != MAGIC {
+    let mut head = [0u8; HEADER_BYTES];
+    if file.read_exact(&mut head).is_err() {
         return Err(StorageError::NotAWal);
     }
+    let header = decode_header(&head)?;
 
     let mut buf: Vec<u8> = Vec::with_capacity(
         SCAN_WINDOW.saturating_add(limits.max_record_bytes.saturating_add(record::HEADER_BYTES)),
@@ -369,6 +470,14 @@ fn scan(
 
     Ok(Recovery {
         records,
+        // What the file started with plus what it has gained since. A
+        // compacted file holds fewer records than were ever allocated, and
+        // the header is the only place that difference survives
+        // (docs/replication.md §116).
+        sequence: header
+            .sequence
+            .saturating_add(records.saturating_sub(header.records)),
+        correlation: header.correlation,
         durable_offset: offset,
         discarded_bytes: length.saturating_sub(offset),
     })
@@ -412,6 +521,7 @@ pub struct Compaction {
 pub fn compact(
     path: &Path,
     limits: WalLimits,
+    correlation: u64,
     keep: &mut impl FnMut(&[u8]) -> bool,
 ) -> Result<Compaction, StorageError> {
     let mut file = match OpenOptions::new().read(true).open(path) {
@@ -429,14 +539,27 @@ pub fn compact(
     let mut target = path.as_os_str().to_owned();
     target.push(".compacting");
     let target = std::path::PathBuf::from(target);
+    // What the file about to be replaced says it has ever allocated. The
+    // records themselves cannot say it: compaction is what removes them
+    // (docs/replication.md §116).
+    let mut head = [0u8; HEADER_BYTES];
+    file.seek(SeekFrom::Start(0))?;
+    if file.read_exact(&mut head).is_err() {
+        return Err(StorageError::NotAWal);
+    }
+    let previous = decode_header(&head)?;
+
     let mut out = std::io::BufWriter::new(
         OpenOptions::new()
+            .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&target)?,
     );
-    out.write_all(&MAGIC)?;
+    // A placeholder: how many records survive is not known until the walk is
+    // done, and the real header goes in before the file is made durable.
+    out.write_all(&encode_header(Header::default()))?;
 
     // `scan` hands records over with no way to report a write failure, so
     // the first one is kept here and returned once the walk is done.
@@ -460,7 +583,22 @@ pub fn compact(
         return Err(error.into());
     }
 
-    let out = out.into_inner().map_err(|error| error.into_error())?;
+    let mut out = out.into_inner().map_err(|error| error.into_error())?;
+    // The allocation state, carried across the rewrite. `sequence` is what
+    // the old file had ever handed out — its own header plus what it gained
+    // since that was written — and it goes into the new file untouched,
+    // together with how many records the new file starts with. A reader then
+    // has both halves and never has to guess one from the other.
+    out.seek(SeekFrom::Start(0))?;
+    out.write_all(&encode_header(Header {
+        sequence: previous
+            .sequence
+            .saturating_add(recovery.records.saturating_sub(previous.records)),
+        records: kept,
+        // `max`, so a caller that does not track correlations cannot lower a
+        // high-water somebody else wrote down.
+        correlation: previous.correlation.max(correlation),
+    }))?;
     out.sync_all()?;
     let bytes_after = out.metadata()?.len();
     drop(out);
@@ -498,22 +636,14 @@ pub fn replay(
         Ok(file) => file,
         // Nothing written yet is not a failure to recover.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Recovery {
-                records: 0,
-                durable_offset: 0,
-                discarded_bytes: 0,
-            });
+            return Ok(Recovery::default());
         }
         Err(error) => return Err(error.into()),
     };
 
     let length = file.metadata()?.len();
     if length == 0 {
-        return Ok(Recovery {
-            records: 0,
-            durable_offset: 0,
-            discarded_bytes: 0,
-        });
+        return Ok(Recovery::default());
     }
     scan(&mut file, &limits, length, visit)
 }

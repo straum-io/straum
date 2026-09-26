@@ -222,9 +222,10 @@ impl Committer {
     /// call between commits and nowhere else (docs/storage.md §104).
     pub fn compact(
         &mut self,
+        correlation: u64,
         keep: &mut impl FnMut(&[u8]) -> bool,
     ) -> Result<crate::Compaction, StorageError> {
-        self.wal.compact(keep)
+        self.wal.compact(correlation, keep)
     }
 
     /// Folds one cycle into the estimates and, occasionally, into the bound.

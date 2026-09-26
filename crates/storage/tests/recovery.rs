@@ -48,7 +48,10 @@ fn a_fresh_log_starts_empty_and_identifiable() {
 
     assert_eq!(recovery.records, 0);
     assert_eq!(recovery.discarded_bytes, 0);
-    assert_eq!(fs::read(&path).unwrap(), b"STRAUMW2");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        storage::empty_header_for_benchmarks()
+    );
     let _ = fs::remove_file(&path);
 }
 
@@ -70,7 +73,18 @@ fn every_truncation_yields_a_prefix_never_a_lie() {
     let bytes = log_with(&path, 20);
     let clean = reopen(&path).records;
 
-    for cut in 8..bytes.len() {
+    // A cut inside the header leaves a file that cannot say what it has ever
+    // allocated, and guessing that is what made identifiers repeat
+    // (docs/replication.md §116). It is refused, not recovered.
+    for cut in 1..storage::HEADER_BYTES {
+        fs::write(&path, &bytes[..cut]).unwrap();
+        assert!(
+            Wal::open(&path, WalLimits::default()).is_err(),
+            "cut at {cut}: a headerless file was opened anyway"
+        );
+    }
+
+    for cut in storage::HEADER_BYTES..bytes.len() {
         fs::write(&path, &bytes[..cut]).unwrap();
         let recovery = reopen(&path);
 
@@ -125,7 +139,8 @@ fn an_impossible_length_ends_the_durable_prefix() {
     let bytes = log_with(&path, 3);
     let mut bytes = bytes;
     // Rewrite the first record's length as something no record can be.
-    bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    let at = storage::HEADER_BYTES;
+    bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     fs::write(&path, &bytes).unwrap();
 
     let recovery = reopen(&path);
@@ -288,7 +303,7 @@ fn a_replicated_run_lands_in_the_log_unchanged() {
     // Byte for byte what the other log held: the checksums were not
     // recomputed, so they are still the ones that log wrote.
     let file = fs::read(&path).unwrap();
-    assert_eq!(&file[8..], &run[..]);
+    assert_eq!(&file[storage::HEADER_BYTES..], &run[..]);
 
     let mut seen = Vec::new();
     let recovery = storage::replay(&path, WalLimits::default(), &mut |payload| {
@@ -383,6 +398,9 @@ fn the_committed_batch_is_the_bytes_that_went_to_the_file() {
     // And what is in the file is those batches, one after the other.
     drop(wal);
     let file = fs::read(&path).unwrap();
-    assert_eq!(&file[8..], &framed(&[b"one", b"two", b"three"])[..]);
+    assert_eq!(
+        &file[storage::HEADER_BYTES..],
+        &framed(&[b"one", b"two", b"three"])[..]
+    );
     let _ = fs::remove_file(&path);
 }

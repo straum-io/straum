@@ -348,6 +348,13 @@ fn scan(settings: &WalSettings, limits: BrokerLimits) -> Result<Found, StorageEr
         }
     })?;
 
+    // The header's high-water is a floor under whatever the surviving records
+    // carry. Compaction removes records — an at-most-once publish and a
+    // session tombstone go whatever their age — so the largest correlation
+    // still in the file is not the largest ever handed out
+    // (docs/replication.md §116).
+    found.correlation = found.correlation.max(recovery.correlation);
+
     tracing::info!(
         path = %settings.path.display(),
         records = recovery.records,
@@ -397,7 +404,7 @@ pub(crate) fn restore(
         }
     }
     if sessions == 0 || from >= correlation {
-        compact(settings, &current, from)?;
+        compact(settings, &current, from, correlation)?;
         return Ok(correlation);
     }
 
@@ -434,7 +441,7 @@ pub(crate) fn restore(
     })?;
 
     tracing::info!(sessions, replayed, from, "restored kept sessions");
-    compact(settings, &current, from)?;
+    compact(settings, &current, from, correlation)?;
     Ok(correlation)
 }
 
@@ -503,6 +510,7 @@ fn compact(
     settings: &WalSettings,
     current: &std::collections::HashSet<u64>,
     floor: u64,
+    correlation: u64,
 ) -> Result<(), StorageError> {
     if settings.compact_bytes == 0 {
         return Ok(());
@@ -514,9 +522,12 @@ fn compact(
         return Ok(());
     }
 
-    let outcome = storage::compact(&settings.path, settings.limits, &mut |payload| {
-        should_keep(payload, current, floor)
-    })?;
+    let outcome = storage::compact(
+        &settings.path,
+        settings.limits,
+        correlation,
+        &mut |payload| should_keep(payload, current, floor),
+    )?;
 
     tracing::info!(
         path = %settings.path.display(),
@@ -560,20 +571,30 @@ pub(crate) fn start(
     let weak = events.downgrade();
     drop(events);
 
+    // The allocator itself, shared with the writer thread so compaction can
+    // write down the correlation high-water. Read once per rewrite, never on
+    // the append path, and not a channel — so no cycle to close.
+    let next = Arc::new(AtomicU64::new(restored));
+    let allocated = Arc::clone(&next);
+
     let writer = std::thread::Builder::new()
         .name("straum-wal".to_owned())
-        .spawn(move || write(committer, Queue(queue), owned, limits, weak, metrics))
+        .spawn(move || {
+            write(
+                committer,
+                Queue(queue),
+                owned,
+                limits,
+                weak,
+                metrics,
+                allocated,
+            )
+        })
         .map_err(StorageError::Io)?;
 
-    Ok((
-        Submitter {
-            records,
-            // Continues where the recovered log left off: a repeated
-            // correlation would make a session's mark mean two records.
-            next: Arc::new(AtomicU64::new(restored)),
-        },
-        writer,
-    ))
+    // `next` continues where the recovered log left off: a repeated
+    // correlation would make a session's mark mean two records.
+    Ok((Submitter { records, next }, writer))
 }
 
 fn write(
@@ -583,6 +604,7 @@ fn write(
     limits: BrokerLimits,
     events: mpsc::WeakSender<Event>,
     metrics: Arc<Metrics>,
+    allocated: Arc<AtomicU64>,
 ) {
     // The loop is here rather than `Committer::run` because compaction needs
     // a point between two commits, and `run` does not offer one: the log is
@@ -596,7 +618,7 @@ fn write(
         };
         report(&commit, &events, &metrics);
 
-        if let Err(error) = shrink(&mut committer, &settings, limits, &metrics) {
+        if let Err(error) = shrink(&mut committer, &settings, limits, &metrics, &allocated) {
             // A log that cannot be rewritten is still a log that works; it
             // only grows. Nothing is acknowledged differently because of it.
             tracing::warn!(%error, "could not compact the log; it keeps growing");
@@ -621,13 +643,19 @@ fn shrink(
     settings: &WalSettings,
     limits: BrokerLimits,
     metrics: &Metrics,
+    allocated: &AtomicU64,
 ) -> Result<(), StorageError> {
     if settings.compact_bytes == 0 || committer.log_bytes() < settings.compact_bytes {
         return Ok(());
     }
 
     let (current, floor) = live_set(settings, limits)?;
-    let outcome = committer.compact(&mut |payload| should_keep(payload, &current, floor))?;
+    // The allocator, not the log: the highest correlation handed out is not
+    // the highest one still on disk (docs/replication.md §116).
+    let correlation = allocated.load(Ordering::Relaxed);
+    let outcome = committer.compact(correlation, &mut |payload| {
+        should_keep(payload, &current, floor)
+    })?;
     Metrics::increment(&metrics.wal_compactions, 1);
 
     tracing::info!(
@@ -675,6 +703,26 @@ impl RecordSource for Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use storage::Wal;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "straum-runtime-wal-{name}-{}-{:?}.wal",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn filter(pattern: &str) -> TopicFilter {
+        TopicFilter::new(Bytes::copy_from_slice(pattern.as_bytes())).unwrap()
+    }
+
+    fn topic(name: &str) -> Topic {
+        Topic::new(Bytes::copy_from_slice(name.as_bytes())).unwrap()
+    }
 
     fn client(name: &str) -> ClientId {
         ClientId::new(Bytes::copy_from_slice(name.as_bytes())).unwrap()
@@ -699,5 +747,108 @@ mod tests {
         assert_eq!(queue.try_recv().unwrap().correlation, 1);
         assert!(submitter.try_submit_session(&SessionEvent::Gone(client("b"))));
         assert_eq!(queue.try_recv().unwrap().correlation, 2);
+    }
+    /// A log whose last two records are exactly the kinds compaction throws
+    /// away: an at-most-once publish, which is owed to nobody, and a session
+    /// tombstone, which has already done its work. Both carry the highest
+    /// correlations in the log.
+    fn log_whose_newest_records_are_disposable(path: &std::path::Path) {
+        let (mut wal, _) = Wal::open(path, storage::WalLimits::default()).unwrap();
+
+        // 1: a retained message. Compaction keeps it — it is the current word
+        // on its topic.
+        wal.stage(&encode(
+            1,
+            &topic("sensors/eu"),
+            &Bytes::from_static(b"21"),
+            DeliveryGuarantee::AtMostOnce,
+            true,
+        ))
+        .unwrap();
+        // 2: a kept session. Also current.
+        wal.stage(&encode_session(
+            2,
+            &SessionEvent::Kept(SessionRecord {
+                client: client("keeper"),
+                filters: vec![(filter("sensors/#"), DeliveryGuarantee::AtLeastOnce)],
+                owes_from: 2,
+            }),
+        ))
+        .unwrap();
+        // 3: an at-most-once publish. Nobody is owed it, so it goes.
+        wal.stage(&encode(
+            3,
+            &topic("chatter"),
+            &Bytes::from_static(b"noise"),
+            DeliveryGuarantee::AtMostOnce,
+            false,
+        ))
+        .unwrap();
+        // 4: a tombstone. It did its work when the live set was computed.
+        wal.stage(&encode_session(4, &SessionEvent::Gone(client("gone"))))
+            .unwrap();
+        wal.commit().unwrap();
+    }
+
+    #[test]
+    fn compaction_cannot_rewind_the_correlation_high_water() {
+        let path = scratch("highwater");
+        log_whose_newest_records_are_disposable(&path);
+
+        let settings = WalSettings {
+            path: path.clone(),
+            queue: 8,
+            // Any size at all: this log is to be rewritten.
+            compact_bytes: 1,
+            limits: storage::WalLimits::default(),
+        };
+        let limits = BrokerLimits::default();
+
+        let found = scan(&settings, limits).unwrap();
+        assert_eq!(found.correlation, 4, "four records were written");
+
+        let (current, floor) = live_set(&settings, limits).unwrap();
+        compact(&settings, &current, floor, found.correlation).unwrap();
+
+        // The two newest records really are gone — otherwise this proves
+        // nothing.
+        let left = storage::replay(&path, settings.limits, &mut |_| {}).unwrap();
+        assert_eq!(
+            left.records, 2,
+            "compaction kept records it should not have"
+        );
+
+        // And the high-water did not come back down with them. Before
+        // STRAUMW3 this read 2, and the next publish would have been given a
+        // correlation two other records already had
+        // (docs/replication.md §116).
+        let after = scan(&settings, limits).unwrap();
+        assert_eq!(after.correlation, 4);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_restored_broker_continues_numbering_above_everything_compacted_away() {
+        let path = scratch("restore");
+        log_whose_newest_records_are_disposable(&path);
+
+        let settings = WalSettings {
+            path: path.clone(),
+            queue: 8,
+            compact_bytes: 1,
+            limits: storage::WalLimits::default(),
+        };
+        let limits = BrokerLimits::default();
+
+        // The whole startup path, which compacts on its way through.
+        let mut broker = Broker::new(limits);
+        let restored = restore(&settings, limits, &mut broker).unwrap();
+        assert_eq!(restored, 4);
+
+        // Restarting again on the compacted log gives the same answer, which
+        // is the property that makes it an identity at all.
+        let mut broker = Broker::new(limits);
+        assert_eq!(restore(&settings, limits, &mut broker).unwrap(), 4);
+        let _ = std::fs::remove_file(&path);
     }
 }

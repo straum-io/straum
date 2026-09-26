@@ -356,7 +356,7 @@ async fn a_durable_publish_reaches_the_disk_before_it_is_acknowledged() {
 
     // And it is on the disk, in a log that identifies itself.
     let bytes = std::fs::read(&path).unwrap();
-    assert!(bytes.starts_with(b"STRAUMW2"));
+    assert!(bytes.starts_with(b"STRAUMW3"));
     assert!(
         bytes.windows(15).any(|window| window == b"durable-payload"),
         "the payload never reached the file"
