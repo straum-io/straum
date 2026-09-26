@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use bytes::BytesMut;
 use domain::SessionId;
 use mqtt::{Connection as Protocol, Disposition, PacketIds, Reaction, decode, encode_outbound};
 use tokio::sync::{mpsc, watch};
@@ -315,7 +314,9 @@ async fn write(
     queued: Arc<AtomicUsize>,
     global_queued: Arc<AtomicUsize>,
 ) {
-    let mut buf = BytesMut::with_capacity(config.transport.read_buffer_bytes);
+    // The buffer belongs to the writer half now, charged to the same budget
+    // as the read buffer and returned to its steady size after every flush
+    // (docs/memory.md).
     let mut batch = Vec::with_capacity(config.writer_batch);
 
     loop {
@@ -334,12 +335,12 @@ async fn write(
 
             let encoded = match &item {
                 Egress::Pong => {
-                    mqtt::encode_pong(&mut buf);
+                    mqtt::encode_pong(writer.buf_mut());
                     Ok(Disposition::KeepOpen)
                 }
                 Egress::Out(outbound) => {
                     let mut ids = lock(&ids);
-                    encode_outbound(outbound, &mut ids, &mut buf, &config.mqtt)
+                    encode_outbound(outbound, &mut ids, writer.buf_mut(), &config.mqtt)
                 }
             };
 
@@ -354,10 +355,10 @@ async fn write(
             }
         }
 
-        if !buf.is_empty() {
-            let write = tokio::time::timeout(config.write_stall_timeout, writer.write_all(&buf));
+        if !writer.buf_mut().is_empty() {
+            let write = tokio::time::timeout(config.write_stall_timeout, writer.flush());
             match write.await {
-                Ok(Ok(())) => Metrics::increment(&metrics.bytes_out, buf.len() as u64),
+                Ok(Ok(wrote)) => Metrics::increment(&metrics.bytes_out, wrote as u64),
                 Ok(Err(error)) => {
                     Metrics::increment(&metrics.transport_errors, 1);
                     tracing::debug!(%error, "write failed");
@@ -371,7 +372,6 @@ async fn write(
                     break;
                 }
             }
-            buf.clear();
         }
 
         if closing {

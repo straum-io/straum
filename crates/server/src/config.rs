@@ -131,8 +131,19 @@ impl Settings {
             1024,
             max_packet_bytes as u64,
         )?;
-        let total_read_bytes = parser.number(
-            "STRAUM_TOTAL_READ_BYTES",
+        let write_buffer_bytes = parser.number(
+            "STRAUM_WRITE_BUFFER_BYTES",
+            16_384,
+            1024,
+            max_packet_bytes as u64,
+        )?;
+        // Renamed, because it now bounds both buffers and a name that said
+        // "read" while counting one half of the resource was the defect
+        // (docs/memory.md). The old name is not accepted: an unknown
+        // variable is an error here, so a broker started with it stops
+        // instead of quietly using a different bound.
+        let total_connection_buffer_bytes = parser.number(
+            "STRAUM_TOTAL_CONNECTION_BUFFER_BYTES",
             1_073_741_824,
             1024,
             u64::from(u32::MAX) * 16,
@@ -294,7 +305,8 @@ impl Settings {
                     nodelay,
                     keepalive: (keepalive_secs > 0).then(|| Duration::from_secs(keepalive_secs)),
                     read_buffer_bytes,
-                    total_read_bytes,
+                    write_buffer_bytes,
+                    total_connection_buffer_bytes,
                     max_connections,
                     listeners,
                     so_rcvbuf_bytes,
@@ -376,8 +388,8 @@ fn check_cross_fields(settings: &Settings) -> Result<(), ConfigError> {
             settings.runtime.total_queued_bytes as u64,
         ),
         (
-            "STRAUM_TOTAL_READ_BYTES",
-            settings.runtime.transport.total_read_bytes as u64,
+            "STRAUM_TOTAL_CONNECTION_BUFFER_BYTES",
+            settings.runtime.transport.total_connection_buffer_bytes as u64,
         ),
         (
             "STRAUM_WAL_MAX_RECORD_BYTES",
@@ -995,7 +1007,8 @@ mod tests {
             ("STRAUM_AUTH_ACL_FILE", ""),
             ("STRAUM_AUTH_ALLOW_ANONYMOUS", "true"),
             ("STRAUM_READ_BUFFER_BYTES", "16384"),
-            ("STRAUM_TOTAL_READ_BYTES", "1073741824"),
+            ("STRAUM_WRITE_BUFFER_BYTES", "16384"),
+            ("STRAUM_TOTAL_CONNECTION_BUFFER_BYTES", "1073741824"),
             ("STRAUM_WRITE_STALL_TIMEOUT_MS", "30000"),
             ("STRAUM_MAX_PACKET_BYTES", "1048576"),
             ("STRAUM_MAX_TOPIC_BYTES", "1024"),

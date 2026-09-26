@@ -13,7 +13,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_rustls::server::TlsStream;
 
-use crate::read::{ReadBudget, ReadBuffer};
+use crate::buffers::{BufferBudget, ConnectionBuffer};
 use crate::tls::Tls;
 use crate::{TransportConfig, TransportError};
 
@@ -30,7 +30,7 @@ pub struct Accepted {
     stream: TcpStream,
     peer: SocketAddr,
     config: TransportConfig,
-    budget: Arc<ReadBudget>,
+    budget: Arc<BufferBudget>,
     tls: Option<Tls>,
 }
 
@@ -39,7 +39,7 @@ impl Accepted {
         stream: TcpStream,
         peer: SocketAddr,
         config: TransportConfig,
-        budget: Arc<ReadBudget>,
+        budget: Arc<BufferBudget>,
         tls: Option<Tls>,
     ) -> Self {
         Self {
@@ -57,7 +57,12 @@ impl Accepted {
 
     /// Completes the handshake, if there is one, and hands back the halves.
     pub async fn establish(self) -> Result<Connection, TransportError> {
-        let buffer = ReadBuffer::new(self.config.read_buffer_bytes, self.budget)?;
+        // Both halves, against the same budget and before either is used: a
+        // connection that cannot be given its memory is refused it rather
+        // than given it and closed afterwards (docs/memory.md).
+        let buffer =
+            ConnectionBuffer::new(self.config.read_buffer_bytes, Arc::clone(&self.budget))?;
+        let outgoing = ConnectionBuffer::new(self.config.write_buffer_bytes, self.budget)?;
 
         let (reader, writer) = match self.tls {
             None => {
@@ -76,7 +81,10 @@ impl Accepted {
                 half: reader,
                 buffer,
             },
-            writer: Writer { half: writer },
+            writer: Writer {
+                half: writer,
+                buffer: outgoing,
+            },
             peer: self.peer,
         })
     }
@@ -102,7 +110,7 @@ enum WriteSide {
 
 pub struct Reader {
     half: Half,
-    buffer: ReadBuffer,
+    buffer: ConnectionBuffer,
 }
 
 impl Reader {
@@ -141,9 +149,47 @@ impl Reader {
 
 pub struct Writer {
     half: WriteSide,
+    /// Where the caller encodes what it wants sent, charged to the same
+    /// budget as the read buffer. Both halves of a connection hold capacity
+    /// and a budget that counted one of them was not a bound
+    /// (docs/memory.md).
+    buffer: ConnectionBuffer,
 }
 
 impl Writer {
+    /// The buffer to encode into. Written out by [`Writer::flush`].
+    pub fn buf_mut(&mut self) -> &mut BytesMut {
+        self.buffer.buf_mut()
+    }
+
+    /// Capacity this writer is holding, as charged to the budget.
+    pub fn held_bytes(&self) -> usize {
+        self.buffer.charged()
+    }
+
+    /// Writes whatever was encoded, empties the buffer and returns any
+    /// capacity a large batch forced. Returns how many bytes went out.
+    ///
+    /// The reclaim is what keeps the charge equal to what is retained: a
+    /// `clear()` alone frees nothing, which is how this buffer used to keep
+    /// the high-water mark of every batch it had ever seen for the life of
+    /// the connection.
+    pub async fn flush(&mut self) -> Result<usize, TransportError> {
+        let Self { half, buffer } = self;
+        let bytes = buffer.buf_mut();
+        let wrote = bytes.len();
+        if wrote == 0 {
+            return Ok(0);
+        }
+        match half {
+            WriteSide::Plain(half) => half.write_all(bytes).await?,
+            WriteSide::Tls(half) => half.write_all(bytes).await?,
+        }
+        bytes.clear();
+        buffer.reclaim();
+        Ok(wrote)
+    }
+
     pub async fn write_all(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
         match &mut self.half {
             WriteSide::Plain(half) => half.write_all(bytes).await?,
@@ -175,14 +221,16 @@ impl Writer {
 pub async fn connect(
     peer: SocketAddr,
     read_buffer_bytes: usize,
-    budget: Arc<ReadBudget>,
+    write_buffer_bytes: usize,
+    budget: Arc<BufferBudget>,
 ) -> Result<Connection, TransportError> {
     let stream = TcpStream::connect(peer).await?;
     // Small writes go out when they are written; a durability report waiting
     // on Nagle would be latency added for nothing.
     stream.set_nodelay(true)?;
 
-    let buffer = ReadBuffer::new(read_buffer_bytes, budget)?;
+    let buffer = ConnectionBuffer::new(read_buffer_bytes, Arc::clone(&budget))?;
+    let outgoing = ConnectionBuffer::new(write_buffer_bytes, budget)?;
     let (read, write) = stream.into_split();
     Ok(Connection {
         reader: Reader {
@@ -191,6 +239,7 @@ pub async fn connect(
         },
         writer: Writer {
             half: WriteSide::Plain(write),
+            buffer: outgoing,
         },
         peer,
     })

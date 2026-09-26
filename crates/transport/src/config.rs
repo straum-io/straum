@@ -25,8 +25,13 @@ pub struct TransportConfig {
     pub tcp_user_timeout: Option<Duration>,
     /// Steady-state read buffer per connection.
     pub read_buffer_bytes: usize,
+    /// Steady-state capacity of the buffer outbound packets are encoded
+    /// into, per connection. Its own setting rather than the read buffer's:
+    /// they are different resources and one number silently moving both was
+    /// the defect this split closes (docs/memory.md).
+    pub write_buffer_bytes: usize,
     /// Global budget for read buffers across all connections.
-    pub total_read_bytes: usize,
+    pub total_connection_buffer_bytes: usize,
     pub max_connections: usize,
 }
 
@@ -42,7 +47,8 @@ impl Default for TransportConfig {
             so_sndbuf_bytes: 0,
             tcp_user_timeout: None,
             read_buffer_bytes: 16_384,
-            total_read_bytes: 1_073_741_824,
+            write_buffer_bytes: 16_384,
+            total_connection_buffer_bytes: 1_073_741_824,
             max_connections: 1024,
         }
     }

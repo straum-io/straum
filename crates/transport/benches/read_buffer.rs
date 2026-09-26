@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use transport::{ReadBudget, ReadBuffer};
+use transport::{BufferBudget, ConnectionBuffer};
 
 #[global_allocator]
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
@@ -17,16 +17,16 @@ fn main() {
 
 const TARGET: usize = 16 * 1024;
 
-fn buffer() -> ReadBuffer {
-    let budget = Arc::new(ReadBudget::new(64 * 1024 * 1024));
-    match ReadBuffer::new(TARGET, budget) {
+fn buffer() -> ConnectionBuffer {
+    let budget = Arc::new(BufferBudget::new(64 * 1024 * 1024));
+    match ConnectionBuffer::new(TARGET, budget) {
         Ok(buffer) => buffer,
         Err(error) => panic!("budget too small for the benchmark: {error}"),
     }
 }
 
 /// One read-loop iteration: bytes arrive, one packet is handed off.
-fn cycle(buffer: &mut ReadBuffer, packet: &[u8], reclaim: bool) {
+fn cycle(buffer: &mut ConnectionBuffer, packet: &[u8], reclaim: bool) {
     if let Err(error) = buffer.reserve(packet.len()) {
         panic!("budget exhausted: {error}");
     }

@@ -138,6 +138,10 @@ pub struct ReplicationSettings {
     pub catch_up_batch_bytes: usize,
     /// Read buffer for one replication connection.
     pub read_buffer_bytes: usize,
+    /// Write buffer for one. The replication task writes straight from the
+    /// frame it holds rather than encoding into this, so it stays at its
+    /// steady size; it is allocated and charged because it exists.
+    pub write_buffer_bytes: usize,
     pub limits: replication::Limits,
 }
 
@@ -150,6 +154,7 @@ impl Default for ReplicationSettings {
             catch_up_queue: 4,
             catch_up_batch_bytes: 1_048_576,
             read_buffer_bytes: 65_536,
+            write_buffer_bytes: 16_384,
             limits: replication::Limits::default(),
         }
     }

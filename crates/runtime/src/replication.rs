@@ -17,7 +17,7 @@ use bytes::Bytes;
 use replication::{Accepted, Follower, Limits, Message, Peer, Reconciled};
 use storage::{Committer, RecordSource, Wal, WalRecord};
 use tokio::sync::{mpsc, watch};
-use transport::{Connection, ReadBudget};
+use transport::{BufferBudget, Connection};
 
 use crate::config::{ReplicationSettings, WalSettings};
 use crate::metrics::Metrics;
@@ -75,7 +75,7 @@ pub(crate) struct Leading {
     pub(crate) peer: SocketAddr,
     pub(crate) settings: ReplicationSettings,
     pub(crate) wal: WalSettings,
-    pub(crate) budget: Arc<ReadBudget>,
+    pub(crate) budget: Arc<BufferBudget>,
     /// The leader's own durable sequence, so a reconnect can be reconciled
     /// against what this node actually holds.
     pub(crate) local: Arc<AtomicU64>,
@@ -103,6 +103,7 @@ pub(crate) async fn lead(
             attempt = transport::connect(
                 held.peer,
                 held.settings.read_buffer_bytes,
+                held.settings.write_buffer_bytes,
                 Arc::clone(&held.budget),
             ) => attempt,
         };

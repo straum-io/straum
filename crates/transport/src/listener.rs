@@ -8,8 +8,8 @@ use std::time::Duration;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::net::TcpListener;
 
+use crate::buffers::BufferBudget;
 use crate::connection::Accepted;
-use crate::read::ReadBudget;
 use crate::sys;
 use crate::tls::Tls;
 use crate::{TransportConfig, TransportError};
@@ -21,7 +21,7 @@ const EXHAUSTED_BACKOFF: Duration = Duration::from_millis(50);
 pub struct Listener {
     inner: TcpListener,
     config: TransportConfig,
-    budget: Arc<ReadBudget>,
+    budget: Arc<BufferBudget>,
     tls: Option<Tls>,
 }
 
@@ -33,7 +33,7 @@ impl Listener {
     /// port (§6).
     pub fn bind(
         config: TransportConfig,
-        budget: Arc<ReadBudget>,
+        budget: Arc<BufferBudget>,
         tls: Option<Tls>,
     ) -> Result<Self, TransportError> {
         let domain = Domain::for_address(config.listen);
@@ -65,7 +65,7 @@ impl Listener {
         Ok(self.inner.local_addr()?)
     }
 
-    pub fn budget(&self) -> &Arc<ReadBudget> {
+    pub fn budget(&self) -> &Arc<BufferBudget> {
         &self.budget
     }
 

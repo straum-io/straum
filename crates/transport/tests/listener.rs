@@ -6,7 +6,7 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
-use transport::{Listener, ReadBudget, TransportConfig};
+use transport::{BufferBudget, Listener, TransportConfig};
 
 fn config() -> TransportConfig {
     TransportConfig {
@@ -15,8 +15,8 @@ fn config() -> TransportConfig {
     }
 }
 
-fn budget() -> Arc<ReadBudget> {
-    Arc::new(ReadBudget::new(64 * 1024 * 1024))
+fn budget() -> Arc<BufferBudget> {
+    Arc::new(BufferBudget::new(64 * 1024 * 1024))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -264,4 +264,133 @@ mod tls {
         let missing = std::path::Path::new("/nonexistent/cert.pem");
         assert!(Tls::from_pem_files(missing, missing).is_err());
     }
+}
+
+/// A connection holds capacity in both directions. A budget that counted one
+/// of them was not a bound on the resource it named (docs/memory.md).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_halves_of_a_connection_are_charged() {
+    let held = Arc::new(BufferBudget::new(64 * 1024 * 1024));
+    let settings = TransportConfig {
+        // Deliberately different, so the assertion cannot pass by the two
+        // being the same number.
+        read_buffer_bytes: 8192,
+        write_buffer_bytes: 4096,
+        ..config()
+    };
+    let listener = Listener::bind(settings, Arc::clone(&held), None).unwrap();
+    let addr = listener.local_addr().unwrap();
+    assert_eq!(held.used(), 0, "an idle listener holds nothing");
+
+    let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+    let connection = listener.accept().await.unwrap().establish().await.unwrap();
+    let socket = client.await.unwrap();
+
+    assert_eq!(held.used(), 8192 + 4096);
+    assert_eq!(connection.reader.held_bytes(), 8192);
+    assert_eq!(connection.writer.held_bytes(), 4096);
+
+    drop(connection);
+    drop(socket);
+    assert_eq!(held.used(), 0, "the charge outlived the connection");
+}
+
+/// The two settings are independent. Moving one must not move the other,
+/// which is what `STRAUM_READ_BUFFER_BYTES` used to do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_read_setting_does_not_move_the_write_buffer() {
+    let held = Arc::new(BufferBudget::new(64 * 1024 * 1024));
+    let settings = TransportConfig {
+        read_buffer_bytes: 1024,
+        ..config()
+    };
+    let listener = Listener::bind(settings, Arc::clone(&held), None).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+    let connection = listener.accept().await.unwrap().establish().await.unwrap();
+    let socket = client.await.unwrap();
+
+    assert_eq!(connection.reader.held_bytes(), 1024);
+    assert_eq!(
+        connection.writer.held_bytes(),
+        TransportConfig::default().write_buffer_bytes,
+        "lowering the read buffer lowered the write buffer with it"
+    );
+    drop(connection);
+    drop(socket);
+}
+
+/// A connection that cannot be given both buffers is refused both, before
+/// either is allocated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_that_fits_only_one_buffer_is_refused() {
+    let settings = TransportConfig {
+        read_buffer_bytes: 4096,
+        write_buffer_bytes: 4096,
+        ..config()
+    };
+    // Room for the read buffer and nothing after it.
+    let held = Arc::new(BufferBudget::new(4096 + 2048));
+    let listener = Listener::bind(settings, Arc::clone(&held), None).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+    let refused = listener.accept().await.unwrap().establish().await;
+    let socket = client.await.unwrap();
+
+    assert!(refused.is_err(), "a connection was given memory it had not");
+    assert_eq!(held.used(), 0, "the refused half was left charged");
+    drop(socket);
+}
+
+/// What a large batch forces is given back. `clear()` alone frees nothing,
+/// and the writer used to keep the high-water mark of every batch it had
+/// ever encoded for the life of the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_write_buffer_returns_what_one_large_batch_forced() {
+    let held = Arc::new(BufferBudget::new(64 * 1024 * 1024));
+    let settings = TransportConfig {
+        write_buffer_bytes: 4096,
+        ..config()
+    };
+    let listener = Listener::bind(settings, Arc::clone(&held), None).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let draining = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut sink = vec![0u8; 1 << 20];
+        let mut total = 0usize;
+        while total < 512 * 1024 {
+            match socket.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => total += read,
+            }
+        }
+        total
+    });
+
+    let mut connection = listener.accept().await.unwrap().establish().await.unwrap();
+    let before = connection.writer.held_bytes();
+    assert_eq!(before, 4096);
+
+    connection
+        .writer
+        .buf_mut()
+        .extend_from_slice(&vec![b'x'; 512 * 1024]);
+    // Grown well past its steady size, and the budget knows before the
+    // write rather than after it.
+    assert!(connection.writer.buf_mut().capacity() > 4096);
+
+    let wrote = connection.writer.flush().await.unwrap();
+    assert_eq!(wrote, 512 * 1024);
+    assert_eq!(
+        connection.writer.held_bytes(),
+        4096,
+        "the capacity the batch forced was kept"
+    );
+    assert_eq!(held.used(), 4096 + config().read_buffer_bytes);
+
+    let _ = draining.await;
 }

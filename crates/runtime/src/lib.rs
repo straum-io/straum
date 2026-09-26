@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use domain::SessionId;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use transport::{Listener, ReadBudget};
+use transport::{BufferBudget, Listener};
 
 pub use auth::{Authority, Permissions};
 
@@ -66,7 +66,9 @@ impl Runtime {
     /// Binds the listener and starts the tasks.
     pub fn start(config: RuntimeConfig) -> Result<Self, RuntimeError> {
         // One budget for the whole process, however many listeners there are.
-        let budget = Arc::new(ReadBudget::new(config.transport.total_read_bytes));
+        let budget = Arc::new(BufferBudget::new(
+            config.transport.total_connection_buffer_bytes,
+        ));
         // Loaded once, at startup: a broker that cannot read its own key
         // must not come up in plaintext instead.
         let tls = match &config.tls {

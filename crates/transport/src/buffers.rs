@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bytes::BytesMut;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ReadError {
+pub enum BufferError {
     #[error("the global read budget is exhausted")]
     BudgetExhausted,
 }
@@ -20,12 +20,12 @@ pub enum ReadError {
 ///
 /// Counters are `Relaxed`: they order nothing but themselves (§14).
 #[derive(Debug)]
-pub struct ReadBudget {
+pub struct BufferBudget {
     used: AtomicUsize,
     limit: usize,
 }
 
-impl ReadBudget {
+impl BufferBudget {
     pub fn new(limit: usize) -> Self {
         Self {
             used: AtomicUsize::new(0),
@@ -34,14 +34,14 @@ impl ReadBudget {
     }
 
     /// Takes `bytes` from the budget, or leaves it untouched and fails.
-    pub fn try_reserve(&self, bytes: usize) -> Result<(), ReadError> {
+    pub fn try_reserve(&self, bytes: usize) -> Result<(), BufferError> {
         let mut used = self.used.load(Ordering::Relaxed);
         loop {
             let Some(next) = used.checked_add(bytes) else {
-                return Err(ReadError::BudgetExhausted);
+                return Err(BufferError::BudgetExhausted);
             };
             if next > self.limit {
-                return Err(ReadError::BudgetExhausted);
+                return Err(BufferError::BudgetExhausted);
             }
             match self
                 .used
@@ -71,17 +71,17 @@ impl ReadBudget {
 /// The charge follows the buffer's capacity, so releasing it is not something
 /// a caller can forget: it happens when the buffer is dropped.
 #[derive(Debug)]
-pub struct ReadBuffer {
+pub struct ConnectionBuffer {
     buf: BytesMut,
     /// Capacity to fall back to once a large packet is out of the way.
     target: usize,
     charged: usize,
-    budget: Arc<ReadBudget>,
+    budget: Arc<BufferBudget>,
 }
 
-impl ReadBuffer {
+impl ConnectionBuffer {
     /// `target` is the steady-state capacity (`STRAUM_READ_BUFFER_BYTES`).
-    pub fn new(target: usize, budget: Arc<ReadBudget>) -> Result<Self, ReadError> {
+    pub fn new(target: usize, budget: Arc<BufferBudget>) -> Result<Self, BufferError> {
         budget.try_reserve(target)?;
         Ok(Self {
             buf: BytesMut::with_capacity(target),
@@ -92,12 +92,12 @@ impl ReadBuffer {
     }
 
     /// Makes room for `additional` bytes, charging the growth.
-    pub fn reserve(&mut self, additional: usize) -> Result<(), ReadError> {
+    pub fn reserve(&mut self, additional: usize) -> Result<(), BufferError> {
         let wanted = self
             .buf
             .len()
             .checked_add(additional)
-            .ok_or(ReadError::BudgetExhausted)?;
+            .ok_or(BufferError::BudgetExhausted)?;
         if wanted <= self.buf.capacity() {
             return Ok(());
         }
@@ -116,10 +116,13 @@ impl ReadBuffer {
 
     /// Returns capacity above the steady state once the buffer has drained.
     pub fn reclaim(&mut self) {
-        if !self.buf.is_empty() || self.buf.capacity() <= self.target {
-            return;
+        if self.buf.is_empty() && self.buf.capacity() > self.target {
+            self.buf = BytesMut::with_capacity(self.target);
         }
-        self.buf = BytesMut::with_capacity(self.target);
+        // Settled even when nothing shrank. The write side grows through
+        // `BytesMut` itself rather than through `reserve`, so this is where
+        // that growth is accounted; on the read side, where every growth
+        // goes through `reserve`, it is a no-op.
         self.settle();
     }
 
@@ -149,7 +152,7 @@ impl ReadBuffer {
     }
 }
 
-impl Drop for ReadBuffer {
+impl Drop for ConnectionBuffer {
     fn drop(&mut self) {
         self.budget.release(self.charged);
     }
