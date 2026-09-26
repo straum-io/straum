@@ -334,7 +334,8 @@ async fn main() {
     // the whole table (CONSTITUTION.md §28: repeat, then counters).
     let only = std::env::var("STRAUM_BENCH_ONLY").unwrap_or_default();
     if only == "slow" {
-        slow_follower().await;
+        slow_follower(false).await;
+        slow_follower(true).await;
         return;
     }
 
@@ -389,7 +390,7 @@ async fn main() {
     }
 
     if only.is_empty() {
-        slow_follower().await;
+        slow_follower(false).await;
     }
 }
 
@@ -399,7 +400,7 @@ async fn main() {
 /// nothing, which is what a node with a slower disk looks like from the
 /// leader. What is checked is not that the two keep pace — they are not
 /// expected to — but that nothing grows with the producer.
-async fn slow_follower() {
+async fn slow_follower(acknowledge: bool) {
     use std::io::Write;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -419,10 +420,18 @@ async fn slow_follower() {
     replication::encode_durable(0, &mut out);
     ok(stream.write_all(&out).await);
 
+    // The one variable. The report carries the position the peer already
+    // holds, so `Peer::on_durable` changes nothing and no state moves: all
+    // that differs is whether the leader's socket ever becomes readable.
     let draining = tokio::spawn(async move {
         let mut sink = vec![0u8; 64 * 1024];
+        let mut report = Vec::new();
+        replication::encode_durable(0, &mut report);
         while let Ok(read) = stream.read(&mut sink).await {
             if read == 0 {
+                break;
+            }
+            if acknowledge && stream.write_all(&report).await.is_err() {
                 break;
             }
         }
@@ -435,12 +444,23 @@ async fn slow_follower() {
         burst: None,
     };
     let started = Instant::now();
-    let _ = run(&work, &leader, None).await;
-    let seconds = started.elapsed().as_secs_f64();
+    let measured = run(&work, &leader, None).await;
+    // The publish loop alone, the same span the table reports. Timing around
+    // the whole call folds in the client's teardown, and that is what made
+    // this section read 667 msg/s (docs/replication.md §124).
+    let seconds = measured.elapsed.as_secs_f64();
+    let teardown = started.elapsed().as_secs_f64() - seconds;
     let seen = leader.metrics();
     let capacity = ReplicationSettings::default().queue as u64;
 
-    println!("\nslow follower: 20000 x 1 KiB, the follower acknowledging nothing");
+    println!(
+        "\nslow follower: 20000 x 1 KiB, the follower {}",
+        if acknowledge {
+            "answering with a no-op report"
+        } else {
+            "acknowledging nothing"
+        }
+    );
     println!(
         "  leader throughput         {:.0} msg/s",
         work.messages as f64 / seconds
@@ -455,6 +475,7 @@ async fn slow_follower() {
         seen.replication_shipments_dropped
     );
     println!("  leader commits            {}", seen.wal_commits);
+    println!("  client teardown           {teardown:.1} s (not throughput)");
     println!("  catch-ups from the log    {}", seen.replication_catchups);
     println!(
         "  last sync                 {:.2} ms",
