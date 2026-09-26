@@ -540,6 +540,17 @@ fn compact(
     Ok(())
 }
 
+/// Positions the writer thread shares with the rest of the process. Both are
+/// read once per rewrite and never on the append path.
+struct Marks {
+    /// The correlation allocator, so compaction can write its value into the
+    /// header rather than guess it from what survived (§116).
+    allocated: Arc<AtomicU64>,
+    /// How far a replica has been given the log. `u64::MAX` means nobody is
+    /// waiting on these bytes, which is what a single node means (§118).
+    replicated: Arc<AtomicU64>,
+}
+
 /// Opens the log, recovers its durable prefix and starts the writer thread.
 pub(crate) fn start(
     settings: &WalSettings,
@@ -575,21 +586,16 @@ pub(crate) fn start(
     // write down the correlation high-water. Read once per rewrite, never on
     // the append path, and not a channel — so no cycle to close.
     let next = Arc::new(AtomicU64::new(restored));
-    let allocated = Arc::clone(&next);
+    // The replication task lowers `replicated` once there is a follower;
+    // until then nothing is waiting on the bytes.
+    let marks = Marks {
+        allocated: Arc::clone(&next),
+        replicated: Arc::new(AtomicU64::new(u64::MAX)),
+    };
 
     let writer = std::thread::Builder::new()
         .name("straum-wal".to_owned())
-        .spawn(move || {
-            write(
-                committer,
-                Queue(queue),
-                owned,
-                limits,
-                weak,
-                metrics,
-                allocated,
-            )
-        })
+        .spawn(move || write(committer, Queue(queue), owned, limits, weak, metrics, marks))
         .map_err(StorageError::Io)?;
 
     // `next` continues where the recovered log left off: a repeated
@@ -604,7 +610,7 @@ fn write(
     limits: BrokerLimits,
     events: mpsc::WeakSender<Event>,
     metrics: Arc<Metrics>,
-    allocated: Arc<AtomicU64>,
+    marks: Marks,
 ) {
     // The loop is here rather than `Committer::run` because compaction needs
     // a point between two commits, and `run` does not offer one: the log is
@@ -618,7 +624,7 @@ fn write(
         };
         report(&commit, &events, &metrics);
 
-        if let Err(error) = shrink(&mut committer, &settings, limits, &metrics, &allocated) {
+        if let Err(error) = shrink(&mut committer, &settings, limits, &metrics, &marks) {
             // A log that cannot be rewritten is still a log that works; it
             // only grows. Nothing is acknowledged differently because of it.
             tracing::warn!(%error, "could not compact the log; it keeps growing");
@@ -643,16 +649,34 @@ fn shrink(
     settings: &WalSettings,
     limits: BrokerLimits,
     metrics: &Metrics,
-    allocated: &AtomicU64,
+    marks: &Marks,
 ) -> Result<(), StorageError> {
     if settings.compact_bytes == 0 || committer.log_bytes() < settings.compact_bytes {
+        return Ok(());
+    }
+
+    // A replica that has not received these records still needs the bytes,
+    // and STRAUMW3 only kept the *numbers* meaningful — a sequence that
+    // exists logically is no use to a follower asking to be sent it
+    // (docs/replication.md §118, C4). Holding the whole log is the blunt
+    // answer and the only correct one until there is a retention policy: a
+    // follower that stays away keeps the log growing, which an operator can
+    // see and act on, where dropping the records it needs is silent.
+    let behind = marks.replicated.load(Ordering::Relaxed);
+    let durable = committer.durable_sequence();
+    if behind < durable {
+        tracing::debug!(
+            replicated = behind,
+            durable,
+            "not compacting: a replica is still behind the log"
+        );
         return Ok(());
     }
 
     let (current, floor) = live_set(settings, limits)?;
     // The allocator, not the log: the highest correlation handed out is not
     // the highest one still on disk (docs/replication.md §116).
-    let correlation = allocated.load(Ordering::Relaxed);
+    let correlation = marks.allocated.load(Ordering::Relaxed);
     let outcome = committer.compact(correlation, &mut |payload| {
         should_keep(payload, &current, floor)
     })?;
@@ -849,6 +873,71 @@ mod tests {
         // is the property that makes it an identity at all.
         let mut broker = Broker::new(limits);
         assert_eq!(restore(&settings, limits, &mut broker).unwrap(), 4);
+        let _ = std::fs::remove_file(&path);
+    }
+    #[test]
+    fn a_replica_that_is_behind_holds_the_log_open() {
+        let path = scratch("c4");
+        let settings = WalSettings {
+            path: path.clone(),
+            queue: 8,
+            // Anything at all is large enough to rewrite.
+            compact_bytes: 1,
+            limits: storage::WalLimits::default(),
+        };
+        let limits = BrokerLimits::default();
+        let metrics = Metrics::default();
+
+        let build = || {
+            let (mut wal, _) = storage::Wal::open(&settings.path, settings.limits).unwrap();
+            // Four records nothing needs: at-most-once, owed to no session.
+            for correlation in 1..=4u64 {
+                wal.stage(&encode(
+                    correlation,
+                    &topic("chatter"),
+                    &Bytes::from_static(b"noise"),
+                    DeliveryGuarantee::AtMostOnce,
+                    false,
+                ))
+                .unwrap();
+            }
+            wal.commit().unwrap();
+            Committer::new(wal, settings.limits, true, 0)
+        };
+
+        // A replica that has only had the first two records still needs the
+        // bytes of the other two, even though STRAUMW3 keeps their numbers
+        // meaningful (docs/replication.md §118).
+        let mut committer = build();
+        let behind = Marks {
+            allocated: Arc::new(AtomicU64::new(0)),
+            replicated: Arc::new(AtomicU64::new(2)),
+        };
+        shrink(&mut committer, &settings, limits, &metrics, &behind).unwrap();
+        drop(committer);
+        assert_eq!(
+            storage::replay(&path, settings.limits, &mut |_| {})
+                .unwrap()
+                .records,
+            4,
+            "the log was rewritten out from under a replica that is behind"
+        );
+
+        // Caught up, and the same log is compacted as it always was.
+        let mut committer = build();
+        let caught_up = Marks {
+            allocated: Arc::new(AtomicU64::new(0)),
+            replicated: Arc::new(AtomicU64::new(u64::MAX)),
+        };
+        shrink(&mut committer, &settings, limits, &metrics, &caught_up).unwrap();
+        drop(committer);
+        assert_eq!(
+            storage::replay(&path, settings.limits, &mut |_| {})
+                .unwrap()
+                .records,
+            0,
+            "nothing needed these records and they should have gone"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

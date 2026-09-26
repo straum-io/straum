@@ -137,6 +137,32 @@ impl Follower {
     }
 }
 
+/// What a freshly connected follower turned out to need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reconciled {
+    /// The positions agree. Ordinary replication continues from here.
+    InSync,
+    /// The follower is behind. Everything from this sequence on goes again
+    /// before anything new does.
+    Resend { from: u64 },
+}
+
+/// The follower holds records this leader never wrote.
+///
+/// Not automatically corruption, and deliberately not automatically
+/// recoverable either. It is what two logs that are not the same history
+/// look like — a leader restarted onto an empty log, a follower pointed at
+/// the wrong node — and this implementation has no way to tell those apart
+/// from a log that legitimately went backwards, because a log carries no
+/// identity of its own yet (docs/replication.md §117). Refusing is the
+/// answer that cannot lose data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("follower holds through {follower}, this log has written {leader}")]
+pub struct Incompatible {
+    pub follower: u64,
+    pub leader: u64,
+}
+
 /// What a peer said that it cannot have meant.
 ///
 /// Both end the connection. Neither can be absorbed: the leader may already
@@ -174,6 +200,32 @@ impl Peer {
             sent: durable,
             durable,
         }
+    }
+
+    /// Settles a freshly connected follower against this leader's own durable
+    /// sequence, before any record is sent.
+    ///
+    /// The follower's own answer is taken as the truth about the follower,
+    /// rather than anything the leader remembers about it. That is what makes
+    /// the awkward case cheap: a follower that synced a batch and lost the
+    /// connection before the acknowledgement left is durable, says so on
+    /// reconnect, and is not sent those records a second time.
+    pub fn connected(reported: u64, local: u64) -> Result<(Self, Reconciled), Incompatible> {
+        if reported > local {
+            return Err(Incompatible {
+                follower: reported,
+                leader: local,
+            });
+        }
+        let peer = Self::starting_at(reported);
+        let outcome = if reported == local {
+            Reconciled::InSync
+        } else {
+            Reconciled::Resend {
+                from: reported.saturating_add(1),
+            }
+        };
+        Ok((peer, outcome))
     }
 
     /// Everything through here has gone out to this peer.

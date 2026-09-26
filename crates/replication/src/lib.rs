@@ -13,4 +13,6 @@ pub use frame::{
     DURABLE_BYTES, Limits, Message, RECORDS_HEADER_BYTES, Records, ReplicationError, decode,
     encode_durable, encode_records_header,
 };
-pub use state::{Accepted, Follower, Peer, PeerError, Refused, quorum_watermark};
+pub use state::{
+    Accepted, Follower, Incompatible, Peer, PeerError, Reconciled, Refused, quorum_watermark,
+};
