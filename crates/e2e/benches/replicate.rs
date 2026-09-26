@@ -65,6 +65,14 @@ const WORKLOADS: &[Workload] = &[
         burst: None,
     },
     Workload {
+        // The control for the slow-follower section, which uses this shape:
+        // without it there is no way to tell a slow follower from the volume.
+        name: "sustained 1 KiB",
+        payload: 1024,
+        messages: 20_000,
+        burst: None,
+    },
+    Workload {
         name: "burst 64 B",
         payload: 64,
         messages: 4_000,
@@ -322,7 +330,18 @@ async fn main() {
     );
     println!("{}", "-".repeat(136));
 
+    // One section at a time, so an anomaly can be chased without paying for
+    // the whole table (CONSTITUTION.md §28: repeat, then counters).
+    let only = std::env::var("STRAUM_BENCH_ONLY").unwrap_or_default();
+    if only == "slow" {
+        slow_follower().await;
+        return;
+    }
+
     for work in WORKLOADS {
+        if !only.is_empty() && !work.name.contains(&only) {
+            continue;
+        }
         // Local only.
         let path = scratch(&format!("{}-local", work.name.replace(' ', "-")));
         let leader = ok(Runtime::start(node(&path, ReplicationSettings::default())));
@@ -369,7 +388,9 @@ async fn main() {
         let _ = std::fs::remove_file(&follower_path);
     }
 
-    slow_follower().await;
+    if only.is_empty() {
+        slow_follower().await;
+    }
 }
 
 /// A follower whose durability is slower than the leader's publishing.
@@ -434,6 +455,15 @@ async fn slow_follower() {
         seen.replication_shipments_dropped
     );
     println!("  leader commits            {}", seen.wal_commits);
+    println!("  catch-ups from the log    {}", seen.replication_catchups);
+    println!(
+        "  last sync                 {:.2} ms",
+        seen.wal_sync_nanos as f64 / 1e6
+    );
+    println!(
+        "  per commit                {:.1} ms",
+        seconds * 1000.0 / seen.wal_commits.max(1) as f64
+    );
     println!(
         "  dropped + queue >= commits {} + {} >= {}",
         seen.replication_shipments_dropped, capacity, seen.wal_commits
