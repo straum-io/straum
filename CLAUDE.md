@@ -6,14 +6,24 @@ One deployable server binary, built from a Cargo workspace of crates with
 enforced dependency boundaries. The first external protocol is
 **MQTT 3.1.1 over TCP**. The broker itself is independent of MQTT and TCP.
 
+`CONSTITUTION.md`, in this directory, governs how the work is done: what
+counts as evidence, what may not be optimized without it, and which
+invariants are contractual. It sits above this file. Where the two appear to
+disagree, the constitution decides and this file is what gets corrected.
+
 This file holds rules and decisions. Details live in:
 
 ```text
 docs/configuration.md   every setting, env var, default and limit
 docs/testing.md         test layers, MQTT conformance, fuzzing
+docs/algorithms.md      how a data structure is chosen; normative, see §28
 docs/benchmarks.md      harness, workload matrix, measurement protocol, reporting
+docs/memory.md          what a connection allocates, and what the budget really bounds
+docs/performance.md     the current measured baseline
 docs/profiling.md       which tool answers which question, per platform
+docs/storage.md         the write-ahead log: group commit, durability, compaction
 docs/cluster.md         architecture for clustering; nothing in it is built yet
+docs/replication.md     durable replication: the audit, and what contradicts it
 docs/linux-tuning.md    kernel parameters and socket options for production hosts
 docs/baselines/         recorded benchmark baselines, one file per machine
 ```
@@ -29,6 +39,7 @@ benchmark or a concrete requirement, and update this file in the same change.
 straum/
 ├── Cargo.toml
 ├── CLAUDE.md
+├── CONSTITUTION.md
 ├── clippy.toml
 ├── crates/
 │   ├── domain/
@@ -37,6 +48,7 @@ straum/
 │   ├── mqtt/
 │   ├── transport/
 │   ├── storage/
+│   ├── replication/
 │   ├── broker/
 │   ├── runtime/
 │   ├── server/
@@ -123,7 +135,8 @@ server
     │   ├── protocol
     │   └── domain
     ├── transport
-    └── storage
+    ├── storage
+    └── replication
 
 e2e (dev only) → runtime, rumqttc
 ```
@@ -135,9 +148,10 @@ e2e (dev only) → runtime, rumqttc
 | protocol | domain, auth | bytes, thiserror | tokio, mqtt, transport, broker, runtime, server |
 | mqtt | domain, protocol | bytes, thiserror | tokio, transport, broker, runtime, server |
 | transport | — | bytes, thiserror, tokio, tracing, socket2, tokio-rustls, rustls-pemfile | protocol, mqtt, broker, runtime, server |
-| storage | — | bytes, thiserror, crc32fast | tokio, protocol, mqtt, transport, broker, runtime, server |
+| storage | — | bytes, thiserror, crc32fast | tokio, protocol, mqtt, transport, replication, broker, runtime, server |
+| replication | — | thiserror, crc32fast | tokio, every other workspace crate |
 | broker | domain, protocol, auth | bytes, thiserror, tracing | tokio, mqtt, transport, runtime, server, storage |
-| runtime | domain, protocol, mqtt, transport, broker, storage | thiserror, tokio, tracing | server |
+| runtime | domain, protocol, mqtt, transport, broker, storage, replication | thiserror, tokio, tracing | server |
 | server | runtime | tokio, tracing, tracing-subscriber | — |
 
 `scripts/check-boundaries.sh` enforces the forbidden column. It is part of
@@ -156,7 +170,7 @@ server depends only on the runtime.
 Allowed dev-dependencies, each with a concrete use:
 
 ```text
-proptest                              core, mqtt, broker: codec round-trip, topic matching, routing invariants
+proptest                              core, mqtt, broker, replication: codec round-trip, topic matching, routing invariants
 divan                                 micro benchmarks, allocation counting
 rumqttc (default-features = false)    e2e only: independent MQTT client
 ```
@@ -255,9 +269,30 @@ loop must never spin on a persistent error.
 The write-ahead log: sequential append, adaptive group commit, durable
 offset, recovery of the durable prefix. Rules in `docs/storage.md`.
 
+A byte offset is a location and a sequence is an identity: compaction rewrites
+the file and never rewinds what the log has allocated. The `STRAUMW3` header
+carries that state, so a restart after a rewrite continues the numbering
+instead of repeating it (docs/storage.md §91).
+
 It does blocking file I/O and reads the clock, because storage latency is
 the signal the batching adapts to (§95). It owns no threads: the runtime
 gives it one, and `sync_data` never runs inside the broker task.
+
+## replication
+
+The replication wire format, **sans-IO**: no sockets, no tasks, no clock, and
+no workspace dependency at all — what it frames is opaque bytes.
+
+One logical frame carries one complete WAL commit batch, exactly as
+`commit_with` handed it to `write()`. Replication re-encodes nothing and
+introduces no ordering of its own: the WAL sequence is the identity, and a
+frame names the range it covers. A frame may cross the network in any number
+of pieces; a partial read is never a partial durability boundary.
+
+It also holds the state machine that decides what a position means: ranges,
+not messages, and every position a contiguous prefix on both sides of the
+wire. Received is not durable and written is not durable. Rules in
+`docs/replication.md`.
 
 ## auth
 
@@ -487,7 +522,9 @@ per publish (for example, a generation counter per session entry).
   each subscriber in publish order. Any concurrency change must preserve this.
 * **Memory is bounded** under any input: per connection, per session, and
   globally: `STRAUM_TOTAL_QUEUED_BYTES` on the way out,
-  `STRAUM_TOTAL_READ_BYTES` on the way in, and `STRAUM_TOTAL_BACKLOG_BYTES`
+  `STRAUM_TOTAL_CONNECTION_BUFFER_BYTES` on the way in — read and write
+  buffers together, because a budget that counts one half of a resource is
+  not a bound on it (docs/memory.md) — and `STRAUM_TOTAL_BACKLOG_BYTES`
   for what the broker holds on behalf of sessions that are behind. Each
   global budget exists because a per-session limit times the session count
   is a product, not a bound.

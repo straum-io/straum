@@ -886,10 +886,8 @@ batches and the queue never filled there either. What is established is that
 the queue has a fixed capacity and that `ship` refuses rather than grows;
 what is not established, by measurement, is the behaviour once it is full.
 
-The 667 msg/s in that run is also **unexplained** and worth a look: it is
-eighteen times slower than the same payload in the table, with the same
-50 messages per commit, and no obvious mechanism in the path accounts for
-it. It is recorded rather than explained.
+The 667 msg/s that run reported was a defect in this harness, not in the
+broker. §124 has it.
 
 ## 123. Backpressure, and the defect it found
 
@@ -937,3 +935,60 @@ skipped, because the top of the loop has already dealt with it.
 With that, the run recovers every refused batch out of the log, in order, and
 the follower ends byte for byte identical to the leader — which is the whole
 claim that "dropped is not lost" rests on, and which nothing had tested.
+
+## 124. The 667 msg/s anomaly was the harness
+
+Worked through the order in `.claude/skills/performance-investigation`, and
+two hypotheses died on the way, which is the point of having an order.
+
+**Reproduced.** 667 msg/s twice, to three figures. Re-running the whole table
+at the same time showed no regression from the catch-up change in `ee08533`
+(7 470 / 7 774 / 17 078 against 7 500 / 7 621 / 14 575), which killed the
+first hypothesis — that the top-of-loop catch-up had started reading the log
+per batch. Read from the source it looked certain; measured, it was nothing.
+
+**Verified the workload.** The table had no row of the same shape, so a slow
+follower and the sheer volume were not separable. Adding `sustained 1 KiB`
+gave the control: 20 000 × 1 KiB with an ordinary follower is 6 323 msg/s.
+Volume was not it.
+
+**Counters.** `replication_catchups` was **0** — the catch-up path never ran
+at all, which killed the first hypothesis a second time, properly. Sync was
+4.49 ms, normal. Time per commit was 75 ms, so 70 ms was somewhere else.
+
+**CPU.** 30.12 s wall against 0.24 s user and 0.45 s sys: the process was
+**98% idle**. That eliminated allocation, copying, the codec and every other
+kind of work in one measurement. A sample confirmed it — all eight tokio
+workers parked, the WAL thread blocked in `records.recv()`, waiting.
+
+**The minimal experiment.** One variable: the follower answers with a report
+carrying the position it already holds, so `Peer::on_durable` changes
+nothing and the only difference is that the leader's socket becomes
+readable. Result: **667 msg/s either way, 75.0 ms per commit either way.**
+Refuted, and the identical 75.0 was the tell — 400 commits at exactly 75 ms
+is exactly 30 seconds, which is a duration something imposes, not a rate
+something achieves.
+
+**The cause.** The table reports `Run::elapsed`, which is the publish loop.
+This section timed around the whole call, which also includes
+`client.disconnect()` and waiting for rumqttc's event loop to drain 20 000
+outstanding QoS 1 publishes. Two numbers measuring different spans.
+
+```text
+                   reported   actual
+throughput         667        11 300 msg/s
+per commit         75.0 ms    4.4 ms      — which is the fsync, 4.5 ms
+client teardown    —          28.2 s      — where the thirty seconds went
+```
+
+667 was 20 000 messages divided by 1.8 s of publishing plus 28.2 s of
+teardown. It never described the broker. Everything reconciles: 400 commits
+at 4.4 ms is 1.76 s, and 11 300 msg/s over 1.77 s is 20 000 messages.
+
+The corrected number also says something worth keeping: **11 300 msg/s is
+higher than the 6 323 an ordinary follower gives**, because this follower has
+no log and never calls `sync_data`. The gap between them is the second
+fsync, and nothing else.
+
+The harness now reports the publish loop, as the table does, and prints the
+teardown separately so it cannot be mistaken for throughput again.

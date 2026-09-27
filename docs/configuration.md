@@ -47,8 +47,9 @@ Defaults below are **initial**. They are adjusted by benchmarks, not intuition.
 | `STRAUM_SO_SNDBUF_BYTES` | `0` | | | Same as above, `net.core.wmem_max`. |
 | `STRAUM_TCP_KEEPALIVE_SECS` | `300` | | | Idle time before TCP keepalive probes. Detects dead peers for clients with MQTT keep-alive 0. `0` disables. |
 | `STRAUM_TCP_USER_TIMEOUT_MS` | `0` | | ignored, warning | Linux only. Max time unacknowledged data may stay in flight before the kernel drops the connection. `0` = kernel default. |
-| `STRAUM_READ_BUFFER_BYTES` | `16384` | | | Steady-state read buffer per connection. It grows for a larger packet and is returned to this size once that packet is out of the way. |
-| `STRAUM_TOTAL_READ_BYTES` | `1073741824` | | | Global budget for read buffers, the ingress counterpart of `STRAUM_TOTAL_QUEUED_BYTES`. A connection that would push the total over it is refused the memory and closed; per-connection limits times the connection count are a product, not a bound. |
+| `STRAUM_READ_BUFFER_BYTES` | `16384` | | | Steady-state read buffer per connection. It grows for a larger packet and is returned to this size once that packet is out of the way. Sizes the read buffer and nothing else; until 2026-09-27 it silently sized the write buffer too (docs/memory.md). |
+| `STRAUM_WRITE_BUFFER_BYTES` | `16384` | | | Steady-state buffer outbound packets are encoded into, per connection. It grows for a large batch and is returned to this size once the batch is written. Independent of the read buffer: they are different resources. |
+| `STRAUM_TOTAL_CONNECTION_BUFFER_BYTES` | `1073741824` | | | Global budget for connection transport buffers, read and write together. A connection that would push the total over it is refused the memory before either buffer is allocated; per-connection limits times the connection count are a product, not a bound. It bounds these two buffers and nothing else — packet-id tables, session state, task futures and channel metadata are separate and are not claimed by it (docs/memory.md). Renamed from `STRAUM_TOTAL_READ_BYTES`, which is now an unknown variable and therefore a startup error. |
 | `STRAUM_WRITE_STALL_TIMEOUT_MS` | `30000` | | | Close if the writer makes no progress this long. |
 
 ## MQTT (owner: mqtt)
@@ -142,8 +143,9 @@ Each variable has a minimum and maximum enforced at startup. Examples:
 STRAUM_MAX_PACKET_BYTES      2 ..= 268435460
 STRAUM_MAX_INFLIGHT          1 ..= 65534
 STRAUM_READ_BUFFER_BYTES     1024 ..= STRAUM_MAX_PACKET_BYTES
+STRAUM_WRITE_BUFFER_BYTES    1024 ..= STRAUM_MAX_PACKET_BYTES
 STRAUM_SESSION_QUEUE_BYTES   >= STRAUM_MAX_PACKET_BYTES
-STRAUM_TOTAL_READ_BYTES      >= STRAUM_MAX_PACKET_BYTES
+STRAUM_TOTAL_CONNECTION_BUFFER_BYTES >= STRAUM_MAX_PACKET_BYTES
 STRAUM_WAL_MAX_RECORD_BYTES  >= STRAUM_MAX_PACKET_BYTES
 STRAUM_WAL_MAX_BATCH_BYTES   >= STRAUM_WAL_MIN_BATCH_BYTES
 STRAUM_WAL_INITIAL_BATCH_BYTES  within [min_batch, max_batch]

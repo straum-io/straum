@@ -180,3 +180,63 @@ Widening the port range or adding a loopback alias both need `sudo`, and the
 runs above already had to wait for TIME_WAIT to drain between them — two
 consecutive runs exhaust the pool. Those counts belong on a Linux host with
 several client addresses.
+
+## 2026-09-27 — an idle connection, after the buffer-budget fix
+
+The same method as the previous entry: `straum-server` in release in its own
+process, `e2e/benches/connhold` holding connections, RSS sampled from a third
+shell. `STRAUM_DURABILITY=memory`, `STRAUM_MAX_CONNECTIONS=20000`,
+`STRAUM_TOTAL_CONNECTION_BUFFER_BYTES=4 GiB`, idle RSS ≈ 2.8 MB.
+
+| connections | per connection |
+|---|---|
+| 2 500 | 54 650 B |
+| 5 000 | 54 490 B |
+| 10 000 | 54 180 B |
+| 15 000 | 54 187 B |
+
+Still linear. **54.2 kB against 53.4 kB before the change** — about 770 B
+more per connection, 1.4%. The internal spread of each set is ~0.9%, so the
+increase is real but small, and it buys the buffer being charged, settled
+and reclaimed rather than merely allocated. No attempt is made here to
+account for the 770 B; it is smaller than the unattributed remainder below.
+
+### What each buffer actually costs
+
+Only possible now that the two sizes are independent. 5 000 connections,
+one variable at a time:
+
+| read | write | per connection | against the 16/16 baseline |
+|---|---|---|---|
+| 16 KiB | 16 KiB | 54 490 B | — |
+| 4 KiB | 16 KiB | 46 252 B | read returns **8 238 B** of a nominal 12 288 |
+| 16 KiB | 4 KiB | 42 159 B | write returns **12 331 B** of a nominal 12 288 |
+| 4 KiB | 4 KiB | 33 935 B | both return **20 555 B** |
+
+They are additive: 8 238 + 12 331 = 20 569 against 20 555 measured, which is
+0.07% apart. So the two buffers are independent in memory as well as in
+configuration, which is the property the split was for.
+
+**The write buffer returns its full nominal 12 KiB; the read buffer returns
+8.2 kB of it.** Why they differ is not established here. Apple Silicon's
+16 KiB page is the obvious suspect — a 16 KiB allocation is exactly one page
+and a 4 KiB one shares — but that would apply to both, and it does not.
+Attributing the 4 kB gap needs a heap profile. It is recorded as open rather
+than explained.
+
+### Against the budget
+
+The two buffers are **38%** of an idle connection: 20.6 kB of 54.2 kB. The
+budget charges 32 KiB per connection at the defaults and the process holds
+54.2 kB, so the budget covers 60% of the real cost — and says so. That is
+the whole difference from the previous entry, where it covered 30% and
+claimed to be the bound.
+
+The remaining ~26 kB is still unattributed: packet-id tables, session state,
+two task futures, channel metadata and allocator rounding. `CONSTITUTION.md`
+§29 forbids calling those bounded by a budget that does not manage them, so
+they are named as outside it in `docs/memory.md` rather than folded in.
+
+The prediction in `docs/memory.md` §8 held: at the default 1 GiB budget the
+ceiling is 32 768 connections, and 32 768 × 54.2 kB is 1.78 GB against the
+~1.75 GB predicted.
