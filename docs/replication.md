@@ -992,3 +992,74 @@ fsync, and nothing else.
 
 The harness now reports the publish loop, as the table does, and prints the
 teardown separately so it cannot be mistaken for throughput again.
+
+## 125. Allocation, measured
+
+§122 audited the path by reading it, and said so. Three of its rows are now
+counted instead. `divan`'s allocation profiler prints a `max alloc` line
+whenever a benchmark allocates — `runtime/pipeline` shows 3 per publish, so
+the absence of that line below is a zero and not a profiler that is off.
+
+`replication/benches/frame.rs`, Apple M1, bench profile:
+
+| | allocations | throughput |
+|---|---|---|
+| `encode_records_header`, 256 records | **0** | 12.55 GB/s |
+| `decode`, 256 records | **0** | 7.38 GB/s |
+| `Follower::accept` + `on_durable` | **0** | 0.872 ns |
+| `Peer::on_durable` × 64 | **0** | 104.9 ns |
+
+**The state machine does not scale with the range.** `Follower::accept` over
+a frame spanning 1 record, 256 records and 65 536 records measures 0.872 ns
+every time, identical to three decimals. That is §115's claim — ranges, not
+messages — as a number rather than a design statement.
+
+Both codec figures are checksum-bound: the throughput is what `crc32fast`
+does over the batch, and the header itself is 25 bytes into a buffer the
+caller already owns.
+
+### What the frame checksum costs
+
+§114 decided to cover the payload and left the cost open. For a 1 MiB
+batch:
+
+```text
+leader    1 MiB / 12.55 GB/s =  84 µs   against a 4.5 ms fsync   1.9%
+follower  1 MiB /  7.38 GB/s = 142 µs   against a 4.5 ms fsync   3.2%
+```
+
+Two to three percent of each side's commit cycle to know that a frame is
+the frame that was sent, including the case a per-record CRC cannot catch:
+a whole record replaced by another well-formed one. That is the number the
+decision was made without, and it does not change the decision.
+
+### Appending a framed run against re-encoding it
+
+`storage/benches/record.rs`, 256 B payloads:
+
+| records | re-encode | append framed | |
+|---|---|---|---|
+| 1 | 156.2 ns | 93.4 ns | 1.7× |
+| 16 | 812.2 ns | 220.9 ns | 3.7× |
+| 256 | 11.36 µs | 2.33 µs | **4.9×** |
+
+The gap widens with the record count because re-encoding pays a CRC per
+record while appending pays one `memcpy` and a walk over the length fields.
+At 256 records — 64 KiB, an ordinary batch — not re-encoding is worth 4.9×
+on the follower's ingest path. It is also what compaction gained when it
+moved to `replay_frames` and stopped re-encoding records it was only
+copying forward.
+
+### Still by inspection
+
+Three rows of §122 are not measured here, because they sit behind tokio or a
+file and `divan` reaches neither:
+
+```text
+Wal::committed_batch   the buffer rotation, no copy
+ship                   one Bytes::copy_from_slice per batch
+take                   one Bytes::copy_from_slice per frame
+```
+
+They remain what §122 called them: an audit. Counting them needs a harness
+that can profile allocations across a runtime, which is not this.

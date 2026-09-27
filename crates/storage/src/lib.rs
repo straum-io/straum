@@ -77,6 +77,14 @@ pub fn checksum_for_benchmarks(bytes: &[u8]) -> u32 {
     crc::checksum(bytes)
 }
 
+/// Exposed for `benches/record.rs`: walking the framing of an already
+/// encoded run is what `stage_framed` does instead of re-encoding, and its
+/// cost is the difference the two benchmarks show.
+#[doc(hidden)]
+pub fn count_for_benchmarks(bytes: &[u8], max_record_bytes: usize) -> Option<usize> {
+    record::count(bytes, max_record_bytes)
+}
+
 /// Exposed for `benches/record.rs`, see above.
 #[doc(hidden)]
 pub fn encode_for_benchmarks(payload: &[u8], out: &mut Vec<u8>) {

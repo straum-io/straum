@@ -45,3 +45,32 @@ fn batch_construction(bencher: divan::Bencher, records: usize) {
             divan::black_box(buffer.len())
         });
 }
+
+/// The same records taken in already framed, as a follower takes a
+/// replication batch.
+///
+/// The claim in docs/replication.md §114 is that nothing is encoded twice:
+/// the bytes go in as they arrived and the framing is only walked to count
+/// the records. Against `batch_construction` above, which encodes the same
+/// records from their payloads, this is the difference between re-framing a
+/// batch and appending it.
+#[divan::bench(args = [1, 16, 256])]
+fn framed_append(bencher: divan::Bencher, records: usize) {
+    let payload = vec![b'x'; 256];
+    let limits = WalLimits::default();
+
+    // One batch, framed once, outside the measured section.
+    let mut run = Vec::new();
+    for _ in 0..records {
+        storage::encode_for_benchmarks(&payload, &mut run);
+    }
+
+    bencher
+        .with_inputs(|| Vec::with_capacity(limits.initial_batch_bytes))
+        .bench_values(|mut buffer: Vec<u8>| {
+            buffer.clear();
+            let counted = storage::count_for_benchmarks(&run, limits.max_record_bytes);
+            buffer.extend_from_slice(&run);
+            divan::black_box((counted, buffer.len()))
+        });
+}
