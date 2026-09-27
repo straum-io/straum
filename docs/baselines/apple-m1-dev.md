@@ -240,3 +240,63 @@ they are named as outside it in `docs/memory.md` rather than folded in.
 The prediction in `docs/memory.md` §8 held: at the default 1 GiB budget the
 ceiling is 32 768 connections, and 32 768 × 54.2 kB is 1.78 GB against the
 ~1.75 GB predicted.
+
+## 2026-09-27 — CPU and RSS per node
+
+The earlier claim that this needed a two-host Linux stand was wrong. Only
+the *in-process* benchmark cannot separate the nodes; two `straum-server`
+processes and `loadgen` — which is a separate binary for exactly this
+reason — can.
+
+Two release servers on loopback, one publisher, no subscribers, QoS 1,
+`fsynced` on both, 20 s. CPU is the process's own `utime`/`stime` delta
+around the run, RSS its `ps` value at the end. One connection, so RSS here
+is a floor and not the per-connection curve.
+
+**Paced to the same rate**, because a fixed-duration run at a lower rate
+divides the same standing overhead among fewer messages and inflates
+per-message CPU. 5 000/s, 100 000 messages, both configurations:
+
+| workload | node | user | sys | CPU/msg | RSS |
+|---|---|---|---|---|---|
+| 1 KiB | local leader | 0.61 s | 1.73 s | 23.40 µs | 4 096 KiB |
+| 1 KiB | replicated leader | 0.70 s | 1.56 s | 22.60 µs | 5 824 KiB |
+| 1 KiB | replicated follower | 0.15 s | 0.80 s | 9.50 µs | 5 232 KiB |
+| 64 B | local leader | 0.55 s | 1.66 s | 22.10 µs | 3 472 KiB |
+| 64 B | replicated leader | 0.55 s | 1.25 s | 18.00 µs | 3 872 KiB |
+| 64 B | replicated follower | 0.10 s | 0.63 s | 7.30 µs | 3 488 KiB |
+
+**Replication costs the leader no measurable CPU.** 22.60 against 23.40 at
+1 KiB, inside the spread and on the low side of it. The whole cost is the
+follower: 9.5 µs per message at 1 KiB, 7.3 at 64 B — about 40% of the
+leader's, which is a node that runs a log and a socket and none of the MQTT
+parsing, routing or client connections.
+
+That is consistent with the throughput table: replication halves throughput
+because of the second `fsync`, not because it does much more work. The
+device is the cost; the code is not.
+
+**System time is three to four times user time** in every row. The same
+shape the very first profile in this project found, and the reason batching
+is the lever that matters here.
+
+### Unpaced, for the record
+
+The same runs without `--rate`, so each side went as fast as it could:
+
+| workload | node | messages in 20 s | CPU/msg |
+|---|---|---|---|
+| 1 KiB | local leader | 240 665 | 13.96 µs |
+| 1 KiB | replicated leader | 125 144 | 21.02 µs |
+| 1 KiB | replicated follower | 125 144 | 8.63 µs |
+
+12 033 against 6 257 msg/s, which agrees with the in-process benchmark's
+12 702 against 7 621 — two harnesses, independently written, on the same
+shape of workload.
+
+These rows must not be read as "replication costs 7 µs more per message on
+the leader". They cannot be compared: the two ran at different rates, and
+at 12 000/s the batches are bigger, so the standing overhead is spread
+thinner. The paced table above is the comparison; this one is here because
+leaving it out would hide why the paced numbers are higher than the
+unpaced ones.
