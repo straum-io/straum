@@ -7,6 +7,7 @@ mod broker_loop;
 mod config;
 mod connection;
 mod metrics;
+mod observe;
 mod replication;
 mod session;
 mod wal;
@@ -58,7 +59,7 @@ pub struct Runtime {
     wal_writer: Option<std::thread::JoinHandle<()>>,
     /// Leader and follower links, drained after the log stops so what was
     /// committed is shipped (docs/replication.md §120).
-    replicating: JoinSet<()>,
+    background: JoinSet<()>,
     replication_addr: Option<SocketAddr>,
 }
 
@@ -144,12 +145,24 @@ impl Runtime {
             }
         };
 
-        let mut replicating = JoinSet::new();
+        let mut background = JoinSet::new();
         let mut replication_addr = None;
+
+        // Bound before anything is served, so a port that cannot be had is a
+        // startup failure rather than a surprise later.
+        if let Some(addr) = config.metrics {
+            let listener = observe::bind(addr).map_err(transport::TransportError::from)?;
+            tracing::info!(%addr, "serving metrics");
+            background.spawn(observe::serve(
+                listener,
+                Arc::clone(&metrics),
+                stopping.clone(),
+            ));
+        }
         if let (Some(peer), Some(outbound), Some(replicated)) =
             (config.replication.follower, outbound, replicated)
         {
-            replicating.spawn(replication::lead(
+            background.spawn(replication::lead(
                 replication::Leading {
                     peer,
                     settings: config.replication.clone(),
@@ -168,7 +181,7 @@ impl Runtime {
             transport.listen = listen;
             let listener = Listener::bind(transport, Arc::clone(&budget), None)?;
             replication_addr = Some(listener.local_addr()?);
-            replicating.spawn(replication::follow(
+            background.spawn(replication::follow(
                 replication::Following {
                     settings: config.replication.clone(),
                     wal: config.wal.clone(),
@@ -217,7 +230,7 @@ impl Runtime {
             brokering,
             events,
             wal_writer,
-            replicating,
+            background,
             replication_addr,
         })
     }
@@ -273,8 +286,8 @@ impl Runtime {
         // left on this node alone is anything the follower never
         // acknowledged — replication is asynchronous in this phase and a
         // PUBACK never waited for it (docs/replication.md §120).
-        let mut replicating = self.replicating;
-        while replicating.join_next().await.is_some() {}
+        let mut background = self.background;
+        while background.join_next().await.is_some() {}
         tracing::info!("stopped");
     }
 }

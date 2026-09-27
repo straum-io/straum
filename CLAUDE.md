@@ -838,11 +838,22 @@ counters: connections_accepted  protocol_errors  transport_errors
           bytes_in  bytes_out  slow_consumer_closes  backlog_refused
           authentication_failures  keepalive_closes
           wal_commits  wal_records_committed  wal_bytes_committed
-          wal_sync_nanos  wal_commit_failures  session_records_dropped
-          wal_compactions
+          wal_commit_failures  session_records_dropped  wal_compactions
+          replication_connections  replication_errors
+          replication_shipments_dropped  replication_catchups
 gauges:   active_sessions  queued_messages  queued_bytes  backlog_bytes
-          wal_durable_sequence
+          wal_durable_sequence  wal_sync_nanos
+          replication_connected  replication_follower_sequence
+          replication_in_flight  replication_queued
 ```
+
+`wal_sync_nanos` is a gauge, not a counter: it is the latest sync, and the
+average of a bimodal latency is a number that never happened.
+
+They leave the process through `STRAUM_METRICS_ADDR`, in the Prometheus
+text exposition format over HTTP. Metrics nobody can read are metrics
+nobody acts on; printing thirty integers is not worth an HTTP framework
+(§2), so the format is written by hand.
 
 The broker keeps its own counters (`published_messages`,
 `delivered_messages`, `dropped_messages` and the rest of `broker::Stats`);

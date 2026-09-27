@@ -27,6 +27,10 @@ pub struct RuntimeConfig {
     /// Commands handled per broker loop wakeup.
     pub broker_batch: usize,
     pub replication: ReplicationSettings,
+    /// Where to serve the counters, if anywhere. `None`: they stay in the
+    /// process, which is where they were until now and where nobody can
+    /// act on them.
+    pub metrics: Option<std::net::SocketAddr>,
     /// Outbound items encoded per socket write.
     pub writer_batch: usize,
     pub shutdown_grace: Duration,
@@ -52,6 +56,7 @@ impl Default for RuntimeConfig {
             broker_queue: 65_536,
             broker_batch: 256,
             replication: ReplicationSettings::default(),
+            metrics: None,
             writer_batch: 64,
             shutdown_grace: Duration::from_millis(5_000),
             write_stall_timeout: Duration::from_millis(30_000),

@@ -325,6 +325,7 @@ impl Settings {
                 total_queued_bytes,
                 broker_queue: parser.number("STRAUM_BROKER_QUEUE", 65_536, 1, 16_777_216)?,
                 broker_batch: parser.number("STRAUM_BROKER_BATCH", 256, 1, 65_536)?,
+                metrics: parser.optional_addr("STRAUM_METRICS_ADDR")?,
                 replication: runtime::ReplicationSettings {
                     listen: parser.optional_addr("STRAUM_REPLICATION_LISTEN")?,
                     follower: parser.optional_addr("STRAUM_REPLICATION_FOLLOWER")?,
@@ -1039,6 +1040,7 @@ mod tests {
             ("STRAUM_WAL_MAX_BATCH_BYTES", "4194304"),
             ("STRAUM_WAL_INITIAL_BATCH_BYTES", "1048576"),
             ("STRAUM_DURABILITY", "memory"),
+            ("STRAUM_METRICS_ADDR", ""),
             ("STRAUM_REPLICATION_LISTEN", ""),
             ("STRAUM_REPLICATION_FOLLOWER", ""),
         ];
