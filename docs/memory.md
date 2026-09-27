@@ -152,8 +152,8 @@ after a split it would move one. Keeping the write buffer defaulted to the
 read buffer's value preserves current behaviour for an unset variable, and
 the coupling stops being silent because it is then written down.
 
-**Shape of the smallest change that makes the invariant true**, for the
-decision, not yet done:
+**Shape of the smallest change that makes the invariant true.** This was
+written for the decision and is what §8 below records as done:
 
 ```text
 1. charge the write buffer to the same budget the read buffer uses

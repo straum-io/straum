@@ -1,8 +1,9 @@
 # Replication
 
-Phases 1-2 of the replication work: the audit, and the map of what in the
-existing implementation contradicts it. C1 and C2 have since been fixed
-(§110); everything else is a finding, not yet a change.
+What it takes to replicate durably, and what had to be fixed first. It began
+as the Phase 1–2 audit — the trace, and the map of what the implementation
+contradicted — and the sections after §110 are the work that followed.
+The table in §108 carries each finding's current state.
 
 `docs/cluster.md` (§70–§83a) decides *who owns a session* and what crosses the
 network for ownership. This file is about a different question: **what it takes
@@ -104,8 +105,8 @@ Against `docs/storage.md` §73–§104 and `CLAUDE.md` §7–§8.
 | C6 | `Broker::replay_retained` iterated a `HashMap` | correctness (determinism) | **fixed** — the matches are sorted by topic before delivery |
 | C7 | `StorageError::Poisoned` is terminal for the log; there is no equivalent for "quorum lost", and the two are different classes of state — local storage unrecoverable versus distributed availability | architecture | yes — losing a peer must withhold acknowledgement, never kill the WAL |
 | C8 | `pending_durable` has no explicit bound; its depth today is limited by the WAL channel, which a network round-trip widens | performance / §8 | no, but the limit must be named before the window grows |
-| C9 | `CLAUDE.md` §16 shutdown has no step that flushes replication; step 7 commits locally and stops | correctness | yes — acknowledged-but-unreplicated records at shutdown |
-| C10 | No metric leaves the process; `Metrics` has no exporter and no caller in `server` | observability | no, but replication lag is unobservable until it does |
+| C9 | `CLAUDE.md` §16 shutdown had no step that flushed replication | correctness | **fixed** — the leader drains after the WAL writer stops, and what may still be leader-only is stated (§120) |
+| C10 | No metric left the process; `Metrics` had no exporter and no caller in `server` | observability | **fixed** — Prometheus text on `STRAUM_METRICS_ADDR`, including the replication gauges |
 | C11 | `docs/storage.md` §80 defines three modes; a fourth changes a table that four documents quote | documentation | no |
 | C12 | **The WAL sequence regressed across compaction plus restart**, and so did the correlation: both were derived from what survived a rewrite | **correctness / durability** | **fixed** — `STRAUMW3` carries the allocation state in the header (§116) |
 
@@ -289,16 +290,19 @@ is the whole design.
 ## 113. Order of work
 
 ```text
-1. contiguous durable watermark + reserve-then-number            done
-2. deterministic retained replay (C6)                            done
-3. replication codec, sans-IO, no peers yet                      done
-4. replication state machine                                     done
-5. STRAUMW3: logical identity survives compaction (C12)          done
-6. one source, one follower, static membership
-7. quorum watermark; Durability::Quorum
-8. compaction floor honours the slowest peer (C4)
-9. failure tests: peer down, peer slow, peer returns, shutdown with lag (C9)
-10. benchmarks against the fsynced baseline in docs/baselines/
+1. contiguous durable watermark + reserve-then-number       done
+2. deterministic retained replay (C6)                       done
+3. replication codec, sans-IO, no peers yet                 done
+4. replication state machine                                done
+5. STRAUMW3: logical identity survives compaction (C12)     done
+6. one source, one follower, static membership              done
+7. quorum watermark; Durability::Quorum                     next
+8. compaction holds the log for a lagging peer (C4)         done
+   a retention policy, and a path for one too far behind    open
+9. failure tests: peer down, slow, returning (§121)         done
+   shutdown with a lagging peer (C9, §120)                  done
+10. replication measured against the local baseline (§122)  done
+   the same for quorum, once there is one                   open
 ```
 
 Step 4 is separate from step 3 on purpose. A codec guarantees nothing by

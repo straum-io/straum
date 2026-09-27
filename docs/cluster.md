@@ -322,15 +322,21 @@ delivers is worse than one that promises less.
 
 ## 83a. Order of work
 
-Nothing here is built. §60 gives the order and it is the right one:
+This file is about **session ownership** across nodes. Durable replication
+of the log turned out to be a separable question and was built first; it is
+in `docs/replication.md`, and steps 1 and 3 below were answered there.
+Nothing specific to ownership is built.
 
-1. Fix the retained-iteration determinism defect (§77a) — it is a today bug.
+1. ~~Fix the retained-iteration determinism defect (§77a)~~ — done, sorted
+   by topic before delivery (docs/replication.md §108, C6).
 2. Command/state/transition boundary, single node, no networking.
-3. Static two-node membership, forward channel only. No state replication.
+3. ~~Static two-node membership, forward channel only~~ — built as durable
+   log replication rather than command forwarding
+   (docs/replication.md §119). Ownership still forwards nothing.
 4. Subscription index and its gossip.
 5. State channel: retained and session records.
 6. Epoch fencing and ownership.
 7. Failure matrix (§57), then performance.
 
-Steps 1 and 2 change nothing observable and can start immediately. Step 3 is
-the first one that needs a decision on question 1 above.
+Step 2 changes nothing observable and can start immediately. Step 4 is the
+first one that needs a decision on question 1 above.

@@ -47,8 +47,13 @@ Failure and edge cases:
 
 Tests for normative statements are named after the statement ID, for example
 `mqtt_3_1_2_1_protocol_name`. Each decision in CLAUDE.md §6 has a test,
-including the documented deviations (Will ignored, RETAIN not stored,
-CleanSession = 0 treated as clean).
+including the documented deviations — which are now one: an empty ClientId
+with CleanSession = 0 is refused with CONNACK 0x02 rather than given a
+kept session nothing can name again.
+
+Will publishing, retained messages and persistent sessions were deviations
+when this was written and are built; §6 is the list that decides, and this
+paragraph follows it rather than repeating it.
 
 ## Property tests
 

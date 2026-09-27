@@ -22,8 +22,8 @@ docs/memory.md          what a connection allocates, and what the budget really 
 docs/performance.md     the current measured baseline
 docs/profiling.md       which tool answers which question, per platform
 docs/storage.md         the write-ahead log: group commit, durability, compaction
-docs/cluster.md         architecture for clustering; nothing in it is built yet
-docs/replication.md     durable replication: the audit, and what contradicts it
+docs/cluster.md         session ownership across nodes; none of it is built
+docs/replication.md     durable log replication: one leader, one follower, built
 docs/linux-tuning.md    kernel parameters and socket options for production hosts
 docs/baselines/         recorded benchmark baselines, one file per machine
 ```
