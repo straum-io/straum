@@ -142,6 +142,14 @@ impl ConnectionBuffer {
     /// that does not match reality is not a bound.
     fn settle(&mut self) {
         let capacity = self.buf.capacity();
+        if capacity == self.charged {
+            // Nothing moved, so there is nothing to settle. The budget is one
+            // counter shared by every connection in the process, and a
+            // read-modify-write of zero on it is work that does not
+            // contribute to the result (CLAUDE.md §11). This is the common
+            // case: every flush of a buffer that never had to grow.
+            return;
+        }
         if capacity > self.charged {
             // Allocator slack, already taken: account it, do not hide it.
             self.budget.try_reserve(capacity - self.charged).ok();

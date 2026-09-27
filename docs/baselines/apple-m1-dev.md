@@ -300,3 +300,55 @@ at 12 000/s the batches are bigger, so the standing overhead is spread
 thinner. The paced table above is the comparison; this one is here because
 leaving it out would hide why the paced numbers are higher than the
 unpaced ones.
+
+## 2026-09-27 — a no-op atomic on the write path
+
+Found by walking the hot path for what had changed since the pass that
+concluded "no change made". What had changed was mine: `f9ddc3d` put
+`ConnectionBuffer::reclaim` on every `flush`, and `reclaim` calls `settle`,
+which in the steady state did
+
+```rust
+self.budget.release(self.charged - capacity)   // release(0)
+```
+
+— a read-modify-write of zero on a counter shared by every connection in
+the process, once per socket write. That change was reported as "no
+performance-sensitive change". It was on the write path, and it was not
+benchmarked.
+
+The fix is a guard: when capacity equals the charge there is nothing to
+settle. Behaviour is identical — `charged = capacity` was already true in
+that branch.
+
+`transport/benches/read_buffer.rs`, bench profile, medians of 100 samples:
+
+| | before | after | |
+|---|---|---|---|
+| 64 flushes at steady size | 216.6 ns | 76.98 ns | 2.81× |
+| 64 flushes, 1 thread | 212.7 ns | 109.2 ns | 1.95× |
+| 64 flushes, 8 threads, median | 290.7 ns | 114 ns | 2.55× |
+| 64 flushes, 8 threads, mean | 665 ns | 180.3 ns | 3.69× |
+| 64 flushes, 8 threads, slowest | 8.207 µs | 3.541 µs | 2.32× |
+
+Per flush: **3.38 ns → 1.20 ns**. And at eight threads the median is now
+114 ns against 109 at one thread — the contention is gone, where before it
+was 291 against 213.
+
+Neighbours unchanged: `steady_large` 24.32 µs → 24.36 µs, and the read-path
+rows are untouched because they grow the buffer, so the guard never fires
+for them. 282 tests pass.
+
+**No end-to-end improvement is claimed, and none was measured.** At one
+connection and 12 000 msg/s with ~50 messages a flush, this is 240 flushes
+a second and half a microsecond an hour; it is invisible and will stay
+invisible. What justifies it is not a throughput number:
+
+* it removes work that provably does nothing (CLAUDE.md §11, first
+  priority), and
+* the cost it removes scales with the connection count rather than with
+  throughput, which is the shape the eight-thread rows show and the shape
+  this project keeps having to be careful about.
+
+A machine with ten thousand connections writing is where it would be
+measurable, and this is not that machine.

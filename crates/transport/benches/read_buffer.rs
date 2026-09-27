@@ -80,3 +80,37 @@ fn burst_then_small(bencher: divan::Bencher, reclaim: bool) {
         buffer
     });
 }
+
+/// What a flush pays when the buffer is already at its steady size, which
+/// is every flush a connection makes until something forces it to grow.
+///
+/// `reclaim` settles the charge against the budget, and the budget is one
+/// counter shared by every connection in the process. When nothing changed
+/// there is nothing to settle, so what this measures is whether the common
+/// case still touches that counter (CONSTITUTION.md §27: fewer
+/// synchronization points).
+#[divan::bench(args = [1, 64])]
+fn flush_at_steady_size(bencher: divan::Bencher, flushes: usize) {
+    bencher.with_inputs(buffer).bench_values(|mut buffer| {
+        for _ in 0..flushes {
+            // A flush writes what was encoded, empties the buffer and
+            // returns whatever capacity a large batch forced.
+            buffer.buf_mut().clear();
+            buffer.reclaim();
+        }
+        buffer
+    });
+}
+
+/// The same, from many threads at once: one shared counter, and this is
+/// where touching it for nothing shows up.
+#[divan::bench(threads = [1, 8])]
+fn flush_contended(bencher: divan::Bencher) {
+    bencher.with_inputs(buffer).bench_values(|mut buffer| {
+        for _ in 0..64 {
+            buffer.buf_mut().clear();
+            buffer.reclaim();
+        }
+        buffer
+    });
+}
