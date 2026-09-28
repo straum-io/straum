@@ -94,6 +94,10 @@ impl Runtime {
         let metrics = Arc::new(Metrics::default());
         let global_queued = Arc::new(AtomicUsize::new(0));
         let (events, commands) = mpsc::channel(config.broker_queue);
+        // Monotonic and latest-only, which is what a watermark is. On its
+        // own channel so a full pending queue cannot stop the thing that
+        // drains it (docs/replication.md §128).
+        let (quorum, quorum_reached) = watch::channel(0u64);
         let (shutdown, stopping) = watch::channel(false);
 
         // No log unless durability asks for one.
@@ -178,6 +182,8 @@ impl Runtime {
                     local: Arc::clone(&local_sequence),
                     replicated,
                     metrics: Arc::clone(&metrics),
+                    quorum: quorum.clone(),
+                    required_copies: config.replication.required_copies,
                 },
                 outbound,
                 stopping.clone(),
@@ -207,7 +213,7 @@ impl Runtime {
                 Arc::clone(&global_queued),
                 wal.clone(),
             )
-            .run(commands),
+            .run(commands, quorum_reached),
         );
         let sessions = Arc::new(AtomicU64::new(0));
         let accepting = listeners

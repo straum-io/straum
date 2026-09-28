@@ -26,6 +26,12 @@ pub struct RuntimeConfig {
     pub broker_queue: usize,
     /// Commands handled per broker loop wakeup.
     pub broker_batch: usize,
+    /// Commits durable here and waiting for a quorum before their publishes
+    /// are acknowledged. Only used with `Durability::Quorum`. Reaching it
+    /// stops the broker taking commands, which reaches the publisher's TCP
+    /// window; the pairs are never dropped, because a lost one is a
+    /// correlation no watermark can release (docs/replication.md §128).
+    pub max_awaiting_quorum: usize,
     pub replication: ReplicationSettings,
     /// Where to serve the counters, if anywhere. `None`: they stay in the
     /// process, which is where they were until now and where nobody can
@@ -55,6 +61,7 @@ impl Default for RuntimeConfig {
             total_queued_bytes: 1_073_741_824,
             broker_queue: 65_536,
             broker_batch: 256,
+            max_awaiting_quorum: 65_536,
             replication: ReplicationSettings::default(),
             metrics: None,
             writer_batch: 64,

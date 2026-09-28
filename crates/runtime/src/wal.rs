@@ -742,7 +742,10 @@ fn report(commit: &storage::Commit, events: &mpsc::WeakSender<Event>, metrics: &
     // The broker may acknowledge everything up to here, and not one
     // record more (docs/storage.md §99, invariant 1).
     if let Some(events) = events.upgrade() {
-        let _ = events.blocking_send(Event::Durable(DurableToken(commit.durable_correlation)));
+        let _ = events.blocking_send(Event::Durable {
+            sequence: commit.durable_sequence,
+            correlation: DurableToken(commit.durable_correlation),
+        });
     }
 }
 

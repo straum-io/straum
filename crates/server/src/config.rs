@@ -326,6 +326,12 @@ impl Settings {
                 broker_queue: parser.number("STRAUM_BROKER_QUEUE", 65_536, 1, 16_777_216)?,
                 broker_batch: parser.number("STRAUM_BROKER_BATCH", 256, 1, 65_536)?,
                 metrics: parser.optional_addr("STRAUM_METRICS_ADDR")?,
+                max_awaiting_quorum: parser.number(
+                    "STRAUM_MAX_AWAITING_QUORUM",
+                    65_536usize,
+                    1,
+                    1 << 24,
+                )?,
                 replication: runtime::ReplicationSettings {
                     listen: parser.optional_addr("STRAUM_REPLICATION_LISTEN")?,
                     follower: parser.optional_addr("STRAUM_REPLICATION_FOLLOWER")?,
@@ -1083,6 +1089,7 @@ mod tests {
             ("STRAUM_DURABILITY", "memory"),
             ("STRAUM_METRICS_ADDR", ""),
             ("STRAUM_REQUIRED_COPIES", "2"),
+            ("STRAUM_MAX_AWAITING_QUORUM", "65536"),
             ("STRAUM_REPLICATION_LISTEN", ""),
             ("STRAUM_REPLICATION_FOLLOWER", ""),
         ];

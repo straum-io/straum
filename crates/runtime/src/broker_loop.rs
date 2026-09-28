@@ -1,13 +1,13 @@
 //! The single broker task: one state machine, no locks, no I/O.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use broker::{Broker, SessionEvent};
-use domain::SessionId;
+use domain::{Durability, SessionId};
 use protocol::{Command, DurableToken, Outbound, Outbox};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::RuntimeConfig;
 use crate::metrics::Metrics;
@@ -30,7 +30,15 @@ pub(crate) enum Event {
         durable: Option<DurableToken>,
     },
     /// Everything up to this token is durable (docs/storage.md §79).
-    Durable(DurableToken),
+    /// One commit became durable on this node, as the pair the commit
+    /// itself established: the WAL sequence that orders it and the
+    /// correlation the broker knows it by. Kept as one fact so nothing has
+    /// to look one up from the other and drift from the log
+    /// (docs/replication.md §128).
+    Durable {
+        sequence: u64,
+        correlation: DurableToken,
+    },
 }
 
 pub(crate) struct Loop {
@@ -47,6 +55,14 @@ pub(crate) struct Loop {
     /// Session state the log has not taken yet. Reused, and bounded: a log
     /// that cannot keep up must not turn session churn into memory growth.
     session_events: Vec<SessionEvent>,
+    /// Commits durable here and waiting for a quorum, in sequence order.
+    /// Empty unless durability is `quorum`.
+    ///
+    /// Never dropped from: losing a pair would leave a correlation that no
+    /// watermark can ever release. When it fills, the loop stops taking
+    /// commands instead, which is the backpressure the reader already
+    /// awaits (CLAUDE.md §4).
+    awaiting_quorum: VecDeque<(u64, DurableToken)>,
 }
 
 /// Session records waiting for room in the log queue. Reaching this means
@@ -75,15 +91,42 @@ impl Loop {
             ready: Vec::new(),
             rejected: Vec::new(),
             session_events: Vec::new(),
+            awaiting_quorum: VecDeque::new(),
         }
     }
 
     /// Runs until every sender is gone.
-    pub(crate) async fn run(mut self, mut events: mpsc::Receiver<Event>) {
+    pub(crate) async fn run(
+        mut self,
+        mut events: mpsc::Receiver<Event>,
+        mut quorum: watch::Receiver<u64>,
+    ) {
         let mut batch = Vec::with_capacity(self.config.broker_batch);
+        let mut watching = true;
 
         loop {
-            let received = events.recv_many(&mut batch, self.config.broker_batch).await;
+            // The watermark arrives on its own channel, and it has to: when
+            // the pending pairs fill, this loop stops reading commands, and
+            // a watermark queued behind them would never arrive to unblock
+            // it (docs/replication.md §128).
+            let room = self.awaiting_quorum.len() < self.config.max_awaiting_quorum;
+            let received = tokio::select! {
+                biased;
+                changed = quorum.changed(), if watching => {
+                    if changed.is_err() {
+                        // Nobody will report a watermark again. Stop
+                        // selecting on it rather than spinning on the
+                        // error it now returns forever.
+                        watching = false;
+                        continue;
+                    }
+                    let reached = *quorum.borrow_and_update();
+                    self.release_through(reached);
+                    self.flush();
+                    continue;
+                }
+                received = events.recv_many(&mut batch, self.config.broker_batch), if room => received,
+            };
             if received == 0 {
                 break;
             }
@@ -110,7 +153,18 @@ impl Loop {
                             self.sinks.remove(&session);
                         }
                     }
-                    Event::Durable(token) => self.broker.on_durable(token, &mut self.out),
+                    Event::Durable {
+                        sequence,
+                        correlation,
+                    } => {
+                        if self.config.durability == Durability::Quorum {
+                            // Durable here is not durable enough yet. The
+                            // pair waits for a watermark to cover it.
+                            self.awaiting_quorum.push_back((sequence, correlation));
+                        } else {
+                            self.broker.on_durable(correlation, &mut self.out);
+                        }
+                    }
                 }
             }
 
@@ -169,6 +223,26 @@ impl Loop {
 
     /// Moves everything the broker produced into the session queues, and lets
     /// the broker decide about what did not fit.
+    /// Releases every commit the quorum now covers.
+    ///
+    /// One call for the whole prefix: correlations advance with sequences,
+    /// so the highest one released covers the rest, and one watermark from
+    /// one replication frame frees a whole group commit rather than
+    /// turning it back into one operation per message.
+    fn release_through(&mut self, watermark: u64) {
+        let mut highest = None;
+        while let Some((sequence, correlation)) = self.awaiting_quorum.front().copied() {
+            if sequence > watermark {
+                break;
+            }
+            self.awaiting_quorum.pop_front();
+            highest = Some(correlation);
+        }
+        if let Some(correlation) = highest {
+            self.broker.on_durable(correlation, &mut self.out);
+        }
+    }
+
     fn flush(&mut self) {
         for _ in 0..MAX_FLUSH_ROUNDS {
             if self.out.is_empty() {

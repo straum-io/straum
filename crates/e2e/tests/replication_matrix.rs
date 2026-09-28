@@ -15,6 +15,8 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -930,6 +932,149 @@ async fn a_follower_that_stops_reading_fills_the_queue_and_still_loses_nothing()
         node.metrics().replication_catchups > 0,
         "the gap closed without the log being read back"
     );
+
+    peer.kill();
+    node.shutdown().await;
+    let _ = std::fs::remove_file(&log);
+}
+
+// ------------------------------------------------------------------ quorum
+// The level exists to make a PUBACK wait for somebody else's disk. These
+// two tests are the claim: one that it arrives when the follower reports,
+// one that it does not when the follower stays silent.
+
+fn quorum_leader(path: &Path, ships_to: SocketAddr) -> RuntimeConfig {
+    RuntimeConfig {
+        durability: Durability::Quorum,
+        replication: ReplicationSettings {
+            follower: Some(ships_to),
+            required_copies: 2,
+            ..ReplicationSettings::default()
+        },
+        ..base(path)
+    }
+}
+
+/// Publishes in the background and counts the PUBACKs as they arrive.
+///
+/// The counter is shared rather than returned at the end, so a test can
+/// read it at a moment it chose rather than after waiting a while and
+/// hoping (CONSTITUTION.md §21).
+fn publishing(broker: &Runtime, count: usize) -> Arc<AtomicUsize> {
+    let addr = broker.local_addr();
+    let acked = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&acked);
+    tokio::spawn(async move {
+        let mut options = rumqttc::MqttOptions::new("quorum", addr.ip().to_string(), addr.port());
+        options.set_keep_alive(Duration::from_secs(30));
+        let (client, mut eventloop) = rumqttc::AsyncClient::new(options, 64);
+        let driving = tokio::spawn(async move {
+            while let Ok(event) = eventloop.poll().await {
+                if matches!(
+                    event,
+                    rumqttc::Event::Incoming(rumqttc::Incoming::PubAck(_))
+                ) {
+                    counting.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        for _ in 0..count {
+            if client
+                .publish(
+                    "quorum/topic",
+                    rumqttc::QoS::AtLeastOnce,
+                    false,
+                    vec![b'x'; 32],
+                )
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        // Held open: the test decides when it has seen enough.
+        let _ = driving.await;
+    });
+    acked
+}
+
+/// Waits for a count to reach `want`, with a deadline only so a broken run
+/// fails instead of hanging.
+async fn acked(counter: &AtomicUsize, want: usize) {
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while counter.load(Ordering::Relaxed) < want {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} of {want} publishes were acknowledged",
+            counter.load(Ordering::Relaxed)
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A follower that reports: the publishes are acknowledged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quorum_publish_is_acknowledged_once_the_follower_has_it() {
+    let log = scratch("quorum-yes");
+    let (listener, at) = AsFollower::listen().await;
+    let node = Runtime::start(quorum_leader(&log, at)).unwrap();
+
+    let mut peer = AsFollower::accept(&listener, 0).await;
+    let counter = publishing(&node, 20);
+
+    // Take what the leader sends and report it durable, as a real follower
+    // does after its own sync_data.
+    let mut reached = 0u64;
+    while reached < 20 {
+        let Some((_, last, _)) = peer.frame().await else {
+            break;
+        };
+        reached = last;
+        peer.report(reached).await;
+    }
+    heard(&node, 20).await;
+    acked(&counter, 20).await;
+
+    peer.kill();
+    node.shutdown().await;
+    let _ = std::fs::remove_file(&log);
+}
+
+/// **The test that makes the level mean something.** The follower takes
+/// everything and acknowledges nothing. The leader's own log is synced, so
+/// `fsynced` would have acknowledged every one of these; `quorum` must not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quorum_publish_is_not_acknowledged_while_the_follower_is_silent() {
+    let log = scratch("quorum-no");
+    let (listener, at) = AsFollower::listen().await;
+    let node = Runtime::start(quorum_leader(&log, at)).unwrap();
+
+    let mut peer = AsFollower::accept(&listener, 0).await;
+    let counter = publishing(&node, 20);
+
+    // Drain the socket so nothing is blocked on backpressure, and report
+    // nothing at all.
+    let mut taken = 0;
+    while taken < 20 {
+        let Some((_, last, _)) = peer.frame().await else {
+            break;
+        };
+        taken = last as usize;
+    }
+
+    // A deterministic moment, not a pause: a record is committed and
+    // synced locally *before* its batch is shipped, so having received the
+    // frame covering all twenty means `fsynced` would already have
+    // acknowledged every one of them.
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        0,
+        "a publish was acknowledged on the leader's own disk alone"
+    );
+    // The records really are on the leader: this is not a broker that
+    // failed to write, it is one that wrote and did not promise.
+    assert_eq!(records(&log), 20);
+    assert_eq!(node.metrics().replication_follower_sequence, 0);
 
     peer.kill();
     node.shutdown().await;

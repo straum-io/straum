@@ -1206,3 +1206,80 @@ stopped syncing its own log. It is an exhaustive `match` now, so the next
 level has to decide rather than inherit whatever a comparison happened to
 say. Nothing else in the codebase matched on the enum exhaustively, which is
 why adding a variant compiled cleanly and changed behaviour.
+
+## 128. Connecting the coordinator to a PUBACK
+
+The watermark counts sequences and `pending_durable` counts correlations.
+The join between them is the commit, which already establishes both as one
+fact — so there is no second index and no new mapping to drift from the log:
+
+```text
+Commit { sequence, correlation }
+        │
+        ▼
+Event::Durable { sequence, correlation }      one pair, one fact
+        │
+        ├── memory / written / fsynced ──► broker.on_durable(correlation)
+        │
+        └── quorum ──► awaiting_quorum.push_back((sequence, correlation))
+                                 │
+                       quorum watermark advances
+                                 │
+                                 ▼
+                       release every pair with sequence <= watermark
+                                 │
+                                 ▼
+                       broker.on_durable(highest correlation)
+                                 │
+                                 ▼
+                              PUBACK
+```
+
+Two invariants, fixed before the code:
+
+> For `Durability::Quorum`, a durability entry is released only when its
+> WAL sequence is at or below the monotonically advancing quorum watermark.
+
+> A watermark never releases a correlation whose sequence is above it.
+
+The coordinator does not know what a correlation is. It says "sequence 100
+is now quorum durable" and the runtime turns that into "every correlation
+attached to a sequence at or below 100 may go". The broker is never asked
+to find a sequence from a correlation, which would be the second mapping
+this design exists to avoid.
+
+**One watermark releases a whole group commit.** Correlations advance with
+sequences, so the highest released covers the rest and one call does the
+prefix. Fifty messages that became one commit and one replication frame
+come back as one acknowledgement boundary, not fifty operations —
+`a_quorum_publish_is_acknowledged_once_the_follower_has_it` publishes
+twenty and they are acknowledged together.
+
+### The pending pairs are never dropped
+
+Dropping one leaves a correlation no watermark can release: sequence 100 is
+lost, the watermark reaches 100, and the publish attached to it can never
+be acknowledged. So the queue does not drop. When it reaches
+`STRAUM_MAX_AWAITING_QUORUM` the broker loop stops taking commands, which
+fills the bounded event channel, which the connection reader awaits, which
+reaches the publisher's TCP window — the backpressure that is already there
+(CLAUDE.md §4). A memory limit creates backpressure here; it never creates
+a silent loss of state.
+
+That is also why the watermark has **its own channel**. On the event
+channel it would queue behind the commands the full queue is refusing to
+take, and the only thing that can drain the queue would be waiting behind
+the thing that filled it. A `watch` fits exactly: monotonic, latest-only,
+and a sender that never blocks.
+
+### The test that makes the level mean something
+
+`a_quorum_publish_is_not_acknowledged_while_the_follower_is_silent`. The
+follower takes every frame and reports nothing. The leader's own log holds
+all twenty records and has synced them, so `fsynced` would have
+acknowledged every one; `quorum` acknowledges none.
+
+Its moment is deterministic and not a pause: a record is committed and
+synced locally *before* its batch is shipped, so receiving the frame that
+covers all twenty means `fsynced` would already have answered. Flipping the
+quorum branch off makes it fail with 20 against 0.

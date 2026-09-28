@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use replication::{Accepted, Follower, Limits, Message, Peer, Reconciled};
+use replication::{Accepted, Follower, Limits, Message, Peer, Quorum, Reconciled};
 use storage::{Committer, RecordSource, Wal, WalRecord};
 use tokio::sync::{mpsc, watch};
 use transport::{BufferBudget, Connection};
@@ -83,6 +83,12 @@ pub(crate) struct Leading {
     /// which will not rewrite the log past it (§118).
     pub(crate) replicated: Arc<AtomicU64>,
     pub(crate) metrics: Arc<Metrics>,
+    /// Where the quorum watermark goes. The coordinator is the only thing
+    /// that writes it, and the broker loop the only thing that reads it
+    /// (CONSTITUTION.md §30).
+    pub(crate) quorum: watch::Sender<u64>,
+    /// Durable copies required, this node counted (docs/replication.md §127).
+    pub(crate) required_copies: usize,
 }
 
 /// Ships committed batches to one follower, reconnecting as needed.
@@ -194,6 +200,15 @@ async fn stream(
     shipments: &mut mpsc::Receiver<Shipment>,
 ) -> Result<(), LinkError> {
     let mut header = Vec::with_capacity(replication::RECORDS_HEADER_BYTES);
+    // One follower, static membership. The coordinator lives for the
+    // connection; the watermark it published does not, because a watermark
+    // already declared is never withdrawn (§126).
+    let mut coordinator = Quorum::new(1, held.required_copies);
+    coordinator.on_peer(0, peer.durable());
+    announce(
+        held,
+        coordinator.on_local(held.local.load(Ordering::Relaxed)),
+    );
     loop {
         // Behind is a state, not an event. Waiting for the next commit to
         // reveal a gap leaves a follower behind for as long as the leader is
@@ -211,7 +226,7 @@ async fn stream(
                 if filled? == 0 {
                     return Err(LinkError::Closed);
                 }
-                drain_reports(held, &mut connection, peer)?;
+                drain_reports(held, &mut connection, peer, &mut coordinator)?;
             }
             shipment = shipments.recv() => {
                 let Some(shipment) = shipment else {
@@ -255,10 +270,19 @@ async fn send_frame(
 }
 
 /// Takes every complete report sitting in the read buffer.
+/// Publishes a watermark that moved. Monotonic by construction: the
+/// coordinator only hands back an advance.
+fn announce(held: &Leading, reached: Option<u64>) {
+    if let Some(reached) = reached {
+        let _ = held.quorum.send(reached);
+    }
+}
+
 fn drain_reports(
     held: &Leading,
     connection: &mut Connection,
     peer: &mut Peer,
+    coordinator: &mut Quorum,
 ) -> Result<(), LinkError> {
     loop {
         let consumed = {
@@ -275,6 +299,15 @@ fn drain_reports(
                         held.metrics
                             .replication_follower_sequence
                             .store(sequence, Ordering::Relaxed);
+                        // The peer said where its own durable prefix ends
+                        // and nothing more. Whether that is enough for a
+                        // quorum is the coordinator's question, and its
+                        // answer alone (CONSTITUTION.md §30).
+                        announce(
+                            held,
+                            coordinator.on_local(held.local.load(Ordering::Relaxed)),
+                        );
+                        announce(held, coordinator.on_peer(0, sequence));
                     }
                     consumed
                 }
