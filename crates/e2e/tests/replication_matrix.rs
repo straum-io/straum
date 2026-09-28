@@ -961,11 +961,16 @@ fn quorum_leader(path: &Path, ships_to: SocketAddr) -> RuntimeConfig {
 /// read it at a moment it chose rather than after waiting a while and
 /// hoping (CONSTITUTION.md §21).
 fn publishing(broker: &Runtime, count: usize) -> Arc<AtomicUsize> {
+    publishing_as(broker, "quorum", count)
+}
+
+fn publishing_as(broker: &Runtime, name: &str, count: usize) -> Arc<AtomicUsize> {
     let addr = broker.local_addr();
+    let name = name.to_owned();
     let acked = Arc::new(AtomicUsize::new(0));
     let counting = Arc::clone(&acked);
     tokio::spawn(async move {
-        let mut options = rumqttc::MqttOptions::new("quorum", addr.ip().to_string(), addr.port());
+        let mut options = rumqttc::MqttOptions::new(name, addr.ip().to_string(), addr.port());
         options.set_keep_alive(Duration::from_secs(30));
         let (client, mut eventloop) = rumqttc::AsyncClient::new(options, 64);
         let driving = tokio::spawn(async move {
@@ -1075,6 +1080,153 @@ async fn a_quorum_publish_is_not_acknowledged_while_the_follower_is_silent() {
     // failed to write, it is one that wrote and did not promise.
     assert_eq!(records(&log), 20);
     assert_eq!(node.metrics().replication_follower_sequence, 0);
+
+    peer.kill();
+    node.shutdown().await;
+    let _ = std::fs::remove_file(&log);
+}
+
+/// Waits for this node's own log to have made `want` records durable. The
+/// moment `fsynced` would have answered.
+async fn locally_durable(node: &Runtime, want: u64) {
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while node.metrics().wal_durable_sequence < want {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the log reached {}, not {want}",
+            node.metrics().wal_durable_sequence
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The whole cycle: in sync, the peer disappears, no new quorum, the peer
+/// returns, catch-up, in sync again — and nothing acknowledged along the
+/// way is ever taken back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn losing_a_quorum_stops_new_acknowledgements_and_withdraws_none() {
+    let log = scratch("quorum-cycle");
+    let (listener, at) = AsFollower::listen().await;
+    let node = Runtime::start(quorum_leader(&log, at)).unwrap();
+
+    // ── in sync ───────────────────────────────────────────────────────
+    let mut peer = AsFollower::accept(&listener, 0).await;
+    let first = publishing_as(&node, "before", 10);
+    let mut reached = 0u64;
+    while reached < 10 {
+        let Some((_, last, _)) = peer.frame().await else {
+            break;
+        };
+        reached = last;
+        peer.report(reached).await;
+    }
+    heard(&node, 10).await;
+    acked(&first, 10).await;
+
+    // ── the peer disappears ───────────────────────────────────────────
+    peer.kill();
+
+    let second = publishing_as(&node, "during", 10);
+    // The leader commits and syncs these on its own disk. At that moment
+    // `fsynced` would have acknowledged all ten.
+    locally_durable(&node, 20).await;
+    assert_eq!(
+        second.load(Ordering::Relaxed),
+        0,
+        "a publish was acknowledged with no quorum to acknowledge it"
+    );
+
+    // The quorum is lost, and that is not a broken log: the broker kept
+    // writing, and nothing failed.
+    let hurt = node.metrics();
+    assert_eq!(
+        hurt.wal_commit_failures, 0,
+        "a lost quorum poisoned the log"
+    );
+    assert_eq!(records(&log), 20, "the broker stopped writing");
+
+    // And what was already promised stays promised.
+    assert_eq!(first.load(Ordering::Relaxed), 10, "a PUBACK was withdrawn");
+
+    // ── the peer returns ──────────────────────────────────────────────
+    let mut peer = AsFollower::accept(&listener, 10).await;
+    let mut reached = 10u64;
+    while reached < 20 {
+        let Some((previous, last, _)) = peer.frame().await else {
+            break;
+        };
+        // Catch-up, continuing exactly where this side said it was.
+        assert_eq!(
+            previous, reached,
+            "the leader left a hole after reconnecting"
+        );
+        reached = last;
+        peer.report(reached).await;
+    }
+    heard(&node, 20).await;
+
+    // ── in sync again ─────────────────────────────────────────────────
+    acked(&second, 10).await;
+    assert_eq!(
+        first.load(Ordering::Relaxed),
+        10,
+        "recovering acknowledged something twice"
+    );
+    assert!(
+        node.metrics().replication_catchups > 0,
+        "nothing was read back"
+    );
+
+    peer.kill();
+    node.shutdown().await;
+    let _ = std::fs::remove_file(&log);
+}
+
+/// Acknowledged, then the peer vanishes, then it comes back. The point is
+/// narrow and worth its own test: durability once declared is not a claim
+/// that can be revisited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acknowledgement_survives_the_replica_that_established_it() {
+    let log = scratch("quorum-irrevocable");
+    let (listener, at) = AsFollower::listen().await;
+    let node = Runtime::start(quorum_leader(&log, at)).unwrap();
+
+    let mut peer = AsFollower::accept(&listener, 0).await;
+    let counter = publishing_as(&node, "promised", 6);
+    let mut reached = 0u64;
+    while reached < 6 {
+        let Some((_, last, _)) = peer.frame().await else {
+            break;
+        };
+        reached = last;
+        peer.report(reached).await;
+    }
+    heard(&node, 6).await;
+    acked(&counter, 6).await;
+    let promised = node.metrics().replication_follower_sequence;
+    assert_eq!(promised, 6);
+
+    peer.kill();
+    // The replica that made it durable is gone. The statement is not.
+    assert_eq!(node.metrics().replication_follower_sequence, 6);
+    assert_eq!(counter.load(Ordering::Relaxed), 6);
+
+    // It comes back claiming less than it had — a replica rebuilt from an
+    // older copy. The leader resends, and the position it already declared
+    // does not move down to meet it.
+    let mut peer = AsFollower::accept(&listener, 3).await;
+    let Some((previous, _, _)) = peer.frame().await else {
+        panic!("the leader sent nothing to a follower that was behind");
+    };
+    assert_eq!(
+        previous, 3,
+        "the leader did not resend from where it was told"
+    );
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        6,
+        "an acknowledgement was withdrawn when the replica came back smaller"
+    );
 
     peer.kill();
     node.shutdown().await;

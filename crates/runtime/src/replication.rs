@@ -216,7 +216,6 @@ async fn stream(
         // it is stale — skipped, revealing nothing (docs/replication.md §123).
         let local = held.local.load(Ordering::Relaxed);
         if peer.sent() < local {
-            Metrics::increment(&held.metrics.replication_catchups, 1);
             catch_up(held, &mut connection, peer, peer.sent().saturating_add(1)).await?;
         }
 
@@ -351,6 +350,10 @@ async fn catch_up(
     peer: &mut Peer,
     from: u64,
 ) -> Result<(), LinkError> {
+    // Counted here rather than at the call sites: reading the log back is
+    // what the counter is about, and a handshake that resends is the same
+    // event as a gap noticed mid-stream.
+    Metrics::increment(&held.metrics.replication_catchups, 1);
     let allocated = storage::allocated(&held.wal.path)?;
     let base = allocated.base();
     if from <= base {

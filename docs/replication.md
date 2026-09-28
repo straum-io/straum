@@ -1283,3 +1283,62 @@ Its moment is deterministic and not a pause: a record is committed and
 synced locally *before* its batch is shipped, so receiving the frame that
 covers all twenty means `fsynced` would already have answered. Flipping the
 quorum branch off makes it fail with 20 against 0.
+
+## 129. The quorum cycle over TCP
+
+`§126` established the coordinator sans-IO and `§128` wired it to a PUBACK.
+This is the same states over a real socket:
+
+```text
+InSync ──── peer disappears ───► QuorumLost ──── peer reconnects ───►
+CatchingUp ──── durable + report ───► InSync
+
+and, throughout:   what was already acknowledged stays acknowledged
+```
+
+`losing_a_quorum_stops_new_acknowledgements_and_withdraws_none` walks all
+of it: ten publishes acknowledged with the peer reporting, the peer killed,
+ten more that the leader commits and syncs and does **not** acknowledge,
+then the peer back, catch-up from where it said it was, and the second ten
+acknowledged. The first ten are checked again at the end — recovering must
+not acknowledge anything twice.
+
+### The moments are protocol, not pauses
+
+There is no `sleep` in the file. Each observation is a transition:
+
+```text
+frame received            the leader shipped it
+report sent               this side made it durable
+wal_durable_sequence      the leader's own log covers it
+replication_follower_sequence   the leader heard the report
+PUBACK count              the client was answered
+```
+
+The one that carries the argument is `wal_durable_sequence`. While the peer
+is gone there is no frame to wait for, so the deterministic moment is the
+leader's own log reaching the new records: at that instant `fsynced` would
+have answered, and `quorum` has not.
+
+### QuorumLost is a state, not damage
+
+Asserted as such rather than described: with the peer gone, the broker
+keeps accepting publishes, `wal_commit_failures` stays at zero, and all
+twenty records are in the log. Nothing is poisoned; the only thing that
+stopped is the acknowledgement, and it starts again when the peer does.
+
+### A replica that comes back smaller
+
+`an_acknowledgement_survives_the_replica_that_established_it` takes the
+narrow case on its own. Six are acknowledged, the peer that made them
+durable is killed, and it reconnects claiming three — a replica rebuilt
+from an older copy. The leader resends from three, and the six stay
+acknowledged. The coordinator's watermark is monotonic, so a replica coming
+back smaller cannot walk a promise backwards.
+
+### What the test found
+
+Not a behaviour defect: `replication_catchups` counted only the gaps
+noticed mid-stream, not the resend a handshake asks for, though both are
+the leader reading its own log to fill a gap and the counter says so. The
+increment moved inside `catch_up`, where every caller passes.
