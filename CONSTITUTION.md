@@ -1085,3 +1085,31 @@ configuration semantics:
 
 Never optimize one memory component in isolation when its cost is coupled to
 another.
+
+---
+
+# 30. Who may declare durability
+
+```text
+Storage declares local durability.
+Replication observes durability.
+Only the replication quorum coordinator may translate peer durability
+reports into a quorum durability watermark.
+The broker consumes the resulting Event::Durable without knowing
+whether it represents local fsync or quorum durability.
+```
+
+A peer's report means one thing: that peer has written and synced
+everything through a position. Whether that position is enough for a quorum
+is a different question with a different owner, and answering it inside the
+peer protocol would let the wire format decide the runtime's durability
+semantics.
+
+A quorum watermark is monotonic. An acknowledgement cannot be taken back, so
+a position once declared durable stays declared even when the replica that
+helped establish it goes away.
+
+Losing a quorum is not a poisoned log. A partition, a peer restarting and a
+follower that is merely slow all stop new acknowledgements and none of them
+is terminal; a poisoned log is this node's storage being unusable. The two
+must not share a failure mode.

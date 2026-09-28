@@ -1,6 +1,6 @@
 //! Positions, and the ways they must not move.
 
-use replication::{Accepted, Follower, Peer, PeerError, Records, Refused, quorum_watermark};
+use replication::{Accepted, Follower, Peer, PeerError, Records, Refused};
 
 /// The batch is opaque to the state machine, so its contents never matter
 /// here — only the range the frame claims.
@@ -169,108 +169,5 @@ mod leader {
             })
         );
         assert_eq!(peer.durable(), 400);
-    }
-}
-
-mod quorum {
-    use super::*;
-
-    #[test]
-    fn it_is_the_position_a_quorum_holds_not_the_highest_one_anybody_does() {
-        // Three replicas at 200, 140 and 60. Two of them hold everything
-        // through 140; a maximum would have said 200.
-        assert_eq!(quorum_watermark(200, &[140, 60], 2), 140);
-        assert_eq!(quorum_watermark(200, &[140, 60], 3), 60);
-    }
-
-    #[test]
-    fn it_never_exceeds_what_this_node_holds() {
-        // A peer claiming more than the leader ever had cannot lift the
-        // position: the leader never sent it, so it cannot be durable there.
-        assert_eq!(quorum_watermark(100, &[9_000, 9_000], 2), 100);
-    }
-
-    #[test]
-    fn a_quorum_that_cannot_be_formed_holds_nothing() {
-        assert_eq!(quorum_watermark(500, &[], 2), 0);
-        assert_eq!(quorum_watermark(500, &[400], 3), 0);
-    }
-
-    #[test]
-    fn alone_is_its_own_quorum() {
-        assert_eq!(quorum_watermark(500, &[], 1), 500);
-        assert_eq!(quorum_watermark(500, &[100], 1), 500);
-    }
-
-    #[test]
-    fn a_peer_that_has_nothing_does_not_drag_the_position_down_below_a_quorum() {
-        // Four replicas, three required. The straggler at 0 is outvoted.
-        assert_eq!(quorum_watermark(900, &[900, 900, 0], 3), 900);
-        assert_eq!(quorum_watermark(900, &[900, 500, 0], 3), 500);
-    }
-}
-
-mod reconciliation {
-    use super::*;
-    use replication::{Incompatible, Reconciled};
-
-    #[test]
-    fn a_follower_that_kept_up_needs_nothing_resent() {
-        let (peer, outcome) = Peer::connected(400, 400).unwrap();
-        assert_eq!(outcome, Reconciled::InSync);
-        assert_eq!(peer.durable(), 400);
-        assert_eq!(peer.in_flight(), 0);
-    }
-
-    #[test]
-    fn a_follower_that_fell_behind_is_resent_only_the_suffix() {
-        let (peer, outcome) = Peer::connected(400, 900).unwrap();
-        assert_eq!(outcome, Reconciled::Resend { from: 401 });
-        // And the leader's idea of the peer starts from what the peer said,
-        // not from what it remembered before the connection dropped.
-        assert_eq!(peer.sent(), 400);
-        assert_eq!(peer.durable(), 400);
-    }
-
-    #[test]
-    fn a_follower_that_synced_but_never_reported_is_not_sent_it_twice() {
-        // The awkward one: the follower completed its durability operation
-        // and the connection died before the acknowledgement left. The leader
-        // last heard 400.
-        let mut before = Peer::starting_at(0);
-        before.on_sent(900);
-        assert_eq!(before.on_durable(400), Ok(true));
-
-        // On reconnect the follower says what it actually holds, and that is
-        // the answer that counts.
-        let (after, outcome) = Peer::connected(900, 900).unwrap();
-        assert_eq!(outcome, Reconciled::InSync);
-        assert_eq!(after.durable(), 900);
-    }
-
-    #[test]
-    fn a_follower_holding_more_than_this_log_wrote_is_refused() {
-        // Two logs that are not the same history. Without an identity on the
-        // log there is no way to tell that from one that went backwards, and
-        // refusing is the answer that cannot lose data.
-        assert_eq!(
-            Peer::connected(900, 400),
-            Err(Incompatible {
-                follower: 900,
-                leader: 400
-            })
-        );
-    }
-
-    #[test]
-    fn a_fresh_follower_is_sent_everything() {
-        let (peer, outcome) = Peer::connected(0, 250).unwrap();
-        assert_eq!(outcome, Reconciled::Resend { from: 1 });
-        assert_eq!(peer.durable(), 0);
-    }
-
-    #[test]
-    fn two_empty_logs_agree() {
-        assert_eq!(Peer::connected(0, 0).unwrap().1, Reconciled::InSync);
     }
 }

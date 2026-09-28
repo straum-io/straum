@@ -1067,3 +1067,100 @@ take                   one Bytes::copy_from_slice per frame
 
 They remain what §122 called them: an audit. Counting them needs a harness
 that can profile allocations across a runtime, which is not this.
+
+## 126. Where the quorum watermark is computed
+
+§112.1 asked whether `report()` gates on the quorum or a separate task owns
+`Event::Durable`. It is the separate task, and it lives in `replication` as
+a sans-IO state machine:
+
+```text
+local WAL: committed + fsynced ──┐
+                                 ├──► Quorum ──► watermark moved ──► Event::Durable
+peer reports ────────────────────┘                                        │
+                                                                          ▼
+                                                                  pending_durable
+                                                                          │
+                                                                          ▼
+                                                                       PUBACK
+```
+
+Storage never learns that peers exist. `Peer::on_durable` still means one
+thing — this peer has written and synced everything through a position —
+and nothing about whether that is enough. Putting the quorum question in
+`report()` would have let the wire format decide the runtime's durability
+semantics, which is now `CONSTITUTION.md` §30.
+
+**Nothing polls.** The watermark is recomputed when the local position moves
+or a peer reports, and `on_local`/`on_peer` return the new value only when
+it advanced — so the caller emits one event per real advance rather than one
+per commit, and there is no timer between a commit becoming durable and an
+acknowledgement going out.
+
+### The watermark
+
+The `required`-th largest position, this node counted as one copy:
+
+```text
+local  120
+peer A 117
+peer B 115   ← the third copy
+peer C  90
+                 required 3  →  115
+```
+
+Not a maximum, not the latest report, not an average — and the tests assert
+it is none of those by name. It is meaningful only because every position
+counts a **contiguous durable prefix** (§111): a peer reports where its
+prefix ends, never which records it happens to hold.
+
+Never above `local`. A leader cannot call a position durable anywhere when
+it does not hold it itself, because it never sent it.
+
+### Monotonic, and why that is not a convenience
+
+```text
+local 100, A 100, B 100, required 3   →  100 declared
+
+B disconnects
+local 105, A 103, B 100 (last known)  →  still 100, never 97, never 0
+```
+
+An acknowledgement cannot be taken back. A position once declared durable
+stays declared even when the replica that helped establish it goes away, so
+`Event::Durable(100)` is never followed by `Event::Durable(97)`.
+
+### Known position is not connected
+
+The two are tracked separately because they answer different questions. A
+peer that is not connected has not lost what it already wrote — the bytes
+are on its disk whatever the link is doing — so its last known position
+keeps counting towards the watermark. What it cannot do is acknowledge
+anything new, so it stops counting towards whether a quorum is
+**reachable**.
+
+```text
+watermark()   what already happened, monotonic
+reachable()   whether something published now can still reach a quorum
+```
+
+### Losing a quorum is not a poisoned log (C7)
+
+`reachable()` going false stops new `Quorum` acknowledgements and nothing
+else. A partition, a peer restarting, a follower that is merely slow: none
+is terminal, and none touches `StorageError::Poisoned`, which is this node's
+storage being unusable. Sharing a failure mode between them would make a
+network hiccup permanent.
+
+### One implementation
+
+The free `quorum_watermark` function this replaced is gone. It computed the
+same value from a slice, had its own tests, and was used by nothing but
+them — two implementations of one calculation is what
+`docs/algorithms.md` §5 and `CONSTITUTION.md` §22 both forbid. Its cases
+that were not already covered moved into the coordinator's tests.
+
+Recomputed on each event rather than maintained incrementally: the
+membership is a handful of entries and this runs on a commit or a report,
+never per message. An order-statistics structure is a change to make when a
+benchmark asks for it.
