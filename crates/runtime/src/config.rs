@@ -148,6 +148,11 @@ pub struct ReplicationSettings {
     /// steady size; it is allocated and charged because it exists.
     pub write_buffer_bytes: usize,
     pub limits: replication::Limits,
+    /// Durable copies required before a `Durability::Quorum` publish is
+    /// acknowledged, **counting this node**. Two means a leader and one
+    /// follower. One means this node alone, which is what `fsynced` already
+    /// promises.
+    pub required_copies: usize,
 }
 
 impl Default for ReplicationSettings {
@@ -161,6 +166,7 @@ impl Default for ReplicationSettings {
             read_buffer_bytes: 65_536,
             write_buffer_bytes: 16_384,
             limits: replication::Limits::default(),
+            required_copies: 2,
         }
     }
 }

@@ -1164,3 +1164,45 @@ Recomputed on each event rather than maintained incrementally: the
 membership is a handful of entries and this runs on a commit or a report,
 never per message. An order-statistics structure is a change to make when a
 benchmark asks for it.
+
+## 127. `required_copies` means copies
+
+Fixed before any of it was written, because it is the one number a
+misreading makes silently wrong:
+
+```text
+required_copies counts durable copies, this node included.
+
+  1   this node alone, which is what fsynced already promises
+  2   a leader and one follower
+  3   a leader and two followers
+```
+
+Not "remote replicas". With three nodes and `required_copies = 2`, any two
+of the three holding a position is enough, and the coordinator takes the
+second largest of `local` and the peer positions.
+
+**An unreachable setting is refused at startup.** `quorum` with two copies
+required and nowhere for the second to live comes up and then acknowledges
+nothing, forever; `STRAUM_REQUIRED_COPIES` above the nodes configured is a
+`ConfigError` before the listener binds.
+
+### The level
+
+`Durability::Quorum` is built on `fsynced` rather than beside it: the local
+log is still synced before anything else happens, and the acknowledgement
+additionally waits for the quorum watermark. The other three levels are
+unchanged, which C11 asked for.
+
+Adding the variant found a defect of exactly the kind it warns about. The
+runtime decided whether to sync with
+
+```rust
+config.durability == Durability::Fsynced
+```
+
+which answers `false` for a level added later — a quorum broker would have
+stopped syncing its own log. It is an exhaustive `match` now, so the next
+level has to decide rather than inherit whatever a comparison happened to
+say. Nothing else in the codebase matched on the enum exhaustively, which is
+why adding a variant compiled cleanly and changed behaviour.

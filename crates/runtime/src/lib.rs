@@ -137,7 +137,14 @@ impl Runtime {
                         shipments,
                         local: Arc::clone(&local_sequence),
                     },
-                    config.durability == Durability::Fsynced,
+                    // Exhaustive on purpose. An equality against one level
+                    // silently answered `false` for a level added later,
+                    // which is how a quorum broker would have stopped
+                    // syncing its own log.
+                    match config.durability {
+                        Durability::Memory | Durability::Written => false,
+                        Durability::Fsynced | Durability::Quorum => true,
+                    },
                     events.clone(),
                     Arc::clone(&metrics),
                 )?;

@@ -122,10 +122,17 @@ silently ignored.
 |---|---|
 | `memory` | The message exists in broker memory. No persistence guarantee. |
 | `written` | The WAL record was submitted to the operating system. It may not survive a machine or storage failure. |
-| `fsynced` | The durability operation covering the record completed. Only this advances the durable acknowledgement boundary. |
+| `fsynced` | The durability operation covering the record completed on this node. Only this advances the local durable acknowledgement boundary. |
+| `quorum` | The durability operation completed on `required_copies` nodes, this one counted among them. Built on `fsynced`: the local log is still synced, and the acknowledgement additionally waits for the quorum watermark to cover the record (docs/replication.md §126). |
 
 Vague words — "safe", "saved", "persistent" — are not used without naming the
 event that establishes the guarantee.
+
+`quorum` is a statement about a set of machines; the other three are
+statements about one. What makes it meaningful is that every position in it
+counts a contiguous durable prefix, so "a quorum holds everything through
+N" is a claim about N records and not about N being somebody's latest
+report (docs/replication.md §126).
 
 What `fsynced` costs is platform-dependent and must be stated, not assumed:
 Rust's `File::sync_data` is `fdatasync` on Linux and `F_FULLFSYNC` on macOS,

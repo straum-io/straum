@@ -329,6 +329,9 @@ impl Settings {
                 replication: runtime::ReplicationSettings {
                     listen: parser.optional_addr("STRAUM_REPLICATION_LISTEN")?,
                     follower: parser.optional_addr("STRAUM_REPLICATION_FOLLOWER")?,
+                    // Copies, this node included: 2 is a leader and one
+                    // follower (docs/replication.md §127).
+                    required_copies: parser.number("STRAUM_REQUIRED_COPIES", 2usize, 1, 16)?,
                     ..runtime::ReplicationSettings::default()
                 },
                 writer_batch: parser.number("STRAUM_WRITER_BATCH", 64, 1, 65_536)?,
@@ -403,6 +406,21 @@ fn check_cross_fields(settings: &Settings) -> Result<(), ConfigError> {
                 value,
                 other: "STRAUM_MAX_PACKET_BYTES",
                 limit: packet,
+            });
+        }
+    }
+
+    // A quorum that cannot be formed acknowledges nothing, ever. Better to
+    // refuse at startup than to come up and silently stop answering
+    // publishes (docs/replication.md §127).
+    if settings.runtime.durability == Durability::Quorum {
+        let copies = 1 + usize::from(settings.runtime.replication.follower.is_some());
+        if settings.runtime.replication.required_copies > copies {
+            return Err(ConfigError::TooSmallFor {
+                name: "STRAUM_REPLICATION_FOLLOWER",
+                value: copies as u64,
+                other: "STRAUM_REQUIRED_COPIES",
+                limit: settings.runtime.replication.required_copies as u64,
             });
         }
     }
@@ -579,6 +597,7 @@ impl Parser {
             "memory" => Durability::Memory,
             "written" => Durability::Written,
             "fsynced" => Durability::Fsynced,
+            "quorum" => Durability::Quorum,
             _ => {
                 return Err(ConfigError::Malformed {
                     name,
@@ -900,6 +919,28 @@ mod tests {
             assert_eq!(settings.runtime.durability, expected, "{raw}");
         }
 
+        // Quorum needs somewhere for the second copy to live.
+        let settings = parse(&[
+            ("STRAUM_DURABILITY", "quorum"),
+            ("STRAUM_REPLICATION_FOLLOWER", "127.0.0.1:7001"),
+        ])
+        .unwrap();
+        assert_eq!(settings.runtime.durability, Durability::Quorum);
+
+        // Two copies required and one node to hold them: refused at
+        // startup rather than accepted and never acknowledging anything.
+        let error = parse(&[("STRAUM_DURABILITY", "quorum")]).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ConfigError::TooSmallFor {
+                    other: "STRAUM_REQUIRED_COPIES",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+
         let error = parse(&[("STRAUM_DURABILITY", "maybe")]).unwrap_err();
         assert!(matches!(
             error,
@@ -1041,6 +1082,7 @@ mod tests {
             ("STRAUM_WAL_INITIAL_BATCH_BYTES", "1048576"),
             ("STRAUM_DURABILITY", "memory"),
             ("STRAUM_METRICS_ADDR", ""),
+            ("STRAUM_REQUIRED_COPIES", "2"),
             ("STRAUM_REPLICATION_LISTEN", ""),
             ("STRAUM_REPLICATION_FOLLOWER", ""),
         ];

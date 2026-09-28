@@ -29,7 +29,14 @@ pub enum Durability {
     /// Handed to the operating system. May not survive machine or storage
     /// failure.
     Written,
-    /// Covered by a completed durability operation. Only this advances the
-    /// durable acknowledgement boundary.
+    /// Covered by a completed durability operation on this node. Only this
+    /// advances the local durable acknowledgement boundary.
     Fsynced,
+    /// Covered by a completed durability operation on enough nodes.
+    ///
+    /// "Enough" is `required_copies`, counted **including this node**: two
+    /// means a leader and one follower, not a leader and two. The position
+    /// is the one a quorum holds, and it is monotonic — see
+    /// `docs/replication.md` §126.
+    Quorum,
 }
