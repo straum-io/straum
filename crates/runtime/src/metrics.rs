@@ -25,8 +25,19 @@ pub struct Metrics {
     pub session_records_dropped: AtomicU64,
     /// At-least-once messages a session backlog had no room for.
     pub backlog_refused: AtomicU64,
+    /// At-most-once deliveries dropped because a session queue was full
+    /// (CLAUDE.md §8). Mirrored from the broker, which counts them.
+    pub dropped_messages: AtomicU64,
     /// Payload bytes the broker is holding for sessions that are behind.
     pub backlog_bytes: AtomicU64,
+    /// PUBACKs held back until their publish is durable at the configured
+    /// level. Bounded by `max_pending_durable`; sitting at it means
+    /// publishers are being held.
+    pub pending_acknowledgements: AtomicU64,
+    /// 1 while a quorum cannot form because the follower was refused:
+    /// nothing is acknowledged under `quorum` until it is served again
+    /// (D-8, D-23).
+    pub quorum_unavailable: AtomicU64,
     /// Subscribers the broker gave up on. Each one is a client that saw a
     /// closed socket and no reason for it.
     pub slow_consumer_closes: AtomicU64,
@@ -34,6 +45,9 @@ pub struct Metrics {
     /// a number that never happened.
     pub wal_sync_nanos: AtomicU64,
     pub wal_durable_sequence: AtomicU64,
+    /// How long the latest rewrite beside the writer took, live-set scan
+    /// included: commits wait for all of it. Latest, like `wal_sync_nanos`.
+    pub wal_rewrite_nanos: AtomicU64,
     /// Replication links established, either direction.
     pub replication_connections: AtomicU64,
     /// Links that ended in an error rather than a shutdown.
@@ -50,6 +64,14 @@ pub struct Metrics {
     pub replication_shipments_dropped: AtomicU64,
     /// Times the leader had to read its own log to fill a gap.
     pub replication_catchups: AtomicU64,
+    /// Times a rewrite moved the retention floor past a follower's known
+    /// position: from the floor up it can be served, below it only a fresh
+    /// copy of the log helps (docs/replication.md §130, D-18).
+    pub replication_followers_lost: AtomicU64,
+    /// The lowest sequence the log can still be read from.
+    pub wal_retention_floor: AtomicU64,
+    /// Bytes of the log that can still be read by sequence.
+    pub wal_retained_bytes: AtomicU64,
     /// Sequences sent to the follower and not yet confirmed. A gauge, stored
     /// once per report and once per frame — not on any per-record path.
     pub replication_in_flight: AtomicU64,
@@ -83,10 +105,14 @@ impl Metrics {
             wal_compactions: self.wal_compactions.load(Ordering::Relaxed),
             session_records_dropped: self.session_records_dropped.load(Ordering::Relaxed),
             backlog_refused: self.backlog_refused.load(Ordering::Relaxed),
+            dropped_messages: self.dropped_messages.load(Ordering::Relaxed),
             backlog_bytes: self.backlog_bytes.load(Ordering::Relaxed),
+            pending_acknowledgements: self.pending_acknowledgements.load(Ordering::Relaxed),
+            quorum_unavailable: self.quorum_unavailable.load(Ordering::Relaxed),
             slow_consumer_closes: self.slow_consumer_closes.load(Ordering::Relaxed),
             wal_sync_nanos: self.wal_sync_nanos.load(Ordering::Relaxed),
             wal_durable_sequence: self.wal_durable_sequence.load(Ordering::Relaxed),
+            wal_rewrite_nanos: self.wal_rewrite_nanos.load(Ordering::Relaxed),
             replication_connections: self.replication_connections.load(Ordering::Relaxed),
             replication_errors: self.replication_errors.load(Ordering::Relaxed),
             replication_connected: self.replication_connected.load(Ordering::Relaxed),
@@ -97,6 +123,9 @@ impl Metrics {
                 .replication_shipments_dropped
                 .load(Ordering::Relaxed),
             replication_catchups: self.replication_catchups.load(Ordering::Relaxed),
+            replication_followers_lost: self.replication_followers_lost.load(Ordering::Relaxed),
+            wal_retention_floor: self.wal_retention_floor.load(Ordering::Relaxed),
+            wal_retained_bytes: self.wal_retained_bytes.load(Ordering::Relaxed),
             replication_in_flight: self.replication_in_flight.load(Ordering::Relaxed),
             replication_queued: self.replication_queued.load(Ordering::Relaxed),
         }
@@ -122,10 +151,14 @@ pub struct Snapshot {
     pub wal_compactions: u64,
     pub session_records_dropped: u64,
     pub backlog_refused: u64,
+    pub dropped_messages: u64,
     pub backlog_bytes: u64,
+    pub pending_acknowledgements: u64,
+    pub quorum_unavailable: u64,
     pub slow_consumer_closes: u64,
     pub wal_sync_nanos: u64,
     pub wal_durable_sequence: u64,
+    pub wal_rewrite_nanos: u64,
     pub replication_connections: u64,
     pub replication_errors: u64,
     /// 1 while a replication link is up.
@@ -134,6 +167,9 @@ pub struct Snapshot {
     pub replication_follower_sequence: u64,
     pub replication_shipments_dropped: u64,
     pub replication_catchups: u64,
+    pub replication_followers_lost: u64,
+    pub wal_retention_floor: u64,
+    pub wal_retained_bytes: u64,
     /// Sequences sent and not yet confirmed.
     pub replication_in_flight: u64,
     /// Committed batches waiting in the live queue.

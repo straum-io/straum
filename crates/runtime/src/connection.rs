@@ -242,7 +242,7 @@ async fn read(
                     // before the broker hears about it. Awaiting here is
                     // the backpressure: a full log queue slows the
                     // publisher down, it never shortens the guarantee.
-                    let durable = match (&wal, &command) {
+                    let (durable, admitted) = match (&wal, &command) {
                         (
                             Some(wal),
                             Command::Publish {
@@ -254,15 +254,44 @@ async fn read(
                             // write for `written`, after the sync for `fsynced`
                             // (docs/storage.md §80).
                         ) if config.durability != Durability::Memory => {
-                            wal.submit(
-                                &publish.topic,
-                                &publish.payload,
-                                publish.guarantee,
-                                publish.retain,
-                            )
-                            .await
+                            // Admission before the log, not after it: this
+                            // publish will hold an acknowledgement back, and
+                            // when the broker already holds as many as it may,
+                            // this reader waits here — this publisher, and no
+                            // other client (D-7).
+                            let Some(permit) = wal.admit().await else {
+                                break 'connection;
+                            };
+                            let token = wal
+                                .submit(
+                                    &publish.topic,
+                                    &publish.payload,
+                                    publish.guarantee,
+                                    publish.retain,
+                                )
+                                .await;
+                            // No token means the log's writer has stopped —
+                            // after a failure it drops its queue — and nothing
+                            // will be durable again on this node. The publish
+                            // must not reach the broker: without a token the
+                            // broker would acknowledge it at once, and the log
+                            // has promised that no further publish will be
+                            // acknowledged (invariant 7, D-9). So this
+                            // connection waits, unanswered, until shutdown —
+                            // the same contract as a quorum that cannot form
+                            // (D-8). The permit goes back as it drops.
+                            let Some(token) = token else {
+                                drop(permit);
+                                while !*shutdown.borrow_and_update() {
+                                    if shutdown.changed().await.is_err() {
+                                        break;
+                                    }
+                                }
+                                break 'connection;
+                            };
+                            (Some(token), Some(permit))
                         }
-                        _ => None,
+                        _ => (None, None),
                     };
 
                     // Bounded on purpose: backpressure reaches the publisher's
@@ -277,6 +306,14 @@ async fn read(
                         .is_err()
                     {
                         break 'connection;
+                    }
+                    // The broker has the command now, and with it the job of
+                    // handing the permit back: when the acknowledgement goes,
+                    // or at once if it was never held. Kept until the send
+                    // completed so a reader stopped mid-send returns it on
+                    // drop instead of leaking it.
+                    if let Some(permit) = admitted {
+                        permit.forget();
                     }
                 }
                 Ok(Reaction::Pong) => {

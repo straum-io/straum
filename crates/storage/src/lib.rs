@@ -15,8 +15,8 @@ mod wal;
 
 pub use commit::{Commit, Committer, RecordSource, WalRecord};
 pub use wal::{
-    Allocated, Committed, Compaction, HEADER_BYTES, Recovery, Wal, allocated, compact, replay,
-    replay_frames,
+    Allocated, Committed, Compaction, HEADER_BYTES, Recovery, Retain, Wal, allocated, compact,
+    replay, replay_addressable,
 };
 
 /// Limits of the write-ahead log. Defaults are the ones documented in

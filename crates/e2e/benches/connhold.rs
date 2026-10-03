@@ -76,6 +76,13 @@ fn rss(pid: u32) -> u64 {
 }
 
 fn main() {
+    // `cargo test --all-targets` runs this program too, as a debug build and
+    // with no arguments. Every real run is a release build, so that is the
+    // line, not the arguments (CLAUDE.md §17).
+    if cfg!(debug_assertions) {
+        eprintln!("connhold: built without optimisation; use `cargo bench` or a --release build");
+        return;
+    }
     let settings = settings();
     if settings.pid == 0 {
         eprintln!("connhold: --pid is required; it is the broker to measure");

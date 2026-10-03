@@ -12,7 +12,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use storage::{Wal, WalLimits};
+use storage::{Retain, Wal, WalLimits};
 
 fn scratch(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -46,7 +46,7 @@ fn a_sequence_that_existed_before_compaction_is_never_handed_out_again() {
 
     // Records 3, 4 and 5 go; 1 and 2 stay.
     let mut seen = 0;
-    wal.compact(0, &mut |_| {
+    wal.compact(0, Retain::NONE, &mut |_| {
         seen += 1;
         seen <= 2
     })
@@ -74,7 +74,7 @@ fn a_correlation_that_existed_before_compaction_is_never_handed_out_again() {
     let mut wal = open(&path);
     append(&mut wal, 0, 5);
 
-    wal.compact(5_000, &mut |_| false).unwrap();
+    wal.compact(5_000, Retain::NONE, &mut |_| false).unwrap();
     drop(wal);
 
     let (mut wal, recovery) = Wal::open(&path, WalLimits::default()).unwrap();
@@ -82,7 +82,7 @@ fn a_correlation_that_existed_before_compaction_is_never_handed_out_again() {
     assert_eq!(recovery.correlation, 5_000);
 
     // And a caller that does not track correlations cannot lower it.
-    wal.compact(0, &mut |_| false).unwrap();
+    wal.compact(0, Retain::NONE, &mut |_| false).unwrap();
     drop(wal);
     assert_eq!(
         Wal::open(&path, WalLimits::default())
@@ -99,7 +99,7 @@ fn an_empty_physical_log_still_knows_what_it_allocated() {
     let path = scratch("empty");
     let mut wal = open(&path);
     append(&mut wal, 0, 12);
-    wal.compact(900, &mut |_| false).unwrap();
+    wal.compact(900, Retain::NONE, &mut |_| false).unwrap();
     drop(wal);
 
     let (mut wal, recovery) = Wal::open(&path, WalLimits::default()).unwrap();
@@ -132,7 +132,7 @@ fn repeated_compaction_never_rewinds_either_value() {
         // Keep one record of the four, and raise the correlation each time.
         correlation = round * 1_000;
         let mut seen = 0;
-        wal.compact(correlation, &mut |_| {
+        wal.compact(correlation, Retain::NONE, &mut |_| {
             seen += 1;
             seen == 1
         })
@@ -169,7 +169,7 @@ fn every_sequence_ever_issued_stays_issued_across_rewrites() {
         // Every other round throws almost everything away.
         if round % 2 == 1 {
             let mut seen = 0;
-            wal.compact(0, &mut |_| {
+            wal.compact(0, Retain::NONE, &mut |_| {
                 seen += 1;
                 seen == 1
             })
@@ -198,7 +198,7 @@ fn a_damaged_header_is_refused_rather_than_read_as_a_smaller_number() {
     let path = scratch("damaged");
     let mut wal = open(&path);
     append(&mut wal, 0, 4);
-    wal.compact(77, &mut |_| false).unwrap();
+    wal.compact(77, Retain::NONE, &mut |_| false).unwrap();
     drop(wal);
 
     let clean = fs::read(&path).unwrap();

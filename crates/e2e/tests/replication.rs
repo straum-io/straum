@@ -88,26 +88,45 @@ async fn until(broker: &Runtime, want: u64) -> u64 {
 }
 
 async fn publish(broker: &Runtime, name: &str, count: usize) {
-    use rumqttc::{AsyncClient, MqttOptions, QoS};
+    use rumqttc::{AsyncClient, Event, MqttOptions, Outgoing, Packet, QoS};
     let addr = broker.local_addr();
     let mut options = MqttOptions::new(name, addr.ip().to_string(), addr.port());
     options.set_keep_alive(Duration::from_secs(5));
     let (client, mut eventloop) = AsyncClient::new(options, 16);
 
-    let driving = tokio::spawn(async move { while eventloop.poll().await.is_ok() {} });
-    for index in 0..count {
-        client
-            .publish(
-                "replicated/topic",
-                QoS::AtLeastOnce,
-                false,
-                format!("payload-{index}").into_bytes(),
-            )
-            .await
-            .unwrap();
+    // Requests leave from a second task: `publish` only queues, and nothing
+    // leaves the queue unless the event loop is being polled.
+    let sending = client.clone();
+    let publisher = tokio::spawn(async move {
+        for index in 0..count {
+            sending
+                .publish(
+                    "replicated/topic",
+                    QoS::AtLeastOnce,
+                    false,
+                    format!("payload-{index}").into_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+
+    // The PUBACK is the broker saying it is done with the publish at the
+    // configured durability level. Waiting for the socket to close instead
+    // costs one keep-alive interval per call and proves nothing.
+    let mut acked = 0usize;
+    while acked < count {
+        if let Event::Incoming(Packet::PubAck(_)) = eventloop.poll().await.unwrap() {
+            acked = acked.saturating_add(1);
+        }
     }
+    publisher.await.unwrap();
+
     client.disconnect().await.unwrap();
-    let _ = driving.await;
+    while !matches!(
+        eventloop.poll().await,
+        Ok(Event::Outgoing(Outgoing::Disconnect)) | Err(_)
+    ) {}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

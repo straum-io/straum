@@ -5,7 +5,7 @@
 # can run cargo directly. Needs podman or docker; set STRAUM_CONTAINER_ENGINE
 # to pick one explicitly.
 #
-#   scripts/linux.sh                          # cargo test --workspace --all-targets
+#   scripts/linux.sh                          # cargo test --workspace --tests
 #   scripts/linux.sh test -p transport
 #   STRAUM_CONTAINER_ARGS="--sysctl net.core.somaxconn=8192" scripts/linux.sh test
 #
@@ -31,7 +31,10 @@ if [ -z "$ENGINE" ]; then
 fi
 
 if [ "$#" -eq 0 ]; then
-    set -- test --workspace --all-targets
+    # --tests rather than --all-targets: it skips the benchmarks entirely,
+    # where --all-targets builds them all and runs divan's short pass
+    # (CLAUDE.md §17, D-4).
+    set -- test --workspace --tests
 fi
 
 # STRAUM_CONTAINER_ARGS is split on whitespace on purpose.

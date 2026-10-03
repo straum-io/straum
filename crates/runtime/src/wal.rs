@@ -24,9 +24,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 use domain::{ClientId, DeliveryGuarantee, Topic, TopicFilter};
 use protocol::{DurableToken, Outbox, Publish};
 use storage::{Committer, RecordSource, StorageError, Wal, WalRecord};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
-use crate::broker_loop::Event;
+use crate::broker_loop::Durable;
 use crate::config::WalSettings;
 use crate::metrics::Metrics;
 
@@ -35,9 +35,47 @@ use crate::metrics::Metrics;
 pub(crate) struct Submitter {
     records: mpsc::Sender<WalRecord>,
     next: Arc<AtomicU64>,
+    /// One permit per acknowledgement the broker may hold back for
+    /// durability, `max_pending_durable` in all (C8, D-7).
+    admission: Arc<Semaphore>,
 }
 
 impl Submitter {
+    /// Waits until the broker may hold one more acknowledgement back.
+    ///
+    /// Taken before a publish that will be acknowledged goes to the log, so
+    /// the wait lands on that publisher alone, at its own reader: every other
+    /// command from every other client keeps moving (D-7). The permit is the
+    /// pending acknowledgement's for as long as there is one; the broker loop
+    /// hands it back with [`Submitter::release`].
+    pub(crate) async fn admit(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.admission).acquire_owned().await.ok()
+    }
+
+    /// A submitter with no writer behind it, for tests that drive the broker
+    /// loop directly. The receiver is what the writer would have read.
+    #[cfg(test)]
+    pub(crate) fn detached(admission: Arc<Semaphore>) -> (Self, mpsc::Receiver<WalRecord>) {
+        let (records, queue) = mpsc::channel(16);
+        let next = Arc::new(AtomicU64::new(0));
+        (
+            Self {
+                records,
+                next,
+                admission,
+            },
+            queue,
+        )
+    }
+
+    /// Returns permits whose acknowledgement is no longer held, or never
+    /// was: the record was durable before the broker saw it.
+    pub(crate) fn release(&self, permits: usize) {
+        if permits > 0 {
+            self.admission.add_permits(permits);
+        }
+    }
+
     /// Queues one message for the log.
     ///
     /// Awaits when the queue is full: backpressure reaches the publisher
@@ -271,6 +309,10 @@ struct Found {
     /// The highest correlation any record carried, so the next one written
     /// continues rather than repeats.
     correlation: u64,
+    /// The highest WAL sequence the log has ever allocated. A different
+    /// space from `correlation`: this one numbers records the log accepted,
+    /// and it is what a replication position is expressed in.
+    sequence: u64,
     refused: u64,
 }
 
@@ -282,6 +324,7 @@ fn scan(settings: &WalSettings, limits: BrokerLimits) -> Result<Found, StorageEr
         retained: HashMap::new(),
         sessions: HashMap::new(),
         correlation: 0,
+        sequence: 0,
         refused: 0,
     };
     let mut bytes = 0usize;
@@ -354,6 +397,10 @@ fn scan(settings: &WalSettings, limits: BrokerLimits) -> Result<Found, StorageEr
     // still in the file is not the largest ever handed out
     // (docs/replication.md §116).
     found.correlation = found.correlation.max(recovery.correlation);
+    // Read straight off the header, never derived from the correlations in
+    // the bodies: the log allocates sequences for records that carry no
+    // correlation at all.
+    found.sequence = recovery.sequence;
 
     tracing::info!(
         path = %settings.path.display(),
@@ -367,18 +414,44 @@ fn scan(settings: &WalSettings, limits: BrokerLimits) -> Result<Found, StorageEr
     Ok(found)
 }
 
+/// Where a recovered log leaves the two identity spaces.
+///
+/// They are independent and neither is derived from the other
+/// (docs/storage.md, location-vs-identity). `sequence` numbers what the WAL
+/// accepted and is what a replication position means; `correlation` is the
+/// broker's own publication identity, opaque to the log. They coincide
+/// numerically in an ordinary single-node run, which is an accident of that
+/// run and not a contract — one record type that carries no correlation, or
+/// one compaction that moves them by different amounts, separates them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Restored {
+    /// The highest WAL sequence the log has ever allocated.
+    pub(crate) sequence: u64,
+    /// The highest correlation any surviving record carried, or the header's
+    /// floor if that is larger.
+    pub(crate) correlation: u64,
+}
+
 /// Puts back everything the log held: retained messages, the sessions that
 /// were kept, and the messages those sessions had not finished with.
 ///
-/// Returns the highest correlation seen, so the next record written
-/// continues the numbering instead of repeating it.
+/// Returns where both identity spaces stand, so the next record written
+/// continues each of them instead of repeating it.
 pub(crate) fn restore(
     settings: &WalSettings,
+    // Nothing has reported a position yet: under `quorum` everything still
+    // addressable stays so, and the first rewrite beside the writer, after
+    // the follower has spoken, is the one that may move the floor (D-20).
+    retention: Retention,
     limits: BrokerLimits,
     broker: &mut Broker,
-) -> Result<u64, StorageError> {
+) -> Result<Restored, StorageError> {
     let found = scan(settings, limits)?;
     let correlation = found.correlation;
+    let restored = Restored {
+        sequence: found.sequence,
+        correlation,
+    };
 
     // Which single record is the current word on each topic and each
     // identity. Everything else the log says about them is history, and
@@ -404,8 +477,8 @@ pub(crate) fn restore(
         }
     }
     if sessions == 0 || from >= correlation {
-        compact(settings, &current, from, correlation)?;
-        return Ok(correlation);
+        compact(settings, retention.retain(0), &current, from, correlation)?;
+        return Ok(restored);
     }
 
     // Second pass: the publishes themselves, streamed rather than held. They
@@ -441,8 +514,8 @@ pub(crate) fn restore(
     })?;
 
     tracing::info!(sessions, replayed, from, "restored kept sessions");
-    compact(settings, &current, from, correlation)?;
-    Ok(correlation)
+    compact(settings, retention.retain(0), &current, from, correlation)?;
+    Ok(restored)
 }
 
 /// Drops everything the log no longer needs: superseded session records,
@@ -508,6 +581,7 @@ fn live_set(
 
 fn compact(
     settings: &WalSettings,
+    retain: storage::Retain,
     current: &std::collections::HashSet<u64>,
     floor: u64,
     correlation: u64,
@@ -526,6 +600,7 @@ fn compact(
         &settings.path,
         settings.limits,
         correlation,
+        retain,
         &mut |payload| should_keep(payload, current, floor),
     )?;
 
@@ -534,25 +609,69 @@ fn compact(
         records_before = outcome.records_before,
         records_after = outcome.records_after,
         bytes_before = outcome.bytes_before,
+        floor = outcome.floor,
         bytes_after = outcome.bytes_after,
         "compacted the write-ahead log"
     );
     Ok(())
 }
 
-/// Positions the writer thread shares with the rest of the process. Both are
+/// What a rewrite keeps readable by sequence, so a follower can be caught
+/// up from it (docs/replication.md §130).
+///
+/// Decided once, from the configuration: whether there is a follower and
+/// whether acknowledgements wait for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Retention {
+    /// No follower: nothing reads the log by sequence, and a rewrite keeps
+    /// only what the broker still needs.
+    Nothing,
+    /// A follower that acknowledgements do not wait for: the last this many
+    /// bytes stay addressable, whatever the follower has reported. One that
+    /// falls further behind than that is lost, and said to be (D-18).
+    Bytes(u64),
+    /// A follower that acknowledgements wait for: everything past its own
+    /// durable reports stays addressable, so a quorum resumes on its own
+    /// after an outage of any length. The quorum watermark plays no part —
+    /// it is a durability position, not a catch-up one (D-20).
+    Follower,
+}
+
+impl Retention {
+    /// What to keep, given the follower's reported durable position.
+    pub(crate) fn retain(self, replicated: u64) -> storage::Retain {
+        match self {
+            Self::Nothing => storage::Retain::NONE,
+            Self::Bytes(bytes) => storage::Retain {
+                from: u64::MAX,
+                bytes,
+            },
+            Self::Follower => storage::Retain {
+                from: replicated.saturating_add(1),
+                bytes: 0,
+            },
+        }
+    }
+}
+
+/// Positions the writer thread shares with the rest of the process. All are
 /// read once per rewrite and never on the append path.
 struct Marks {
     /// The correlation allocator, so compaction can write its value into the
     /// header rather than guess it from what survived (§116).
     allocated: Arc<AtomicU64>,
-    /// How far a replica has been given the log. `u64::MAX` means nobody is
-    /// waiting on these bytes, which is what a single node means (§118).
+    /// How far the follower has reported itself durable. `u64::MAX` means no
+    /// follower position matters: a single node, or a follower this log has
+    /// refused for good.
     replicated: Arc<AtomicU64>,
+    retention: Retention,
     /// The live fan-out to a follower, if there is one.
     shipments: Option<mpsc::Sender<crate::replication::Shipment>>,
     /// This node's own durable sequence, published for the replication task.
     local: Arc<AtomicU64>,
+    /// Set by a test to make the next commit fail the way a real one does.
+    #[cfg(test)]
+    fail: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Opens the log, recovers its durable prefix and starts the writer thread.
@@ -564,8 +683,17 @@ pub(crate) struct FanOut {
     /// This node's own durable sequence, published so a reconnecting
     /// follower can be reconciled against what this log actually holds.
     pub(crate) local: Arc<AtomicU64>,
+    /// What a rewrite keeps readable for the follower.
+    pub(crate) retention: Retention,
+    /// Test-only: makes the next commit fail (see `Runtime::fail_log`).
+    #[cfg(test)]
+    pub(crate) fail: Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the log is wired once; the alternative is a struct that exists only to be destructured"
+)]
 pub(crate) fn start(
     settings: &WalSettings,
     limits: BrokerLimits,
@@ -574,7 +702,11 @@ pub(crate) fn start(
     // Whether a commit waits for the storage device: `fsynced` does,
     // `written` does not (docs/storage.md §80).
     sync: bool,
-    events: mpsc::Sender<Event>,
+    // Where each commit is reported. Its own channel, not the one commands
+    // arrive on, so the broker loop can stop reading reports when a quorum
+    // is behind without stopping every client's commands (D-7).
+    durable: mpsc::Sender<Durable>,
+    admission: Arc<Semaphore>,
     metrics: Arc<Metrics>,
 ) -> Result<(Submitter, Arc<AtomicU64>, std::thread::JoinHandle<()>), StorageError> {
     let (wal, recovery) = Wal::open(&settings.path, settings.limits)?;
@@ -589,46 +721,79 @@ pub(crate) fn start(
     let committer = Committer::new(wal, settings.limits, sync, restored);
 
     let owned = settings.clone();
-    // A weak sender on purpose, and downgraded here rather than inside the
-    // closure so the strong one is not carried along by the move. The broker
-    // loop holds a submitter of its own for session records, so a strong
-    // sender here would close a cycle: two channels, each kept open only by
-    // the thread waiting on the other.
-    let weak = events.downgrade();
-    drop(events);
-
     // The allocator itself, shared with the writer thread so compaction can
     // write down the correlation high-water. Read once per rewrite, never on
     // the append path, and not a channel — so no cycle to close.
     let next = Arc::new(AtomicU64::new(restored));
-    // The replication task lowers `replicated` once there is a follower;
-    // until then nothing is waiting on the bytes.
-    let replicated = Arc::new(AtomicU64::new(u64::MAX));
+    // Under `quorum` nothing is known about the follower until it reports,
+    // and what it needs must not be rewritten away before then: from zero,
+    // everything still addressable stays so. Otherwise the position decides
+    // only whether a follower was lost, and there is none to lose yet.
+    let replicated = Arc::new(AtomicU64::new(match fan_out.retention {
+        Retention::Follower => 0,
+        Retention::Nothing | Retention::Bytes(_) => u64::MAX,
+    }));
+    metrics.wal_retention_floor.store(
+        storage::allocated(&settings.path)?.retention_floor(),
+        Ordering::Relaxed,
+    );
+    let rewrites = Rewrites {
+        at: recovery.durable_offset,
+        addressable_from: recovery.addressable_offset,
+        lost: false,
+    };
     let marks = Marks {
         allocated: Arc::clone(&next),
         replicated: Arc::clone(&replicated),
+        retention: fan_out.retention,
         shipments: fan_out.shipments,
         local: fan_out.local,
+        #[cfg(test)]
+        fail: fan_out.fail,
     };
 
     let writer = std::thread::Builder::new()
         .name("straum-wal".to_owned())
-        .spawn(move || write(committer, Queue(queue), owned, limits, weak, metrics, marks))
+        .spawn(move || {
+            write(
+                committer,
+                Queue(queue),
+                owned,
+                limits,
+                durable,
+                metrics,
+                marks,
+                rewrites,
+            )
+        })
         .map_err(StorageError::Io)?;
 
     // `next` continues where the recovered log left off: a repeated
     // correlation would make a session's mark mean two records.
-    Ok((Submitter { records, next }, replicated, writer))
+    Ok((
+        Submitter {
+            records,
+            next,
+            admission,
+        },
+        replicated,
+        writer,
+    ))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the writer thread's whole state, moved in once; a struct would exist only to be destructured"
+)]
 fn write(
     mut committer: Committer,
     mut queue: Queue,
     settings: WalSettings,
     limits: BrokerLimits,
-    events: mpsc::WeakSender<Event>,
+    durable: mpsc::Sender<Durable>,
     metrics: Arc<Metrics>,
     marks: Marks,
+    mut rewrites: Rewrites,
 ) {
     // The loop is here rather than `Committer::run` because compaction needs
     // a point between two commits, and `run` does not offer one: the log is
@@ -637,10 +802,21 @@ fn write(
         let commit = match committer.commit_available(&mut queue) {
             // The source is gone; every submitter has dropped.
             Ok(None) => break Ok(()),
-            Ok(Some(commit)) => commit,
+            Ok(Some(commit)) => {
+                // A test standing in for a failed write or sync: the same
+                // exit a real failure takes, so what follows is the real
+                // failure path, not a model of it.
+                #[cfg(test)]
+                if marks.fail.swap(false, Ordering::Relaxed) {
+                    break Err(StorageError::Io(std::io::Error::other(
+                        "a failure injected by a test",
+                    )));
+                }
+                commit
+            }
             Err(error) => break Err(error),
         };
-        report(&commit, &events, &metrics);
+        report(&commit, &durable, &metrics);
         marks
             .local
             .store(commit.durable_sequence, Ordering::Relaxed);
@@ -659,13 +835,25 @@ fn write(
             );
         }
 
-        if let Err(error) = shrink(&mut committer, &settings, limits, &metrics, &marks) {
+        if let Err(error) = shrink(
+            &mut committer,
+            &settings,
+            limits,
+            &metrics,
+            &marks,
+            &mut rewrites,
+        ) {
             // A log that cannot be rewritten is still a log that works; it
             // only grows. Nothing is acknowledged differently because of it.
             tracing::warn!(%error, "could not compact the log; it keeps growing");
         }
     };
 
+    // Closed before the failure is counted or logged: from the moment it is
+    // visible, a submitter must already find the queue gone and get no
+    // token, so no publish can be queued into a log that will never write it
+    // (D-9).
+    drop(queue);
     if let Err(error) = outcome {
         Metrics::increment(&metrics.wal_commit_failures, 1);
         // Nothing is reported as durable after this, so nothing is
@@ -675,59 +863,106 @@ fn write(
     tracing::debug!("wal writer stopped");
 }
 
-/// Rewrites the log if it has grown past the threshold.
+/// The writer's own record of the last rewrite.
+struct Rewrites {
+    /// Where the log ended when it was last rewritten, or when the writer
+    /// started.
+    at: u64,
+    /// Where the addressable region starts in the file as it is now.
+    addressable_from: u64,
+    /// Whether the floor has already been reported as past the follower,
+    /// so one fall is said once rather than at every rewrite (D-18).
+    lost: bool,
+}
+
+/// Rewrites the log once enough has been appended since the last rewrite.
 ///
 /// Called between commits, where nothing is staged: the alternative is
 /// writing a batch into a file that is about to be replaced.
+///
+/// Measured from the last rewrite, not from the size of the file. A file
+/// that has to stay large — a retained suffix, a live set bigger than the
+/// threshold — would otherwise be over it after every commit and rewritten
+/// after every commit (D-18).
 fn shrink(
     committer: &mut Committer,
     settings: &WalSettings,
     limits: BrokerLimits,
     metrics: &Metrics,
     marks: &Marks,
+    rewrites: &mut Rewrites,
 ) -> Result<(), StorageError> {
-    if settings.compact_bytes == 0 || committer.log_bytes() < settings.compact_bytes {
+    // Once per commit, a store: how much of the log a follower can still be
+    // served from, as it is now rather than as of the last rewrite.
+    metrics.wal_retained_bytes.store(
+        committer
+            .log_bytes()
+            .saturating_sub(rewrites.addressable_from),
+        Ordering::Relaxed,
+    );
+    if settings.compact_bytes == 0
+        || committer.log_bytes().saturating_sub(rewrites.at) < settings.compact_bytes
+    {
         return Ok(());
     }
 
-    // A replica that has not received these records still needs the bytes,
-    // and STRAUMW3 only kept the *numbers* meaningful — a sequence that
-    // exists logically is no use to a follower asking to be sent it
-    // (docs/replication.md §118, C4). Holding the whole log is the blunt
-    // answer and the only correct one until there is a retention policy: a
-    // follower that stays away keeps the log growing, which an operator can
-    // see and act on, where dropping the records it needs is silent.
-    let behind = marks.replicated.load(Ordering::Relaxed);
-    let durable = committer.durable_sequence();
-    if behind < durable {
-        tracing::debug!(
-            replicated = behind,
-            durable,
-            "not compacting: a replica is still behind the log"
-        );
-        return Ok(());
-    }
-
+    // Commits wait from here to the end of the rewrite, so this is the stall
+    // a rewrite costs them, scan included (D-24).
+    let started = std::time::Instant::now();
     let (current, floor) = live_set(settings, limits)?;
     // The allocator, not the log: the highest correlation handed out is not
     // the highest one still on disk (docs/replication.md §116).
     let correlation = marks.allocated.load(Ordering::Relaxed);
-    let outcome = committer.compact(correlation, &mut |payload| {
-        should_keep(payload, &current, floor)
-    })?;
+    let follower = marks.replicated.load(Ordering::Relaxed);
+    let outcome = committer.compact(
+        correlation,
+        marks.retention.retain(follower),
+        &mut |payload| should_keep(payload, &current, floor),
+    )?;
+    rewrites.at = committer.log_bytes();
+    rewrites.addressable_from = outcome.bytes_after.saturating_sub(outcome.retained_bytes);
     Metrics::increment(&metrics.wal_compactions, 1);
+    metrics.wal_rewrite_nanos.store(
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    metrics
+        .wal_retention_floor
+        .store(outcome.floor, Ordering::Relaxed);
+    metrics
+        .wal_retained_bytes
+        .store(outcome.retained_bytes, Ordering::Relaxed);
+
+    // A follower that needs a record below the floor can no longer be
+    // served from this log. While it is streaming live it may never ask;
+    // once it has to catch up, it is refused (§130). Said at the moment the
+    // floor passes it, because that is the moment it became true.
+    let behind = follower != u64::MAX && follower.saturating_add(1) < outcome.floor;
+    if behind && !rewrites.lost {
+        Metrics::increment(&metrics.replication_followers_lost, 1);
+        tracing::error!(
+            follower,
+            floor = outcome.floor,
+            "the log no longer holds what the follower needs: if it has to catch up it \
+             will need a fresh copy of the log"
+        );
+    }
+    rewrites.lost = behind;
 
     tracing::info!(
         records_before = outcome.records_before,
         records_after = outcome.records_after,
         bytes_before = outcome.bytes_before,
         bytes_after = outcome.bytes_after,
+        floor = outcome.floor,
+        retained_bytes = outcome.retained_bytes,
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "compacted the write-ahead log beside the writer"
     );
     Ok(())
 }
 
-fn report(commit: &storage::Commit, events: &mpsc::WeakSender<Event>, metrics: &Metrics) {
+fn report(commit: &storage::Commit, durable: &mpsc::Sender<Durable>, metrics: &Metrics) {
     Metrics::increment(&metrics.wal_commits, 1);
     Metrics::increment(&metrics.wal_records_committed, commit.records as u64);
     Metrics::increment(&metrics.wal_bytes_committed, commit.bytes as u64);
@@ -741,12 +976,18 @@ fn report(commit: &storage::Commit, events: &mpsc::WeakSender<Event>, metrics: &
 
     // The broker may acknowledge everything up to here, and not one
     // record more (docs/storage.md §99, invariant 1).
-    if let Some(events) = events.upgrade() {
-        let _ = events.blocking_send(Event::Durable {
-            sequence: commit.durable_sequence,
-            correlation: DurableToken(commit.durable_correlation),
-        });
-    }
+    //
+    // A strong sender, where it used to be a weak one. The weak one existed
+    // because these reports shared the command channel, and the broker loop
+    // ended only when that channel had no senders left: a strong one here
+    // would have kept it open for as long as this thread waited for the loop
+    // to let go of its submitter. The loop now ends on the command channel
+    // alone, so this sender keeps nothing alive. Once the loop is gone the
+    // send fails, and a report nobody can act on is dropped.
+    let _ = durable.blocking_send(Durable {
+        sequence: commit.durable_sequence,
+        correlation: DurableToken(commit.durable_correlation),
+    });
 }
 
 /// The runtime's channel, seen the way the writer thread needs it.
@@ -796,6 +1037,7 @@ mod tests {
         let submitter = Submitter {
             records,
             next: Arc::new(AtomicU64::new(0)),
+            admission: Arc::new(Semaphore::new(1)),
         };
 
         assert!(submitter.try_submit_session(&SessionEvent::Gone(client("a"))));
@@ -862,6 +1104,7 @@ mod tests {
             queue: 8,
             // Any size at all: this log is to be rewritten.
             compact_bytes: 1,
+            retain_bytes: 0,
             limits: storage::WalLimits::default(),
         };
         let limits = BrokerLimits::default();
@@ -870,7 +1113,14 @@ mod tests {
         assert_eq!(found.correlation, 4, "four records were written");
 
         let (current, floor) = live_set(&settings, limits).unwrap();
-        compact(&settings, &current, floor, found.correlation).unwrap();
+        compact(
+            &settings,
+            storage::Retain::NONE,
+            &current,
+            floor,
+            found.correlation,
+        )
+        .unwrap();
 
         // The two newest records really are gone — otherwise this proves
         // nothing.
@@ -898,88 +1148,324 @@ mod tests {
             path: path.clone(),
             queue: 8,
             compact_bytes: 1,
+            retain_bytes: 0,
             limits: storage::WalLimits::default(),
         };
         let limits = BrokerLimits::default();
 
         // The whole startup path, which compacts on its way through.
         let mut broker = Broker::new(limits);
-        let restored = restore(&settings, limits, &mut broker).unwrap();
-        assert_eq!(restored, 4);
+        let restored = restore(&settings, Retention::Nothing, limits, &mut broker).unwrap();
+        assert_eq!(restored.correlation, 4);
 
         // Restarting again on the compacted log gives the same answer, which
         // is the property that makes it an identity at all.
         let mut broker = Broker::new(limits);
-        assert_eq!(restore(&settings, limits, &mut broker).unwrap(), 4);
+        assert_eq!(
+            restore(&settings, Retention::Nothing, limits, &mut broker)
+                .unwrap()
+                .correlation,
+            4
+        );
         let _ = std::fs::remove_file(&path);
     }
+
+    /// The two identity spaces are independent, and a restart continues each
+    /// of them on its own.
+    ///
+    /// Not a test that two numbers survive: they are made to differ by 600
+    /// first, so a restart that continued the wrong one is off by 600 rather
+    /// than off by nothing. `local_sequence` used to be seeded from the
+    /// correlation high-water, which is only ever right when a log has one
+    /// record per publish and has never been rewritten.
     #[test]
-    fn a_replica_that_is_behind_holds_the_log_open() {
-        let path = scratch("c4");
+    fn a_restart_continues_each_identity_space_on_its_own() {
+        let path = scratch("spaces");
         let settings = WalSettings {
             path: path.clone(),
             queue: 8,
-            // Anything at all is large enough to rewrite.
-            compact_bytes: 1,
+            // Large: this test is about the two numbers, and a rewrite in the
+            // middle of it would be a second variable.
+            compact_bytes: u64::MAX,
+            retain_bytes: 0,
             limits: storage::WalLimits::default(),
         };
         let limits = BrokerLimits::default();
-        let metrics = Metrics::default();
 
-        let build = || {
-            let (mut wal, _) = storage::Wal::open(&settings.path, settings.limits).unwrap();
-            // Four records nothing needs: at-most-once, owed to no session.
-            for correlation in 1..=4u64 {
+        // 100 records, carrying correlations 601..=700. The log allocates a
+        // sequence per record and reads no bodies, so it ends at sequence 100
+        // while the broker's own numbering ends at 700.
+        {
+            let mut wal = Wal::open(&path, settings.limits).unwrap().0;
+            for index in 1..=100u64 {
+                let correlation = index.saturating_add(600);
                 wal.stage(&encode(
                     correlation,
-                    &topic("chatter"),
-                    &Bytes::from_static(b"noise"),
+                    &topic("sensors/one"),
+                    &Bytes::from_static(b"x"),
                     DeliveryGuarantee::AtMostOnce,
                     false,
                 ))
                 .unwrap();
             }
-            wal.commit().unwrap();
-            Committer::new(wal, settings.limits, true, 0)
-        };
+            assert_eq!(wal.commit().unwrap().0.durable_sequence, 100);
+        }
 
-        // A replica that has only had the first two records still needs the
-        // bytes of the other two, even though STRAUMW3 keeps their numbers
-        // meaningful (docs/replication.md §118).
-        let mut committer = build();
-        let behind = Marks {
+        let mut broker = Broker::new(limits);
+        let restored = restore(&settings, Retention::Nothing, limits, &mut broker).unwrap();
+        assert_eq!(restored.sequence, 100, "the WAL sequence");
+        assert_eq!(restored.correlation, 700, "the broker's correlation");
+
+        // And each one continues from its own value, not from the other's.
+        let mut wal = Wal::open(&path, settings.limits).unwrap().0;
+        wal.stage(&encode(
+            restored.correlation.saturating_add(1),
+            &topic("sensors/one"),
+            &Bytes::from_static(b"y"),
+            DeliveryGuarantee::AtMostOnce,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            wal.commit().unwrap().0.durable_sequence,
+            101,
+            "the next sequence followed the correlation instead of the sequence"
+        );
+        drop(wal);
+
+        let mut last = 0u64;
+        storage::replay(&path, settings.limits, &mut |record| {
+            if let Some(recorded) = decode(record) {
+                last = recorded.correlation();
+            }
+        })
+        .unwrap();
+        assert_eq!(last, 701, "the next correlation did not continue at 701");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Four at-most-once records nothing needs, committed, and the writer's
+    /// side of the log around them.
+    fn disposable(settings: &WalSettings) -> Committer {
+        let (mut wal, _) = storage::Wal::open(&settings.path, settings.limits).unwrap();
+        for correlation in 1..=4u64 {
+            wal.stage(&encode(
+                correlation,
+                &topic("chatter"),
+                &Bytes::from_static(b"noise"),
+                DeliveryGuarantee::AtMostOnce,
+                false,
+            ))
+            .unwrap();
+        }
+        wal.commit().unwrap();
+        Committer::new(wal, settings.limits, true, 0)
+    }
+
+    /// One more at-most-once record, appended to the log as it now is.
+    fn append(settings: &WalSettings, correlation: u64) -> Committer {
+        let (mut wal, _) = storage::Wal::open(&settings.path, settings.limits).unwrap();
+        wal.stage(&encode(
+            correlation,
+            &topic("chatter"),
+            &Bytes::from_static(b"noise"),
+            DeliveryGuarantee::AtMostOnce,
+            false,
+        ))
+        .unwrap();
+        wal.commit().unwrap();
+        Committer::new(wal, settings.limits, true, 0)
+    }
+
+    fn marks(retention: Retention, replicated: u64) -> Marks {
+        Marks {
             allocated: Arc::new(AtomicU64::new(0)),
-            replicated: Arc::new(AtomicU64::new(2)),
+            replicated: Arc::new(AtomicU64::new(replicated)),
+            retention,
             shipments: None,
             local: Arc::new(AtomicU64::new(0)),
-        };
-        shrink(&mut committer, &settings, limits, &metrics, &behind).unwrap();
+            fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn fresh() -> Rewrites {
+        Rewrites {
+            at: 0,
+            addressable_from: 0,
+            lost: false,
+        }
+    }
+
+    fn addressable(path: &std::path::Path) -> Vec<u64> {
+        let mut seen = Vec::new();
+        storage::replay_addressable(
+            path,
+            storage::WalLimits::default(),
+            &mut |_| true,
+            &mut |sequence, _| seen.push(sequence),
+        )
+        .unwrap();
+        seen
+    }
+
+    fn settings(path: &std::path::Path) -> WalSettings {
+        WalSettings {
+            path: path.to_path_buf(),
+            queue: 8,
+            // Anything at all is large enough to rewrite.
+            compact_bytes: 1,
+            retain_bytes: 0,
+            limits: storage::WalLimits::default(),
+        }
+    }
+
+    /// Under `quorum` a follower that has had only the first two records
+    /// keeps the other two readable by the numbers it will ask for, and the
+    /// rewrite still runs (D-20). It used to stop altogether.
+    #[test]
+    fn under_quorum_the_follower_position_is_the_floor() {
+        let path = scratch("quorum-floor");
+        let settings = settings(&path);
+        let metrics = Metrics::default();
+        let mut committer = disposable(&settings);
+        shrink(
+            &mut committer,
+            &settings,
+            BrokerLimits::default(),
+            &metrics,
+            &marks(Retention::Follower, 2),
+            &mut fresh(),
+        )
+        .unwrap();
         drop(committer);
+
+        assert_eq!(addressable(&path), vec![3, 4]);
+        let seen = metrics.snapshot();
+        assert_eq!(seen.wal_compactions, 1);
+        assert_eq!(seen.wal_retention_floor, 3);
+        assert!(seen.wal_rewrite_nanos > 0, "the rewrite was not timed");
+        assert_eq!(seen.replication_followers_lost, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Without a follower nothing reads the log by sequence, and the
+    /// rewrite keeps only what the broker needs — nothing, here.
+    #[test]
+    fn without_a_follower_nothing_stays_addressable() {
+        let path = scratch("no-follower");
+        let settings = settings(&path);
+        let metrics = Metrics::default();
+        let mut committer = disposable(&settings);
+        shrink(
+            &mut committer,
+            &settings,
+            BrokerLimits::default(),
+            &metrics,
+            &marks(Retention::Nothing, u64::MAX),
+            &mut fresh(),
+        )
+        .unwrap();
+        drop(committer);
+
+        assert!(addressable(&path).is_empty());
         assert_eq!(
             storage::replay(&path, settings.limits, &mut |_| {})
                 .unwrap()
                 .records,
-            4,
-            "the log was rewritten out from under a replica that is behind"
+            0
         );
+        assert_eq!(metrics.snapshot().wal_retention_floor, 5);
+        let _ = std::fs::remove_file(&path);
+    }
 
-        // Caught up, and the same log is compacted as it always was.
-        let mut committer = build();
-        let caught_up = Marks {
-            allocated: Arc::new(AtomicU64::new(0)),
-            replicated: Arc::new(AtomicU64::new(u64::MAX)),
-            shipments: None,
-            local: Arc::new(AtomicU64::new(0)),
-        };
-        shrink(&mut committer, &settings, limits, &metrics, &caught_up).unwrap();
+    /// An asynchronous follower behind a byte budget it no longer fits in is
+    /// lost, and that is said once — not again at the next rewrite that
+    /// finds it still behind (D-18).
+    #[test]
+    fn a_follower_the_budget_no_longer_covers_is_reported_once() {
+        let path = scratch("lost");
+        let settings = settings(&path);
+        let metrics = Metrics::default();
+        let limits = BrokerLimits::default();
+        let mut committer = disposable(&settings);
+        // Room for one record: the floor lands on 4, and a follower at 1
+        // needs 2.
+        let one = std::fs::metadata(&path).unwrap().len() - storage::HEADER_BYTES as u64;
+        let behind = marks(Retention::Bytes(one / 4), 1);
+        let mut rewrites = fresh();
+        shrink(
+            &mut committer,
+            &settings,
+            limits,
+            &metrics,
+            &behind,
+            &mut rewrites,
+        )
+        .unwrap();
+        assert_eq!(addressable(&path), vec![4]);
+        assert_eq!(metrics.snapshot().replication_followers_lost, 1);
+
+        // More is appended and rewritten again; the follower has not moved.
+        // Still lost, and not news.
         drop(committer);
-        assert_eq!(
-            storage::replay(&path, settings.limits, &mut |_| {})
-                .unwrap()
-                .records,
-            0,
-            "nothing needed these records and they should have gone"
-        );
+        let mut committer = append(&settings, 5);
+        shrink(
+            &mut committer,
+            &settings,
+            limits,
+            &metrics,
+            &behind,
+            &mut rewrites,
+        )
+        .unwrap();
+        drop(committer);
+        assert_eq!(addressable(&path), vec![5]);
+        assert_eq!(metrics.snapshot().replication_followers_lost, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The trigger counts what was appended since the last rewrite. A log
+    /// that stays above the threshold after a rewrite — here, because the
+    /// whole of it is retained — is not rewritten again at the next commit.
+    #[test]
+    fn a_log_that_stays_large_is_not_rewritten_after_every_commit() {
+        let path = scratch("trigger");
+        let mut settings = settings(&path);
+        let metrics = Metrics::default();
+        let limits = BrokerLimits::default();
+        let mut committer = disposable(&settings);
+        let four = committer.log_bytes();
+        settings.compact_bytes = four;
+        let keep_all = marks(Retention::Follower, 0);
+        let mut rewrites = fresh();
+        shrink(
+            &mut committer,
+            &settings,
+            limits,
+            &metrics,
+            &keep_all,
+            &mut rewrites,
+        )
+        .unwrap();
+        assert_eq!(metrics.snapshot().wal_compactions, 1);
+        assert!(committer.log_bytes() >= settings.compact_bytes);
+
+        // One more record: the file is over the threshold, the appended
+        // bytes are not.
+        drop(committer);
+        let mut committer = append(&settings, 5);
+        shrink(
+            &mut committer,
+            &settings,
+            limits,
+            &metrics,
+            &keep_all,
+            &mut rewrites,
+        )
+        .unwrap();
+        assert_eq!(metrics.snapshot().wal_compactions, 1);
+        drop(committer);
         let _ = std::fs::remove_file(&path);
     }
 }

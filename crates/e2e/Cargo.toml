@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "connhold"
 harness = false
+
+[[bench]]
+name = "durability"
+harness = false

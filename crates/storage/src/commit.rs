@@ -258,14 +258,16 @@ impl Committer {
         self.wal.durable_offset()
     }
 
-    /// Rewrites the log, keeping only the records `keep` accepts. Safe to
+    /// Rewrites the log: the suffix `retain` names verbatim, the rest as
+    /// `keep` decides (`Wal::compact`). Safe to
     /// call between commits and nowhere else (docs/storage.md §104).
     pub fn compact(
         &mut self,
         correlation: u64,
+        retain: crate::Retain,
         keep: &mut impl FnMut(&[u8]) -> bool,
     ) -> Result<crate::Compaction, StorageError> {
-        self.wal.compact(correlation, keep)
+        self.wal.compact(correlation, retain, keep)
     }
 
     /// Folds one cycle into the estimates and, occasionally, into the bound.

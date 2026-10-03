@@ -209,6 +209,14 @@ fn write_strategies() {
 }
 
 fn main() {
+    // `cargo test --all-targets` runs this program too, as a debug build and
+    // with no arguments, and would do minutes of real fsyncs to measure a
+    // build whose numbers mean nothing. Every real run is a release build,
+    // so that is the line, not the arguments (CLAUDE.md §17).
+    if cfg!(debug_assertions) {
+        eprintln!("commit: built without optimisation; use `cargo bench` or a --release build");
+        return;
+    }
     println!(
         "{:<22} {:>9} {:>7} {:>10} {:>11} {:>9} {:>9} {:>9} {:>9} {:>11}",
         "workload",

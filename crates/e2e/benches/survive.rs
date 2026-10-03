@@ -111,6 +111,13 @@ async fn closed(eventloop: &mut rumqttc::EventLoop, seconds: u64) {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    // `cargo test --all-targets` runs this program too, as a debug build and
+    // with no arguments. Every real run is a release build, so that is the
+    // line, not the arguments (CLAUDE.md §17).
+    if cfg!(debug_assertions) {
+        eprintln!("survive: built without optimisation; use `cargo bench` or a --release build");
+        return;
+    }
     let settings = settings();
     match settings.phase {
         Phase::Arm => arm(settings).await,

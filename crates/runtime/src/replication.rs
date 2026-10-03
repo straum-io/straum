@@ -38,10 +38,17 @@ pub(crate) struct Shipment {
 ///
 /// Never blocks and never fails the commit. A follower that cannot keep up
 /// loses its place in this queue and is caught up from the log instead — the
-/// bytes are not lost, they are on the disk, and §118 keeps them there. The
+/// bytes are on the disk, and §130 keeps them addressable: under `quorum`
+/// everything past the follower, otherwise the last `STRAUM_WAL_RETAIN_BYTES`.
+/// The
 /// alternative, blocking the WAL thread on a socket, would make local
 /// durability wait for a remote node, which this phase explicitly does not
 /// do.
+///
+/// A closed queue is counted the same way as a full one. The replication
+/// task keeps its receiver for the life of the process — it retries a
+/// refused follower rather than returning (D-23) — so the queue closes only
+/// at shutdown, after the writer has stopped (docs/replication.md §120).
 pub(crate) fn ship(
     to: &mpsc::Sender<Shipment>,
     previous: u64,
@@ -79,8 +86,9 @@ pub(crate) struct Leading {
     /// The leader's own durable sequence, so a reconnect can be reconciled
     /// against what this node actually holds.
     pub(crate) local: Arc<AtomicU64>,
-    /// How far the follower is known to be durable. Read by compaction,
-    /// which will not rewrite the log past it (§118).
+    /// How far the follower is known to be durable. Read by compaction:
+    /// under `quorum` the log stays addressable past it, otherwise it only
+    /// tells whether a rewrite left the follower behind (§130, D-18, D-20).
     pub(crate) replicated: Arc<AtomicU64>,
     pub(crate) metrics: Arc<Metrics>,
     /// Where the quorum watermark goes. The coordinator is the only thing
@@ -89,6 +97,15 @@ pub(crate) struct Leading {
     pub(crate) quorum: watch::Sender<u64>,
     /// Durable copies required, this node counted (docs/replication.md §127).
     pub(crate) required_copies: usize,
+    /// Whether a PUBACK on this node waits for the quorum this task builds.
+    /// When it does, a refused follower means nothing is acknowledged until
+    /// it is served again, and that has to be said (D-8, D-23).
+    pub(crate) acknowledges_on_quorum: bool,
+    /// How long one frame may take to leave. The same limit, and the same
+    /// meaning, as a client connection's writer (CLAUDE.md §8): a follower
+    /// that holds the connection and stops reading is cut off, counted and
+    /// reconnected, rather than holding this task for ever (D-27).
+    pub(crate) write_stall_timeout: std::time::Duration,
 }
 
 /// Ships committed batches to one follower, reconnecting as needed.
@@ -98,6 +115,14 @@ pub(crate) async fn lead(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut backoff = std::time::Duration::from_millis(50);
+    // A refusal is retried, not final (D-23): an operator who gives the
+    // follower a fresh copy of the log should not also have to restart this
+    // node. It has its own backoff, because a successful connection resets
+    // the ordinary one and a refusal follows a successful connection.
+    let mut refusal_backoff = std::time::Duration::from_millis(50);
+    // The position last refused, so one refusal is logged once rather than
+    // at every retry.
+    let mut refused_from: Option<u64> = None;
     loop {
         if *shutdown.borrow() {
             return;
@@ -118,13 +143,56 @@ pub(crate) async fn lead(
             Ok(connection) => {
                 backoff = std::time::Duration::from_millis(50);
                 Metrics::increment(&held.metrics.replication_connections, 1);
-                if let Err(error) = serve(&held, connection, &mut shipments).await {
-                    Metrics::increment(&held.metrics.replication_errors, 1);
-                    tracing::warn!(peer = %held.peer, %error, "replication link ended");
-                }
+                let outcome = serve(&held, connection, &mut shipments, &mut shutdown).await;
                 held.metrics
                     .replication_connected
                     .store(0, Ordering::Relaxed);
+                match outcome {
+                    Err(LinkError::TooFarBehind { from, available }) => {
+                        Metrics::increment(&held.metrics.replication_errors, 1);
+                        // Under `quorum` the log stays addressable past this
+                        // follower. It cannot be served from this log at all,
+                        // so keeping records for it means nothing and would
+                        // grow the log for as long as it stays like this.
+                        // Back to "no position matters".
+                        held.replicated.store(u64::MAX, Ordering::Relaxed);
+                        if held.acknowledges_on_quorum
+                            && held.metrics.quorum_unavailable.swap(1, Ordering::Relaxed) == 0
+                        {
+                            // Said once, at the transition. The log is not
+                            // poisoned and nothing is closed: acknowledgements
+                            // are withheld, as `quorum` promises (D-8).
+                            tracing::error!(
+                                peer = %held.peer,
+                                "acknowledgements stopped: a quorum can no longer form until the \
+                                 follower is given a fresh copy of the log"
+                            );
+                        }
+                        if refused_from == Some(from) {
+                            tracing::debug!(peer = %held.peer, from, available, "follower still below the retention floor");
+                        } else {
+                            tracing::error!(
+                                peer = %held.peer, from, available,
+                                "the follower is below the retention floor and needs a fresh \
+                                 copy of the log; it will be served once it has one"
+                            );
+                            refused_from = Some(from);
+                        }
+                        backoff = refusal_backoff;
+                        refusal_backoff =
+                            (refusal_backoff * 2).min(std::time::Duration::from_secs(5));
+                    }
+                    Err(error) => {
+                        Metrics::increment(&held.metrics.replication_errors, 1);
+                        tracing::warn!(peer = %held.peer, %error, "replication link ended");
+                        refused_from = None;
+                        refusal_backoff = std::time::Duration::from_millis(50);
+                    }
+                    Ok(()) => {
+                        refused_from = None;
+                        refusal_backoff = std::time::Duration::from_millis(50);
+                    }
+                }
             }
             Err(error) => {
                 tracing::debug!(peer = %held.peer, %error, "cannot reach the follower");
@@ -154,11 +222,15 @@ pub(crate) enum LinkError {
     Refused(#[from] replication::Incompatible),
     #[error("the peer closed the connection")]
     Closed,
-    /// The follower needs records this log no longer holds. It is not
-    /// discarded and not reset: an operator has to decide, because the only
-    /// answers are a fresh copy of the log or accepting the loss
-    /// (docs/replication.md §118).
-    #[error("follower needs sequence {from}, this log starts at {available}")]
+    /// A frame could not be written within the write-stall limit (D-27).
+    #[error("the follower stopped reading: a frame did not leave within the write-stall limit")]
+    Stalled,
+    /// The follower asked for a sequence below this log's retention floor.
+    /// The bytes may still be in the file; the names are not, so there is
+    /// no answer to give. It is not discarded and not reset: an operator has
+    /// to decide, because the only answers are a fresh copy of the log or
+    /// accepting the loss (docs/replication.md §118, §130).
+    #[error("follower needs sequence {from}, this log can be read from {available}")]
     TooFarBehind { from: u64, available: u64 },
 }
 
@@ -167,11 +239,21 @@ async fn serve(
     held: &Leading,
     mut connection: Connection,
     shipments: &mut mpsc::Receiver<Shipment>,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), LinkError> {
     // The follower speaks first, and what it says about itself is what
     // counts — not anything this leader remembers from a previous connection
     // (docs/replication.md §117).
-    let reported = read_durable(&mut connection, held.settings.limits).await?;
+    //
+    // Until it has, nothing is owed to it, so a shutdown does not wait: a
+    // peer whose kernel accepted the connection and that never speaks would
+    // otherwise hold the shutdown for ever (D-21). After the handshake the
+    // stream ends when the queue closes, and not before (§120).
+    let reported = tokio::select! {
+        biased;
+        _ = shutdown.changed() => return Ok(()),
+        reported = read_durable(&mut connection, held.settings.limits) => reported?,
+    };
 
     let local = held.local.load(Ordering::Relaxed);
     let (mut peer, outcome) = Peer::connected(reported, local)?;
@@ -205,6 +287,11 @@ async fn stream(
     // already declared is never withdrawn (§126).
     let mut coordinator = Quorum::new(1, held.required_copies);
     coordinator.on_peer(0, peer.durable());
+    // Caught up: a quorum can form again, whatever refused this follower
+    // before (D-23).
+    if held.metrics.quorum_unavailable.swap(0, Ordering::Relaxed) == 1 {
+        tracing::info!(peer = %held.peer, "the follower is served again; acknowledgements can resume");
+    }
     announce(
         held,
         coordinator.on_local(held.local.load(Ordering::Relaxed)),
@@ -241,7 +328,7 @@ async fn stream(
                     // the one to send now.
                     continue;
                 }
-                send_frame(&mut connection, &mut header, peer, shipment.previous, shipment.last, &shipment.batch, &held.metrics).await?;
+                send_frame(held, &mut connection, &mut header, peer, shipment.previous, shipment.last, &shipment.batch).await?;
             }
         }
     }
@@ -249,20 +336,30 @@ async fn stream(
 
 /// Writes one frame and records that it went out. Sent is not durable.
 async fn send_frame(
+    held: &Leading,
     connection: &mut Connection,
     header: &mut Vec<u8>,
     peer: &mut Peer,
     previous: u64,
     last: u64,
     batch: &[u8],
-    metrics: &Metrics,
 ) -> Result<(), LinkError> {
     header.clear();
     replication::encode_records_header(previous, last, batch, header);
-    connection.writer.write_all(header).await?;
-    connection.writer.write_all(batch).await?;
+    // The whole frame under one limit, as a client writer's flush is: a
+    // frame that cannot leave in that long is a follower that stopped
+    // reading, and under `quorum` one that silently stops every
+    // acknowledgement (D-27).
+    let write = async {
+        connection.writer.write_all(header).await?;
+        connection.writer.write_all(batch).await
+    };
+    match tokio::time::timeout(held.write_stall_timeout, write).await {
+        Ok(written) => written?,
+        Err(_) => return Err(LinkError::Stalled),
+    }
     peer.on_sent(last);
-    metrics
+    held.metrics
         .replication_in_flight
         .store(peer.in_flight(), Ordering::Relaxed);
     Ok(())
@@ -354,28 +451,24 @@ async fn catch_up(
     // what the counter is about, and a handshake that resends is the same
     // event as a gap noticed mid-stream.
     Metrics::increment(&held.metrics.replication_catchups, 1);
-    let allocated = storage::allocated(&held.wal.path)?;
-    let base = allocated.base();
-    if from <= base {
-        // The records were compacted away. §118 keeps them while a replica
-        // is known to be behind, so arriving here means this follower was
-        // away long enough for the leader to forget it existed — an operator
-        // question, not one this code may answer by resetting anybody.
-        return Err(LinkError::TooFarBehind {
-            from,
-            available: base.saturating_add(1),
-        });
-    }
 
     let (frames, mut ready) = mpsc::channel::<Shipment>(held.settings.catch_up_queue);
     let path = held.wal.path.clone();
     let limits = held.wal.limits;
     let bound = held.settings.catch_up_batch_bytes;
+    // What this node has made durable, read once. The file holds more than
+    // that the moment a batch is written and before it is synced, and a
+    // record shipped from there reaches the follower before it is durable
+    // here: the follower then reports past `local`, the coordinator takes
+    // the smaller of the two, and with no later report the watermark never
+    // moves again (§112, D-22). `local` is a commit boundary, so stopping at
+    // it never splits a batch; the rest goes out live or on the next pass.
+    let until = held.local.load(Ordering::Relaxed);
 
-    let reader = tokio::task::spawn_blocking(move || -> Result<(), storage::StorageError> {
-        let mut sequence = base;
+    let reader = tokio::task::spawn_blocking(move || -> Result<(), LinkError> {
         let mut batch: Vec<u8> = Vec::with_capacity(bound);
-        let mut start = base;
+        let mut start = from.saturating_sub(1);
+        let mut last = from.saturating_sub(1);
         let send = |start: u64, last: u64, batch: &mut Vec<u8>| {
             let shipment = Shipment {
                 previous: start,
@@ -387,21 +480,45 @@ async fn catch_up(
         };
 
         let mut stopped = false;
-        storage::replay_frames(&path, limits, &mut |framed| {
-            sequence = sequence.saturating_add(1);
-            if stopped || sequence < from {
-                return;
-            }
-            if batch.is_empty() {
-                start = sequence.saturating_sub(1);
-            }
-            batch.extend_from_slice(framed);
-            if batch.len() >= bound && !send(start, sequence, &mut batch) {
-                stopped = true;
-            }
-        })?;
+        let mut refused = None;
+        // The floor and the records come out of one read of one file. A
+        // separate call to check the range first would be checking a log that
+        // the next call is no longer reading (docs/replication.md §130).
+        storage::replay_addressable(
+            &path,
+            limits,
+            &mut |floor| {
+                if from < floor {
+                    // Compacted away. Under `quorum` the log keeps what a
+                    // follower it has heard from needs, so arriving here means
+                    // one it never heard from or one that lost its own log;
+                    // otherwise the follower fell further behind than the
+                    // retained bytes (§130). Either way an operator question,
+                    // not one this code may answer by resetting anybody.
+                    refused = Some(floor);
+                    return false;
+                }
+                true
+            },
+            &mut |sequence, framed| {
+                if stopped || sequence < from || sequence > until {
+                    return;
+                }
+                if batch.is_empty() {
+                    start = sequence.saturating_sub(1);
+                }
+                last = sequence;
+                batch.extend_from_slice(framed);
+                if batch.len() >= bound && !send(start, last, &mut batch) {
+                    stopped = true;
+                }
+            },
+        )?;
+        if let Some(available) = refused {
+            return Err(LinkError::TooFarBehind { from, available });
+        }
         if !stopped && !batch.is_empty() {
-            send(start, sequence, &mut batch);
+            send(start, last, &mut batch);
         }
         Ok(())
     });
@@ -413,13 +530,13 @@ async fn catch_up(
             continue;
         }
         outcome = send_frame(
+            held,
             connection,
             &mut header,
             peer,
             shipment.previous,
             shipment.last,
             &shipment.batch,
-            &held.metrics,
         )
         .await;
     }
@@ -427,7 +544,7 @@ async fn catch_up(
     // cannot hang on a socket that died.
     match reader.await {
         Ok(Ok(())) => outcome,
-        Ok(Err(error)) => outcome.and(Err(error.into())),
+        Ok(Err(error)) => outcome.and(Err(error)),
         Err(_) => outcome.and(Err(LinkError::Closed)),
     }
 }

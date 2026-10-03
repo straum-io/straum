@@ -332,6 +332,12 @@ impl Settings {
                     1,
                     1 << 24,
                 )?,
+                max_pending_durable: parser.number(
+                    "STRAUM_MAX_PENDING_DURABLE",
+                    65_536usize,
+                    1,
+                    1 << 24,
+                )?,
                 replication: runtime::ReplicationSettings {
                     listen: parser.optional_addr("STRAUM_REPLICATION_LISTEN")?,
                     follower: parser.optional_addr("STRAUM_REPLICATION_FOLLOWER")?,
@@ -361,6 +367,12 @@ impl Settings {
                     // rewrite is worth its own I/O.
                     compact_bytes: parser.number(
                         "STRAUM_WAL_COMPACT_BYTES",
+                        67_108_864u64,
+                        0,
+                        1_099_511_627_776,
+                    )?,
+                    retain_bytes: parser.number(
+                        "STRAUM_WAL_RETAIN_BYTES",
                         67_108_864u64,
                         0,
                         1_099_511_627_776,
@@ -1081,6 +1093,7 @@ mod tests {
             ("STRAUM_WRITER_BATCH", "64"),
             ("STRAUM_WAL_PATH", "straum.wal"),
             ("STRAUM_WAL_COMPACT_BYTES", "67108864"),
+            ("STRAUM_WAL_RETAIN_BYTES", "67108864"),
             ("STRAUM_WAL_QUEUE", "65536"),
             ("STRAUM_WAL_MAX_RECORD_BYTES", "1048576"),
             ("STRAUM_WAL_MIN_BATCH_BYTES", "65536"),
@@ -1090,6 +1103,7 @@ mod tests {
             ("STRAUM_METRICS_ADDR", ""),
             ("STRAUM_REQUIRED_COPIES", "2"),
             ("STRAUM_MAX_AWAITING_QUORUM", "65536"),
+            ("STRAUM_MAX_PENDING_DURABLE", "65536"),
             ("STRAUM_REPLICATION_LISTEN", ""),
             ("STRAUM_REPLICATION_FOLLOWER", ""),
         ];

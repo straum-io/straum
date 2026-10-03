@@ -143,10 +143,18 @@ struct Run {
 
 /// Publishes the workload and records both latencies.
 ///
+/// Timed from the first publish to the last PUBACK. `publish()` only queues
+/// in the client, so a clock stopped when it returned measured queueing:
+/// that is what this harness did until D-11, and its 64 KiB row read
+/// 16 899 msg/s with a 0.01 ms acknowledgement under `fsynced`. Latency is
+/// per packet: PUBLISH written to the PUBACK for that packet id.
+///
 /// The replication latency comes from the leader's watermark: the nth record
 /// in a fresh log is sequence n, so when the watermark moves from a to b the
-/// messages in that range have just become durable on the follower. Sampling
-/// it costs a busy task, which is why CPU is measured in a separate pass.
+/// messages in that range have just become durable on the follower. It is
+/// measured from the moment the nth PUBLISH was written — rumqttc writes them
+/// in order — not from when it was queued. Sampling it costs a busy task,
+/// which is why CPU is measured in a separate pass.
 async fn run(work: &Workload, leader: &Runtime, follower: Option<&Runtime>) -> Run {
     // Where the log already is. The warm-up put records in it, so sequence
     // `base + n` is this run's nth message and not the nth overall.
@@ -158,13 +166,53 @@ async fn run(work: &Workload, leader: &Runtime, follower: Option<&Runtime>) -> R
     options.set_keep_alive(Duration::from_secs(30));
     options.set_max_packet_size(work.payload + 1024, work.payload + 1024);
     let (client, mut eventloop) = AsyncClient::new(options, 256);
-    let driving = tokio::spawn(async move { while eventloop.poll().await.is_ok() {} });
 
+    // When the nth PUBLISH went out, by message index.
     let sent: Arc<Vec<std::sync::Mutex<Option<Instant>>>> = Arc::new(
         (0..work.messages)
             .map(|_| std::sync::Mutex::new(None))
             .collect(),
     );
+    let messages = work.messages;
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<(Vec<u64>, Instant)>();
+    let written = Arc::clone(&sent);
+    let driving = tokio::spawn(async move {
+        // Packet ids are reused once acknowledged, so one slot per id is
+        // enough to pair a PUBACK with its PUBLISH.
+        let mut by_id: Vec<Option<Instant>> = vec![None; usize::from(u16::MAX) + 1];
+        let mut acked = Vec::with_capacity(messages);
+        let mut outgoing = 0usize;
+        let mut done = Some(done_tx);
+        while let Ok(event) = eventloop.poll().await {
+            match event {
+                rumqttc::Event::Outgoing(rumqttc::Outgoing::Publish(pkid)) => {
+                    let now = Instant::now();
+                    if let Some(slot) = by_id.get_mut(usize::from(pkid)) {
+                        *slot = Some(now);
+                    }
+                    if let Some(slot) = written.get(outgoing) {
+                        if let Ok(mut held) = slot.lock() {
+                            *held = Some(now);
+                        }
+                    }
+                    outgoing += 1;
+                }
+                rumqttc::Event::Incoming(rumqttc::Packet::PubAck(ack)) => {
+                    let now = Instant::now();
+                    if let Some(at) = by_id.get(usize::from(ack.pkid)).copied().flatten() {
+                        acked.push(now.duration_since(at).as_nanos() as u64);
+                    }
+                    if acked.len() == messages {
+                        if let Some(done) = done.take() {
+                            let _ = done.send((std::mem::take(&mut acked), now));
+                        }
+                    }
+                }
+                rumqttc::Event::Outgoing(rumqttc::Outgoing::Disconnect) => break,
+                _ => {}
+            }
+        }
+    });
 
     let watching = follower.is_some().then(|| {
         let metrics = leader.metrics_handle();
@@ -198,19 +246,11 @@ async fn run(work: &Workload, leader: &Runtime, follower: Option<&Runtime>) -> R
 
     let payload = vec![b'x'; work.payload];
     let started = Instant::now();
-    let mut acked = Vec::with_capacity(work.messages);
     for index in 0..work.messages {
-        if let Some(slot) = sent.get(index) {
-            if let Ok(mut held) = slot.lock() {
-                *held = Some(Instant::now());
-            }
-        }
-        let at = Instant::now();
         client
             .publish("bench/topic", QoS::AtLeastOnce, false, payload.clone())
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        acked.push(at.elapsed().as_nanos() as u64);
         if let Some(burst) = work.burst {
             if index % burst == burst - 1 {
                 // A quiet moment, so the next batch is built from an idle
@@ -219,7 +259,8 @@ async fn run(work: &Workload, leader: &Runtime, follower: Option<&Runtime>) -> R
             }
         }
     }
-    let elapsed = started.elapsed();
+    let (acked, last_ack) = ok(done_rx.await);
+    let elapsed = last_ack.duration_since(started);
 
     let replicated = match watching {
         None => Vec::new(),
@@ -237,6 +278,7 @@ async fn run(work: &Workload, leader: &Runtime, follower: Option<&Runtime>) -> R
         }
     };
 
+    // Outside the interval, on purpose.
     ok(client.disconnect().await);
     let _ = driving.await;
 
@@ -311,6 +353,13 @@ fn report(name: &str, mode: &str, mut run: Run) {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    // `cargo test --all-targets` runs this program too, as a debug build and
+    // with no arguments. Every real run is a release build, so that is the
+    // line, not the arguments (CLAUDE.md §17).
+    if cfg!(debug_assertions) {
+        eprintln!("replicate: built without optimisation; use `cargo bench` or a --release build");
+        return;
+    }
     println!(
         "{:<16} {:<10} {:>9} {:>8} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8} {:>7} {:>9} {:>7} {:>9}",
         "workload",

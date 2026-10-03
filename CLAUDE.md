@@ -272,7 +272,10 @@ offset, recovery of the durable prefix. Rules in `docs/storage.md`.
 A byte offset is a location and a sequence is an identity: compaction rewrites
 the file and never rewinds what the log has allocated. The `STRAUMW3` header
 carries that state, so a restart after a rewrite continues the numbering
-instead of repeating it (docs/storage.md §91).
+instead of repeating it (docs/storage.md §91). A rewrite keeps a filtered
+set rather than a prefix, so what it leaves behind still recovers but can no
+longer be named: below the retention floor the log has bytes and no addresses
+(docs/replication.md §130).
 
 It does blocking file I/O and reads the clock, because storage latency is
 the signal the batching adapts to (§95). It owns no threads: the runtime
@@ -466,8 +469,9 @@ Being built, in this order (the adoption path, not a wish list):
    restart. A kept session is written down as its subscriptions plus the
    last log record it finished with; what it is owed is replayed from the
    log rather than stored twice (docs/storage.md §90a). Compaction respects
-   that mark and runs both at startup and beside the writer once the log
-   passes STRAUM_WAL_COMPACT_BYTES (docs/storage.md §104).
+   that mark and runs both at startup and beside the writer once
+   STRAUM_WAL_COMPACT_BYTES were appended since the last rewrite, keeping
+   what a follower still needs (docs/storage.md §104, docs/replication.md §118).
 3. Will publishing is built.
 
 Out of scope: MQTT 5, QoS 2, shared subscriptions, WebSocket. Each needs
@@ -554,7 +558,7 @@ Overflow policy **(initial)**:
 
 | Situation | Action |
 |---|---|
-| At-most-once delivery, session queue full (messages or bytes) | drop, `dropped_messages += 1` |
+| At-most-once delivery, session queue full (messages or bytes) | drop, `dropped_messages += 1`, exported as a counter |
 | At-least-once delivery, session backlog full (messages or bytes) | `Close(SlowConsumer)`, counted in `backlog_refused` and logged with the limit that was reached |
 | Reply cannot be enqueued | `Close(SlowConsumer)` |
 | Global queued-bytes budget exceeded | same as a full session queue |
@@ -562,7 +566,11 @@ Overflow policy **(initial)**:
 | Global read-bytes budget exceeded | the growth is refused before it is allocated; the connection is closed |
 | Broker command queue full | reader awaits; nothing dropped |
 | WAL queue full | the submitter awaits; a publish is never acknowledged early to make room |
+| Pending acknowledgements at `STRAUM_MAX_PENDING_DURABLE` | that publisher's reader waits for a permit before its record goes to the log; no other client waits; nothing dropped |
 | Writer makes no progress for `STRAUM_WRITE_STALL_TIMEOUT_MS` | close connection |
+| Follower stops reading for `STRAUM_WRITE_STALL_TIMEOUT_MS` | the replication link is ended, `replication_errors += 1`, redialled; the follower is caught up from the log once it reads (D-27) |
+| Follower further behind than `STRAUM_WAL_RETAIN_BYTES`, below `quorum` | the log is rewritten past it; one `error` and `replication_followers_lost += 1`; refused when it next needs catching up (D-18) |
+| Follower away under `quorum` | the log is kept past its own reports, bounded by `STRAUM_MAX_PENDING_DURABLE` publishes plus session records (D-20) |
 
 Every path in this table has a test.
 
@@ -836,13 +844,17 @@ shows contention.
 ```text
 counters: connections_accepted  protocol_errors  transport_errors
           bytes_in  bytes_out  slow_consumer_closes  backlog_refused
+          dropped_messages
           authentication_failures  keepalive_closes
           wal_commits  wal_records_committed  wal_bytes_committed
           wal_commit_failures  session_records_dropped  wal_compactions
           replication_connections  replication_errors
           replication_shipments_dropped  replication_catchups
+          replication_followers_lost
 gauges:   active_sessions  queued_messages  queued_bytes  backlog_bytes
+          pending_acknowledgements  quorum_unavailable
           wal_durable_sequence  wal_sync_nanos
+          wal_retention_floor  wal_retained_bytes  wal_rewrite_nanos
           replication_connected  replication_follower_sequence
           replication_in_flight  replication_queued
 ```
@@ -866,6 +878,8 @@ the runtime mirrors out only what an operator acts on.
 The runtime coordinates; nothing relies on `Drop` for application shutdown.
 
 ```text
+0. close publish admission: a publisher waiting for room ends now, not
+   at the end of the grace period (D-10)
 1. stop accepting connections
 2. stop reading new commands
 3. let writers drain for STRAUM_SHUTDOWN_GRACE_MS
@@ -923,11 +937,21 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 # transport depends on ring, which compiles C: this one only runs in the
 # container (§13), not against the cross target on macOS.
 scripts/linux.sh clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets
+# Benchmarks are built but not run. `harness = false` targets are plain
+# programs that `cargo test --all-targets` runs too. divan recognises that
+# and does one short pass; the hand-written load generators (e2e, and
+# storage/benches/commit.rs) refuse to run as a debug build, which is what
+# `cargo test` produces — before that guard the e2e ones alone cost 13
+# minutes (D-4). `--tests` selects every target with `test = true` — library
+# and binary unit tests, integration tests — and benches default to `false`.
+# Setting `test = false` on a bench does not help: `--all-targets` runs it
+# anyway (checked).
+cargo test --workspace --all-targets --no-run
+cargo test --workspace --tests
 scripts/check-boundaries.sh
 
 # when code under transport/src/sys/ or other Linux-only behavior changed:
-scripts/linux.sh test --workspace --all-targets
+scripts/linux.sh test --workspace --tests
 
 # when the hot path changed: the relevant benchmarks, named in the report
 cargo bench -p <crate> --bench <name>

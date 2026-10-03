@@ -100,11 +100,11 @@ Against `docs/storage.md` §73–§104 and `CLAUDE.md` §7–§8.
 | C1 | `Commit.last_correlation` was a running maximum, not a watermark: a publish could be acknowledged before its record was written (§110) | **correctness / durability** | **fixed** — contiguous prefix in `Committer` |
 | C2 | Correlations were consumed by `fetch_add` before the record was guaranteed to enter the queue; `try_submit_session` returning `false` burned one permanently | **correctness** | **fixed** — the queue slot is reserved first |
 | C3 | Byte offsets are not stable across compaction: `Wal::compact` rewrites the file and recomputes `durable_offset` (`storage/src/wal.rs:206`) | architecture | yes — correlation is identity, offset is local location, and only the first may cross the network |
-| C4 | `shrink()` compacted on size alone; nothing held the log for a follower that had not received those records | architecture | **partly fixed** — compaction is suspended while a replica is behind (§118); a retention policy is still open |
+| C4 | `shrink()` compacted on size alone; nothing held the log for a follower that had not received those records | architecture | **fixed** — a rewrite keeps an addressable suffix: the last `STRAUM_WAL_RETAIN_BYTES` below `quorum`, everything past the follower under it (§118, D-18, D-20) |
 | C5 | Correlations are per-node (`Submitter.next` starts at the local recovered maximum) and `Session.owes_from` is a correlation | architecture | not for one source; yes for multi-writer |
 | C6 | `Broker::replay_retained` iterated a `HashMap` | correctness (determinism) | **fixed** — the matches are sorted by topic before delivery |
 | C7 | `StorageError::Poisoned` is terminal for the log; there is no equivalent for "quorum lost", and the two are different classes of state — local storage unrecoverable versus distributed availability | architecture | yes — losing a peer must withhold acknowledgement, never kill the WAL |
-| C8 | `pending_durable` has no explicit bound; its depth today is limited by the WAL channel, which a network round-trip widens | performance / §8 | no, but the limit must be named before the window grows |
+| C8 | `pending_durable` has no explicit bound; its depth today is limited by the WAL channel, which a network round-trip widens | performance / §8 | **fixed** — quorum widened the window, and the only bound left was `STRAUM_MAX_AWAITING_QUORUM` × records per commit, a product. Now `STRAUM_MAX_PENDING_DURABLE`, counted in publishes, taken as a permit at the publisher's reader before its record goes to the log, so only that publisher waits (D-6, D-7, docs/memory.md §9) |
 | C9 | `CLAUDE.md` §16 shutdown had no step that flushed replication | correctness | **fixed** — the leader drains after the WAL writer stops, and what may still be leader-only is stated (§120) |
 | C10 | No metric left the process; `Metrics` had no exporter and no caller in `server` | observability | **fixed** — Prometheus text on `STRAUM_METRICS_ADDR`, including the replication gauges |
 | C11 | `docs/storage.md` §80 defines three modes; a fourth changes a table that four documents quote | documentation | no |
@@ -296,9 +296,11 @@ is the whole design.
 4. replication state machine                                done
 5. STRAUMW3: logical identity survives compaction (C12)     done
 6. one source, one follower, static membership              done
-7. quorum watermark; Durability::Quorum                     next
-8. compaction holds the log for a lagging peer (C4)         done
-   a retention policy, and a path for one too far behind    open
+7. quorum watermark; Durability::Quorum                     done
+8. compaction keeps what a lagging peer needs (C4)          done
+   retention floor; one too far behind is refused (§130)    done
+   recovering that one: operator reinitialization (D-3)     decided
+   a retention policy (D-18, D-20)                          done
 9. failure tests: peer down, slow, returning (§121)         done
    shutdown with a lagging peer (C9, §120)                  done
 10. replication measured against the local baseline (§122)  done
@@ -528,9 +530,12 @@ any number of rewrites.
 `records` is how many it started with, so a reader finding `n` records knows
 the live sequence is `sequence + (n - records)`. Two fields rather than one
 base, because a file that says what it started with can be checked against
-what it holds. `correlation` is a floor the owner of the record bodies writes
-down and takes back, since the log never reads them; recovery uses the larger
-of it and whatever the surviving records carry. The checksum covers the three
+what it holds. That gives the log's live sequence, which is not the same as a
+sequence for each record in the file: §130 has the difference.
+
+`correlation` is a floor the owner of the record bodies writes down and takes
+back, since the log never reads them; recovery uses the larger of it and
+whatever the surviving records carry. The checksum covers the three
 numbers: a damaged high-water reads as a plausible smaller number, which is
 the exact failure this header exists to prevent.
 
@@ -598,18 +603,46 @@ the bytes of record 150 are still on this disk        §118
 A leader that compacts away 100..200 while a follower is durable through 99
 can tell the follower that sequence 100 exists, and cannot send it.
 
-Compaction is therefore suspended while a replica is behind: `shrink()`
-compares how far the log has been replicated against its own durable
-sequence and does nothing until they meet. With no replica the position is
-`u64::MAX` and nothing changes for a single node.
+Until D-18 the answer was to hold the whole log: `shrink()` did nothing
+while a replica was behind. That bounded nothing — a follower that stayed
+away kept the log growing until an operator noticed — and a restart got
+around it, because the rewrite at startup checked the file size alone.
 
-This is the blunt answer and deliberately so. It is not a retention policy:
-a follower that stays away keeps the log growing until an operator notices,
-where the alternative — dropping the records it needs — is silent and
-unrecoverable. A real policy needs a minimum available sequence the log
-admits to, and a defined path for a follower below it (a snapshot, or a
-refusal). That is still open, and it is the reason C4 is marked partly fixed
-rather than fixed.
+It is now a retention rule. A rewrite keeps a **suffix** of the log verbatim,
+under the numbers it was written with, and filters only what lies below it
+(§130). What the suffix covers depends on what the follower is for:
+
+```text
+no follower                    nothing; the floor is the head, as before
+follower, below `quorum`       the last STRAUM_WAL_RETAIN_BYTES        (D-18)
+follower, `quorum`             everything past the follower's own
+                               durable reports                         (D-20)
+```
+
+Below `quorum` the follower is a copy that acknowledgements do not wait for,
+so its position does not hold the log: one further behind than the budget
+is lost, and that is said when a rewrite passes it — one `error` and
+`replication_followers_lost` — rather than discovered at the next
+reconnect. Under `quorum` the follower *is* the acknowledgement, so the log
+is kept past its own reports, never past the quorum watermark: the
+watermark is a durability position, the floor a catch-up one, and neither
+is derived from the other. What that costs in disk is bounded by admission:
+only a publish holding a permit, or a session record, reaches the log, so
+the log past the follower holds at most `STRAUM_MAX_PENDING_DURABLE`
+publishes plus session records (docs/memory.md).
+
+The rule applies at startup exactly as beside the writer (D-19). At startup
+under `quorum` nothing has reported yet, so everything still addressable
+stays addressable; the first rewrite after the follower has spoken is the
+one that may move the floor. The follower's position is not written down:
+holding until it reports gives the same guarantee — a leader restart does
+not end a quorum — and a stored position would only let the startup
+rewrite free disk sooner.
+
+A rewrite is triggered by what was appended since the last one, not by the
+size of the file. A file that has to stay large — a retained suffix, a live
+set above the threshold — would otherwise be over the threshold after every
+commit and rewritten after every commit.
 
 ## 119. The TCP adapter
 
@@ -645,12 +678,20 @@ than two.
 
 Catch-up reads the leader's own log on a blocking thread and hands frames
 over a bounded channel: the log is never held in memory and a slow socket
-stops the reader instead of growing a queue. `storage::allocated` reads the
-36-byte header alone to learn which sequence the file's records start from,
-so finding the resend point costs no extra pass. `storage::replay_frames`
-hands over each record with its framing intact — the leader sends the bytes
-it holds and encodes nothing twice. Compaction now uses the same path, which
-removed a re-encode it never needed either.
+stops the reader instead of growing a queue. `storage::replay_addressable`
+hands over each record with its framing intact, together with the sequence
+computed from that file's own header — the leader sends the bytes it holds, encodes nothing
+twice, and derives no numbers of its own (§130). Compaction uses the same
+walk, which removed a re-encode it never needed either.
+
+It stops at `local`, this node's own durable sequence, read once when it
+starts. The file holds a batch from the moment it is written, before it is
+synced; catch-up used to ship from there, so a follower could report a
+position this node had not yet made durable, the coordinator took the
+smaller of the two, and with no later report the watermark never moved
+again (D-22, matrix row 39). Stopping at `local` keeps §112's order — durable
+here, then shipped — on the catch-up path as well as the live one, and
+`local` is a commit boundary, so no batch is split.
 
 **What advances what.** On the follower, only the completed durability
 operation: the writer thread reports `commit.durable_sequence` after
@@ -675,6 +716,20 @@ leader task deliberately does not watch the shutdown signal while it is
 streaming. The writer dropping its end of the shipment queue is what tells it
 there is nothing more coming, so a shutdown ships what was committed rather
 than dropping it.
+
+Before the handshake nothing is owed to the follower, so that phase does
+watch the shutdown signal: a follower whose kernel accepted the connection
+and that never speaks would otherwise hold the shutdown for ever (D-21,
+matrix row 40).
+
+After it, the stream still does not watch the signal; what bounds it is the
+write-stall limit. Each frame must leave within `STRAUM_WRITE_STALL_TIMEOUT_MS`,
+the limit a client writer has, or the link ends with `Stalled`, is counted
+in `replication_errors` and is redialled; the follower is caught up from
+the log once it reads again. Without it a follower that held the connection
+and stopped reading kept the replication task — and under `quorum` every
+acknowledgement — for as long as it liked, and a shutdown waited with it
+(D-26, D-27; matrix rows 41 and 42, both of which fail without the limit).
 
 What may remain on the leader alone when shutdown completes: anything the
 follower never acknowledged. Replication is asynchronous in this phase, a
@@ -778,9 +833,25 @@ Method     one warm-up run of 200 messages discarded per row, then the
            the measured run so the warm-up is not in the averages
 ```
 
-Latencies in milliseconds. `ack` is publish to PUBACK, which is what a client
-sees and what this phase must not change. `rep` is publish to the leader
-hearing the follower call it durable — the whole path, not a TCP write.
+> **Historical table, superseded 2026-10-02 (D-6 B, D-11).** It is kept as
+> it was measured, and it is not current. This harness stopped its clock
+> when the last publish had been *queued in the client*, and its `ack`
+> columns are the time `publish()` took to queue — not publish to PUBACK, as
+> this paragraph used to say. The `msg/s`, `MB/s` and `ack` columns below are
+> therefore queueing figures: the 64 KiB `local` row, re-run, reads ~12–16 k
+> msg/s with `ack50` = 0.01 ms, while the same point timed to the last PUBACK
+> is 4 402 msg/s. The commit-shape columns (`m/lcmt`, `B/lcmt`, `m/fcmt`) are
+> counters and stand. `rep` runs from the moment a message was queued in the
+> client to the leader hearing it durable on the follower: real time, but it
+> includes the client's own queue. The harness is fixed (D-11) and the table
+> re-measured to the last PUBACK in docs/baselines/apple-m1-dev.md: the long
+> runs barely moved (`sustained 1 KiB replicated` 6 323 → 6 293), the short
+> ones and 64 KiB did (`large 64 KiB local` 16 899 → 3 702). The current
+> table is the one in the baselines file, not this one.
+
+Latencies in milliseconds. `ack` was meant to be publish to PUBACK; see the
+note above for what it measured. `rep` is queued-in-client to the leader
+hearing the follower call it durable.
 `m/lcmt` and `m/fcmt` are messages per leader and per follower commit.
 
 | workload | mode | msg/s | MB/s | ack50 | ack95 | ack99 | rep50 | rep95 | rep99 | m/lcmt | B/lcmt | m/fcmt |
@@ -947,13 +1018,16 @@ two hypotheses died on the way, which is the point of having an order.
 
 **Reproduced.** 667 msg/s twice, to three figures. Re-running the whole table
 at the same time showed no regression from the catch-up change in `ee08533`
-(7 470 / 7 774 / 17 078 against 7 500 / 7 621 / 14 575), which killed the
+(7 470 / 7 774 / 17 078 against 7 500 / 7 621 / 14 575 — queueing rates from
+the same flawed loop, so they compare with each other and with nothing else;
+see the note on the table above), which killed the
 first hypothesis — that the top-of-loop catch-up had started reading the log
 per batch. Read from the source it looked certain; measured, it was nothing.
 
 **Verified the workload.** The table had no row of the same shape, so a slow
 follower and the sheer volume were not separable. Adding `sustained 1 KiB`
-gave the control: 20 000 × 1 KiB with an ordinary follower is 6 323 msg/s.
+gave the control: 20 000 × 1 KiB with an ordinary follower is 6 323 msg/s
+(6 293 re-measured to the last PUBACK after D-11 — a run this long held).
 Volume was not it.
 
 **Counters.** `replication_catchups` was **0** — the catch-up path never ran
@@ -1260,17 +1334,36 @@ twenty and they are acknowledged together.
 Dropping one leaves a correlation no watermark can release: sequence 100 is
 lost, the watermark reaches 100, and the publish attached to it can never
 be acknowledged. So the queue does not drop. When it reaches
-`STRAUM_MAX_AWAITING_QUORUM` the broker loop stops taking commands, which
-fills the bounded event channel, which the connection reader awaits, which
-reaches the publisher's TCP window — the backpressure that is already there
-(CLAUDE.md §4). A memory limit creates backpressure here; it never creates
-a silent loss of state.
+`STRAUM_MAX_AWAITING_QUORUM` the broker loop stops reading the log's
+reports, which makes the writer thread wait, which fills the log queue,
+which the connection reader awaits, which reaches the publisher's TCP
+window — the backpressure that is already there (CLAUDE.md §4). A memory
+limit creates backpressure here; it never creates a silent loss of state.
 
-That is also why the watermark has **its own channel**. On the event
-channel it would queue behind the commands the full queue is refusing to
+It counts commits, so it bounds the reports and not what the broker holds:
+a commit carries any number of publishes, and the broker keeps one pending
+acknowledgement per publish. That is a separate limit,
+`STRAUM_MAX_PENDING_DURABLE`, counted in publishes and taken as a permit
+before a publish goes to the log (C8, D-7, docs/memory.md §9). The reports
+moved off the command channel for the same reason: stopping them when this
+queue is full now stops the log writer and the durable publishers behind
+it, and not every other client's commands with them.
+
+That is also why the watermark has **its own channel**. On the report
+channel it would queue behind the reports the full queue is refusing to
 take, and the only thing that can drain the queue would be waiting behind
 the thing that filled it. A `watch` fits exactly: monotonic, latest-only,
 and a sender that never blocks.
+
+Two channels have no order between them, and the loop reads the watermark
+first. So a watermark can arrive before the report of a commit it already
+covers, and that pair is queued behind the watermark that should release
+it. The loop therefore keeps the highest watermark it has seen and releases
+against it after every batch of reports, not only when the watermark
+changes: once the quorum has caught up and publishing stops, the watermark
+never changes again, and those acknowledgements would be held for good.
+Found under CPU load, where 18 of 100 stayed held
+(`broker_loop::tests::a_report_behind_its_watermark_is_still_released`).
 
 ### The test that makes the level mean something
 
@@ -1342,3 +1435,198 @@ Not a behaviour defect: `replication_catchups` counted only the gaps
 noticed mid-stream, not the resend a handshake asks for, though both are
 the leader reading its own log to fill a gap and the counter says so. The
 increment moved inside `catch_up`, where every caller passes.
+
+---
+
+## §130 The retention floor
+
+A compaction keeps a filtered set ahead of an optional verbatim suffix
+(§118). The suffix keeps its numbers; the filtered set does not. Ten
+records rewritten, with no suffix kept,
+to the ones written as 1, 5 and 9 leave three records in a file whose header
+says the log had allocated 10 and started with 10 records. Nothing in that
+file maps a survivor back to the number it was written under, and nothing
+can: the numbers of the records in between went with the records.
+
+So a log has two regions, and the difference between them is not *present*
+and *absent*.
+
+```text
+                  header.records            end of file
+ ┌────────────────────┬──────────────────────────┐
+ │  filtered by a     │  retained suffix, and    │
+ │  rewrite           │  appended since          │
+ │  no sequence       │  sequence = header.sequence + (n - header.records)
+ │  recovers          │  recovers
+ │  not replayable    │  replayable by sequence
+ └────────────────────┴──────────────────────────┘
+                       ▲
+                       retention_floor = header.sequence + 1
+```
+
+`retention_floor` is the lowest sequence a reader may ask this log for. It
+is **not** a claim that everything below it was deleted. The survivors are
+still there, still checksummed, still recovered at startup and still what a
+kept session is replayed from (§90b). They simply have no addresses any
+more, and a replication stream is addressed by sequence.
+
+### Two definitions that had been one
+
+They were conflated, and the conflation was live. `catch_up` derived a base
+as `sequence - records` — the header's high-water minus the survivor count —
+and then labelled the *n*th record in the file `base + n`. On an untouched
+log that is right by accident, because nothing has been removed. After the
+rewrite above it labels records 1, 5 and 9 as 8, 9 and 10, and ships them
+under those names. The follower accepts: the frame is well formed, the
+range is contiguous, the checksum matches. Both logs then believe sequence 9
+names a record, and they disagree about which one. No error is raised on
+either side, then or ever.
+
+The old §118 hold — compaction suspended while a replica was known to be
+behind — is what kept this from being reachable in practice. That was a
+scheduling accident, not a boundary.
+
+### Who computes what
+
+The distinction is made where the header has just been read, and nowhere
+else:
+
+* `scan` labels each record with `Some(sequence)` or `None` as it walks,
+  from the header of the file it is walking.
+* `replay_addressable` offers only the labelled ones, and hands the caller
+  the floor **before the first record**, through `ready`.
+* `catch_up` computes no sequence at all. It refuses a range from inside
+  `ready`, and otherwise ships what it is handed.
+
+`ready` exists for one reason: the check and the read must be the same read.
+Asking for the floor and then opening the log again is a check against a log
+the second call is no longer reading — a rewrite between the two calls makes
+the answer describe a file that no longer exists. Since `scan` reads the
+header and the records from one descriptor, and a rewrite replaces the path
+rather than the inode, a reader that started is answering one log all the
+way through.
+
+### `TooFarBehind` is an answer
+
+A follower below the floor cannot be served from this log, and rereading
+the same log refuses the same range for as long as the follower holds what
+it holds. The leader still dials it again, with a backoff that doubles to
+5 s (D-23): what changes the answer is the follower, not the leader, and an
+operator who gives it a fresh copy should not also have to restart the
+leader. A retry costs a connection and one 36-byte header read, and the
+refusal is logged once per refused position, not at every retry.
+
+What it is not: the follower is not reset, not discarded, and never told it
+is synchronised. Getting it back in sync needs a fresh copy of the log,
+which is an operator action. A leader that quietly re-seeded a replica from
+its own current state would be choosing, on its own, which of two divergent
+histories is the real one.
+
+Under `quorum` the log stops being kept for a refused follower: a replica
+that cannot be served is not one the suffix is kept for, so `replicated`
+goes back to "no position matters" until it is served again. Keeping it
+would keep everything past that position for as long as the follower stays
+broken.
+
+Until D-23 the refusal stopped the task for good (D-2). That was settled
+while §118 held the whole log for a follower, when a retrying leader would
+have made retention a function of a broken follower. The retention rule no
+longer depends on the follower being healthy (D-18, D-20), so the reason
+was gone and the leader retries.
+
+### Reinitialization, and what it costs
+
+A follower below the floor needs **explicit reinitialization**. This is not
+a reconnect with extra steps, and it must not be described as one.
+
+```text
+follower < retention_floor
+        ↓
+TooFarBehind
+        ↓
+the leader keeps dialling with a backoff; under `quorum`, the log stops being kept for it
+        ↓
+follower requires explicit reinitialization
+```
+
+What reinitialization means in this version:
+
+* **The follower's existing WAL is not fit to continue the replication
+  history.** It is a log of a history that this leader can no longer address.
+  Continuing from it would mean agreeing about positions neither side can
+  still name. It is not repaired, and it is not resumed.
+* **The leader's existing quorum acknowledgements stand.** Nothing that was
+  acknowledged is withdrawn. A watermark already declared is never taken
+  back (§126), and a replica going away is not evidence against a copy that
+  existed when the acknowledgement was made.
+* **The new follower starts a new agreed WAL history**, from a copy of the
+  leader's log, at a position both sides can name.
+* **There is no snapshot or bootstrap protocol.** Producing that copy is an
+  operator action. Until one exists, this is where the automatic path ends,
+  and saying otherwise in a log line or a metric would be the one thing this
+  section is written to prevent.
+
+The operator procedure, in full: stop the follower; copy the leader's log
+file to it; start the follower. The leader picks it up at its next dial,
+within 5 s, and serves it from the floor. A follower rebuilt with an
+*empty* log is not a fresh copy: after any rewrite it is refused again,
+because the floor is above 1.
+
+How the refused state reads in the metrics. Every refused attempt counts in
+`replication_errors`; the `error` line appears once per refused position.
+`replication_connected` stays 0 between attempts and `replication_catchups`
+does not move, which is what tells it apart from a slow follower, whose
+catch-ups keep moving.
+
+Under `quorum` there is a second consequence, and it gets its own signal
+(D-8). That follower was the quorum, so from the refusal on nothing is
+acknowledged until it is served again. The leader says so once, at the
+transition: an `error` naming it, and the gauge `quorum_unavailable` set to
+1. When the follower is caught up again the gauge returns to 0, an `info`
+says so, and what waited is acknowledged as the follower reports it (D-23). Nothing else changes. The log is not poisoned — local durability is
+fine, and publishes keep being written up to `STRAUM_MAX_PENDING_DURABLE`,
+after which publishers wait for a permit before the log (D-7) — no publisher
+is closed, and every PUBACK stays withheld, because `quorum` promised more
+than this node alone can give. Under `fsynced` the same refusal withholds
+nothing and sets nothing.
+
+Tested by matrix row 32,
+`an_unreachable_quorum_is_reported_and_withholds_acknowledgements`: the
+gauge goes to 1 on the refusal, three publishes are written and none is
+acknowledged, and `wal_commit_failures` stays 0; then a follower holding
+through the floor is served, the gauge returns to 0 and the three are
+acknowledged. Row 24 checks the gauge stays 0 under `fsynced`. Row 26,
+`a_refused_follower_is_served_once_it_has_a_fresh_copy`, refuses twice and
+then serves the fresh copy without a leader restart.
+
+The full resync path — a snapshot a follower past the floor can be rebuilt
+from — is not built. Until it is, `TooFarBehind` is where that story ends.
+
+### Tests
+
+`crates/storage/tests/retention.rs` holds the region rules: an untouched log
+addressable from 1; a rewrite keeping 1, 5 and 9 yielding a floor of 11 and
+no addressable records at all; appends after a rewrite numbered 11, 12, 13
+and carrying the bodies written under those numbers; the boundary record at
+`header.records` belonging to the compacted region; the floor rising across
+five rounds of rewrite and reopen; a reader that refuses the floor handed
+nothing; and a rewrite that lands while a reader is stopped inside `ready`,
+which still sees the log it checked.
+
+Rows 24–26 of the matrix take it over a socket: a follower below the floor
+refused with no frames sent, a follower at exactly the floor served with a
+range starting at 10, and a refused follower dialled again and served
+once it holds a fresh copy (D-23).
+
+The retention rule (§118): `retention.rs` also holds a suffix that keeps
+the numbers and bytes it was written with, a byte bound that keeps the
+longest suffix that fits, a floor that a later rewrite asking for more
+cannot lower, and a rewrite that retains nothing behaving as before. The
+runtime unit tests hold the three rules, the once-only `followers_lost`,
+and a log that stays above the threshold not being rewritten at the next
+commit. Rows 33–38 take it over a socket: a follower within the budget
+caught up after rewrites; one beyond it reported once and refused; a
+leader restart that still serves a follower within the budget (D-19);
+without a follower, the file within the threshold plus one batch; under
+`quorum`, a follower away for longer than any budget caught up with the
+quorum resuming on its own; and the same across a leader restart.

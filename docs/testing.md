@@ -3,7 +3,8 @@
 ## Running
 
 ```bash
-cargo test --workspace --all-targets          # everything
+cargo test --workspace --tests                 # everything, benches excluded
+cargo test --workspace --all-targets --no-run # and they still compile
 cargo test -p mqtt                     # one crate
 cargo test -p mqtt decode_connect      # one test, or any name filter
 cargo test -p mqtt --test mqtt_connect # one integration test file

@@ -286,6 +286,16 @@ impl Broker {
         self.dispatch(session, command, Some(durable), out);
     }
 
+    /// Publishes routed and waiting for durability before they are
+    /// acknowledged: one per publish, whatever the commit they landed in.
+    ///
+    /// The broker does not bound this itself — it cannot refuse a command it
+    /// has been handed without losing it. The runtime bounds it by not
+    /// handing over more (`STRAUM_MAX_PENDING_DURABLE`, docs/memory.md).
+    pub fn pending_durable(&self) -> usize {
+        self.pending_durable.len()
+    }
+
     /// Everything submitted up to and including `token` is durable.
     pub fn on_durable(&mut self, token: DurableToken, out: &mut Outbox) {
         self.durable_high_water = self.durable_high_water.max(token.0);

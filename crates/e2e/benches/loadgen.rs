@@ -122,6 +122,15 @@ impl Samples {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    // `cargo test --all-targets` runs this program too, as a debug build and
+    // with no arguments, and would spend minutes measuring a build whose
+    // numbers mean nothing. Every real run is a release build — `cargo
+    // bench`, or `cargo build --release --bench` and the binary run directly
+    // — so that is the line, not the arguments (CLAUDE.md §17).
+    if cfg!(debug_assertions) {
+        eprintln!("loadgen: built without optimisation; use `cargo bench` or a --release build");
+        return;
+    }
     let settings = settings();
     match settings.mode {
         Mode::Throughput => throughput(settings).await,

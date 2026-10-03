@@ -67,16 +67,34 @@ async fn the_counters_can_be_read_from_outside_the_process() {
     let mut options = MqttOptions::new("watched", addr.ip().to_string(), addr.port());
     options.set_keep_alive(Duration::from_secs(5));
     let (client, mut eventloop) = AsyncClient::new(options, 16);
-    let driving = tokio::spawn(async move { while eventloop.poll().await.is_ok() {} });
-    for index in 0..8 {
-        client
-            .publish("metrics/topic", QoS::AtLeastOnce, false, vec![b'x'; 32])
-            .await
-            .unwrap();
-        let _ = index;
+    // Requests leave from a second task: `publish` only queues, and nothing
+    // leaves the queue unless the event loop is being polled.
+    let sending = client.clone();
+    let publisher = tokio::spawn(async move {
+        for _ in 0..8 {
+            sending
+                .publish("metrics/topic", QoS::AtLeastOnce, false, vec![b'x'; 32])
+                .await
+                .unwrap();
+        }
+    });
+    // The PUBACKs, not the socket closing: the event loop only notices a
+    // closed socket when its keep-alive timer fires, which cost five
+    // seconds here and proved nothing.
+    let mut acked = 0usize;
+    while acked < 8 {
+        if let rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_)) =
+            eventloop.poll().await.unwrap()
+        {
+            acked += 1;
+        }
     }
+    publisher.await.unwrap();
     client.disconnect().await.unwrap();
-    let _ = driving.await;
+    while !matches!(
+        eventloop.poll().await,
+        Ok(rumqttc::Event::Outgoing(rumqttc::Outgoing::Disconnect)) | Err(_)
+    ) {}
 
     let body = scrape(at).await;
     assert_eq!(value(&body, "straum_connections_accepted"), 1);
@@ -104,5 +122,83 @@ async fn nothing_listens_unless_an_address_is_configured() {
     // The default is off: counters that are served to anybody who can reach
     // a port are an operator's decision, not a default.
     assert!(RuntimeConfig::default().metrics.is_none());
+    broker.shutdown().await;
+}
+
+/// An at-most-once delivery a full session queue had no room for is
+/// dropped — CLAUDE.md §8 allows it — and an operator can see that it was
+/// (D-14). Until then the broker counted it and nobody outside could read it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_at_most_once_deliveries_are_counted_outside() {
+    let probe = tokio::net::TcpListener::bind(any_port()).await.unwrap();
+    let at = probe.local_addr().unwrap();
+    drop(probe);
+
+    let broker = Runtime::start(RuntimeConfig {
+        transport: TransportConfig {
+            listen: any_port(),
+            ..TransportConfig::default()
+        },
+        // A short queue, so a subscriber that stops reading fills it quickly.
+        session_queue_messages: 4,
+        metrics: Some(at),
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    assert_eq!(value(&scrape(at).await, "straum_dropped_messages"), 0);
+
+    let addr = broker.local_addr();
+    // Subscribes, then stops polling: nothing reads its socket again, so the
+    // kernel's buffers fill, its writer stalls and its queue fills behind it.
+    let (stuck, mut stuck_loop) = AsyncClient::new(
+        MqttOptions::new("stuck", addr.ip().to_string(), addr.port()),
+        16,
+    );
+    stuck
+        .subscribe("load/topic", QoS::AtMostOnce)
+        .await
+        .unwrap();
+    loop {
+        if let rumqttc::Event::Incoming(rumqttc::Packet::SubAck(_)) =
+            stuck_loop.poll().await.unwrap()
+        {
+            break;
+        }
+    }
+
+    let (publisher, mut publisher_loop) = AsyncClient::new(
+        MqttOptions::new("publisher", addr.ip().to_string(), addr.port()),
+        16,
+    );
+    let publishing = tokio::spawn(async move { while publisher_loop.poll().await.is_ok() {} });
+    // Published until the drop shows, with a bound so a broken run fails
+    // instead of hanging. Each message is 4 KiB, so the socket buffers in
+    // between fill after a few hundred.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let payload = vec![b'x'; 4096];
+    while broker.metrics().dropped_messages == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no at-most-once delivery was dropped"
+        );
+        for _ in 0..64 {
+            publisher
+                .publish("load/topic", QoS::AtMostOnce, false, payload.clone())
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+    }
+
+    // And outside the process, as a counter.
+    let body = scrape(at).await;
+    assert!(
+        body.contains("# TYPE straum_dropped_messages counter"),
+        "{body}"
+    );
+    assert!(value(&body, "straum_dropped_messages") > 0);
+
+    publishing.abort();
+    drop(stuck_loop);
     broker.shutdown().await;
 }

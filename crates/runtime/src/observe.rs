@@ -90,7 +90,7 @@ async fn answer(mut stream: TcpStream, seen: &Snapshot) {
 fn expose(seen: &Snapshot) -> String {
     let mut out = String::with_capacity(4096);
 
-    let counters: [(&str, u64, &str); 19] = [
+    let counters: [(&str, u64, &str); 21] = [
         (
             "connections_accepted",
             seen.connections_accepted,
@@ -127,6 +127,11 @@ fn expose(seen: &Snapshot) -> String {
             "backlog_refused",
             seen.backlog_refused,
             "At-least-once deliveries a session backlog had no room for.",
+        ),
+        (
+            "dropped_messages",
+            seen.dropped_messages,
+            "At-most-once deliveries dropped because a session queue was full.",
         ),
         (
             "session_records_dropped",
@@ -174,8 +179,13 @@ fn expose(seen: &Snapshot) -> String {
             seen.replication_catchups,
             "Times the leader read its own log to fill a gap.",
         ),
+        (
+            "replication_followers_lost",
+            seen.replication_followers_lost,
+            "Times the retention floor passed a follower's known position; it needs a fresh copy of the log to be served again.",
+        ),
     ];
-    let gauges: [(&str, u64, &str); 10] = [
+    let gauges: [(&str, u64, &str); 15] = [
         (
             "wal_sync_nanos",
             seen.wal_sync_nanos,
@@ -205,6 +215,31 @@ fn expose(seen: &Snapshot) -> String {
             "backlog_bytes",
             seen.backlog_bytes,
             "Payload bytes held for sessions that are behind.",
+        ),
+        (
+            "pending_acknowledgements",
+            seen.pending_acknowledgements,
+            "PUBACKs held back until their publish is durable.",
+        ),
+        (
+            "quorum_unavailable",
+            seen.quorum_unavailable,
+            "1 while a quorum cannot form because the follower was refused; nothing is acknowledged until it is served again.",
+        ),
+        (
+            "wal_rewrite_nanos",
+            seen.wal_rewrite_nanos,
+            "Duration of the latest log rewrite beside the writer; commits wait for it.",
+        ),
+        (
+            "wal_retention_floor",
+            seen.wal_retention_floor,
+            "Lowest WAL sequence the log can still be read from by a follower.",
+        ),
+        (
+            "wal_retained_bytes",
+            seen.wal_retained_bytes,
+            "Bytes of the log that can still be read by sequence.",
         ),
         (
             "wal_durable_sequence",

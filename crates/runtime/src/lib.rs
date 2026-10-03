@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use domain::SessionId;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use transport::{BufferBudget, Listener};
 
@@ -61,6 +61,11 @@ pub struct Runtime {
     /// committed is shipped (docs/replication.md §120).
     background: JoinSet<()>,
     replication_addr: Option<SocketAddr>,
+    /// Closed first at shutdown, so publishers waiting for room end at once
+    /// instead of at the end of the grace period (D-10).
+    admission: Arc<Semaphore>,
+    #[cfg(test)]
+    log_fault: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Runtime {
@@ -94,6 +99,10 @@ impl Runtime {
         let metrics = Arc::new(Metrics::default());
         let global_queued = Arc::new(AtomicUsize::new(0));
         let (events, commands) = mpsc::channel(config.broker_queue);
+        // The log's reports travel apart from the commands, so a full
+        // pending-acknowledgement queue that stops the commands cannot stop
+        // the reports that empty it (C8, docs/memory.md).
+        let (reports, reported) = mpsc::channel(broker_loop::DURABLE_REPORTS);
         // Monotonic and latest-only, which is what a watermark is. On its
         // own channel so a full pending queue cannot stop the thing that
         // drains it (docs/replication.md §128).
@@ -112,16 +121,39 @@ impl Runtime {
         // Read back before anything is served: the log is the recovery
         // boundary, so what it held is state again before the first
         // client can ask for it.
+        // What a rewrite keeps readable for the follower: its own position
+        // when acknowledgements wait for it, a byte budget when they do not,
+        // nothing without one (docs/replication.md §130, D-18, D-20).
+        let retention = match (config.replication.follower, config.durability) {
+            (None, _) => wal::Retention::Nothing,
+            (Some(_), Durability::Quorum) => wal::Retention::Follower,
+            (Some(_), Durability::Memory | Durability::Written | Durability::Fsynced) => {
+                wal::Retention::Bytes(config.wal.retain_bytes)
+            }
+        };
         let mut state = broker::Broker::new(config.broker);
         let restored = match config.durability {
-            Durability::Memory => 0,
-            _ => wal::restore(&config.wal, config.broker, &mut state)?,
+            Durability::Memory => wal::Restored::default(),
+            _ => wal::restore(&config.wal, retention, config.broker, &mut state)?,
         };
 
         // A leader ships committed batches to one follower. Bounded: a
         // follower that cannot keep up loses its place here and is caught up
         // from the log (docs/replication.md §119).
-        let local_sequence = Arc::new(AtomicU64::new(restored));
+        //
+        // The WAL sequence, not the correlation high-water. A replication
+        // position is expressed in sequences, and the two spaces are
+        // independent — they coincide in an ordinary run and stop coinciding
+        // the moment the log holds a record that carries no correlation
+        // (docs/storage.md, location-vs-identity).
+        let local_sequence = Arc::new(AtomicU64::new(restored.sequence));
+        // One permit per acknowledgement the broker may hold back for
+        // durability: taken by a publisher's reader before its record goes
+        // to the log, returned by the broker loop when the acknowledgement
+        // goes (C8, D-7). Kept here as well, so shutdown can close it first.
+        let admission = Arc::new(Semaphore::new(config.max_pending_durable));
+        #[cfg(test)]
+        let log_fault = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (shipments, outbound) = match config.replication.follower {
             Some(_) => {
                 let (tx, rx) = mpsc::channel(config.replication.queue);
@@ -136,10 +168,15 @@ impl Runtime {
                 let (submitter, replicated, writer) = wal::start(
                     &config.wal,
                     config.broker,
-                    restored,
+                    // The correlation allocator continues the broker's own
+                    // identity space, which is not the one above.
+                    restored.correlation,
                     wal::FanOut {
                         shipments,
                         local: Arc::clone(&local_sequence),
+                        retention,
+                        #[cfg(test)]
+                        fail: Arc::clone(&log_fault),
                     },
                     // Exhaustive on purpose. An equality against one level
                     // silently answered `false` for a level added later,
@@ -149,7 +186,8 @@ impl Runtime {
                         Durability::Memory | Durability::Written => false,
                         Durability::Fsynced | Durability::Quorum => true,
                     },
-                    events.clone(),
+                    reports,
+                    Arc::clone(&admission),
                     Arc::clone(&metrics),
                 )?;
                 (Some(submitter), Some(replicated), Some(writer))
@@ -184,6 +222,8 @@ impl Runtime {
                     metrics: Arc::clone(&metrics),
                     quorum: quorum.clone(),
                     required_copies: config.replication.required_copies,
+                    acknowledges_on_quorum: config.durability == Durability::Quorum,
+                    write_stall_timeout: config.write_stall_timeout,
                 },
                 outbound,
                 stopping.clone(),
@@ -213,7 +253,7 @@ impl Runtime {
                 Arc::clone(&global_queued),
                 wal.clone(),
             )
-            .run(commands, quorum_reached),
+            .run(commands, reported, quorum_reached),
         );
         let sessions = Arc::new(AtomicU64::new(0));
         let accepting = listeners
@@ -245,6 +285,9 @@ impl Runtime {
             wal_writer,
             background,
             replication_addr,
+            admission,
+            #[cfg(test)]
+            log_fault,
         })
     }
 
@@ -269,9 +312,24 @@ impl Runtime {
         self.metrics.snapshot()
     }
 
-    /// Stops in the order of CLAUDE.md §16: accepting, then reading, then the
-    /// writers drain, then the sessions and sockets go, then the broker loop.
+    /// Test-only: the next commit fails the way a failed write or sync
+    /// does, and the log's writer stops behind it.
+    #[cfg(test)]
+    pub(crate) fn fail_log(&self) {
+        self.log_fault.store(true, Ordering::Relaxed);
+    }
+
+    /// Stops in the order of CLAUDE.md §16: publish admission closes first,
+    /// so publishers waiting for room end at once (D-10); then accepting,
+    /// then reading, then the writers drain, then the sessions and sockets
+    /// go, then the broker loop.
     pub async fn shutdown(self) {
+        // First, before anything waits: a publisher parked on a permit is in
+        // no read and watches no signal, so only closing the semaphore ends
+        // its wait. Left open, every such publisher costs the whole grace
+        // period (D-10). Its publish never reached the log and is not
+        // acknowledged; the client sends it again, as after any shutdown (§16).
+        self.admission.close();
         let _ = self.shutdown.send(true);
         // The accept task owns the connection tasks and gives them the grace
         // period before it stops waiting.
@@ -348,4 +406,146 @@ async fn accept(listener: Listener, sessions: Arc<AtomicU64>, wiring: connection
         tracing::warn!("grace period expired; closing the rest");
     }
     tasks.shutdown().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    fn connect_packet(client: &[u8]) -> Vec<u8> {
+        let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C];
+        body.extend_from_slice(&u16::try_from(client.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(client);
+        let mut packet = vec![0x10, u8::try_from(body.len()).unwrap()];
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    fn publish_packet(id: u16, payload: &[u8]) -> Vec<u8> {
+        let mut body = vec![0x00, 0x01, b't'];
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(payload);
+        let mut packet = vec![0x32, u8::try_from(body.len()).unwrap()];
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// One packet as `(first byte, body)`, or `None` once the socket closes.
+    /// Every packet here is short, so the remaining length is one byte.
+    async fn next_packet(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
+        let mut head = [0u8; 2];
+        stream.read_exact(&mut head).await.ok()?;
+        let mut body = vec![0u8; usize::from(head[1])];
+        stream.read_exact(&mut body).await.ok()?;
+        Some((head[0], body))
+    }
+
+    /// D-9, in the order the decision names it: the log fails, the next
+    /// publish arrives, the broker never takes it, no PUBACK is sent.
+    ///
+    /// Before the fix the reader got no token from the stopped log, passed
+    /// the publish on without one, and the broker acknowledged it at once —
+    /// under `fsynced`, for a record that was never written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_publish_after_the_log_failed_is_never_acknowledged() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("straum-log-failed-{}.wal", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let node = Runtime::start(RuntimeConfig {
+            transport: TransportConfig {
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+                ..TransportConfig::default()
+            },
+            durability: Durability::Fsynced,
+            wal: WalSettings {
+                path: path.clone(),
+                ..WalSettings::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let mut client = TcpStream::connect(node.local_addr()).await.unwrap();
+        client
+            .write_all(&connect_packet(b"publisher"))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_packet(&mut client).await.unwrap().0,
+            0x20,
+            "no CONNACK"
+        );
+
+        // The log works: the first publish is acknowledged.
+        client.write_all(&publish_packet(1, b"one")).await.unwrap();
+        assert_eq!(
+            next_packet(&mut client).await.unwrap(),
+            (0x40, vec![0x00, 0x01]),
+            "the first publish was not acknowledged"
+        );
+
+        // The commit carrying the second publish is the one that fails.
+        node.fail_log();
+        client.write_all(&publish_packet(2, b"two")).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while node.metrics().wal_commit_failures == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the log never failed"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // The log's queue is closed before the failure is counted, so this
+        // publish finds no log to go to. A PINGREQ behind it is the anchor:
+        // a reader that passed the publish on would answer the ping itself,
+        // and the broker's PUBACK would be here in microseconds. Neither
+        // comes, because the reader stopped at the publish.
+        client
+            .write_all(&publish_packet(3, b"three"))
+            .await
+            .unwrap();
+        client.write_all(&[0xC0, 0x00]).await.unwrap();
+        let heard =
+            tokio::time::timeout(Duration::from_millis(500), next_packet(&mut client)).await;
+        assert!(
+            heard.is_err(),
+            "the connection answered after the log failed: {heard:?}"
+        );
+
+        // Only that connection waits. Another client still subscribes and
+        // gets a QoS 0 message through: it needs no log, and the broker took
+        // nothing it could not keep its word on.
+        let mut other = TcpStream::connect(node.local_addr()).await.unwrap();
+        other
+            .write_all(&connect_packet(b"bystander"))
+            .await
+            .unwrap();
+        assert_eq!(next_packet(&mut other).await.unwrap().0, 0x20, "no CONNACK");
+        other
+            .write_all(&[0x82, 0x06, 0x00, 0x01, 0x00, 0x01, b'q', 0x00])
+            .await
+            .unwrap();
+        assert_eq!(next_packet(&mut other).await.unwrap().0, 0x90, "no SUBACK");
+        other
+            .write_all(&[0x30, 0x07, 0x00, 0x01, b'q', b'a', b'l', b'i', b'v'])
+            .await
+            .unwrap();
+        assert_eq!(
+            next_packet(&mut other).await.unwrap(),
+            (0x30, vec![0x00, 0x01, b'q', b'a', b'l', b'i', b'v']),
+            "a QoS 0 message did not get through after the log failed"
+        );
+
+        // And nothing is sent late either: shutdown ends the waiting reader,
+        // and everything up to the close is checked for an acknowledgement.
+        node.shutdown().await;
+        while let Some((kind, body)) = next_packet(&mut client).await {
+            assert_ne!(kind, 0x40, "acknowledged after the log failed: {body:?}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }

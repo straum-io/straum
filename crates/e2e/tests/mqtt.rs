@@ -38,14 +38,22 @@ fn durable_client(name: &str, broker: &Runtime) -> (AsyncClient, rumqttc::EventL
     AsyncClient::new(options, 16)
 }
 
-/// Polls until the connection is actually gone, so what happens next
-/// happens to a broker that already knows about it.
+/// Polls until the goodbye is on the wire, so what happens next happens to
+/// a broker that is being told about it.
+///
+/// Stops at the DISCONNECT rather than at the event loop noticing a closed
+/// socket. It only notices when its keep-alive timer fires, so waiting for
+/// that cost one keep-alive interval per call and said nothing about the
+/// broker: measured on this machine, the broker drops the session 218 µs
+/// after `disconnect()` and the event loop gave up 5.004 s after it.
 async fn closed(eventloop: &mut rumqttc::EventLoop) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::timeout_at(deadline, eventloop.poll())
-        .await
-        .is_ok_and(|polled| polled.is_ok())
-    {}
+    loop {
+        match tokio::time::timeout_at(deadline, eventloop.poll()).await {
+            Ok(Ok(Event::Outgoing(rumqttc::Outgoing::Disconnect))) | Ok(Err(_)) | Err(_) => return,
+            Ok(Ok(_)) => {}
+        }
+    }
 }
 
 /// Publishes `count` numbered messages at QoS 1 and waits for every
@@ -1047,14 +1055,37 @@ mod restart {
         // grows without bound while the live set stays at one message.
         let size = || std::fs::metadata(&path).map(|held| held.len()).unwrap_or(0);
         let mut peak = 0;
-        for version in 0..1200 {
-            publish_retained(&broker, "a/b", &format!("value-{version}")).await;
+        // One connection for all of them. The log grows because of the
+        // records, not because of the clients, and reconnecting for each
+        // publish cost 1200 handshakes to prove nothing about compaction.
+        let (writer, mut writer_loop) = client("versions", &broker);
+        // Enough versions to bury the live set in history and cross the
+        // threshold with room to spare — the assertions below check that it
+        // did. Each one is a separate durable commit, so the count is paid
+        // for in fsyncs: what the test needs is bytes, and those come more
+        // cheaply from the payload than from a thousand more round trips.
+        for version in 0..250 {
+            writer
+                .publish(
+                    "a/b",
+                    QoS::AtLeastOnce,
+                    true,
+                    format!("value-{version:-<64}"),
+                )
+                .await
+                .unwrap();
+            until(&mut writer_loop, |incoming| {
+                matches!(incoming, Incoming::PubAck(_))
+            })
+            .await
+            .unwrap();
             peak = peak.max(size());
         }
+        drop(writer);
 
         assert!(
             peak > threshold,
-            "the workload never crossed the threshold, so nothing is proved: peak {peak} bytes"
+            "the workload never crossed the threshold, so nothing is proved: peak {peak} bytes against {threshold}"
         );
         assert!(
             broker.metrics().wal_compactions >= 1,

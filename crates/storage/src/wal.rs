@@ -57,6 +57,9 @@ pub struct Recovery {
     /// the larger of this and whatever the surviving records carry.
     pub correlation: u64,
     pub durable_offset: u64,
+    /// Where the addressable region starts: everything from here to
+    /// `durable_offset` can be read by sequence (docs/replication.md §130).
+    pub addressable_offset: u64,
     /// Bytes of incomplete or corrupt tail that were cut off.
     pub discarded_bytes: u64,
 }
@@ -67,10 +70,13 @@ pub struct Recovery {
 /// [ magic 8 ][ sequence u64 BE ][ records u64 BE ][ correlation u64 BE ][ crc32 u32 BE ]
 /// ```
 ///
-/// `sequence` is the highest sequence allocated when this file was written and
-/// `records` is how many records it started with, so a reader finding `n`
-/// records now knows the live sequence is `sequence + (n - records)`. A fresh
-/// log writes zeroes; compaction writes both forward. Two fields rather than
+/// `records` is how many records the file starts with that have no sequence
+/// — the ones a rewrite filtered — and `sequence` is the number just below
+/// the first record after them. A reader finding `n` records knows the live
+/// sequence is `sequence + (n - records)`. A fresh log writes zeroes. A
+/// rewrite that keeps no suffix writes the highest sequence allocated; one
+/// that keeps a suffix writes the number below its first record, which is
+/// what lets the suffix keep its numbers (docs/replication.md §130). Two fields rather than
 /// one base, because a log that says what it started with can be checked.
 ///
 /// `correlation` is opaque: the log never reads a record body, so the owner of
@@ -180,10 +186,11 @@ impl Wal {
             file.sync_data()?;
             Recovery {
                 durable_offset: header_len(),
+                addressable_offset: header_len(),
                 ..Recovery::default()
             }
         } else {
-            scan(&mut file, &limits, length, &mut |_, _| {})?
+            scan(&mut file, &limits, length, &mut |_| true, &mut |_, _, _| {})?
         };
 
         // Appends continue at the end of the durable prefix: the tail is gone.
@@ -309,8 +316,9 @@ impl Wal {
         ))
     }
 
-    /// Rewrites the log in place, keeping only the records `keep` accepts,
-    /// and continues writing to the result.
+    /// Rewrites the log in place, keeping the suffix `retain` names verbatim
+    /// and, ahead of it, only the records `keep` accepts; then continues
+    /// writing to the result.
     ///
     /// Nothing may be staged: the batch would be written to a file that is
     /// about to be replaced. The sequence carries across — it numbers
@@ -320,6 +328,7 @@ impl Wal {
     pub fn compact(
         &mut self,
         correlation: u64,
+        retain: Retain,
         keep: &mut impl FnMut(&[u8]) -> bool,
     ) -> Result<Compaction, StorageError> {
         if self.failed {
@@ -329,7 +338,7 @@ impl Wal {
             return Err(StorageError::StagedDuringCompaction);
         }
 
-        let outcome = compact(&self.path, self.limits, correlation, keep)?;
+        let outcome = compact(&self.path, self.limits, correlation, retain, keep)?;
 
         // The file the handle refers to has been replaced; reopen or every
         // later write lands in an unlinked inode.
@@ -415,11 +424,19 @@ fn scan(
     file: &mut File,
     limits: &WalLimits,
     length: u64,
-    // The record's body, and the same record with its framing. A reader that
-    // is going to hand these bytes to another log wants the second: encoding
-    // the first again would recompute a checksum to arrive at bytes it
-    // already has (docs/replication.md §114).
-    visit: &mut impl FnMut(&[u8], &[u8]),
+    // Called once with this file's retention floor as soon as the header is
+    // decoded, before any record is handed over; `false` stops the walk.
+    ready: &mut impl FnMut(u64) -> bool,
+    // The record's body, the same record with its framing, and its WAL
+    // sequence — `None` for one that survived a compaction.
+    //
+    // Compaction keeps a filtered set ahead of an optional verbatim
+    // suffix. The filtered records have no recoverable sequence: nothing
+    // maps a survivor back to its own number. The suffix, and anything
+    // appended after it, does.
+    // The distinction is made here, where the header has just been read,
+    // and never reconstructed by a caller (docs/replication.md §130).
+    visit: &mut impl FnMut(&[u8], &[u8], Option<u64>),
 ) -> Result<Recovery, StorageError> {
     file.seek(SeekFrom::Start(0))?;
     let mut head = [0u8; HEADER_BYTES];
@@ -427,12 +444,16 @@ fn scan(
         return Err(StorageError::NotAWal);
     }
     let header = decode_header(&head)?;
+    if !ready(header.sequence.saturating_add(1)) {
+        return Ok(Recovery::default());
+    }
 
     let mut buf: Vec<u8> = Vec::with_capacity(
         SCAN_WINDOW.saturating_add(limits.max_record_bytes.saturating_add(record::HEADER_BYTES)),
     );
     let mut start = 0usize;
     let mut offset = header_len();
+    let mut addressable_offset = offset;
     let mut records = 0u64;
     let mut exhausted = false;
 
@@ -446,11 +467,21 @@ fn scan(
             } => {
                 // Only records inside the durable prefix are handed over: the
                 // tail is not a record, it is whatever the crash left.
-                if let (Some(payload), Some(framed)) = (rest.get(from..end), rest.get(..total)) {
-                    visit(payload, framed);
-                }
                 records = records.saturating_add(1);
+                // `past == 0` is the last record the rewrite kept, not the
+                // first it appended: at or below `header.records` a record
+                // belongs to the filtered set and has no sequence.
+                let sequence = records
+                    .checked_sub(header.records)
+                    .filter(|past| *past > 0)
+                    .map(|past| header.sequence.saturating_add(past));
+                if let (Some(payload), Some(framed)) = (rest.get(from..end), rest.get(..total)) {
+                    visit(payload, framed, sequence);
+                }
                 offset = offset.saturating_add(u64::try_from(total).unwrap_or(0));
+                if records <= header.records {
+                    addressable_offset = offset;
+                }
                 start = start.saturating_add(total);
             }
             Frame::Invalid => break,
@@ -483,6 +514,7 @@ fn scan(
             .saturating_add(records.saturating_sub(header.records)),
         correlation: header.correlation,
         durable_offset: offset,
+        addressable_offset,
         discarded_bytes: length.saturating_sub(offset),
     })
 }
@@ -511,9 +543,37 @@ pub struct Compaction {
     pub records_after: u64,
     pub bytes_before: u64,
     pub bytes_after: u64,
+    /// The retention floor the rewrite left: the lowest sequence the log can
+    /// still be read from.
+    pub floor: u64,
+    /// Bytes of the addressable suffix the rewrite kept.
+    pub retained_bytes: u64,
 }
 
-/// Rewrites the log, keeping only the records `keep` accepts, in order.
+/// Which records a rewrite keeps verbatim, under the sequences they were
+/// written with, instead of offering them to the caller's filter.
+///
+/// A record is retained if its sequence is at least `from`, or if it and
+/// everything after it fit in `bytes`. Retention only extends the region
+/// that is already addressable: it cannot give a number back to a record an
+/// earlier rewrite filtered, so the floor never moves down
+/// (docs/replication.md §130).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retain {
+    pub from: u64,
+    pub bytes: u64,
+}
+
+impl Retain {
+    /// Every record goes through the filter; nothing stays addressable.
+    pub const NONE: Self = Self {
+        from: u64::MAX,
+        bytes: 0,
+    };
+}
+
+/// Rewrites the log, keeping the suffix `retain` names verbatim and, ahead
+/// of it, only the records `keep` accepts, in order.
 ///
 /// The log is a byte log: which records still matter is a question only the
 /// caller can answer, so this does the mechanical half and nothing else.
@@ -526,6 +586,7 @@ pub fn compact(
     path: &Path,
     limits: WalLimits,
     correlation: u64,
+    retain: Retain,
     keep: &mut impl FnMut(&[u8]) -> bool,
 ) -> Result<Compaction, StorageError> {
     let mut file = match OpenOptions::new().read(true).open(path) {
@@ -569,18 +630,50 @@ pub fn compact(
     // the first one is kept here and returned once the walk is done.
     let mut failure: Option<std::io::Error> = None;
     let mut kept = 0u64;
-    let recovery = scan(&mut file, &limits, length, &mut |payload, framed| {
-        if failure.is_some() || !keep(payload) {
-            return;
-        }
-        // The record goes across as it is. Re-encoding it would recompute a
-        // checksum to produce the bytes already in hand.
-        if let Err(error) = out.write_all(framed) {
-            failure = Some(error);
-            return;
-        }
-        kept = kept.saturating_add(1);
-    })?;
+    // Records written ahead of the retained suffix: the filtered set.
+    let mut filtered = 0u64;
+    // The first sequence kept as part of the suffix, once one has been.
+    let mut suffix: Option<u64> = None;
+    let mut retained_bytes = 0u64;
+    let mut at = header_len();
+    let recovery = scan(
+        &mut file,
+        &limits,
+        length,
+        &mut |_| true,
+        &mut |payload, framed, sequence| {
+            let size = u64::try_from(framed.len()).unwrap_or(u64::MAX);
+            // Measured against the file's length, which a crash may have left
+            // a torn batch past: then the suffix comes out smaller than
+            // `retain.bytes` by that batch, never larger.
+            let from_end = length.saturating_sub(at);
+            at = at.saturating_add(size);
+            if failure.is_some() {
+                return;
+            }
+            // Once the suffix starts it runs to the end: the addressable
+            // region is contiguous, and a record dropped from the middle of
+            // it would shift every number after it.
+            let retained = suffix.is_some()
+                || sequence
+                    .is_some_and(|sequence| sequence >= retain.from || from_end <= retain.bytes);
+            if retained {
+                suffix = suffix.or(sequence);
+                retained_bytes = retained_bytes.saturating_add(size);
+            } else if keep(payload) {
+                filtered = filtered.saturating_add(1);
+            } else {
+                return;
+            }
+            // The record goes across as it is. Re-encoding it would recompute a
+            // checksum to produce the bytes already in hand.
+            if let Err(error) = out.write_all(framed) {
+                failure = Some(error);
+                return;
+            }
+            kept = kept.saturating_add(1);
+        },
+    )?;
     if let Some(error) = failure {
         let _ = std::fs::remove_file(&target);
         return Err(error.into());
@@ -593,11 +686,17 @@ pub fn compact(
     // together with how many records the new file starts with. A reader then
     // has both halves and never has to guess one from the other.
     out.seek(SeekFrom::Start(0))?;
+    let allocated = previous
+        .sequence
+        .saturating_add(recovery.records.saturating_sub(previous.records));
+    // With a suffix kept, the header names the sequence just below it and
+    // counts only the filtered records ahead of it, so a reader labels the
+    // suffix with exactly the numbers it was written under and the live
+    // sequence still comes out as `allocated`.
+    let sequence = suffix.map_or(allocated, |first| first.saturating_sub(1));
     out.write_all(&encode_header(Header {
-        sequence: previous
-            .sequence
-            .saturating_add(recovery.records.saturating_sub(previous.records)),
-        records: kept,
+        sequence,
+        records: filtered,
         // `max`, so a caller that does not track correlations cannot lower a
         // high-water somebody else wrote down.
         correlation: previous.correlation.max(correlation),
@@ -622,6 +721,8 @@ pub fn compact(
         records_after: kept,
         bytes_before: length,
         bytes_after,
+        floor: sequence.saturating_add(1),
+        retained_bytes,
     })
 }
 
@@ -635,25 +736,41 @@ pub fn replay(
     limits: WalLimits,
     visit: &mut impl FnMut(&[u8]),
 ) -> Result<Recovery, StorageError> {
-    replay_with(path, limits, &mut |payload, _| visit(payload))
+    replay_with(path, limits, &mut |_| true, &mut |payload, _, _| {
+        visit(payload)
+    })
 }
 
-/// Like [`replay`], handing over each record with its framing intact.
+/// The records a follower can be caught up from, with their sequences.
 ///
-/// What a leader sends a follower: the bytes exactly as this log holds them,
-/// so nothing is encoded twice (docs/replication.md §114).
-pub fn replay_frames(
+/// Only the addressable region is offered: the suffix the last rewrite kept
+/// verbatim and everything appended since. What a compaction filtered is
+/// still in the file and still valid for
+/// recovery, but it has no sequence any more, so it cannot be a source for
+/// a sequence-addressed replication stream (docs/replication.md §130).
+pub fn replay_addressable(
     path: &Path,
     limits: WalLimits,
-    visit: &mut impl FnMut(&[u8]),
+    // Called once with this file's retention floor before any record is
+    // handed over, and returning `false` stops the walk. That is what makes
+    // the check and the read one representation: a caller cannot validate a
+    // range against one state of the file and then read another
+    // (docs/replication.md §130).
+    ready: &mut impl FnMut(u64) -> bool,
+    visit: &mut impl FnMut(u64, &[u8]),
 ) -> Result<Recovery, StorageError> {
-    replay_with(path, limits, &mut |_, framed| visit(framed))
+    replay_with(path, limits, ready, &mut |_, framed, sequence| {
+        if let Some(sequence) = sequence {
+            visit(sequence, framed);
+        }
+    })
 }
 
 fn replay_with(
     path: &Path,
     limits: WalLimits,
-    visit: &mut impl FnMut(&[u8], &[u8]),
+    ready: &mut impl FnMut(u64) -> bool,
+    visit: &mut impl FnMut(&[u8], &[u8], Option<u64>),
 ) -> Result<Recovery, StorageError> {
     let mut file = match OpenOptions::new().read(true).open(path) {
         Ok(file) => file,
@@ -668,24 +785,28 @@ fn replay_with(
     if length == 0 {
         return Ok(Recovery::default());
     }
-    scan(&mut file, &limits, length, visit)
+    scan(&mut file, &limits, length, ready, visit)
 }
 
 /// What a log says it has allocated, read from its header alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Allocated {
-    /// The highest sequence allocated when the file was last written.
+    /// The sequence just below the first addressable record.
     pub sequence: u64,
-    /// How many records the file held at that moment.
+    /// How many filtered records precede the addressable region.
     pub records: u64,
     pub correlation: u64,
 }
 
 impl Allocated {
-    /// The sequence of the record before the first one in the file, so the
-    /// `n`th record it holds has sequence `base() + n`.
-    pub fn base(&self) -> u64 {
-        self.sequence.saturating_sub(self.records)
+    /// The lowest sequence this log can still be read from by sequence.
+    ///
+    /// Not a claim that everything below it is gone. Records a compaction
+    /// filtered are still in the file and still recover, but nothing maps
+    /// them back to the numbers they were written under. Below this floor the log has bytes
+    /// and no addresses (docs/replication.md §130).
+    pub fn retention_floor(&self) -> u64 {
+        self.sequence.saturating_add(1)
     }
 }
 

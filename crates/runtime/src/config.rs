@@ -28,10 +28,22 @@ pub struct RuntimeConfig {
     pub broker_batch: usize,
     /// Commits durable here and waiting for a quorum before their publishes
     /// are acknowledged. Only used with `Durability::Quorum`. Reaching it
-    /// stops the broker taking commands, which reaches the publisher's TCP
+    /// stops the broker reading the log's reports, which makes the writer
+    /// wait and the log queue fill, which reaches the publisher's TCP
     /// window; the pairs are never dropped, because a lost one is a
     /// correlation no watermark can release (docs/replication.md §128).
+    /// Counted in commits, so it is not the bound on what the broker holds
+    /// per publish: that is `max_pending_durable` (C8).
     pub max_awaiting_quorum: usize,
+    /// Publishes routed and waiting for durability before their PUBACK,
+    /// counted in publishes. **(initial)** The memory bound under `fsynced`
+    /// and `quorum`: `max_awaiting_quorum` counts commits, and a commit holds
+    /// any number of publishes, so it bounds nothing here (C8). Enforced as
+    /// permits taken before a publish that will be acknowledged goes to the
+    /// log: at the limit that publisher waits at its own reader, which
+    /// reaches its TCP window, and no other client waits at all. Nothing is
+    /// dropped (D-7, docs/memory.md §9).
+    pub max_pending_durable: usize,
     pub replication: ReplicationSettings,
     /// Where to serve the counters, if anywhere. `None`: they stay in the
     /// process, which is where they were until now and where nobody can
@@ -62,6 +74,7 @@ impl Default for RuntimeConfig {
             broker_queue: 65_536,
             broker_batch: 256,
             max_awaiting_quorum: 65_536,
+            max_pending_durable: 65_536,
             replication: ReplicationSettings::default(),
             metrics: None,
             writer_batch: 64,
@@ -81,9 +94,16 @@ pub struct WalSettings {
     pub path: PathBuf,
     /// Records queued between the connections and the writer thread.
     pub queue: usize,
-    /// Rewrite the log at startup once it is at least this large, dropping
-    /// records nothing needs any more. `0` never rewrites it.
+    /// Rewrite the log once this many bytes were appended since the last
+    /// rewrite, dropping records nothing needs any more; at startup, once the
+    /// file is this large. `0` never rewrites it.
     pub compact_bytes: u64,
+    /// With a follower configured and durability below `quorum`, the last
+    /// this many bytes of the log stay readable by sequence after a rewrite,
+    /// so a follower that far behind is caught up rather than lost (D-18).
+    /// Ignored without a follower; under `quorum` the follower's own
+    /// position decides instead (D-20).
+    pub retain_bytes: u64,
     pub limits: WalLimits,
 }
 
@@ -93,6 +113,7 @@ impl Default for WalSettings {
             path: PathBuf::from("straum.wal"),
             queue: 65_536,
             compact_bytes: 67_108_864,
+            retain_bytes: 67_108_864,
             limits: WalLimits::default(),
         }
     }

@@ -311,13 +311,17 @@ replaces the original, and the directory entry is synced after. A crash at
 any point leaves either the whole old log or the whole new one — a
 half-rewritten log is not a state this can produce.
 
-**It runs at startup only**, when nothing is appending and the broker's
-state came from this same log a moment before. `STRAUM_WAL_COMPACT_BYTES`
-is the size it starts bothering (default 64 MiB, `0` disables it). The
-limitation that follows is real and worth stating: a broker that never
-restarts never compacts. Closing that needs the rewrite to run while the
-writer thread is appending — either by pausing it between commits or by
-segmenting the log — and neither is built.
+It runs at startup, once the file is at least `STRAUM_WAL_COMPACT_BYTES`
+(default 64 MiB, `0` disables it), and on the writer thread between two
+commits, once that many bytes were appended since the last rewrite.
+Appended, not the size of the file: a file that has to stay large — a
+retained suffix, or a live set above the threshold — would otherwise be
+rewritten after every commit (D-18). Commits wait while it runs.
+
+With a follower configured, a rewrite keeps a suffix of the log verbatim
+under the sequences it was written with, so the follower can still be
+caught up from it; only what lies below the suffix is filtered
+(docs/replication.md §118, §130).
 
 Correlations and sequences are both preserved across a rewrite. The numbering
 continues from the highest either has ever reached, not the highest that
@@ -348,6 +352,14 @@ of each other. Neither is derived from the other and neither is derived from
 how many records the file happens to contain. The sequence is the log's own
 count of what it has accepted; the correlation is the submitter's, opaque to
 the log, which only stores it.
+
+An identity a rewrite did not carry forward is gone even when its record is
+not. Compaction keeps a filtered set, not a prefix, so the records it leaves
+behind still recover and still replay — they simply have no sequence any
+more, because nothing in the file maps a survivor to the number it was
+written under. `retention_floor` is where the log can still be read by
+sequence, and it is above everything the file physically holds after a
+rewrite (docs/replication.md §130).
 
 **Compaction changes the physical representation and never rewinds a logical
 identity.** After a rewrite the file holds fewer records than were ever
@@ -437,6 +449,13 @@ write against several writes for the real workload.
 6. The WAL stays globally ordered.
 7. A failed durability operation never produces successful `fsynced`
    acknowledgements.
+
+   That includes the publishes that come after it. A failure stops the
+   log's writer, which closes its queue before the failure is even counted;
+   a reader that then gets no token does not pass the publish to the
+   broker — without a token the broker would acknowledge it at once — but
+   waits, unanswered, until shutdown (D-9). Tested by
+   `runtime::tests::a_publish_after_the_log_failed_is_never_acknowledged`.
 
 ## 100. Separation of concerns
 
