@@ -26,6 +26,8 @@ cargo test -p e2e -- --nocapture --test-threads=1
 | Fuzz | `fuzz/` (nightly) | decoder never panics, bounded allocation |
 | End-to-end | `crates/e2e/tests/` | real TCP, independent client |
 | Crash recovery | `crates/storage/tests/` | every way a WAL tail can be cut, flipped or lied about (docs/storage.md §92) |
+| Simulated disk | `crates/storage/tests/simulated.rs` | the production log on `storage::simulated::SimDisk`: power loss at every torn length after acknowledged commits, process crash, injected write and sync failures, and a rewrite failing at each of its writes and syncs with no commit after it; deterministic, no real file or clock (D-28 stage 1, scenarios S1–S3). A failed directory sync after a rewrite poisons the log (D-31); a new log survives a power loss (D-30) |
+| Simulated link | `crates/replication/tests/link.rs`, `crates/runtime/tests/simulated_link.rs` | the leader's `Link` under random interleavings of commits, live batches, drops, catch-ups, reports and reconnects (property test: nothing shipped beyond the leader's durable sequence, no hole, watermark monotonic and never ahead of a copy); a leader and a follower on two simulated disks through power loss under `quorum`, `fsynced` and `written` (D-28 stage 2) |
 | Platform | `#[cfg(target_os = "linux")]` tests, run via `scripts/linux.sh` | kernel probes, Linux-only socket options |
 
 Direct broker unit tests do not replace e2e tests.

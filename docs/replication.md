@@ -658,6 +658,19 @@ machine; `runtime::replication` moves bytes between that and a
 `transport::Connection`, and `transport` gained an outbound `connect` because
 a `TcpStream` still does not leave that crate.
 
+The leader's decisions live there too, as `replication::Link` and
+`replication::Redial` (D-28, stage 2): where a reconnecting follower
+stands, how far a catch-up may read (never past this node's durable
+sequence), whether a live batch is the next one, what a report moves
+including the quorum watermark, how long to wait before dialling again and
+whether a refusal is news, and whether a follower can be served at all
+(`Link::serves`, the retention floor). Time is only a value they hand back.
+The runtime keeps what is input and output — the socket, the reading of the
+log, the sleep, the write-stall timer around a frame (a property of the
+write, not a decision about the link) — and what a refusal does to state
+that is not the link's: it releases the retention hold for that follower
+and, under `quorum`, sets `quorum_unavailable`.
+
 ```text
 leader                                          follower
   WAL commit                                      accept

@@ -788,6 +788,7 @@ name = "replication"
 version = "0.0.0"
 dependencies = [
  "crc32fast",
+ "divan",
  "proptest",
  "thiserror 2.0.20",
 ]

@@ -7,6 +7,7 @@
 //! of the wire (§111).
 
 mod frame;
+mod link;
 mod quorum;
 mod state;
 
@@ -14,5 +15,6 @@ pub use frame::{
     DURABLE_BYTES, Limits, Message, RECORDS_HEADER_BYTES, Records, ReplicationError, decode,
     encode_durable, encode_records_header,
 };
+pub use link::{Advance, Link, Live, Redial};
 pub use quorum::Quorum;
 pub use state::{Accepted, Follower, Incompatible, Peer, PeerError, Reconciled, Refused};

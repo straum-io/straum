@@ -27,7 +27,7 @@ updated in the same change.
 | §15 says at-least-once messages inflight at shutdown are lost, "no persistence". §79 requires a durable acknowledgement. | Both stand. Durability is opt-in per `Durability`; with `memory` the old behavior is unchanged. `fsynced` changes when the acknowledgement is sent, not what the broker routes. |
 | §5 emits `PublishAccepted` once routing completed. §79 forbids acknowledging before the durability operation completes. | With `fsynced`, routing completing is no longer sufficient: the reply is withheld until the durable boundary covers the record. `Command::Publish` carries no new field; the runtime passes a `DurableToken` alongside the command and the broker releases it on `Broker::on_durable`. |
 | §4 makes the broker a single synchronous task that must never block. `sync_data()` blocks for milliseconds. | The WAL never runs inside `Broker::handle`. It owns a dedicated thread, and its completions enter the broker loop as events. This is why the durable acknowledgement is a second entry point rather than a return value. |
-| §2 gives every crate a layer. A WAL is neither transport (TCP only) nor broker (no I/O). | A new crate, `storage`. It does blocking file I/O and reads the clock to measure storage latency; it owns no threads. |
+| §2 gives every crate a layer. A WAL is neither transport (TCP only) nor broker (no I/O). | A new crate, `storage`. It does blocking file I/O and reads the clock to measure storage latency, both through its `Disk` boundary (§95); it owns no threads. |
 | §7 bounds memory globally. Recovery of a large log would read it whole. | Recovery scans in a window: memory is the window plus one record, never the log. |
 | `DeliveryGuarantee` (`AtMostOnce`/`AtLeastOnce`) and `Durability` (`memory`/`written`/`fsynced`) both sound like "how safe is this message". | They are orthogonal axes and must never be conflated. Delivery guarantee is about redelivery to a subscriber; durability is about surviving a crash. MQTT 3.1.1 has no wire representation for the second, so it is configuration, not a protocol field. |
 
@@ -317,6 +317,17 @@ replaces the original, and the directory entry is synced after. A crash at
 any point leaves either the whole old log or the whole new one — a
 half-rewritten log is not a state this can produce.
 
+If that directory sync fails, the log is poisoned, as after a failed data
+sync (D-9): the name already points at the new file and nothing says it will
+after a power loss, so a record committed there could vanish with it. It
+used to be ignored, and on the simulated disk an fsynced record acknowledged
+after it was lost (D-31). Beside the writer it stops the writer at once,
+through the same path as a failed commit (invariant 7): the queue closes
+before the failure is counted, and nothing further is acknowledged (D-32).
+
+A new log's directory is synced when the file is created, for the same
+reason: POSIX promises nothing about a name from a sync of the file (D-30).
+
 It runs at startup, once the file is at least `STRAUM_WAL_COMPACT_BYTES`
 (default 64 MiB, `0` disables it), and on the writer thread between two
 commits, once that many bytes were appended since the last rewrite.
@@ -422,6 +433,16 @@ Measured, never assumed: write duration, sync duration, total commit duration,
 batch size. The broker must expose enough to tell CPU, WAL encoding, memory
 copies, storage write, sync latency and queue contention apart. Do not
 optimize the broker while the device is the limit.
+
+The log reads the clock through the same `Disk` boundary as the device it is
+timing (`crates/storage/src/disk.rs`). On `OsDisk` that is the operating
+system's monotonic clock and nothing changes. On `simulated::SimDisk` it is
+simulated time, which writes and syncs advance by a latency the simulation
+sets, so the adaptation sees the same latencies on every run of the same
+seed (D-28, stage 1; mechanism accepted in D-30, in place of the caller
+passing durations in). The simulated disk follows POSIX strictly for names:
+a sync of a file does not make its name durable, only a directory sync
+does.
 
 ## 96. CPU efficiency
 

@@ -6,17 +6,22 @@
 //! has completed.
 //!
 //! This crate does blocking file I/O and reads the clock to measure storage
-//! latency. It owns no threads: the runtime gives it one.
+//! latency, both through the [`Disk`] boundary: the operating system in
+//! production, [`simulated::SimDisk`] in a deterministic simulation (D-28).
+//! It owns no threads: the runtime gives it one.
 
 mod commit;
 mod crc;
+mod disk;
 mod record;
+pub mod simulated;
 mod wal;
 
 pub use commit::{Commit, Committer, RecordSource, WalRecord};
+pub use disk::{Access, Disk, DiskFile, OsDisk};
 pub use wal::{
-    Allocated, Committed, Compaction, HEADER_BYTES, Recovery, Retain, Wal, allocated, compact,
-    replay, replay_addressable,
+    Allocated, Committed, Compaction, HEADER_BYTES, Recovery, Retain, Wal, allocated, allocated_on,
+    compact, compact_on, replay, replay_addressable, replay_addressable_on, replay_on,
 };
 
 /// Limits of the write-ahead log. Defaults are the ones documented in
@@ -66,6 +71,11 @@ pub enum StorageError {
     /// would leave a half record where truncation cannot reach it.
     #[error("the bytes are not a whole number of framed records")]
     NotFramedRecords,
+    /// A directory entry the log depends on could not be made durable: a
+    /// new log's name, or the rename that replaced the log with its rewrite.
+    /// After a rewrite the log is poisoned by it (D-31).
+    #[error("the log's directory entry could not be made durable: {0}")]
+    DirectoryNotDurable(std::io::Error),
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }

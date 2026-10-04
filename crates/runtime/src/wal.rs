@@ -141,6 +141,12 @@ impl Submitter {
 /// `FLAG_GONE` on a session record means the identity keeps nothing.
 const KIND_PUBLISH: u8 = 1;
 const KIND_SESSION: u8 = 2;
+
+/// Test-only fault kinds for `Marks::fail` (see `Runtime::fail_log`).
+#[cfg(test)]
+pub(crate) const FAIL_COMMIT: u8 = 1;
+#[cfg(test)]
+pub(crate) const FAIL_REWRITE: u8 = 2;
 const FLAG_RETAIN: u8 = 0b0000_0001;
 const FLAG_AT_LEAST_ONCE: u8 = 0b0000_0010;
 const FLAG_GONE: u8 = 0b0000_0100;
@@ -669,9 +675,10 @@ struct Marks {
     shipments: Option<mpsc::Sender<crate::replication::Shipment>>,
     /// This node's own durable sequence, published for the replication task.
     local: Arc<AtomicU64>,
-    /// Set by a test to make the next commit fail the way a real one does.
+    /// Set by a test: `FAIL_COMMIT` makes the next commit fail the way a real
+    /// one does, `FAIL_REWRITE` the next rewrite's directory sync.
     #[cfg(test)]
-    fail: Arc<std::sync::atomic::AtomicBool>,
+    fail: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Opens the log, recovers its durable prefix and starts the writer thread.
@@ -687,7 +694,7 @@ pub(crate) struct FanOut {
     pub(crate) retention: Retention,
     /// Test-only: makes the next commit fail (see `Runtime::fail_log`).
     #[cfg(test)]
-    pub(crate) fail: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) fail: Arc<std::sync::atomic::AtomicU8>,
 }
 
 #[expect(
@@ -807,7 +814,11 @@ fn write(
                 // exit a real failure takes, so what follows is the real
                 // failure path, not a model of it.
                 #[cfg(test)]
-                if marks.fail.swap(false, Ordering::Relaxed) {
+                if marks
+                    .fail
+                    .compare_exchange(FAIL_COMMIT, 0, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
                     break Err(StorageError::Io(std::io::Error::other(
                         "a failure injected by a test",
                     )));
@@ -843,9 +854,18 @@ fn write(
             &marks,
             &mut rewrites,
         ) {
-            // A log that cannot be rewritten is still a log that works; it
-            // only grows. Nothing is acknowledged differently because of it.
-            tracing::warn!(%error, "could not compact the log; it keeps growing");
+            if matches!(error, StorageError::DirectoryNotDurable(_)) {
+                // The rename happened and is not known durable: the log is
+                // poisoned (D-31). Stopped here rather than at the next
+                // commit, so a publisher already queued finds the log gone
+                // now instead of whenever the next record arrives (D-32).
+                break Err(error);
+            } else {
+                // Any other rewrite failure leaves the old log in place and
+                // working; it only grows. Nothing is acknowledged
+                // differently because of it.
+                tracing::warn!(%error, "could not compact the log; it keeps growing");
+            }
         }
     };
 
@@ -904,6 +924,19 @@ fn shrink(
         || committer.log_bytes().saturating_sub(rewrites.at) < settings.compact_bytes
     {
         return Ok(());
+    }
+
+    // A test standing in for a rewrite whose directory sync failed: the
+    // error `Wal::compact` returns, after it has poisoned the log.
+    #[cfg(test)]
+    if marks
+        .fail
+        .compare_exchange(FAIL_REWRITE, 0, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        return Err(StorageError::DirectoryNotDurable(std::io::Error::other(
+            "a failure injected by a test",
+        )));
     }
 
     // Commits wait from here to the end of the rewrite, so this is the stall
@@ -1285,7 +1318,7 @@ mod tests {
             retention,
             shipments: None,
             local: Arc::new(AtomicU64::new(0)),
-            fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
 

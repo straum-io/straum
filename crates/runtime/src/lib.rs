@@ -65,7 +65,7 @@ pub struct Runtime {
     /// instead of at the end of the grace period (D-10).
     admission: Arc<Semaphore>,
     #[cfg(test)]
-    log_fault: Arc<std::sync::atomic::AtomicBool>,
+    log_fault: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Runtime {
@@ -153,7 +153,7 @@ impl Runtime {
         // goes (C8, D-7). Kept here as well, so shutdown can close it first.
         let admission = Arc::new(Semaphore::new(config.max_pending_durable));
         #[cfg(test)]
-        let log_fault = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let log_fault = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let (shipments, outbound) = match config.replication.follower {
             Some(_) => {
                 let (tx, rx) = mpsc::channel(config.replication.queue);
@@ -316,7 +316,14 @@ impl Runtime {
     /// does, and the log's writer stops behind it.
     #[cfg(test)]
     pub(crate) fn fail_log(&self) {
-        self.log_fault.store(true, Ordering::Relaxed);
+        self.log_fault.store(wal::FAIL_COMMIT, Ordering::Relaxed);
+    }
+
+    /// Test-only: the next rewrite beside the writer fails as one whose
+    /// directory sync failed does (D-31).
+    #[cfg(test)]
+    pub(crate) fn fail_rewrite(&self) {
+        self.log_fault.store(wal::FAIL_REWRITE, Ordering::Relaxed);
     }
 
     /// Stops in the order of CLAUDE.md §16: publish admission closes first,
@@ -449,6 +456,84 @@ mod tests {
     /// Before the fix the reader got no token from the stopped log, passed
     /// the publish on without one, and the broker acknowledged it at once —
     /// under `fsynced`, for a record that was never written.
+    /// A rewrite beside the writer whose directory sync failed poisons the
+    /// log (D-31). The writer stops there and then, through the same path as
+    /// a failed commit — not at the next commit, which may be a long time
+    /// coming (D-32) — and nothing after it is acknowledged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_poisoned_rewrite_stops_the_log_at_once() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("straum-rewrite-failed-{}.wal", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let node = Runtime::start(RuntimeConfig {
+            transport: TransportConfig {
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+                ..TransportConfig::default()
+            },
+            durability: Durability::Fsynced,
+            wal: WalSettings {
+                path: path.clone(),
+                // A rewrite after every commit.
+                compact_bytes: 1,
+                ..WalSettings::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let mut client = TcpStream::connect(node.local_addr()).await.unwrap();
+        client
+            .write_all(&connect_packet(b"publisher"))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_packet(&mut client).await.unwrap().0,
+            0x20,
+            "no CONNACK"
+        );
+        client.write_all(&publish_packet(1, b"one")).await.unwrap();
+        assert_eq!(
+            next_packet(&mut client).await.unwrap(),
+            (0x40, vec![0x00, 0x01])
+        );
+
+        // This publish is committed — durable, and acknowledged for that —
+        // and the rewrite after its commit is the one that fails.
+        node.fail_rewrite();
+        client.write_all(&publish_packet(2, b"two")).await.unwrap();
+        assert_eq!(
+            next_packet(&mut client).await.unwrap(),
+            (0x40, vec![0x00, 0x02])
+        );
+
+        // No further record is sent: the writer stops on the rewrite alone.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while node.metrics().wal_commit_failures == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the writer kept running on a poisoned log"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // And the next publish finds no log: neither it nor the ping behind
+        // it is answered.
+        client
+            .write_all(&publish_packet(3, b"three"))
+            .await
+            .unwrap();
+        client.write_all(&[0xC0, 0x00]).await.unwrap();
+        let heard =
+            tokio::time::timeout(Duration::from_millis(500), next_packet(&mut client)).await;
+        assert!(
+            heard.is_err(),
+            "answered after the log was poisoned: {heard:?}"
+        );
+
+        node.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_publish_after_the_log_failed_is_never_acknowledged() {
         let mut path = std::env::temp_dir();

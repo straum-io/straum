@@ -34,6 +34,7 @@ impl RecordSource for std::sync::mpsc::Receiver<WalRecord> {
 
 use bytes::Bytes;
 
+use crate::disk::{Disk, OsDisk};
 use crate::wal::Wal;
 use crate::{StorageError, WalLimits};
 
@@ -105,10 +106,10 @@ pub struct Commit {
 }
 
 /// Drives one WAL through commit cycles.
-pub struct Committer {
+pub struct Committer<D: Disk = OsDisk> {
     /// Whether a commit waits for the storage device.
     sync: bool,
-    wal: Wal,
+    wal: Wal<D>,
     limits: WalLimits,
     /// Upper bound for the batch currently being built. Not a target to wait
     /// for: a batch is closed as soon as nothing more is available.
@@ -126,7 +127,7 @@ pub struct Committer {
     ahead: BTreeSet<u64>,
 }
 
-impl Committer {
+impl<D: Disk> Committer<D> {
     /// `sync` false commits without asking the storage device, which is
     /// what `Durability::Written` means (docs/storage.md §80). The
     /// adaptation still runs: without a sync to measure, the write latency
@@ -136,7 +137,7 @@ impl Committer {
     /// next record submitted is expected to carry the correlation after it.
     /// A value that is too low stalls acknowledgement until the gap closes,
     /// which is the safe direction to be wrong in.
-    pub fn new(wal: Wal, limits: WalLimits, sync: bool, durable_correlation: u64) -> Self {
+    pub fn new(wal: Wal<D>, limits: WalLimits, sync: bool, durable_correlation: u64) -> Self {
         Self {
             sync,
             wal,

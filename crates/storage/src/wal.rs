@@ -9,10 +9,11 @@
     clippy::cast_possible_truncation
 )]
 
-use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::disk::{Access, Disk, DiskFile, OsDisk};
 
 use crate::record::{self, Frame, MAGIC};
 use crate::{StorageError, WalLimits};
@@ -147,8 +148,11 @@ fn decode_header(bytes: &[u8]) -> Result<Header, StorageError> {
     })
 }
 
-pub struct Wal {
-    file: File,
+/// Generic over the [`Disk`] it lives on; [`OsDisk`] unless a simulation says
+/// otherwise (D-28).
+pub struct Wal<D: Disk = OsDisk> {
+    disk: D,
+    file: D::File,
     /// Kept so the log can be reopened after it is rewritten underneath.
     path: std::path::PathBuf,
     limits: WalLimits,
@@ -170,20 +174,30 @@ pub struct Wal {
     fail_next_sync: bool,
 }
 
-impl Wal {
+impl Wal<OsDisk> {
     /// Opens a log, recovering its durable prefix and cutting off the tail.
     pub fn open(path: &Path, limits: WalLimits) -> Result<(Self, Recovery), StorageError> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        Self::open_on(OsDisk, path, limits)
+    }
+}
 
-        let length = file.metadata()?.len();
+impl<D: Disk> Wal<D> {
+    /// [`Wal::open`], on a disk of the caller's choosing.
+    pub fn open_on(
+        disk: D,
+        path: &Path,
+        limits: WalLimits,
+    ) -> Result<(Self, Recovery), StorageError> {
+        let mut file = disk.open(path, Access::Create)?;
+
+        let length = file.size()?;
         let recovery = if length == 0 {
             file.write_all(&encode_header(Header::default()))?;
             file.sync_data()?;
+            // A new file's name is durable only once its directory is: POSIX
+            // promises nothing for the entry from a sync of the file (D-30).
+            disk.sync_directory(directory_of(path))
+                .map_err(StorageError::DirectoryNotDurable)?;
             Recovery {
                 durable_offset: header_len(),
                 addressable_offset: header_len(),
@@ -199,6 +213,7 @@ impl Wal {
 
         Ok((
             Self {
+                disk,
                 file,
                 path: path.to_path_buf(),
                 limits,
@@ -280,7 +295,7 @@ impl Wal {
         let bytes = self.batch.len();
         let records = self.batch_records;
 
-        let started = Instant::now();
+        let started = self.disk.now();
         // Two buffers, rotated: the one just written becomes the one a
         // replica can be handed without a copy, and the one it held becomes
         // the next batch with its capacity intact. The inner take-and-return
@@ -291,13 +306,13 @@ impl Wal {
         let written = self.write(&committed);
         self.committed = committed;
         written?;
-        let write = started.elapsed();
+        let write = self.disk.now().saturating_sub(started);
 
-        let started = Instant::now();
+        let started = self.disk.now();
         if sync {
             self.sync()?;
         }
-        let sync = started.elapsed();
+        let sync = self.disk.now().saturating_sub(started);
 
         self.batch.clear();
         self.batch_records = 0;
@@ -338,12 +353,29 @@ impl Wal {
             return Err(StorageError::StagedDuringCompaction);
         }
 
-        let outcome = compact(&self.path, self.limits, correlation, retain, keep)?;
+        let outcome = match compact_on(
+            &self.disk,
+            &self.path,
+            self.limits,
+            correlation,
+            retain,
+            keep,
+        ) {
+            Ok(outcome) => outcome,
+            // The name already points at the new file, and nothing says it
+            // will after a power loss: whatever is committed from here could
+            // vanish with it. Terminal, like a failed sync (D-9, D-31).
+            Err(error @ StorageError::DirectoryNotDurable(_)) => {
+                self.failed = true;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
 
         // The file the handle refers to has been replaced; reopen or every
         // later write lands in an unlinked inode.
-        let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        let end = file.metadata()?.len();
+        let mut file = self.disk.open(&self.path, Access::Write)?;
+        let end = file.size()?;
         file.seek(SeekFrom::End(0))?;
         self.file = file;
         self.write_offset = end;
@@ -414,6 +446,15 @@ impl Wal {
     }
 }
 
+/// The directory a log lives in. A bare file name lives in the current one,
+/// which `Path::parent` reports as empty rather than as `.`.
+fn directory_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
 fn header_len() -> u64 {
     u64::try_from(HEADER_BYTES).unwrap_or(0)
 }
@@ -421,7 +462,7 @@ fn header_len() -> u64 {
 /// Walks the log from the start and stops at the first thing that is not a
 /// complete record. Everything before that point is the durable prefix.
 fn scan(
-    file: &mut File,
+    file: &mut (impl Read + Seek),
     limits: &WalLimits,
     length: u64,
     // Called once with this file's retention floor as soon as the header is
@@ -520,7 +561,7 @@ fn scan(
 }
 
 /// Fills `buf[from..]` with as much as the file has left.
-fn read_some(file: &mut File, buf: &mut [u8], from: usize) -> Result<usize, StorageError> {
+fn read_some(file: &mut impl Read, buf: &mut [u8], from: usize) -> Result<usize, StorageError> {
     let target = buf.get_mut(from..).unwrap_or_default();
     let mut filled = 0usize;
     while let Some(slot) = target.get_mut(filled..) {
@@ -589,14 +630,26 @@ pub fn compact(
     retain: Retain,
     keep: &mut impl FnMut(&[u8]) -> bool,
 ) -> Result<Compaction, StorageError> {
-    let mut file = match OpenOptions::new().read(true).open(path) {
+    compact_on(&OsDisk, path, limits, correlation, retain, keep)
+}
+
+/// [`compact`], on a disk of the caller's choosing.
+pub fn compact_on<D: Disk>(
+    disk: &D,
+    path: &Path,
+    limits: WalLimits,
+    correlation: u64,
+    retain: Retain,
+    keep: &mut impl FnMut(&[u8]) -> bool,
+) -> Result<Compaction, StorageError> {
+    let mut file = match disk.open(path, Access::Read) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Compaction::default());
         }
         Err(error) => return Err(error.into()),
     };
-    let length = file.metadata()?.len();
+    let length = file.size()?;
     if length == 0 {
         return Ok(Compaction::default());
     }
@@ -614,14 +667,7 @@ pub fn compact(
     }
     let previous = decode_header(&head)?;
 
-    let mut out = std::io::BufWriter::new(
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&target)?,
-    );
+    let mut out = std::io::BufWriter::new(disk.open(&target, Access::Replace)?);
     // A placeholder: how many records survive is not known until the walk is
     // done, and the real header goes in before the file is made durable.
     out.write_all(&encode_header(Header::default()))?;
@@ -675,7 +721,7 @@ pub fn compact(
         },
     )?;
     if let Some(error) = failure {
-        let _ = std::fs::remove_file(&target);
+        let _ = disk.remove(&target);
         return Err(error.into());
     }
 
@@ -702,19 +748,18 @@ pub fn compact(
         correlation: previous.correlation.max(correlation),
     }))?;
     out.sync_all()?;
-    let bytes_after = out.metadata()?.len();
+    let bytes_after = out.size()?;
     drop(out);
 
     // The rename is the commit point: until it returns, the old log is
     // still the log.
-    std::fs::rename(&target, path)?;
-    // The rename itself has to reach the disk, or a crash can leave the
-    // directory pointing at a file that is gone.
-    if let Some(parent) = path.parent() {
-        if let Ok(directory) = File::open(parent) {
-            let _ = directory.sync_all();
-        }
-    }
+    disk.rename(&target, path)?;
+    // The rename itself has to reach the disk, or a power loss puts the old
+    // file back under the name — taking with it every record committed to
+    // the new one since. A failure here is not swallowed: it was, and a
+    // record acknowledged as fsynced after it was lost (D-31).
+    disk.sync_directory(directory_of(path))
+        .map_err(StorageError::DirectoryNotDurable)?;
 
     Ok(Compaction {
         records_before: recovery.records,
@@ -736,7 +781,17 @@ pub fn replay(
     limits: WalLimits,
     visit: &mut impl FnMut(&[u8]),
 ) -> Result<Recovery, StorageError> {
-    replay_with(path, limits, &mut |_| true, &mut |payload, _, _| {
+    replay_on(&OsDisk, path, limits, visit)
+}
+
+/// [`replay`], on a disk of the caller's choosing.
+pub fn replay_on<D: Disk>(
+    disk: &D,
+    path: &Path,
+    limits: WalLimits,
+    visit: &mut impl FnMut(&[u8]),
+) -> Result<Recovery, StorageError> {
+    replay_with(disk, path, limits, &mut |_| true, &mut |payload, _, _| {
         visit(payload)
     })
 }
@@ -759,20 +814,32 @@ pub fn replay_addressable(
     ready: &mut impl FnMut(u64) -> bool,
     visit: &mut impl FnMut(u64, &[u8]),
 ) -> Result<Recovery, StorageError> {
-    replay_with(path, limits, ready, &mut |_, framed, sequence| {
+    replay_addressable_on(&OsDisk, path, limits, ready, visit)
+}
+
+/// [`replay_addressable`], on a disk of the caller's choosing.
+pub fn replay_addressable_on<D: Disk>(
+    disk: &D,
+    path: &Path,
+    limits: WalLimits,
+    ready: &mut impl FnMut(u64) -> bool,
+    visit: &mut impl FnMut(u64, &[u8]),
+) -> Result<Recovery, StorageError> {
+    replay_with(disk, path, limits, ready, &mut |_, framed, sequence| {
         if let Some(sequence) = sequence {
             visit(sequence, framed);
         }
     })
 }
 
-fn replay_with(
+fn replay_with<D: Disk>(
+    disk: &D,
     path: &Path,
     limits: WalLimits,
     ready: &mut impl FnMut(u64) -> bool,
     visit: &mut impl FnMut(&[u8], &[u8], Option<u64>),
 ) -> Result<Recovery, StorageError> {
-    let mut file = match OpenOptions::new().read(true).open(path) {
+    let mut file = match disk.open(path, Access::Read) {
         Ok(file) => file,
         // Nothing written yet is not a failure to recover.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -781,7 +848,7 @@ fn replay_with(
         Err(error) => return Err(error.into()),
     };
 
-    let length = file.metadata()?.len();
+    let length = file.size()?;
     if length == 0 {
         return Ok(Recovery::default());
     }
@@ -816,14 +883,19 @@ impl Allocated {
 /// in the file needs the base the records start from, and walking the whole
 /// log to learn it would be a second pass over everything.
 pub fn allocated(path: &Path) -> Result<Allocated, StorageError> {
-    let mut file = match OpenOptions::new().read(true).open(path) {
+    allocated_on(&OsDisk, path)
+}
+
+/// [`allocated`], on a disk of the caller's choosing.
+pub fn allocated_on<D: Disk>(disk: &D, path: &Path) -> Result<Allocated, StorageError> {
+    let mut file = match disk.open(path, Access::Read) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Allocated::default());
         }
         Err(error) => return Err(error.into()),
     };
-    if file.metadata()?.len() == 0 {
+    if file.size()? == 0 {
         return Ok(Allocated::default());
     }
 

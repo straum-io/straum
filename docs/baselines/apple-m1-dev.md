@@ -646,3 +646,58 @@ column for it (`wal_rewrite_nanos`, the latest rewrite, live-set scan
 included) after these rows were taken. It holds the latest rewrite only:
 with two or three rewrites a run, the column is one sample, not the
 per-rewrite distribution D-24 is after. The Linux run reports it.
+
+## D-28 stage 1: the log behind a `Disk` boundary — no measurable change (2026-10-04)
+
+`storage` became generic over `Disk` (`OsDisk` in production, static
+dispatch) and reads its clock through it. Baseline (HEAD 4279a35) and
+candidate binaries alternated, 5 rounds, this machine, medians:
+
+```text
+benches/commit.rs, records/s      baseline   candidate
+idle (one at a time)                   263         264
+low 1k/s                             1 001       1 001
+moderate 50k/s                      47 427      47 372
+high (unpaced)                     664 782     717 634
+high 4 KiB payload                  51 559      49 524
+burst                              175 518     172 245
+
+benches/scan.rs, median per run
+scan_large 10 000                 3.777 ms    3.635 ms
+scan_small 10 000                 211.6 µs    211.1 µs
+scan_small 100 000                1.999 ms    2.072 ms
+```
+
+Every difference is inside the 10% noise floor of this machine; the
+largest, `high (unpaced)`, runs in the candidate's favour. `benches/record.rs`
+was run once per side as a control. It exercises code this change did not
+touch, and its runs differed by up to 4× on single-nanosecond cases, which
+is this machine's noise and not a result. Allocations per scan: one of
+1.114 MB on both.
+
+## D-28 stage 2: the leader's link decisions in `replication::Link` — no measurable change (2026-10-04)
+
+The decisions of the leader's replication task moved from `runtime` into
+`replication::Link` and `replication::Redial`; behaviour unchanged.
+Baseline (before the move) and candidate binaries alternated, 5 rounds, this
+machine, medians, msg/s:
+
+```text
+replicate.rs                 local              replicated
+                          base     cand       base     cand
+small 64 B              11 958   11 621      6 157    6 252
+medium 1 KiB            10 682   10 800      5 935    5 990
+large 64 KiB             3 573    3 633      1 894    1 961
+sustained 64 B          11 736   11 421      6 106    6 121
+sustained 1 KiB         10 994   10 970      6 104    6 172
+burst 64 B              11 858   11 734      6 134    6 240
+
+durability.rs, quorum     base     cand
+64 B                     5 081    5 418
+1 KiB                    4 201    4 169
+64 KiB                   2 160    2 181
+```
+
+Every difference is within ±3.5% except quorum 64 B (+6.6%), whose
+baseline spread across rounds was 4 567–5 478 (20%); all inside this
+machine's noise floor. No change is claimed.
