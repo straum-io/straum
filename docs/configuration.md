@@ -1,5 +1,10 @@
 # Configuration
 
+> **`STRAUM_DURABILITY` and the target.** The levels below are the current
+> single-node and leader/follower modes. In the target, a PUBACK and a
+> delivery follow commit by a majority (docs/architecture/unified-stream.md
+> §2.3, ADR-0005); how the single-node levels relate to that is open (D-36).
+
 All configuration comes from `STRAUM_*` environment variables. No config file,
 no serde.
 

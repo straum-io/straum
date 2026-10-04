@@ -1,35 +1,109 @@
 # Straum
 
-Straum is a message broker written in Rust.
+Straum is a replicated message broker written in Rust: MQTT 3.1.1 and
+MQTT 5 over TCP, a Cargo workspace of crates with enforced dependency
+boundaries, sans-IO cores, a WAL with group commit and compaction, and
+durable leader/follower replication. This file is the working guide; the
+architecture is in `docs/architecture/unified-stream.md`.
 
-One deployable server binary, built from a Cargo workspace of crates with
-enforced dependency boundaries. The first external protocol is
-**MQTT 3.1.1 over TCP**. The broker itself is independent of MQTT and TCP.
-
-`CONSTITUTION.md`, in this directory, governs how the work is done: what
-counts as evidence, what may not be optimized without it, and which
-invariants are contractual. It sits above this file. Where the two appear to
-disagree, the constitution decides and this file is what gets corrected.
-
-This file holds rules and decisions. Details live in:
+## Sources, in order of precedence
 
 ```text
-docs/configuration.md   every setting, env var, default and limit
-docs/testing.md         test layers, MQTT conformance, fuzzing
-docs/algorithms.md      how a data structure is chosen; normative, see §28
-docs/benchmarks.md      harness, workload matrix, measurement protocol, reporting
-docs/memory.md          what a connection allocates, and what the budget really bounds
-docs/performance.md     the current measured baseline
-docs/profiling.md       which tool answers which question, per platform
-docs/storage.md         the write-ahead log: group commit, durability, compaction
-docs/cluster.md         session ownership across nodes; none of it is built
-docs/replication.md     durable log replication: one leader, one follower, built
-docs/linux-tuning.md    kernel parameters and socket options for production hosts
-docs/baselines/         recorded benchmark baselines, one file per machine
+1. docs/architecture/unified-stream.md   architecture, target model, rules of work
+2. CLAUDE.md                             this file: working rules
+3. docs/adr/                             decisions; every deviation from (1) is one
+4. everything else                       CONSTITUTION.md, docs/*.md, .claude/
 ```
 
+Where two disagree, the higher one decides and the lower one is corrected.
 Decisions marked **(initial)** are the current choice. Change one only with a
 benchmark or a concrete requirement, and update this file in the same change.
+Where CONSTITUTION.md sits in this order is an open decision (D-35); until
+it is taken, it is read as level 4, and its rules that do not contradict (1)
+still apply.
+
+Details live in:
+
+```text
+docs/architecture/current-implementation.md   what runs today (crates, task model, protocol contract, MQTT table, shutdown)
+docs/adr/                 architecture decision records
+docs/configuration.md     every setting, env var, default and limit
+docs/testing.md           test layers, MQTT conformance, fuzzing, simulation
+docs/algorithms.md        how a data structure is chosen; normative
+docs/benchmarks.md        harness, workload matrix, measurement protocol, reporting
+docs/memory.md            what a connection allocates, and what the budget really bounds
+docs/performance.md       the current measured baseline
+docs/profiling.md         which tool answers which question, per platform
+docs/storage.md           the write-ahead log: group commit, durability, compaction
+docs/replication.md       durable log replication as built: one leader, one follower
+docs/linux-tuning.md      kernel parameters and socket options for production hosts
+docs/baselines/           recorded benchmark baselines, one file per machine
+```
+
+## Philosophy (unified-stream §1)
+
+- The cluster is one mechanism, not a set of autonomous nodes.
+- The log is the only source of truth: every observable effect — PUBACK,
+  delivery, retained, session state, inflight QoS 1, expiry, will, a change
+  of sequencer or of membership — is the application of a committed record.
+- A node is a deterministic function of (committed log + input events).
+- Predictability before peak speed. Time never decides safety: clocks and
+  timeouts only trigger transitions; decisions go through the log and the
+  quorum.
+- Correctness is shown by deterministic simulation, performance by
+  measurement on Linux.
+
+## Current phase
+
+Phase 0 of unified-stream §6: gap analysis and ADRs, this file, a
+deterministic simulation harness for the existing leader/follower
+replication with invariants 1, 3 and 5, a versioned WAL record format with a
+properties section, and an MQTT codec model with properties and reason
+codes. ADR-0001 records the move to the unified stream.
+
+## Scope
+
+MQTT 3.1.1 and MQTT 5 over TCP, TLS optional. MQTT 5 is designed in from
+the start (ADR-0003): properties, reason codes and reason strings are part
+of the model, and the WAL record carries a properties section. QoS 2 and
+shared subscriptions are phase 6, but the log model allows them now. Out of
+scope: WebSocket, CRDT or eventual consistency, safety built on physical
+time.
+
+## Rules of work (unified-stream §7)
+
+- Small verifiable steps. Each step carries tests, simulation scenarios and
+  unchanged benchmarks.
+- No claim of better performance without a measurement on Linux. Numbers
+  from macOS or Docker are marked preliminary.
+- Every deviation from unified-stream.md is recorded in an ADR and in the
+  report.
+- No node gets logic that changes shared state other than through the log.
+  If a task seems to need it, stop and propose options.
+- A task ends with: what was done; what was verified, and with what; open
+  risks; the next step as 2–3 worked options with their trade-offs, for
+  Stanislav to choose from (decision cards, decision-options skill).
+- Every task that changes files ends with the task-closeout skill; a Stop
+  hook enforces it. Do not commit unless asked.
+- Do not do work the task did not ask for. Notice it, and make it a card.
+- Answers of the form `D-<n>: <choice>` refer to `docs/decisions/pending.md`.
+
+## Unsafe (unified-stream §4.1, ADR-0002)
+
+`unsafe_code = "forbid"` in every crate by default. Unsafe is allowed only
+when it is justified and provably sound — no safe caller of the public API
+can cause UB — and all of these hold: a Linux profile shows a gain safe code
+does not give, with the safe version kept as a baseline behind a feature
+flag; it lives in a small crate of its own (`straum-sys-*`) with a safe
+public API; every block has `// SAFETY:` and every `unsafe fn` a `# Safety`
+section; it is tested under Miri where possible, otherwise with sanitizers
+and fuzzing, and its failures are scenarios in the simulation; and it has an
+ADR, with Stanislav's final consent. Never unsafe to silence the borrow
+checker, and never as an early step in the priority order of section 11.
+
+Sections 3–6 and 16 of the previous version of this file moved to
+`docs/architecture/current-implementation.md`. The sections below keep their
+numbers.
 
 ---
 
@@ -71,14 +145,22 @@ resolver = "3"
 edition = "2024"
 rust-version = "1.85"
 
+# Unsafe policy: docs/architecture/unified-stream.md §4.1, ADR-0002.
+# `forbid` everywhere until a crate is exempted under that policy; an
+# exempted crate does not inherit this table (ADR-0002 describes its own).
+# The other three are inert while nothing is exempt and become binding the
+# moment something is.
 [workspace.lints.rust]
 unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
 dbg_macro = "deny"
 todo = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
 
 # Frozen build configuration for all performance work. Changing any of these
 # values is itself a benchmark variable (section 11).
@@ -203,323 +285,6 @@ maintenance cost. State the reason in the change report.
 
 ---
 
-# 3. Crate Responsibilities
-
-## domain
-
-Domain types and pure logic. No I/O, no clock, no async.
-
-```rust
-Message  Topic  TopicFilter  ClientId  SessionId  DeliveryId  DeliveryGuarantee
-```
-
-`Topic` and `TopicFilter` are validated on construction and cheap to clone
-(backed by `Bytes`). Validation happens once, at construction; nothing
-downstream re-validates or re-parses. Topic filter matching is a pure function
-here; the routing index lives in the broker.
-
-`DeliveryGuarantee` is `AtMostOnce | AtLeastOnce`. MQTT QoS numbers are mapped
-to it in `mqtt`.
-
-## protocol
-
-The contract between protocol implementations and the broker (section 5).
-No MQTT vocabulary: `Connected`, not `ConnAck`.
-
-## mqtt
-
-A **sans-IO** MQTT 3.1.1 implementation:
-
-* packet decoding and encoding
-* validation
-* per-connection protocol state and packet identifiers
-* keep-alive and connect deadlines, computed from a `std::time::Instant`
-  passed in by the caller
-* mapping packets ↔ `Command` / `Outbound`
-
-It never reads the clock, never touches a socket, never spawns. `Instant::now()`
-is called only in the runtime.
-
-The decoder module additionally declares:
-
-```rust
-#![deny(clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
-```
-
-Remote-controlled lengths must go through checked arithmetic and bounds-checked
-access. The compiler enforces it, not review.
-
-## transport
-
-TCP only:
-
-* listener, accept loop, connection lifecycle
-* socket options (section 13)
-* kernel limit probing on Linux (section 13)
-* owned read/write halves that move bytes
-
-It exposes connection reader/writer wrappers with byte-level operations.
-`TcpStream` does not leave the crate. No MQTT, no broker semantics.
-
-Accept errors `EMFILE`/`ENFILE` back off (sleep, rate-limited log). An accept
-loop must never spin on a persistent error.
-
-## storage
-
-The write-ahead log: sequential append, adaptive group commit, durable
-offset, recovery of the durable prefix. Rules in `docs/storage.md`.
-
-A byte offset is a location and a sequence is an identity: compaction rewrites
-the file and never rewinds what the log has allocated. The `STRAUMW3` header
-carries that state, so a restart after a rewrite continues the numbering
-instead of repeating it (docs/storage.md §91). A rewrite keeps a filtered
-set rather than a prefix, so what it leaves behind still recovers but can no
-longer be named: below the retention floor the log has bytes and no addresses
-(docs/replication.md §130).
-
-It does blocking file I/O and reads the clock, because storage latency is
-the signal the batching adapts to (§95). It owns no threads: the runtime
-gives it one, and `sync_data` never runs inside the broker task.
-
-## replication
-
-The replication wire format, **sans-IO**: no sockets, no tasks, no clock, and
-no workspace dependency at all — what it frames is opaque bytes.
-
-One logical frame carries one complete WAL commit batch, exactly as
-`commit_with` handed it to `write()`. Replication re-encodes nothing and
-introduces no ordering of its own: the WAL sequence is the identity, and a
-frame names the range it covers. A frame may cross the network in any number
-of pieces; a partial read is never a partial durability boundary.
-
-It also holds the state machine that decides what a position means: ranges,
-not messages, and every position a contiguous prefix on both sides of the
-wire. Received is not durable and written is not durable. Rules in
-`docs/replication.md`.
-
-## auth
-
-Credentials and per-topic authorisation: password hashing (argon2id) and
-the rules a session is allowed to act under. It reads no files and no
-environment — the server parses both and hands over typed values.
-
-`Permissions` travels inside `protocol::Connect`, which is why `protocol`
-depends on this crate: a CONNECT is not a command until somebody has
-checked what it carries.
-
----
-
-## broker
-
-A synchronous state machine: sessions, subscriptions, routing index,
-at-least-once inflight tracking, overflow policy.
-
-It owns no tasks and no channels. It receives commands and writes effects into
-an `Outbox` supplied by the caller.
-
-## runtime
-
-Tokio: tasks, channels, the broker loop, connection reader/writer tasks, timers,
-shutdown, metrics registry. The only crate that spawns.
-
-## server
-
-Composition root: parse configuration from environment, initialize tracing,
-log kernel checks, wire, run, handle signals. Very little logic.
-
-## e2e
-
-`publish = false`. End-to-end tests and network benchmarks through a real TCP
-socket, using an independent MQTT client.
-
----
-
-# 4. Task Model and Data Flow (initial)
-
-```text
-  per connection                                  one broker task
-┌──────────────────────────────┐   Command     ┌──────────────────────────┐
-│ reader task                  │  bounded mpsc │ loop:                    │
-│  socket read → BytesMut      │ ────────────► │  recv_many(batch)        │
-│  mqtt decode → Command       │  await send   │  Broker::handle → Outbox │
-│  keep-alive, connect timeout │               │  flush Outbox:           │
-└──────────────────────────────┘               │   try_send per session   │
-┌──────────────────────────────┐   Outbound    └────────────┬─────────────┘
-│ writer task                  │ ◄──────────────────────────┘
-│  recv_many → mqtt encode     │   bounded mpsc per session
-│  → socket write              │
-└──────────────────────────────┘
-```
-
-Rules:
-
-* **Reader → broker** is bounded; the reader awaits `send`. Backpressure
-  propagates to the publisher's TCP window. Intentional.
-* **Broker → writer** is bounded per session. The broker loop uses `try_send`
-  only and never awaits a single session. A full queue goes to the overflow
-  policy (section 8).
-* Reader and writer are separate tasks so a client that stops reading cannot
-  block us from reading its packets, and vice versa.
-* Outgoing packet identifiers are assigned by the writer; PUBACKs arrive at the
-  reader. **(initial)** The per-connection packet-id table is shared by the two
-  tasks as `Arc<std::sync::Mutex<_>>`: uncontended, never held across `.await`.
-  Forwarding PUBACKs reader → writer over a channel is the alternative; switch
-  only on benchmark evidence.
-* The broker loop drains up to `STRAUM_BROKER_BATCH` commands per wakeup. The
-  writer drains up to `STRAUM_WRITER_BATCH` items and writes once: batching
-  amortizes both scheduling and syscalls.
-* One broker task means no locks on broker state and trivial ordering. It is the
-  likely first throughput limit; measure the broker benchmark before optimizing
-  the connection path. Sharding is a later, benchmarked change that must
-  preserve ordering (section 7) and handle wildcard subscriptions across shards.
-* No task per message. No spawning outside the runtime.
-
----
-
-# 5. Protocol Contract
-
-Shape (not final API; semantics are fixed):
-
-```rust
-/// Opaque correlation chosen by the protocol layer and echoed back.
-/// The broker never interprets it.
-pub struct RequestId(pub u32);
-
-pub enum Command {
-    Connect(Connect),
-    /// `ack: Some` => the sender wants confirmation that the broker accepted it.
-    Publish { ack: Option<RequestId>, publish: Publish },
-    Subscribe { request: RequestId, filters: Vec<(TopicFilter, DeliveryGuarantee)> },
-    Unsubscribe { request: RequestId, filters: Vec<TopicFilter> },
-    /// The client confirmed an at-least-once delivery.
-    Ack(DeliveryId),
-    Disconnect { reason: DisconnectReason }, // Client | ConnectionLost | ProtocolViolation
-}
-
-pub enum Outbound {
-    Reply(Response),     // to the session that issued the command
-    Deliver(Delivery),   // a message for a subscriber session
-    Close(CloseReason),  // the broker decided to end this session
-}
-
-/// Issued by the runtime for a publish it is persisting, echoed back by the
-/// WAL once durable. The broker holds the reply until then.
-pub struct DurableToken(pub u64);
-
-pub enum Response {
-    Connected { session_present: bool },
-    ConnectRejected(ConnectRejectReason),
-    PublishAccepted(RequestId),
-    Subscribed { request: RequestId, granted: Vec<SubscribeResult> },
-    Unsubscribed(RequestId),
-}
-
-pub struct Delivery {
-    pub id: Option<DeliveryId>, // Some iff AtLeastOnce; the guarantee follows from it
-    pub topic: Topic,
-    pub payload: Bytes,
-}
-```
-
-Broker API:
-
-```rust
-impl Broker {
-    pub fn handle(&mut self, session: SessionId, cmd: Command, out: &mut Outbox);
-    /// A publish the runtime is persisting: the reply is held back until
-    /// `on_durable` covers `durable` (docs/storage.md §79).
-    pub fn handle_durable(&mut self, session: SessionId, cmd: Command, durable: DurableToken, out: &mut Outbox);
-    /// Everything up to and including `token` is durable.
-    pub fn on_durable(&mut self, token: DurableToken, out: &mut Outbox);
-    pub fn on_overflow(&mut self, session: SessionId, rejected: Outbound, out: &mut Outbox);
-}
-```
-
-Semantics:
-
-* `SessionId` is allocated by the runtime per connection. `ClientId` is the
-  client-visible identity; the broker maps between them.
-* `PublishAccepted` is emitted after routing completed for all matched sessions
-  (enqueued or handled by overflow policy). With `Durability::Fsynced` it is
-  additionally withheld until `on_durable` covers the publish: routing having
-  finished is not a durability statement (docs/storage.md §79).
-* A `Delivery` with `id: Some` stays in the session's inflight set until
-  `Command::Ack`. At most `STRAUM_MAX_INFLIGHT` per session; further
-  at-least-once deliveries wait in the broker's session backlog.
-* `Disconnect { ConnectionLost }` is sent by the runtime when the socket closes.
-  A session that asked to be resumed is kept without a connection, collecting
-  what it is owed; anything else is removed with its subscriptions and its
-  inflight set in the same call (§7).
-* `Outbound::Close` makes the runtime close the connection.
-* Keep-alive, PINGREQ and PINGRESP never reach the broker.
-* `Outbox` is owned by the caller and reused across iterations; it is cleared,
-  not reallocated.
-
----
-
-# 6. MQTT 3.1.1 Scope
-
-Packets: CONNECT, CONNACK, PUBLISH, PUBACK, SUBSCRIBE, SUBACK, UNSUBSCRIBE,
-UNSUBACK, PINGREQ, PINGRESP, DISCONNECT. QoS 0 and QoS 1.
-
-Being built, in this order (the adoption path, not a wish list):
-
-1. TLS, then authentication with per-topic authorisation.
-2. Retained messages and persistent sessions are built, and both survive a
-   restart. A kept session is written down as its subscriptions plus the
-   last log record it finished with; what it is owed is replayed from the
-   log rather than stored twice (docs/storage.md §90a). Compaction respects
-   that mark and runs both at startup and beside the writer once
-   STRAUM_WAL_COMPACT_BYTES were appended since the last rewrite, keeping
-   what a follower still needs (docs/storage.md §104, docs/replication.md §118).
-3. Will publishing is built.
-
-Out of scope: MQTT 5, QoS 2, shared subscriptions, WebSocket. Each needs
-a concrete requirement before it moves out of this line.
-
-A feature stays in the table below as a documented deviation until it is
-built, so the gap between what is written here and what runs is always
-visible.
-
-Decisions and documented deviations:
-
-| Situation | Behavior |
-|---|---|
-| Protocol level ≠ 4 | CONNACK 0x01, close |
-| First packet is not CONNECT, or a second CONNECT | close |
-| CleanSession = 0 | the session is kept when the connection ends and resumed on the next CONNECT from that identity; SessionPresent = 1 |
-| CleanSession = 1 with a kept session | the kept session is discarded; SessionPresent = 0 |
-| Offline session store full | the session is not kept; `offline_refused` counts it |
-| At-most-once for an offline session | dropped (3.1.1 allows it); `offline_dropped` counts it |
-| Unacknowledged at-least-once on resume | sent again with DUP = 1 |
-| Empty ClientId, CleanSession = 1 | broker assigns an id |
-| Empty ClientId, CleanSession = 0 | CONNACK 0x02, close — a session nobody can name again cannot be asked for (3.1.1 §3.1.3.1) |
-| ClientId already connected | old session closed (takeover) |
-| Will flag | published when the connection ends any way but a DISCONNECT (3.1.1 §3.1.2.5); a clean goodbye takes it with it |
-| Will on a kept session | replaced by whatever the next CONNECT carries; it belongs to the connection, not the session |
-| Will and durability | routed like any other message but never written to the log: the connection that would carry a durable token is the one that just went away |
-| Username / password | checked against the credential file before the broker sees the session |
-| Bad user name or password | CONNACK 0x04, close |
-| Anonymous where it is not allowed | CONNACK 0x05, close |
-| Publish outside the access rules | dropped, PUBACK still sent (3.1.1 cannot refuse a publish) |
-| Subscribe outside the access rules | SUBACK 0x80 for that filter |
-| PUBLISH with QoS 2 | close |
-| SUBSCRIBE requesting QoS 2 | granted QoS 1 |
-| RETAIN = 1 on PUBLISH | stored as the last message for that topic and replayed to the next subscriber; an empty payload deletes it |
-| Retained store full | the message is delivered but not stored; `retained_rejected` counts it |
-| Overlapping subscriptions of one session | one delivery, maximum granted QoS |
-| Delivered QoS | min(publish QoS, granted QoS) |
-| Topics starting with `$` | not matched by `#` or `+` at the first level |
-| TLS configured | the listener speaks TLS only; plaintext and TLS do not share a port |
-| Keep-alive | close if nothing received within 1.5 × keep-alive; 0 disables |
-| No CONNECT within `STRAUM_CONNECT_TIMEOUT_MS` | close |
-| Broker-initiated end of session | TCP close (3.1.1 has no server DISCONNECT) |
-
-Overlapping-subscription deduplication is on the hot path: it must not allocate
-per publish (for example, a generation counter per session entry).
-
----
-
 # 7. Invariants
 
 * **Ordering.** Messages published by one session to one topic are delivered to
@@ -563,7 +328,7 @@ Overflow policy **(initial)**:
 | Reply cannot be enqueued | `Close(SlowConsumer)` |
 | Global queued-bytes budget exceeded | same as a full session queue |
 | Global backlog-bytes budget exceeded | same as a full session backlog |
-| Global read-bytes budget exceeded | the growth is refused before it is allocated; the connection is closed |
+| Global connection-buffer budget exceeded | the growth is refused before it is allocated; the connection is closed |
 | Broker command queue full | reader awaits; nothing dropped |
 | WAL queue full | the submitter awaits; a publish is never acknowledged early to make room |
 | Pending acknowledgements at `STRAUM_MAX_PENDING_DURABLE` | that publisher's reader waits for a permit before its record goes to the log; no other client waits; nothing dropped |
@@ -702,7 +467,7 @@ measured. A change is accepted only after repeated measurement.
 
 The fastest instruction is the one that does not execute. Do not jump to unsafe,
 SIMD or manual memory management. Those sit at the end of the list and require
-lifting `unsafe_code = "forbid"` under section 14, on top of a measured gain on
+lifting `unsafe_code = "forbid"` under unified-stream §4.1 (ADR-0002), on top of a measured gain on
 a quiet Linux host across the relevant matrix.
 
 ## Claims
@@ -816,17 +581,8 @@ or a concrete architectural requirement. No speculative `trait Transport`,
 `trait Protocol`, `trait Broker`, `trait Queue`. Dynamic dispatch on the hot
 path needs a measured reason.
 
-`unsafe_code = "forbid"` workspace-wide. It is lifted for one module only when
-all of these hold:
-
-1. a benchmark on a quiet Linux host shows the gain, across the relevant matrix
-2. the safe version stays in the repository as the comparison baseline
-3. the unsafe block is isolated in one module with documented invariants
-4. the invariants are tested, and the module is covered by fuzzing where it
-   parses remote input
-
-Never unsafe to silence the borrow checker, and never as an early step in the
-priority order of section 11.
+Unsafe: see "Unsafe" at the top of this file, unified-stream §4.1 and
+ADR-0002.
 
 ---
 
@@ -870,34 +626,6 @@ nobody acts on; printing thirty integers is not worth an HTTP framework
 The broker keeps its own counters (`published_messages`,
 `delivered_messages`, `dropped_messages` and the rest of `broker::Stats`);
 the runtime mirrors out only what an operator acts on.
-
----
-
-# 16. Shutdown
-
-The runtime coordinates; nothing relies on `Drop` for application shutdown.
-
-```text
-0. close publish admission: a publisher waiting for room ends now, not
-   at the end of the grace period (D-10)
-1. stop accepting connections
-2. stop reading new commands
-3. let writers drain for STRAUM_SHUTDOWN_GRACE_MS
-4. close sessions
-5. close sockets
-6. stop the broker loop (it holds a log submitter of its own)
-7. commit what the WAL already accepted, then stop its writer and the
-   remaining tasks
-8. exit
-```
-
-With `STRAUM_DURABILITY=memory`, at-least-once messages still inflight at
-shutdown are lost — an acknowledgement there means routed, not written. With
-`written` the record reached the operating system, so it survives this
-process but not the machine. With `fsynced` an acknowledged publish is
-already on the device and comes back at the next start (docs/storage.md §79).
-What is lost at every level is a delivery the subscriber had not
-acknowledged: it is sent again with DUP.
 
 ---
 
@@ -1031,3 +759,4 @@ measurement over assumptions
 repeated measurement over one good number
 simple code over clever code
 ```
+

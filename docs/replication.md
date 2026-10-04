@@ -1,5 +1,12 @@
 # Replication
 
+> **Superseded as a target by docs/architecture/unified-stream.md §2.2–§2.6**
+> (slots and fencing with `(slot, lsn, prev_hash)`, commit by majority,
+> graceful and ungraceful handoff, membership, topology) and ADR-0001. This
+> document describes the leader/follower replication as built, which is the
+> starting point of phases 0 and 1; its plans for what comes next (§112,
+> §113) are replaced by unified-stream §6.
+
 What it takes to replicate durably, and what had to be fixed first. It began
 as the Phase 1–2 audit — the trace, and the map of what the implementation
 contradicted — and the sections after §110 are the work that followed.

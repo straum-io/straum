@@ -1,5 +1,11 @@
 # Durable Storage
 
+> **Target: docs/architecture/unified-stream.md §3** — a segmented WAL, compaction
+> that never truncates a segment somebody reads (refcount), versioned records
+> with a properties section (§2.7, ADR-0003), and `(slot, lsn, prev_hash)` on
+> every record (§2.2). This document describes the single-file `STRAUMW3` log as
+> built.
+
 Rules for the write-ahead log, adaptive group commit and durable
 acknowledgement. Section numbers are the ones these rules were issued under
 and are referenced from code comments.
@@ -250,7 +256,7 @@ the retained messages it holds become state again — last word per topic
 wins, an empty payload deletes, and the same bounds apply on the way in
 as on the way out.
 
-## 90a. Sessions
+## 90b. Sessions
 
 A session that asked to be resumed is written down by what it subscribed
 to and one number: the last record it had finished with. The messages it

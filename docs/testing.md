@@ -1,5 +1,10 @@
 # Testing
 
+> **Simulation target: docs/architecture/unified-stream.md §5** — the harness
+> with controlled clock, network and disk, its failure list and its eight
+> invariants. The oracle described for D-28 (I1–I10, chain C0–C5) is the
+> current one for the leader/follower replication as built (phase 0).
+
 ## Running
 
 ```bash

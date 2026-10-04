@@ -1,5 +1,11 @@
 # Cluster
 
+> **Superseded by docs/architecture/unified-stream.md §2** (gateway and
+> sequencer roles §2.1, slots and fencing §2.2, commit §2.3, handoff §2.4,
+> membership §2.5, session takeover through the log §2.7) and ADR-0001. Kept
+> as the record of the earlier plan; nothing here is built, or to be built as
+> written.
+
 Architecture document, written before any implementation. Nothing here is
 built. Its purpose is to decide the shape before code makes the decision by
 accident.
