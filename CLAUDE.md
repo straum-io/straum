@@ -18,9 +18,8 @@ architecture is in `docs/architecture/unified-stream.md`.
 Where two disagree, the higher one decides and the lower one is corrected.
 Decisions marked **(initial)** are the current choice. Change one only with a
 benchmark or a concrete requirement, and update this file in the same change.
-Where CONSTITUTION.md sits in this order is an open decision (D-35); until
-it is taken, it is read as level 4, and its rules that do not contradict (1)
-still apply.
+CONSTITUTION.md is level 4 (D-35): its rules apply where they do not
+contradict (1), and an ADR that replaces one of them says so.
 
 Details live in:
 
@@ -59,7 +58,11 @@ Phase 0 of unified-stream §6: gap analysis and ADRs, this file, a
 deterministic simulation harness for the existing leader/follower
 replication with invariants 1, 3 and 5, a versioned WAL record format with a
 properties section, and an MQTT codec model with properties and reason
-codes. ADR-0001 records the move to the unified stream.
+codes. ADR-0001 records the move to the unified stream; ADR-0007 splits
+phase 0 into three tasks (the `sim` harness, the WAL record format v4, the
+MQTT 5 codec model) and records its deviations; ADR-0006 keeps the
+durability levels for a single node and allows only majority commit in a
+cluster.
 
 ## Scope
 

@@ -30,11 +30,11 @@ In the target model:
 
 ## Consequences
 
-- Delivery moves behind commit. That is a change of current behaviour at
-  every level and is phase 3 work (gateway/sequencer), with its own
-  simulation scenarios.
-- What becomes of the single-node durability levels (`memory`, `written`,
-  `fsynced`) under "commit = majority" is an open decision (D-36).
+- Delivery moves behind commit in cluster mode (ADR-0006). That is phase 3
+  work (gateway/sequencer), with its own simulation scenarios; a single node
+  keeps delivery at routing.
+- The single-node durability levels (`memory`, `written`, `fsynced`) remain
+  for a single node; a cluster commits by majority only (ADR-0006, D-36).
 - The invariant "PUBACK and delivery never precede commit" (unified-stream §5,
   invariant 4) joins the simulation's oracle; the current oracle (I1–I10 of
   D-28) checks PUBACK only.

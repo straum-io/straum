@@ -2,17 +2,17 @@
 
 > **Precedence.** `docs/architecture/unified-stream.md` decides where it and
 > this constitution differ (CLAUDE.md, "Sources, in order of precedence";
-> the constitution's exact place in that order is open, D-35). Superseded or
-> held open, in particular:
+> level 4 of that order, D-35). Superseded or narrowed, in particular:
 >
 > - §1: the contractual list ("durable acknowledgement semantics",
 >   "memory / written / fsynced durability distinction") and the rule
 >   "existing architecture is authoritative". The unified stream replaces the
 >   architecture (ADR-0001) and the acknowledgement semantics (ADR-0005:
->   PUBACK and delivery only after commit by a majority); what becomes of the
->   durability distinction is open (D-36). §1's requirement to name each
->   invariant and show it is preserved or intentionally replaced still applies
->   to every change that follows.
+>   PUBACK and delivery only after commit by a majority); the durability
+>   distinction remains for a single node and the current leader/follower,
+>   while a cluster commits by majority only (ADR-0006, D-36). §1's
+>   requirement to name each invariant and show it is preserved or
+>   intentionally replaced still applies to every change that follows.
 > - §13: "Do not introduce quorum into local fsynced semantics" and "Do not
 >   make MQTT PUBACK wait for replication merely because replication exists".
 >   In the target a PUBACK waits for commit by a majority (§2.3, ADR-0005).

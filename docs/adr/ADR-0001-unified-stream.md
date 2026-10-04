@@ -55,11 +55,9 @@ Separate records cover the decisions this one rests on:
 - The WAL record format and the replication protocol will change (phase 0:
   versioned records with properties; phase 1: `(slot, lsn, prev_hash)`).
   The current `STRAUMW3` format and its tests remain until then.
-- The durability levels are the current single-node and leader/follower
-  modes. How they relate to "commit = majority" in the target is an open
-  decision (D-36).
-- The deterministic simulation already begun under D-28 continues as the
-  phase-0 harness; how D-28's remaining stages map onto phase 0 is an open
-  decision (D-37).
+- The durability levels remain the modes of a single node and of the current
+  leader/follower; a cluster commits by majority only (ADR-0006, D-36).
+- The deterministic simulation begun under D-28 is the phase-0 harness;
+  ADR-0007 records how D-28's remaining stages map onto phase 0 (D-37).
 - Decisions still pending on the old model (D-33, D-34) are re-read against
   this one before they are taken.

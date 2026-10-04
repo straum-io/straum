@@ -1,6 +1,6 @@
 # ADR-0002: Unsafe policy
 
-- Status: accepted (items 1, 2, 4); item 3 proposed (D-40)
+- Status: accepted (item 3 by D-40)
 - Date: 2026-10-04
 - Decided by: Stanislav
 - Source: docs/architecture/unified-stream.md §4, §4.1
@@ -33,8 +33,7 @@ under which they may arrive.
    `// SAFETY:`, every `unsafe fn` a `# Safety` section; Miri where it can
    run, sanitizers and fuzzing where it cannot, and the failure scenarios in
    the simulation harness; an ADR per use, with Stanislav's final consent.
-3. **Proposed, pending Stanislav's decision (D-40); not part of the accepted
-   policy until then.** **How the first exempt crate is set up.** It does not write
+3. **How the first exempt crate is set up** (accepted, D-40). It does not write
    `[lints] workspace = true`, because that would inherit `forbid`. It
    declares its own table, which repeats every workspace lint except
    `unsafe_code`:
