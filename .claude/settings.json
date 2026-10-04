@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "scripts/agent/gate.sh", "timeout": 600 }
+        ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/require-closeout.sh" }
+        ]
+      }
+    ]
+  }
+}
