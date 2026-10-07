@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-10-04
+- Amended by: ADR-0008 (D-48 C: the broker and replication are rewritten for gateway/sequencer now, ahead of the phase order); D-51 A: at ADR-0008 step 8 a single node becomes a cluster of one and the levels go, once a witness carries the two-node pair (ADR-0008, step 8)
 - Decided by: Stanislav (D-36: A)
 - Refines: ADR-0005
 - Deviation from: docs/architecture/unified-stream.md §1, §2.3 and §5
@@ -49,8 +50,9 @@ mode.
   delivery never precede commit") in cluster mode; for a single node and the
   current leader/follower it checks the PUBACK half through C0–C5 and I1–I10
   of D-28.
-- D-33 (`written` with a follower) stays a leader/follower question until
-  phase 1; in cluster mode `written` cannot occur.
+- D-33 (`written` with a follower) was withdrawn (D-55 A) as an old-path
+  question; the defect stays in the old path until step 8 of ADR-0008,
+  reproduced by `written_with_a_follower_diverges_when_the_leader_loses_power` in `crates/runtime/tests/simulated_link.rs`. In cluster mode `written` cannot occur.
 - Documentation separates the two modes wherever durability is described.
 
 ## Proposed, for the start of phase 1 (D-42)
@@ -63,3 +65,5 @@ then put to Stanislav as a card.
 - Commit is a majority of the voters that hold data among the voters, so a
   witness can complete a promise but never stands in for a durable copy.
 - A single node remains a shipped mode after phase 3, with its levels.
+  **Reversed by D-51 A:** a single node becomes a cluster of one at ADR-0008
+  step 8.

@@ -11,7 +11,7 @@ already checked against `docs/architecture/unified-stream.md` and the ADRs
 in `docs/adr/`, and executable the moment he picks
 one.
 
-Write decision cards **in Russian**. Identifiers, file paths, code and
+Write decision cards **in English** (the user asked, 2026-10-05). Identifiers, file paths, code and
 commands stay as they are.
 
 ## When a card is required
@@ -49,21 +49,20 @@ benchmark or experiment, its cost, and which result selects which option.
    (including its rule that no node changes shared state outside the log), an
    ADR, a contractual invariant, or a rejected decision in
    `docs/decisions/log.md`.
-   They go to "Отсеяно" with the reason, one line each.
+   They go to "Rejected" with the reason, one line each.
 4. **Work out each survivor** fully (template below). An option the user
    would have to research before choosing is not finished.
 5. **Recommend one** and say what would change the recommendation.
 6. **Vet**: the vision-guardian reviews the options before the user sees them
    (task-closeout does this). Apply its FIX items; drop its REJECTs into
-   "Отсеяно"; add its MISSING options.
+   "Rejected"; add its MISSING options.
 
 Two to four options survive. More than four means the question is too broad
 — split it into two decisions.
 
 ## Card template
 
-Read `references/card-template.md` for the exact template and a filled
-example. Every field is mandatory; write "нет" rather than dropping a field.
+Read `references/card-template.md` for the exact template. Every field is mandatory; write "none" rather than dropping a field.
 
 ## Numbering
 
@@ -74,13 +73,16 @@ with:
 
 ````text
 D-12: B                 execute option B as written
-D-12: B, но <правка>    execute B with the amendment; restate it before starting
-D-12: обсудить          discuss; do not execute anything yet
-D-12: отклонить         reject all options; record it
-D-12: отложить          keep it pending
+D-12: B, but <change>   execute B with the amendment; restate it before starting
+D-12: discuss           discuss; do not execute anything yet
+D-12: reject            reject all options; record it
+D-12: defer             keep it pending
 ````
 
-When the user answers, move the card from `pending.md` to `log.md` with the
-choice, the date and his amendment, then do the work. A rejected option stays
-in `log.md`: it is how the guardian knows not to let it come back without
-new evidence.
+When the user answers, remove the card from `pending.md`: append its full
+text to `docs/decisions/archive/cards.md`, and add to `log.md` only the
+compact entry (question, date, choice with the amendment, one line per
+rejected option with its reason, a pointer to the archive). Then do the
+work. The rejected-option lines are how the guardian knows not to let an
+option come back without new evidence; the full card is read only when
+needed.

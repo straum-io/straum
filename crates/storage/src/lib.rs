@@ -14,11 +14,13 @@ mod commit;
 mod crc;
 mod disk;
 mod record;
+mod segments;
 pub mod simulated;
 mod wal;
 
 pub use commit::{Commit, Committer, RecordSource, WalRecord};
 pub use disk::{Access, Disk, DiskFile, OsDisk};
+pub use segments::{Pin, SegmentLimits, Segments};
 pub use wal::{
     Allocated, Committed, Compaction, HEADER_BYTES, Recovery, Retain, Wal, allocated, allocated_on,
     compact, compact_on, replay, replay_addressable, replay_addressable_on, replay_on,

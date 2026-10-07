@@ -701,3 +701,56 @@ durability.rs, quorum     base     cand
 Every difference is within ±3.5% except quorum 64 B (+6.6%), whose
 baseline spread across rounds was 4 567–5 478 (20%); all inside this
 machine's noise floor. No change is claimed.
+
+## ADR-0008 step 4 baseline: `codec`, `apply`, `gateway` before the hot path (2026-10-07)
+
+Taken before step 4 puts the new path's code behind sockets (D-66 A).
+Allocation bytes per operation are the stable measure on this machine
+(they do not move between runs); times are shown for direction only and
+varied by an order of magnitude between two runs of the same 64 B decode
+(388 ns, then 10.67 µs), which is this Mac, not the code. `cargo bench -p
+codec --bench codec`, `-p apply --bench apply`, `-p gateway --bench
+gateway`, against `-p mqtt --bench decode` and `--bench encode`.
+
+| Operation | Old path | New path | Note |
+|---|---|---|---|
+| CONNECT decode | 216 B | 456 B | properties struct and its defaults |
+| PUBLISH 3.1.1 decode, 64 B | 104 B | 104 B | same: the payload copy below the threshold |
+| PUBLISH 3.1.1 decode, 1 KiB | 40 B | 40 B | same |
+| PUBLISH 5 decode, 64 B / 1 KiB, one user property | — | 520 B / 456 B | the boxed properties |
+| SUBSCRIBE decode, 1 / 8 filters | 200 B / 200 B | 200 B / 200 B | same |
+| PUBLISH 3.1.1 encode | 0 B | 16 B | the scratch body buffer marked `ponytail` in `encode.rs` |
+| PUBLISH 5 encode | — | 8 B–16 B | scratch buffers |
+| apply, one publish, at most once, 1 / 10 / 100 sessions | — | 674 B / 1.97 KB / 14.93 KB | ~150 B per delivery effect |
+| apply, one publish, at least once, 1 / 10 / 100 sessions | — | 1.92 KB / 14.45 KB / 139.7 KB | ~1.4 KB per session: inflight copy and map nodes |
+| gateway, delivery out, 64 B / 1 KiB | — | 528 B / 528 B | encode buffer and action |
+| gateway, publish in, 64 B / 1 KiB | — | 715 B / 1.48 KB | decode, proposal body, action |
+
+Medians (direction only): 3.1.1 publish decode 126–150 ns new against
+131–134 ns old; encode 246–263 ns new against 41–66 ns old — the scratch
+buffer and the general packet path; apply per at-least-once session about
+0.45 µs at 100 sessions. Two candidates for phase 5, each to be measured on
+Linux before it is changed: the encode scratch buffer, and the inflight
+copy per at-least-once session in `apply`.
+
+### The same benchmarks in the Linux container (preliminary)
+
+`scripts/linux.sh bench -p codec -p apply -p gateway` (rust:1.85-bookworm in
+the container VM on this Mac, 8 vCPU). It is Linux, but not a quiet Linux host:
+CLAUDE.md §11 accepts no decision on these times. Allocation bytes match
+the macOS run except the 3.1.1 encode (8 B here, 16 B there), the 5 encode
+(16 B, 8–16 B there) and the gateway's 1 KiB publish in (1.551 KB, 1.48 KB
+there); why is not investigated. Medians of divan's 100 samples:
+
+| Benchmark | Median | Allocations / bytes |
+|---|---|---|
+| codec_connect_decode | 219.9 ns | 2 / 456 B |
+| codec_publish_decode_v311 64 B / 1 KiB | 149 / 164.7 ns | 2 / 104 B, 1 / 40 B |
+| codec_publish_decode_v5 64 B / 1 KiB | 298.5 / 306.4 ns | 4 / 520 B, 3 / 456 B |
+| codec_publish_encode_v311 64 B / 1 KiB | 156.7 / 236.7 ns | 1 / 8 B |
+| codec_publish_encode_v5 64 B / 1 KiB | 363.3 / 449.2 ns | 2 / 16 B |
+| codec_subscribe_decode 1 / 8 filters | 242.7 ns / 1.207 µs | 2 / 200 B |
+| apply_publish_at_most_once 1 / 10 / 100 subscribers | 483.2 ns / 2.353 µs / 20.49 µs | 6 / 674 B, 6 / 1.97 KB, 6 / 14.93 KB |
+| apply_publish_at_least_once 1 / 10 / 100 subscribers | 597.7 ns / 3.122 µs / 39.23 µs | 7 / 1.922 KB, 16 / 14.45 KB, 106 / 139.7 KB |
+| gateway_publish_in 64 B / 1 KiB | 275 / 384.6 ns | 3.9 / 714.7 B, 2.9 / 1.551 KB |
+| gateway_deliver_out 64 B / 1 KiB | 414.9 / 488.4 ns | 3 / 528 B |

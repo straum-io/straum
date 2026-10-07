@@ -34,8 +34,9 @@ Always:
   precedence")
 * `docs/adr/` — the decisions it rests on, and every recorded deviation
 * `docs/decisions/log.md` (accepted and rejected decisions)
-* `docs/VISION.md` only for its V3 promises, which stand where they agree
-  with the unified stream; its V1, V4 and V5 are superseded (ADR-0001)
+* `docs/VISION.md`: V2, V3, V4 (as amended by ADR-0003), V6, V7 stand where
+  they agree with the unified stream; V1 and V5 are superseded (ADR-0001)
+  and live only in `docs/archive/VISION.md`
 * `git diff <BASE>` and `git status`
 * CONSTITUTION.md §1 (contractual invariants) and CLAUDE.md §7 (invariants)
 

@@ -69,3 +69,13 @@ under which they may arrive.
 - The first exemption is a change to the boundary script and to the crate's
   manifest as above, plus its own ADR.
 - CLAUDE.md §14 no longer carries its own unsafe rule; it points here.
+
+## Scope: third-party dependencies (D-50, 2026-10-05)
+
+The policy in unified-stream §4.1 governs unsafe in Straum's own code. A
+third-party crate that contains unsafe internally is judged as a dependency,
+under CLAUDE.md §2: what it is for, what it costs, its transitive
+dependencies and its maintenance. The first such crate admitted on these
+terms is `xxhash-rust` (xxh3-128 for the log's `prev_hash`, D-50 A). It
+contains unsafe internally (34 occurrences in 0.8.19: unaligned reads and
+SIMD in `xxh3` and `utils`), checked on 2026-10-05 from the crate source.

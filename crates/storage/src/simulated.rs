@@ -234,6 +234,18 @@ impl Disk for SimDisk {
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
     }
 
+    fn list(&self, directory: &Path) -> io::Result<Vec<PathBuf>> {
+        let mut paths: Vec<PathBuf> = self
+            .state()
+            .names
+            .keys()
+            .filter(|path| path.parent() == Some(directory))
+            .cloned()
+            .collect();
+        paths.sort();
+        Ok(paths)
+    }
+
     fn sync_directory(&self, _directory: &Path) -> io::Result<()> {
         // One directory: everything the log touches lives beside it.
         let mut state = self.state();

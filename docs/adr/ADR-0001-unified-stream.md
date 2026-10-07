@@ -2,9 +2,10 @@
 
 - Status: accepted
 - Date: 2026-10-04
+- Amended by: ADR-0008 (D-48 C: the broker and replication are rewritten for gateway/sequencer now, ahead of the phase order)
 - Decided by: Stanislav
-- Supersedes: the cluster plan (docs/cluster.md), the roadmap order of
-  docs/VISION.md V5, and "leader/follower as the target" in
+- Supersedes: the cluster plan (docs/archive/cluster.md), the roadmap order of
+  docs/archive/VISION.md V5, and "leader/follower as the target" in
   docs/replication.md
 
 ## Context
@@ -13,7 +14,7 @@ Straum runs as one node, or as one leader shipping its WAL to one static
 follower. Durability levels `memory`, `written`, `fsynced` and `quorum`
 decide when a PUBACK goes; `quorum` waits for the follower's durable report.
 There is no election, no fencing and no failover; a lost leader is an
-operator's problem. The earlier cluster plan (docs/cluster.md) designed
+operator's problem. The earlier cluster plan (docs/archive/cluster.md) designed
 session ownership across autonomous nodes and was never built.
 
 Work on that model found defects that live between the nodes rather than
@@ -59,5 +60,6 @@ Separate records cover the decisions this one rests on:
   leader/follower; a cluster commits by majority only (ADR-0006, D-36).
 - The deterministic simulation begun under D-28 is the phase-0 harness;
   ADR-0007 records how D-28's remaining stages map onto phase 0 (D-37).
-- Decisions still pending on the old model (D-33, D-34) are re-read against
-  this one before they are taken.
+- Decisions pending on the old model were re-read against this one: D-34
+  was taken (A); D-33 was withdrawn (D-55 A), its defect left in the old path
+  until ADR-0008 step 8.

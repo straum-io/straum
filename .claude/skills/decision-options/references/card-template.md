@@ -1,119 +1,48 @@
 # Decision card template
 
-Every field is mandatory. Facts, measurements and hypotheses are labelled as
-such (CONSTITUTION: a hypothesis is never presented as a result).
+Every field is mandatory; write "none" rather than dropping one. Facts,
+measurements and hypotheses are labelled as such: a hypothesis is never
+presented as a result.
 
 ````markdown
-## D-<n>. <решение одним вопросом>
+## D-<n>. <the decision as one question>
 
-**Контекст.** 2–3 предложения фактов: что обнаружено, где (файл:строка),
-чем подтверждено.
-**Почему сейчас.** Что блокируется или ухудшается, если отложить.
-**Связь с видением.** Раздел(ы) docs/architecture/unified-stream.md и ADR, которым служит решение (V3-обещания docs/VISION.md — там, где они согласуются с ним).
+**Context.** 2–3 sentences of fact: what was found, where (file:line), how it
+was confirmed.
+**Why now.** What is blocked or gets worse if it waits.
+**Vision.** The sections of docs/architecture/unified-stream.md and the ADRs
+the decision serves.
 
-### A. <короткое название> — рекомендую
-- **Что делаем:** конкретные изменения — крейты, файлы, типы, тесты.
-- **Результат:** что станет верным после, в проверяемой форме.
-- **Цена:** S / M / L и что входит (крейты, тесты, документы, бенчмарки).
-- **Риски:** что может пойти не так → как это будет поймано.
-- **Инварианты:** какие затронуты и почему сохраняются (или: не затрагивает).
-- **Обратимость:** легко откатить / меняет формат или API / необратимо.
-- **Проверка:** команды, тесты, бенчмарки, которые подтвердят результат.
-- **Факт / гипотеза:** что здесь измерено, а что предполагается.
+### A. <short name> — recommended
+- **What we do:** concrete changes: crates, files, types, tests.
+- **Result:** what is true afterwards, in a checkable form.
+- **Cost:** S / M / L and what it includes.
+- **Risks:** what can go wrong → how it is caught.
+- **Invariants:** which are touched and why they hold (or: none).
+- **Reversibility:** easy / changes a format or API / irreversible.
+- **Check:** commands, tests, simulation scenarios, benchmarks.
+- **Fact / hypothesis:** what is measured, what is assumed.
 
 ### B. <…>
-(те же поля)
+(same fields)
 
-### C. Ничего не делать / отложить
-- **Когда это правильный выбор:** …
-- **Цена бездействия:** …
+### C. Do nothing / defer
+- **When this is right:** …
+- **Cost of waiting:** …
 
-**Сравнение**
-
-| | A | B | C |
-|---|---|---|---|
-| Соответствие видению | | | |
-| Риск для инвариантов | | | |
-| Цена | | | |
-| Обратимость | | | |
-
-**Рекомендация.** A, потому что … B лучше, если … (конкретное условие).
-**Что изменит рекомендацию.** Факт или измерение, которое переключит выбор.
-**Отсеяно.**
-- <вариант> — нарушает <V-пункт / инвариант / решение D-k>.
-
-**Ответ:** `D-<n>: A` · `D-<n>: B, но …` · `D-<n>: обсудить` · `D-<n>: отложить`
-````
-
----
-
-# Filled example
-
-The example predates the unified stream (ADR-0001) and cites docs/VISION.md V3;
-a card written now cites unified-stream.md sections and ADRs instead.
-
-Illustrative: file and function names below show the level of detail
-expected and may not match the repository.
-
-````markdown
-## D-7. Как исправить нижнюю границу STRAUM_TOTAL_CONNECTION_BUFFER_BYTES
-
-**Контекст.** После разделения буферов соединение при admission заряжает
-R + W (transport/src/read.rs, `ConnectionBuffer::charge`), а валидация всё
-ещё требует лишь `TOTAL >= MAX_PACKET` (docs/configuration.md, Validation
-ranges). При `TOTAL = MAX_PACKET` и `R = W = MAX_PACKET` конфигурация
-принимается, но ни одно соединение не будет допущено. Факт: следует из кода
-и документа; воспроизведено тестом не было.
-**Почему сейчас.** Конфигурация, которая стартует и никого не принимает, —
-худший вид ошибки для оператора: сбой проявляется не при старте, а в работе.
-**Связь с видением.** V3.3 (ошибки конфигурации падают на старте), V3.2.
-
-### A. Граница `TOTAL >= MAX_PACKET + WRITE_BUFFER` — рекомендую
-- **Что делаем:** server/src/config.rs — новое cross-field правило; ошибка
-  называет три переменные; docs/configuration.md — строка в Validation
-  ranges; тест `total_buffer_must_fit_one_max_packet_connection`.
-- **Результат:** любая принятая конфигурация допускает хотя бы одно
-  соединение, способное принять пакет максимального размера.
-- **Цена:** S — один крейт, один тест, одна строка документа.
-- **Риски:** ранее принимавшиеся конфигурации начнут падать на старте →
-  это и есть цель; сообщение ошибки указывает минимальное значение.
-- **Инварианты:** не затрагивает; усиливает проверку V3.3.
-- **Обратимость:** легко откатить.
-- **Проверка:** `cargo test -p server config`, `cargo test -p transport`.
-- **Факт / гипотеза:** граница выведена из admission-кода, факт.
-
-### B. Граница `TOTAL >= READ_BUFFER + WRITE_BUFFER`
-- **Что делаем:** то же, что A, с меньшей границей.
-- **Результат:** гарантирует допуск соединения, но не приём пакета
-  максимального размера: рост read-буфера до MAX_PACKET будет отклонён.
-- **Цена:** S.
-- **Риски:** конфигурация стартует, но большие пакеты закрывают соединения →
-  ловится только в работе.
-- **Инварианты:** не затрагивает.
-- **Обратимость:** легко откатить.
-- **Проверка:** как в A.
-- **Факт / гипотеза:** факт.
-
-### C. Ничего не делать
-- **Когда это правильный выбор:** никогда при текущем поведении admission.
-- **Цена бездействия:** конфигурация, молча не принимающая соединения.
-
-**Сравнение**
+**Comparison**
 
 | | A | B | C |
 |---|---|---|---|
-| Соответствие видению | V3.3 полностью | V3.3 частично | нарушает V3.3 |
-| Риск для инвариантов | нет | нет | нет |
-| Цена | S | S | 0 |
-| Обратимость | легко | легко | — |
+| Fit with vision | | | |
+| Risk to invariants | | | |
+| Cost | | | |
+| Reversibility | | | |
 
-**Рекомендация.** A: единственный вариант, при котором «конфигурация
-принята» означает «брокер способен выполнить свой собственный лимит
-MAX_PACKET». B лучше, только если MAX_PACKET станет лимитом на уровне
-сессии, а не процесса.
-**Что изменит рекомендацию.** Решение сделать MAX_PACKET per-listener.
-**Отсеяно.**
-- Проверять бюджет лениво при первом соединении — нарушает V3.3.
+**Recommendation.** A, because … B instead if … (a concrete condition).
+**What would change it.** The fact or measurement that would switch the choice.
+**Rejected.**
+- <option> — violates <unified-stream §, ADR, invariant or D-k>.
 
-**Ответ:** `D-7: A` · `D-7: B, но …` · `D-7: обсудить` · `D-7: отложить`
+**Answer:** `D-<n>: A` · `D-<n>: B, but …` · `D-<n>: discuss` · `D-<n>: defer`
 ````

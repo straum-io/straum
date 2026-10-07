@@ -54,15 +54,19 @@ docs/baselines/           recorded benchmark baselines, one file per machine
 
 ## Current phase
 
-Phase 0 of unified-stream §6: gap analysis and ADRs, this file, a
-deterministic simulation harness for the existing leader/follower
-replication with invariants 1, 3 and 5, a versioned WAL record format with a
-properties section, and an MQTT codec model with properties and reason
-codes. ADR-0001 records the move to the unified stream; ADR-0007 splits
-phase 0 into three tasks (the `sim` harness, the WAL record format v4, the
-MQTT 5 codec model) and records its deviations; ADR-0006 keeps the
-durability levels for a single node and allows only majority commit in a
-cluster.
+The rewrite to gateway/sequencer, ADR-0008 (D-48 C): eight steps, new
+crates beside the old leader/follower path, which keeps working until step
+8 (D-49 A). Steps 1 (`journal`: record v4, every record carrying the previous batch's hash), 2
+(`storage::Segments`, `cluster`: sequencer and replica, three nodes in `sim`)
+3a (`codec`: MQTT 3.1.1 and 5 over one packet model), 3b-1 (`apply`: the apply
+function over committed records) and 3b-2 (`gateway`: MQTT clients over the
+log, end to end in `sim`) are done; step 4 (`node`: the runtime driver —
+links, sequencer or replica, the log on disk, the gateway over TCP — three
+nodes on loopback in tests) is done in part (log retention and
+configuration open: D-67, D-68) and not yet wired into the server. The
+progress of each step is recorded in ADR-0008. ADR-0006
+keeps the durability levels for a single node and allows only majority
+commit in a cluster.
 
 ## Scope
 
@@ -126,9 +130,16 @@ straum/
 │   ├── transport/
 │   ├── storage/
 │   ├── replication/
+│   ├── journal/      # record v4 bodies and the prev_hash chain (ADR-0008)
+│   ├── cluster/      # sans-IO sequencer and replica (ADR-0008 step 2)
+│   ├── codec/        # MQTT 3.1.1 and 5, one packet model (ADR-0008 step 3a)
+│   ├── apply/        # the apply function over committed records (ADR-0008 step 3b-1)
+│   ├── gateway/      # sans-IO MQTT gateway over codec and apply (ADR-0008 step 3b-2)
+│   ├── node/         # publish = false; runtime driver of the new path (ADR-0008 step 4)
 │   ├── broker/
 │   ├── runtime/
 │   ├── server/
+│   ├── sim/          # publish = false; deterministic simulation (ADR-0007)
 │   └── e2e/          # publish = false; e2e tests, network benchmarks
 ├── fuzz/                    # cargo-fuzz, separate workspace, nightly only
 ├── docs/
@@ -235,9 +246,16 @@ e2e (dev only) → runtime, rumqttc
 | transport | — | bytes, thiserror, tokio, tracing, socket2, tokio-rustls, rustls-pemfile | protocol, mqtt, broker, runtime, server |
 | storage | — | bytes, thiserror, crc32fast | tokio, protocol, mqtt, transport, replication, broker, runtime, server |
 | replication | — | thiserror, crc32fast | tokio, every other workspace crate |
+| journal | — | thiserror, xxhash-rust | tokio, every other workspace crate |
+| cluster | journal | thiserror | tokio, every other workspace crate |
+| codec | domain | bytes, thiserror | tokio, every other workspace crate |
+| apply | domain, journal | bytes, thiserror | tokio, every other workspace crate |
+| gateway | apply, codec, domain, journal | bytes | tokio, every other workspace crate |
+| node | apply, cluster, gateway, journal, storage, transport | bytes, thiserror, tokio, tracing | protocol, mqtt, replication, broker, runtime, server, sim |
 | broker | domain, protocol, auth | bytes, thiserror, tracing | tokio, mqtt, transport, runtime, server, storage |
 | runtime | domain, protocol, mqtt, transport, broker, storage, replication | thiserror, tokio, tracing | server |
 | server | runtime | tokio, tracing, tracing-subscriber | — |
+| sim | storage, replication, journal, cluster, apply, codec, gateway, domain | — | tokio, runtime, transport, server, broker, mqtt, protocol |
 
 `scripts/check-boundaries.sh` enforces the forbidden column. It is part of
 validation.
@@ -255,9 +273,9 @@ server depends only on the runtime.
 Allowed dev-dependencies, each with a concrete use:
 
 ```text
-proptest                              core, mqtt, broker, replication: codec round-trip, topic matching, routing invariants
+proptest                              core, mqtt, broker, replication, codec, journal, apply: codec round-trip, topic matching, routing invariants
 divan                                 micro benchmarks, allocation counting
-rumqttc (default-features = false)    e2e only: independent MQTT client
+rumqttc (default-features = false)    e2e and node tests only: independent MQTT client
 ```
 
 ```text
@@ -270,6 +288,11 @@ crc32fast    storage: WAL record checksums. The hand-rolled table version
              measured 244 MB/s against 15 GB/s here — below NVMe write
              throughput, so it would have capped the WAL. Same polynomial,
              identical values, one transitive dependency (cfg-if).
+xxhash-rust  journal: xxh3-128 for the batch chain `prev_hash` (D-50, ADR-0008).
+             Non-cryptographic: it detects divergence and corruption, not
+             an adversary. `default-features = false, features = ["xxh3"]`,
+             no transitive dependencies. Contains unsafe; judged as a
+             dependency under ADR-0002 (D-50).
 ```
 
 Not added by default, each requires a concrete reason:

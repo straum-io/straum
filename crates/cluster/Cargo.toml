@@ -1,0 +1,13 @@
+[package]
+name = "cluster"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Sans-IO sequencer and replica: one slot owner, star replication, majority commit (ADR-0008 step 2)"
+
+[lints]
+workspace = true
+
+[dependencies]
+journal = { path = "../journal" }
+thiserror = "2"

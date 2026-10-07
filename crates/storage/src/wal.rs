@@ -209,6 +209,16 @@ impl<D: Disk> Wal<D> {
 
         // Appends continue at the end of the durable prefix: the tail is gone.
         file.set_len(recovery.durable_offset)?;
+        // What was recovered is what the operating system holds, and after a
+        // process crash that can be a batch whose sync failed or never ran.
+        // The log is about to call all of it durable — a follower reports it,
+        // a leader ships it — so it is made durable first. One sync per open.
+        // Without it a restart after a failed sync claimed records a power
+        // loss then took (D-43, found by the simulation). A new file synced its
+        // header above and holds nothing else.
+        if length != 0 {
+            file.sync_data()?;
+        }
         file.seek(SeekFrom::Start(recovery.durable_offset))?;
 
         Ok((

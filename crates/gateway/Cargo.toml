@@ -1,0 +1,23 @@
+[package]
+name = "gateway"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Sans-IO MQTT gateway: packets in, proposals to the log, committed effects back out as packets (ADR-0008 step 3b-2)"
+
+[lints]
+workspace = true
+
+[dependencies]
+apply = { path = "../apply" }
+journal = { path = "../journal" }
+codec = { path = "../codec" }
+domain = { path = "../domain" }
+bytes = "1"
+
+[dev-dependencies]
+divan = "0.1"
+
+[[bench]]
+name = "gateway"
+harness = false

@@ -1,33 +1,9 @@
-# Straum Vision
+# Straum Vision — what still stands
 
-> **Superseded in part by docs/architecture/unified-stream.md** (ADR-0001):
-> V1 positioning by §1; V4's exclusion of MQTT 5 and QoS 2 by §2.7 and §6
-> (ADR-0003: MQTT 5 from the first day, QoS 2 and shared subscriptions in
-> phase 6); V5's roadmap order by §6. V3's promises stand where they agree
-> with the unified stream; "acknowledged ⇒ durable at the declared level"
-> becomes "PUBACK only after commit" in the target (ADR-0005).
-
-Status: **DRAFT.** Written from the product analysis of 2026-09-28.
-Every item marked `(unconfirmed)` is a proposal until Stanislav confirms it.
-The vision-guardian treats unconfirmed items as soft: a conflict with one is
-reported as a note, never as a DRIFT verdict.
-
-This file answers one question for every change: **does it move Straum
-towards what it is for?** `CONSTITUTION.md` says how work is done;
-`CLAUDE.md` says how the system is built; this file says why it exists and
-what it deliberately is not.
-
-Keep it under two screens. It is loaded by the guardian on every closeout.
-
----
-
-## V1. Positioning
-
-An MQTT broker whose acknowledgement means exactly what it says, and that
-claim is verified rather than asserted.
-
-A PUBACK at level `written`, `fsynced` or `quorum` is a durability statement
-that survives the failures that level names. Proving that is the product.
+The architecture is `docs/architecture/unified-stream.md`. This file keeps
+the parts of the original vision it did not supersede (ADR-0001): V1
+positioning and V5 roadmap order are superseded and live only in
+`docs/archive/VISION.md`; V4 is amended by ADR-0003.
 
 ## V2. Who it is for (unconfirmed)
 
@@ -50,6 +26,9 @@ When two promises conflict, the higher one wins.
 4. **Performance per CPU cycle,** measured and reported with its workload.
 5. **Protocol coverage** sufficient for the users in V2.
 
+
+In the target, promise 1 reads "PUBACK only after commit" (ADR-0005).
+
 ## V4. Non-goals
 
 A change that moves towards one of these is drift unless a decision in
@@ -61,22 +40,10 @@ A change that moves towards one of these is drift unless a decision in
 * Protocols other than MQTT (MQTT-SN, CoAP, LwM2M, STOMP).
 * Becoming a general streaming platform (retention-as-storage, consumer
   groups, Kafka semantics).
-* QoS 2 before there is a concrete user requirement.
+* QoS 2 and shared subscriptions before phase 6 (ADR-0003; MQTT 5 itself is in scope from the start).
 * Speculative abstraction: traits, plugin systems or extension points without
   two real implementations.
 
-## V5. Roadmap priority (unconfirmed)
-
-Work that serves an earlier item is preferred over work that serves a later
-one, unless it unblocks the earlier item.
-
-1. Deterministic simulation of broker, WAL and replication with fault
-   injection; a published verification of V3.1.
-2. Automatic failover with fencing.
-3. MQTT 5 core: reason codes, session and message expiry, shared
-   subscriptions, receive maximum.
-4. A reproducible comparison against other brokers on a quiet Linux host.
-5. Operability: Helm chart, runbooks for every failure in the failure matrix.
 
 ## V6. Licence (unconfirmed)
 
@@ -88,7 +55,7 @@ behind a commercial licence.
 The guardian looks for these in particular:
 
 * A feature from V4 appearing without an accepted decision.
-* Work on a later V5 item while an earlier one is blocked by nothing.
+* Work on a later ADR-0008 step while an earlier one is blocked by nothing.
 * A durability, ordering or memory guarantee weakened "temporarily".
 * A performance claim without a workload and a measurement.
 * A task that grew beyond what was asked (scope creep), however useful.

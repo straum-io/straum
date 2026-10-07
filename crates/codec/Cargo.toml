@@ -1,0 +1,22 @@
+[package]
+name = "codec"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "MQTT 3.1.1 and 5 over one packet model: properties, reason codes, reason strings (ADR-0008 step 3a, ADR-0003)"
+
+[lints]
+workspace = true
+
+[dependencies]
+domain = { path = "../domain" }
+bytes = "1"
+thiserror = "2"
+
+[dev-dependencies]
+divan = "0.1"
+proptest = "1"
+
+[[bench]]
+name = "codec"
+harness = false

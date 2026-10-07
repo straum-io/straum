@@ -54,7 +54,7 @@ Then act on its verdict:
 | BLOCKED | fix every BLOCKER, re-validate, re-run the guardian; if a BLOCKER cannot be fixed, the task is reported as not done |
 
 Apply OPTIONS VETTING: FIX items change the card, REJECT moves the option to
-"Отсеяно" with the guardian's reason, MISSING options are worked out and
+"Rejected" with the guardian's reason, MISSING options are worked out and
 added. At most two guardian rounds; if the second is still DRIFT or BLOCKED,
 report that plainly with its findings.
 
@@ -76,16 +76,16 @@ closeout.
 
 This is the end-of-task format of docs/architecture/unified-stream.md §7.
 
-In Russian, in this order and nothing more:
+In English, in this order and nothing more:
 
 ````text
-Итог: <one sentence — done / done with notes / not done>
-Проверка видения: <verdict> — <one line; findings only if not ALIGNED>
-Сделано: <from the report>
-Проверено и чем: <tests, simulation scenarios, benchmarks — from the report>
-Открытые риски: <what is not covered, what could still be wrong>
-Решения: <the next step as 2–3 worked options — the cards, full text>
+Result: <one sentence — done / done with notes / not done>
+Vision check: <verdict> — <one line; findings only if not ALIGNED>
+Done: <from the report>
+Verified, and how: <tests, simulation scenarios, benchmarks — from the report>
+Open risks: <what is not covered, what could still be wrong>
+Decisions: <the next step as 2–3 worked options — the cards, full text>
 ````
 
-If there are no cards, write "Решения: нет открытых". Never end with a
+If there are no cards, write "Decisions: none open". Never end with a
 question to the user other than the cards themselves.

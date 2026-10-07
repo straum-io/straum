@@ -371,3 +371,31 @@ fn a_new_log_survives_a_power_loss() {
     disk.power_loss(0);
     assert_eq!(recovered(&disk), vec![record(0), record(1)]);
 }
+
+/// D-43: a commit's sync fails after the batch reached the operating
+/// system, and the process restarts. What the reopened log recovers it calls
+/// durable — so it has to be, and a power loss right after must not take it.
+/// Found by the simulation: a follower reported such records to the quorum
+/// and lost them.
+#[test]
+fn what_a_restart_recovers_survives_a_power_loss() {
+    let disk = SimDisk::new();
+    let (mut wal, _) = open(&disk);
+    commit(&mut wal, 0, 2, true);
+    disk.fail_sync_after(0);
+    for index in 2..5 {
+        wal.stage(&record(index)).unwrap();
+    }
+    assert!(wal.commit_with(true).is_err(), "the sync was meant to fail");
+    drop(wal);
+
+    // The process restarts; the batch is in the operating system.
+    let (wal, recovery) = open(&disk);
+    assert_eq!(recovery.sequence, 5, "the written batch was not recovered");
+    assert_eq!(wal.durable_sequence(), 5);
+    drop(wal);
+
+    // What it called durable is.
+    disk.power_loss(0);
+    assert_eq!(recovered(&disk), (0..5).map(record).collect::<Vec<_>>());
+}

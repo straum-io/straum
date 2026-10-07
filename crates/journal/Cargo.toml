@@ -1,0 +1,17 @@
+[package]
+name = "journal"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Log record format v4: (slot, lsn, prev_hash) on every record, prev_hash per batch, properties, batch header (ADR-0008 step 1, D-56 A)"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "2"
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
+
+[dev-dependencies]
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
+proptest = "1"

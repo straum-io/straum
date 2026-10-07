@@ -408,6 +408,12 @@ tests. At minimum: crash before write, during write, before sync, during sync,
 after sync; partial final record; truncated WAL; invalid record length;
 corrupted checksum; a blob reference without its blob.
 
+What recovery returns, the log calls durable, so opening a log syncs it
+(D-43). After a process crash the file holds what the operating system had,
+which can include a batch whose sync failed or never ran; without the sync
+at open, a restarted follower reported those records to the quorum and a
+power loss took them. One sync per open.
+
 Recovery distinguishes the valid durable prefix from an incomplete or corrupt
 tail, and never treats the file length as that boundary.
 
@@ -515,3 +521,30 @@ not
 
 The storage device provides the pacing signal. The algorithm adapts to it
 instead of imposing a cadence on it.
+
+## 105. Segments (the new path, ADR-0008 step 2)
+
+`storage::Segments` is the log the sequencer and the replicas of the new
+path write: a directory of segment files named by the key of their first
+batch (the batch's first lsn), zero-padded so they sort in log order. Each
+segment is a `Wal`, so framing, checksums, group commit, recovery of the
+durable prefix and the sync at open (§92, D-43) are unchanged.
+
+* A new segment starts only at a batch boundary, once the last one holds
+  `segment_bytes`; a batch is never split.
+* The segment being left is synced before the next one is created: a power
+  loss takes the unsynced end of the log, never a stretch in the middle.
+* Space comes back by removing whole segments from the front, never by
+  rewriting a file. Removal stops at the first segment a reader has pinned
+  (unified-stream §3), and never takes the active segment or the last
+  sealed one: if a crash leaves the active segment with nothing but a torn
+  batch to cut, the last record before it says where the chain stands.
+* A torn batch is found by the caller (`journal::Verifier`) and cut with
+  `truncate_tail`, which rewrites only the active segment, as §104 rewrites
+  a file.
+* `sizes` reports every segment's bytes: the sequencer's retention bound
+  (D-57 A) is measured on them, and the floor itself is the sequencer's
+  decision (`cluster::Sequencer::compaction_floor`).
+
+The old path keeps the single-file log with filtered rewrites (§104); the
+two live side by side until ADR-0008 step 8.

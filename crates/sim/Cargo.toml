@@ -1,0 +1,20 @@
+[package]
+name = "sim"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Deterministic simulation: the leader/follower replication (ADR-0007) and the three-node sequencer/replica (ADR-0008 step 2)"
+
+[lints]
+workspace = true
+
+[dependencies]
+gateway = { path = "../gateway" }
+codec = { path = "../codec" }
+apply = { path = "../apply" }
+bytes = "1"
+domain = { path = "../domain" }
+cluster = { path = "../cluster" }
+journal = { path = "../journal" }
+replication = { path = "../replication" }
+storage = { path = "../storage" }

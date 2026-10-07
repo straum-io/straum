@@ -70,6 +70,66 @@ Defaults below are **initial**. They are adjusted by benchmarks, not intuition.
 | `STRAUM_CONNECT_TIMEOUT_MS` | `10000` | Time from accept to a valid CONNECT. |
 | `STRAUM_PAYLOAD_COPY_THRESHOLD_BYTES` | `512` | Payloads up to this size are copied at ingress instead of sliced (CLAUDE.md §9). |
 
+### New path: `codec` (ADR-0008 step 3a; not yet configurable)
+
+The `codec` crate takes the limits above in its own `codec::Limits`, with the
+same defaults, plus one of its own. None is read from the environment until
+the server runs the new path (step 7, D-68); then each gets a variable here.
+
+| Limit | Default | Notes |
+|---|---|---|
+| `max_user_properties` | `32` | User Properties in one MQTT 5 property section; more is refused before the next is kept (Implementation specific error, 0x83). |
+
+### New path: `apply` and `gateway` (ADR-0008 step 3b-2; not yet configurable)
+
+Bounds the apply function decides from the log. Every node must run with the
+same values: they are part of what the log means. None is read from the
+environment until the server runs the new path (step 7, D-68).
+
+| Limit | Default | Notes |
+|---|---|---|
+| `max_subscriptions_per_session` | `1024` | Beyond: SUBACK failure (Quota exceeded in MQTT 5). |
+| `max_subscriptions` | `1000000` | All sessions together. |
+| `max_retained` | `10000` | Beyond: delivered, not kept (as the old path). |
+| `max_retained_bytes` | `67108864` | Retained payload bytes. |
+| `max_inflight` | `256` | At-least-once deliveries unacknowledged per session (as `STRAUM_MAX_INFLIGHT`). |
+| `max_backlog` | `16384` | Waiting behind a full window, per session (as `STRAUM_SESSION_BACKLOG_MESSAGES`). |
+| `max_backlog_bytes` | `8388608` | Per session. Beyond: at-most-once dropped, at-least-once closes the session as a slow consumer. |
+| `max_total_queued_bytes` | `1073741824` | Inflight and backlog payload bytes of all sessions together (the budget of `STRAUM_TOTAL_BACKLOG_BYTES`, now counting inflight too). At-least-once beyond: backlog, then a slow-consumer close. |
+
+Gateway settings, per node:
+
+| Setting | Notes |
+|---|---|
+| `first_session` | Kept durable and growing across restarts by the driver: sessions are never renumbered. |
+| `max_connections` | Beyond: the socket is closed at accept. |
+| `connect_timeout` | As `STRAUM_CONNECT_TIMEOUT_MS`. |
+| `max_pending`, `max_pending_bytes` | Proposals of one connection awaiting commit; at the bound the connection is not read. |
+| `max_total_pending_bytes` | All connections. |
+| `commit_timeout` | A proposal not committed within it closes its connection. |
+| `retry_interval` | First interval for `Ack`, `SessionGone`, `NodeReset`; doubles to 32×. |
+| `receive_maximum`, `topic_alias_maximum` | Advertised to MQTT 5 clients. |
+| `max_waiting`, `max_waiting_bytes`, `max_total_waiting_bytes` | At-most-once deliveries held behind a QoS 1 delivery waiting for the client's receive maximum; beyond, dropped and counted. |
+| `max_retries` | Lifecycle proposals awaiting their effect; at the bound new connections are refused. |
+
+### New path: `node` (ADR-0008 step 4; test-only, not yet configurable)
+
+`node::NodeConfig`, per node. None is read from the environment until step 7
+lets the server start in cluster mode.
+
+| Setting | Notes |
+|---|---|
+| `core` | `cluster::Config`: id, voters, slot owner, replication window, queue, batch, `max_uncommitted`. |
+| `listen`, `peers` | Where other nodes connect to this one; where to reach each of them. One TCP connection per direction. |
+| `data` | The segmented log and the `incarnation` file (the gateway's `first_session`, made durable before use). |
+| `segments` | `storage::SegmentLimits`. |
+| `limits` | `apply::Limits`, the table above. A link whose HELLO carries another digest of them is refused. |
+| `heartbeat` | Sequencer tick and gateway tick. |
+| `max_frame` | Largest link frame read; beyond, the link closes. |
+| `link_queue` | Frames queued per peer; beyond, dropped (the protocol resends). |
+| `mqtt.listen`, `mqtt.gateway` | MQTT listener and the gateway settings above. |
+| `mqtt.write_queue` | Packets queued per client; a client that lets it fill is closed. |
+
 ## WAL (owner: storage)
 
 | Variable | Default | Notes |

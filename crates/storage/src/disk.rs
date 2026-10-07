@@ -10,7 +10,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,9 @@ pub trait Disk {
     /// Replaces `to` with `from`. Durable only once the directory is synced.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn remove(&self, path: &Path) -> io::Result<()>;
+    /// The files in `directory`, sorted by name. A segmented log finds its
+    /// segments this way when it recovers.
+    fn list(&self, directory: &Path) -> io::Result<Vec<PathBuf>>;
     /// Makes the entries of `directory` durable, a rename among them.
     fn sync_directory(&self, directory: &Path) -> io::Result<()>;
     /// Monotonic time since an arbitrary origin. Storage latency is the
@@ -106,6 +109,18 @@ impl Disk for OsDisk {
 
     fn remove(&self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
+    }
+
+    fn list(&self, directory: &Path) -> io::Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
+        Ok(paths)
     }
 
     fn sync_directory(&self, directory: &Path) -> io::Result<()> {

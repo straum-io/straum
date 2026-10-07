@@ -12,7 +12,7 @@ as the Phase 1–2 audit — the trace, and the map of what the implementation
 contradicted — and the sections after §110 are the work that followed.
 The table in §108 carries each finding's current state.
 
-`docs/cluster.md` (§70–§83a) decides *who owns a session* and what crosses the
+`docs/archive/cluster.md` (§70–§83a) decides *who owns a session* and what crosses the
 network for ownership. This file is about a different question: **what it takes
 for an acknowledged message to exist on more than one machine**, and where the
 existing implementation already allows that and where it contradicts it.
@@ -117,7 +117,7 @@ Against `docs/storage.md` §73–§104 and `CLAUDE.md` §7–§8.
 | C11 | `docs/storage.md` §80 defines three modes; a fourth changes a table that four documents quote | documentation | no |
 | C12 | **The WAL sequence regressed across compaction plus restart**, and so did the correlation: both were derived from what survived a rewrite | **correctness / durability** | **fixed** — `STRAUMW3` carries the allocation state in the header (§116) |
 
-C6 and C10 were already on the work order in `docs/cluster.md` §83a. C1, C2,
+C6 and C10 were already on the work order in `docs/archive/cluster.md` §83a. C1, C2,
 C3, C4, C7 and C9 are new.
 
 Two neighbouring places were checked for the same defect and are clean. The

@@ -2,11 +2,12 @@
 
 - Status: accepted
 - Date: 2026-10-04
+- Amended by: ADR-0008 (D-48 C: the broker and replication are rewritten for gateway/sequencer now, ahead of the phase order)
 - Decided by: Stanislav
 - Source: docs/architecture/unified-stream.md §2.7, §6
 - Supersedes: "Out of scope: MQTT 5, QoS 2, shared subscriptions" in the
   former CLAUDE.md §6 (now docs/architecture/current-implementation.md) and
-  docs/VISION.md V4 where it ruled MQTT 5 out
+  docs/archive/VISION.md V4 where it ruled MQTT 5 out
 
 ## Context
 

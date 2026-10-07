@@ -1,0 +1,26 @@
+[package]
+name = "node"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "The runtime driver of the new path: links, sequencer or replica, log on disk, apply (ADR-0008 step 4)"
+
+[lints]
+workspace = true
+
+[dependencies]
+apply = { path = "../apply" }
+bytes = "1"
+cluster = { path = "../cluster" }
+gateway = { path = "../gateway" }
+journal = { path = "../journal" }
+storage = { path = "../storage" }
+transport = { path = "../transport" }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+codec = { path = "../codec" }
+domain = { path = "../domain" }
+rumqttc = { version = "0.24", default-features = false }
