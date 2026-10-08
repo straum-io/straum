@@ -62,8 +62,10 @@ crates beside the old leader/follower path, which keeps working until step
 function over committed records) and 3b-2 (`gateway`: MQTT clients over the
 log, end to end in `sim`) are done; step 4 (`node`: the runtime driver —
 links, sequencer or replica, the log on disk, the gateway over TCP — three
-nodes on loopback in tests) is done in part (log retention and
-configuration open: D-67, D-68) and not yet wired into the server. The
+nodes on loopback in tests, local snapshots and compaction, D-67 B) is
+done; step 5 (`cluster::Voter`: ungraceful takeover by durable promises,
+`SlotStart` and truncation by the slot table, D-69 A) is done; none is
+wired into the server yet. The
 progress of each step is recorded in ADR-0008. ADR-0006
 keeps the durability levels for a single node and allows only majority
 commit in a cluster.
@@ -251,7 +253,7 @@ e2e (dev only) → runtime, rumqttc
 | codec | domain | bytes, thiserror | tokio, every other workspace crate |
 | apply | domain, journal | bytes, thiserror | tokio, every other workspace crate |
 | gateway | apply, codec, domain, journal | bytes | tokio, every other workspace crate |
-| node | apply, cluster, gateway, journal, storage, transport | bytes, thiserror, tokio, tracing | protocol, mqtt, replication, broker, runtime, server, sim |
+| node | apply, cluster, gateway, journal, storage, transport | bytes, crc32fast, thiserror, tokio, tracing | protocol, mqtt, replication, broker, runtime, server, sim |
 | broker | domain, protocol, auth | bytes, thiserror, tracing | tokio, mqtt, transport, runtime, server, storage |
 | runtime | domain, protocol, mqtt, transport, broker, storage, replication | thiserror, tokio, tracing | server |
 | server | runtime | tokio, tracing, tracing-subscriber | — |
@@ -284,7 +286,7 @@ tokio-rustls transport: TLS. Not something to hand-roll, and rustls is pure
              NASM) — which does compile C, so the cross-target clippy for
              Linux only runs in the container now (§17).
 rustls-pemfile transport: reading the certificate and key from PEM.
-crc32fast    storage: WAL record checksums. The hand-rolled table version
+crc32fast    storage: WAL record checksums; node: the snapshot file's checksum. The hand-rolled table version
              measured 244 MB/s against 15 GB/s here — below NVMe write
              throughput, so it would have capped the WAL. Same polynomial,
              identical values, one transitive dependency (cfg-if).

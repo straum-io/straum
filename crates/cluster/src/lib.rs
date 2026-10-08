@@ -10,17 +10,22 @@
 //!
 //! What this step builds, and what it leaves for later steps:
 //!
-//! * The slot owner is fixed by configuration. Taking over a slot (promises,
-//!   truncation by the slot table) is step 5, handoff step 6.
+//! * [`Sequencer`] and [`Replica`] serve one slot whose owner is fixed;
+//!   [`Voter`] (step 5) runs a node across slots: it follows the owner,
+//!   takes the next slot over when that owner falls silent (durable
+//!   promises from a majority, the longest of their logs, `SlotStart`), and
+//!   cuts a tail from an older slot where the slot table proves it differs.
+//!   Planned handoff (`SlotEnd`) is step 6.
 //! * Star topology: the sequencer sends to every replica directly (§2.6).
 //! * Commit is a majority of voters durable (§2.3), as a prefix: the highest
 //!   lsn that a majority holds durably. It only grows.
 //! * The sequencer ships only what is durable in its own log. A replica's log
-//!   is therefore always a prefix of the sequencer's durable log, and a
-//!   sequencer that restarts after a power loss has lost nothing a replica
-//!   holds — no divergent suffix can exist with one fixed owner. Shipping
-//!   before the local sync, in parallel with it, needs the takeover of step 5
-//!   on every sequencer restart (D-58).
+//!   is therefore always a prefix of the sequencer's durable log within a
+//!   slot. Across slots a replica may hold a tail of an older slot the new
+//!   owner's log does not have; its durability counts toward commit only
+//!   once its log ends in the sequencer's slot. A restarted [`Voter`] never
+//!   leads its old slot again, which is what would let a sequencer ship
+//!   before its own sync (D-58); it still syncs first.
 //! * A replica accepts a batch only from the slot's owner, only in the
 //!   current slot, only as the continuation of its own log, and only if the
 //!   `prev_hash` chain holds (§2.2, invariant 5).
@@ -30,7 +35,10 @@
 //! have been sent beyond what it has made durable (`window`). A replica
 //! further behind is caught up from the log, one batch at a time.
 
+mod voter;
 pub mod wire;
+
+pub use voter::Voter;
 
 use std::collections::VecDeque;
 
@@ -59,6 +67,11 @@ pub struct Config {
     /// makes no new batch: proposals wait in the queue, which refuses when
     /// full, so the uncommitted tail a driver holds is bounded.
     pub max_uncommitted: u64,
+    /// Heartbeats without hearing from the slot's owner before the next
+    /// node in the schedule takes the slot over ([`Voter`], step 5); each
+    /// further period of silence passes the turn to the node after it.
+    /// Time only starts a takeover; the promises decide it (§1).
+    pub takeover_ticks: u32,
 }
 
 impl Config {
@@ -66,6 +79,36 @@ impl Config {
     pub fn majority(&self) -> usize {
         self.nodes.len() / 2 + 1
     }
+
+    /// The node that may write `slot` (§2.2): `owner` for `self.slot`, then
+    /// the voters in turn. No one owns a slot before the first.
+    pub fn owner_of(&self, slot: u64) -> Option<NodeId> {
+        let count = u64::try_from(self.nodes.len()).ok().filter(|&n| n > 0)?;
+        let first = self.nodes.iter().position(|&id| id == self.owner)?;
+        let steps = slot.checked_sub(self.slot)?;
+        let index = (u64::try_from(first).ok()? + steps % count) % count;
+        self.nodes.get(usize::try_from(index).ok()?).copied()
+    }
+}
+
+/// The last lsn of the latest slot at or below `slot` in a log whose slot
+/// table is `slots` (slot, first lsn; ascending) and which ends at `end`:
+/// where a log whose last record is in `slot` stops agreeing with this one,
+/// at the latest (Kafka's leader-epoch rule).
+pub(crate) fn end_of_slot(slots: &[(u64, u64)], slot: u64, end: u64) -> u64 {
+    slots
+        .iter()
+        .find(|&&(s, _)| s > slot)
+        .map_or(end, |&(_, first)| first.saturating_sub(1))
+}
+
+/// The slot of the record at `lsn` by the slot table; 0 for no record.
+pub(crate) fn slot_at(slots: &[(u64, u64)], lsn: u64) -> u64 {
+    slots
+        .iter()
+        .take_while(|&&(_, first)| first <= lsn)
+        .last()
+        .map_or(0, |&(slot, _)| slot)
 }
 
 /// What travels between nodes. The wire encoding comes with the runtime
@@ -81,15 +124,46 @@ impl Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// Sequencer → replica: one complete batch, record by record as the
-    /// sequencer's log holds it, and the commit point. No records: a
-    /// heartbeat that carries the commit point and asks for an `Ack`.
+    /// sequencer's log holds it, following lsn `prev`, whose record is in
+    /// `prev_slot`, and the commit point. No records: a heartbeat that
+    /// carries the commit point and asks for an `Ack`.
     Append {
         slot: u64,
+        prev: u64,
+        prev_slot: u64,
         records: Vec<Vec<u8>>,
         commit: u64,
     },
-    /// Replica → sequencer: its log ends at `end`, durable through `durable`.
-    Ack { slot: u64, end: u64, durable: u64 },
+    /// Replica → sequencer: its log ends at `end`, whose record is in
+    /// `last_slot`, durable through `durable`. `cut`: it cut its log back
+    /// and has taken nothing since — its position went back, which no other
+    /// report may move it to: a stale one could, and lose it.
+    Ack {
+        slot: u64,
+        last_slot: u64,
+        end: u64,
+        durable: u64,
+        cut: bool,
+    },
+    /// Candidate → every voter: promise to accept nothing of a slot below
+    /// `slot`, and say where your log ends (§2.4, ungraceful).
+    Promise { slot: u64 },
+    /// The promise, durable before it is sent, and the log's end.
+    Promised { slot: u64, last_slot: u64, end: u64 },
+    /// Candidate → the voter with the longest log: what follows mine?
+    Fetch { slot: u64, last_slot: u64, end: u64 },
+    /// One batch following lsn `after`, whose record is in `after_slot`.
+    /// Where the asker's log parts from that, it cuts back first. No records
+    /// at the asker's end: nothing more.
+    Fetched {
+        slot: u64,
+        /// The asker's end this answers: an answer to an older question is
+        /// ignored.
+        asked: u64,
+        after: u64,
+        after_slot: u64,
+        records: Vec<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,12 +198,26 @@ pub enum Effect {
     Lost {
         to: NodeId,
     },
+    /// Make "this node accepts nothing below `slot`" durable, then call
+    /// [`Voter::on_promised`]. Nothing that depends on it is sent before
+    /// (§2.2).
+    Promise {
+        slot: u64,
+    },
+    /// Cut the local log back to end at `after` — a tail from an older slot
+    /// that the new owner's log does not have, never below the commit point —
+    /// then call [`Voter::on_truncated`] with the chain there.
+    Truncate {
+        after: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ClusterError {
     #[error("the proposal queue is full")]
     Full,
+    #[error("this node is not the slot's sequencer")]
+    NotLeader,
     #[error("{0}")]
     Chain(#[from] ChainError),
 }
@@ -165,6 +253,15 @@ struct Peer {
     stalled_ticks: u32,
     backoff: u32,
     durable: u64,
+    /// Its last report ended in this sequencer's slot: its log is a prefix
+    /// of this one, and only then does its durability count toward commit.
+    /// A log ending in an older slot may hold records this one does not.
+    in_slot: bool,
+    /// Its log ends in a slot this one does not have: where the two agree
+    /// is not known yet, and no point is known to be a batch boundary in
+    /// both. It gets only heartbeats, which carry the slot at its position,
+    /// until it cuts back into a slot both logs share.
+    probing: bool,
     /// A read from the log is outstanding for it, starting here.
     reading: Option<u64>,
     /// Shipped from the log rather than from memory since the last
@@ -190,6 +287,8 @@ fn last_lsn(records: &[Vec<u8>]) -> Option<u64> {
 #[derive(Debug)]
 pub struct Sequencer {
     config: Config,
+    /// The local log's slot table: (slot, first lsn), ascending.
+    slots: Vec<(u64, u64)>,
     /// After the last batch handed to the log.
     chain: Chain,
     durable: u64,
@@ -204,6 +303,24 @@ impl Sequencer {
     /// A sequencer over a log that ends with `chain` — recovered, its torn
     /// batch cut and, being reopened, durable (D-43).
     pub fn new(config: Config, chain: Chain) -> Self {
+        let durable = chain.next_lsn().saturating_sub(1);
+        let slots = if durable > 0 {
+            vec![(chain.slot(), 1)]
+        } else {
+            Vec::new()
+        };
+        Self::with(config, chain, durable, 0, slots)
+    }
+
+    /// A sequencer taking over a log that ends with `chain`, durable through
+    /// `durable`, known committed through `commit`, with slot table `slots`.
+    pub fn with(
+        config: Config,
+        chain: Chain,
+        durable: u64,
+        commit: u64,
+        slots: Vec<(u64, u64)>,
+    ) -> Self {
         let peers = config
             .nodes
             .iter()
@@ -217,16 +334,19 @@ impl Sequencer {
                 stalled_ticks: 0,
                 backoff: 1,
                 durable: 0,
+                in_slot: false,
+                probing: false,
                 reading: None,
                 from_log: false,
                 lost: false,
             })
             .collect();
         Self {
-            durable: chain.next_lsn().saturating_sub(1),
+            durable,
             config,
+            slots,
             chain,
-            commit: 0,
+            commit,
             peers,
             queue: VecDeque::new(),
             recent: VecDeque::new(),
@@ -245,6 +365,15 @@ impl Sequencer {
     /// The last lsn handed to the log.
     pub fn end(&self) -> u64 {
         self.chain.next_lsn().saturating_sub(1)
+    }
+
+    pub fn slot(&self) -> u64 {
+        self.config.slot
+    }
+
+    /// After the last batch handed to the log.
+    pub fn chain(&self) -> Chain {
+        self.chain
     }
 
     pub fn take_effects(&mut self) -> Vec<Effect> {
@@ -293,10 +422,27 @@ impl Sequencer {
 
     /// Makes one batch of what is queued and hands it to the log.
     pub fn flush(&mut self) -> Result<(), ClusterError> {
-        if self.queue.is_empty() {
+        if self.end().saturating_sub(self.commit) >= self.config.max_uncommitted {
             return Ok(());
         }
-        if self.end().saturating_sub(self.commit) >= self.config.max_uncommitted {
+        self.batch()
+    }
+
+    /// The first batch of a slot taken over: alone, and past the
+    /// uncommitted bound. A new owner may inherit more uncommitted records
+    /// than the bound from the slots before, and only this batch's commit
+    /// can commit them; held back by the bound, it would never be made
+    /// (found by the takeover simulation, seed 1).
+    pub(crate) fn begin_slot(&mut self, start: Proposal) -> Result<(), ClusterError> {
+        if !self.queue.is_empty() {
+            return Err(ClusterError::Full);
+        }
+        self.queue.push_back(start);
+        self.batch()
+    }
+
+    fn batch(&mut self) -> Result<(), ClusterError> {
+        if self.queue.is_empty() {
             return Ok(());
         }
         let take = self.queue.len().min(self.config.max_batch);
@@ -316,6 +462,9 @@ impl Sequencer {
             self.chain.batch(self.config.slot, &entries, &mut records)?;
         }
         self.queue.drain(..take);
+        if self.slots.last().map(|&(slot, _)| slot) != Some(self.config.slot) {
+            self.slots.push((self.config.slot, first));
+        }
         let last = self.end();
         self.effects.push(Effect::Append {
             first,
@@ -340,15 +489,66 @@ impl Sequencer {
     }
 
     pub fn on_message(&mut self, from: NodeId, message: Message) {
-        let Message::Ack { slot, end, durable } = message else {
+        let Message::Ack {
+            slot,
+            last_slot,
+            end,
+            durable,
+            cut,
+        } = message
+        else {
             return;
         };
         if slot != self.config.slot {
             return;
         }
+        let own_end = self.end();
+        let meets = end_of_slot(&self.slots, last_slot, own_end);
         let Some(peer) = self.peers.iter_mut().find(|peer| peer.id == from) else {
             return;
         };
+        // An empty log holds nothing to repair: a stale report of one, taken
+        // for a repair, moved a replica back below what was compacted and
+        // lost it (the apply simulation, seed 19). A cut says so itself.
+        if cut || (last_slot != self.config.slot && end > 0) {
+            // A log ending in an older slot: it may hold records this one
+            // does not, and it may cut them. Ship from where the two meet
+            // as it reports itself now — its position and durability can go
+            // back, unlike a replica's in this slot, which only grows (found
+            // by the takeover simulation, seed 2: a replica that cut its tail
+            // was never shipped to again). Its durability does not count
+            // toward commit until it is in this slot.
+            let at = meets.min(end);
+            // Shipping needs `at` to be a batch boundary in this log. The end
+            // of one of its slots is; the replica's end is when the slot it
+            // ends in is one both logs share — the records are the same
+            // ones there. A slot only the replica has: a probe first, which
+            // carries the slot here at `at` (found by the takeover
+            // simulation, seed 1010: shipping from such an end read from
+            // inside a batch, and lost the replica).
+            let shared = self
+                .slots
+                .iter()
+                .take_while(|&&(s, _)| s <= last_slot)
+                .last()
+                .map(|&(s, _)| s);
+            // `at` is a batch boundary here if it ends a slot of this log;
+            // the replica's end only if that slot is one both logs share.
+            peer.probing = at < meets && shared != Some(last_slot);
+            peer.in_slot = false;
+            peer.known = true;
+            peer.durable = durable.min(at);
+            peer.end = at;
+            peer.reported = at;
+            peer.reading = None;
+            if let Some(index) = self.peers.iter().position(|peer| peer.id == from) {
+                self.ship(index);
+            }
+            return;
+        }
+        // An empty log is a prefix of every log.
+        peer.in_slot = last_slot == self.config.slot || end == 0;
+        peer.probing = false;
         // Durable only grows: what a replica synced survives its restarts,
         // and an older report overtaken by a newer one says less, not other.
         peer.durable = peer.durable.max(durable.min(end));
@@ -390,12 +590,15 @@ impl Sequencer {
         let Some(last) = last_lsn(&records) else {
             return;
         };
+        let prev = peer.end;
         peer.end = last;
         peer.from_log = true;
         self.effects.push(Effect::Send {
             to,
             message: Message::Append {
                 slot,
+                prev,
+                prev_slot: slot_at(&self.slots, prev),
                 records,
                 commit,
             },
@@ -418,6 +621,16 @@ impl Sequencer {
         if let Some(peer) = self.peers.get_mut(index) {
             peer.reading = None;
             peer.from_log = false;
+            if !peer.in_slot {
+                // A replica in repair is placed by each report, and a stale
+                // one can place it below what was compacted since: forget
+                // where it is and wait for the next, rather than lose it
+                // (found by the apply simulation, seed 19). One that really
+                // needs what is gone waits here, unshipped, as a lost one
+                // would, until state copy (step 7b).
+                peer.known = false;
+                return;
+            }
             peer.lost = true;
             self.effects.push(Effect::Lost { to });
         }
@@ -475,6 +688,8 @@ impl Sequencer {
                 to: peer.id,
                 message: Message::Append {
                     slot: self.config.slot,
+                    prev: peer.end,
+                    prev_slot: slot_at(&self.slots, peer.end),
                     records: Vec::new(),
                     commit: self.commit,
                 },
@@ -484,14 +699,31 @@ impl Sequencer {
     }
 
     fn advance_commit(&mut self) {
-        let mut durable: Vec<u64> = self.peers.iter().map(|peer| peer.durable).collect();
+        // Only a replica whose log is a prefix of this one counts: one
+        // ending in an older slot may hold other records at those lsns.
+        let mut durable: Vec<u64> = self
+            .peers
+            .iter()
+            .map(|peer| if peer.in_slot { peer.durable } else { 0 })
+            .collect();
         durable.push(self.durable);
         durable.sort_unstable_by(|a, b| b.cmp(a));
         let candidate = durable
             .get(self.config.majority().saturating_sub(1))
             .copied()
             .unwrap_or(0);
-        if candidate > self.commit {
+        // A slot commits only through a record of its own: the commit point
+        // reaches this slot's first lsn or does not move. Records of older
+        // slots commit with it, never by counting their copies — copies a
+        // later takeover may not see (found by the takeover simulation, seed
+        // 5985: a slot 31 sequencer committed lsn 2, a slot 1 record, and a
+        // log without it later won).
+        let start = self
+            .slots
+            .iter()
+            .find(|&&(slot, _)| slot == self.config.slot)
+            .map(|&(_, first)| first);
+        if candidate > self.commit && start.is_some_and(|start| candidate >= start) {
             self.commit = candidate;
             self.effects.push(Effect::Committed(candidate));
         }
@@ -512,6 +744,7 @@ impl Sequencer {
             };
             if !peer.known
                 || peer.lost
+                || peer.probing
                 || peer.reading.is_some()
                 || peer.end >= self.durable
                 || peer.end.saturating_sub(peer.durable) >= self.config.window
@@ -521,6 +754,7 @@ impl Sequencer {
             let from = peer.end.saturating_add(1);
             match self.recent.iter().find(|batch| batch.first == from) {
                 Some(batch) if batch.last <= self.durable => {
+                    let prev = peer.end;
                     peer.end = batch.last;
                     if std::mem::take(&mut peer.from_log) {
                         self.effects.push(Effect::ReadDone { to: peer.id });
@@ -529,6 +763,8 @@ impl Sequencer {
                         to: peer.id,
                         message: Message::Append {
                             slot: self.config.slot,
+                            prev,
+                            prev_slot: slot_at(&self.slots, prev),
                             records: batch.records.clone(),
                             commit: self.commit,
                         },
@@ -551,6 +787,8 @@ pub struct Replica {
     /// At the end of the log, after its last complete batch.
     verifier: Verifier,
     end: u64,
+    /// The slot of the record at `end`.
+    last_slot: u64,
     durable: u64,
     commit: u64,
     refused: u64,
@@ -565,6 +803,7 @@ impl Replica {
             config,
             verifier: Verifier::new(chain),
             end,
+            last_slot: chain.slot(),
             durable: end,
             commit: 0,
             refused: 0,
@@ -601,6 +840,7 @@ impl Replica {
             slot,
             records,
             commit,
+            ..
         } = message
         else {
             return;
@@ -642,6 +882,9 @@ impl Replica {
         let first = self.end.saturating_add(1);
         self.verifier = verifier;
         self.end = last;
+        if let Some(record) = records.last().and_then(|r| decode(r).ok()) {
+            self.last_slot = record.slot;
+        }
         self.effects.push(Effect::Append { first, records });
     }
 
@@ -656,8 +899,10 @@ impl Replica {
             to: self.config.owner,
             message: Message::Ack {
                 slot: self.config.slot,
+                last_slot: self.last_slot,
                 end: self.end,
                 durable: self.durable,
+                cut: false,
             },
         });
     }

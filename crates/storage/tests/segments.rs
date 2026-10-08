@@ -183,3 +183,36 @@ fn segments_on_the_operating_systems_disk_recover_in_order() {
     assert_eq!(numbers(&seen), (1..key).collect::<Vec<_>>());
     std::fs::remove_dir_all(&directory).unwrap();
 }
+
+/// A tail spanning segments is cut at a batch boundary: later segments go
+/// whole, the one holding the boundary is cut, and writing continues there.
+#[test]
+fn a_tail_is_cut_across_segments_and_writing_continues_after_it() {
+    let disk = SimDisk::new();
+    let (mut log, _) = open(&disk);
+    let end = write(&mut log, 1, 12, 3, true);
+    let before: Vec<u64> = log.keys().collect();
+    assert!(before.len() > 3, "{before:?}");
+    // Inside the second segment, at a batch's end.
+    let last = before[1] + 2;
+    log.truncate_after(last).unwrap();
+    assert!(
+        log.keys().all(|k| k <= last),
+        "{:?}",
+        log.keys().collect::<Vec<_>>()
+    );
+    let next = write(&mut log, last + 1, 2, 3, true);
+    drop(log);
+    let (_, seen) = open(&disk);
+    assert_eq!(numbers(&seen), (1..next).collect::<Vec<_>>());
+    assert!(next < end);
+
+    // Back to nothing: every segment goes, and the log starts again.
+    let (mut log, _) = open(&disk);
+    log.truncate_after(0).unwrap();
+    assert_eq!(log.keys().count(), 0);
+    write(&mut log, 1, 1, 3, true);
+    drop(log);
+    let (_, seen) = open(&disk);
+    assert_eq!(numbers(&seen), vec![1, 2, 3]);
+}

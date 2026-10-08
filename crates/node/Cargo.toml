@@ -12,6 +12,7 @@ workspace = true
 apply = { path = "../apply" }
 bytes = "1"
 cluster = { path = "../cluster" }
+crc32fast = "1"
 gateway = { path = "../gateway" }
 journal = { path = "../journal" }
 storage = { path = "../storage" }

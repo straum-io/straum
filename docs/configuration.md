@@ -74,7 +74,7 @@ Defaults below are **initial**. They are adjusted by benchmarks, not intuition.
 
 The `codec` crate takes the limits above in its own `codec::Limits`, with the
 same defaults, plus one of its own. None is read from the environment until
-the server runs the new path (step 7, D-68); then each gets a variable here.
+the server runs the new path (step 7, D-68 A); then each gets a variable here.
 
 | Limit | Default | Notes |
 |---|---|---|
@@ -84,7 +84,7 @@ the server runs the new path (step 7, D-68); then each gets a variable here.
 
 Bounds the apply function decides from the log. Every node must run with the
 same values: they are part of what the log means. None is read from the
-environment until the server runs the new path (step 7, D-68).
+environment until the server runs the new path (step 7, D-68 A).
 
 | Limit | Default | Notes |
 |---|---|---|
@@ -119,9 +119,12 @@ lets the server start in cluster mode.
 
 | Setting | Notes |
 |---|---|
-| `core` | `cluster::Config`: id, voters, slot owner, replication window, queue, batch, `max_uncommitted`. |
+| `core` | `cluster::Config`: id, voters, the first slot's owner, replication window, queue, batch, `max_uncommitted`, `takeover_ticks` (heartbeats of silence before the next node in the schedule takes the slot over; step 5). |
+| `data` (step 5) | Also holds `promise`: the highest slot promised, synced before any answer. |
 | `listen`, `peers` | Where other nodes connect to this one; where to reach each of them. One TCP connection per direction. |
-| `data` | The segmented log and the `incarnation` file (the gateway's `first_session`, made durable before use). |
+| `data` | The segmented log, the `snapshot` file (the applied state at one lsn, D-67 B) and the `incarnation` file (the gateway's `first_session`, made durable before use). |
+| `retain_bytes` | D-57 A: the log keeps no more than this behind a replica that is only slow; one further behind is lost until state copy (step 7b). |
+| `snapshot_every` | Applied records between snapshots; segments wholly below the last durable snapshot and the retention floor are removed after it is written. |
 | `segments` | `storage::SegmentLimits`. |
 | `limits` | `apply::Limits`, the table above. A link whose HELLO carries another digest of them is refused. |
 | `heartbeat` | Sequencer tick and gateway tick. |

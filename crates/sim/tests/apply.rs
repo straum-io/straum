@@ -103,6 +103,7 @@ fn config(id: u8) -> Config {
         max_batch: 4,
         recent_batches: 4,
         max_uncommitted: 1_000_000,
+        takeover_ticks: 3,
     }
 }
 
@@ -145,6 +146,13 @@ struct Node {
     written: usize,
     durable: usize,
     state: State,
+    /// The last snapshot of `state`, taken only at a durable lsn; survives
+    /// crashes and power losses, as the node's snapshot file does (D-67 B).
+    snapshot: Option<Vec<u8>>,
+    /// Records below this index are compacted away: emptied, so any read of
+    /// one fails the run, and a restart can only rebuild from the snapshot
+    /// and the log after it.
+    floor: usize,
     /// Survives crashes, as a gateway's durable counter would: sessions of
     /// incarnation k are numbered from k * 1000.
     incarnation: u64,
@@ -455,6 +463,10 @@ struct Stats {
     restarts: u64,
     power_losses: u64,
     forwards_dropped: u64,
+    snapshots: u64,
+    snapshot_restarts: u64,
+    compactions: u64,
+    compacted_restarts: u64,
 }
 
 struct World {
@@ -495,6 +507,8 @@ impl World {
                     written: 0,
                     durable: 0,
                     state: State::new(LIMITS),
+                    snapshot: None,
+                    floor: 0,
                     incarnation: 0,
                     next_session: 0,
                     live: BTreeMap::new(),
@@ -519,8 +533,16 @@ impl World {
     fn start(&mut self, id: u8) {
         self.network.retain(|(_, to, _)| *to != id);
         let node = &mut self.nodes[usize::from(id)];
-        let mut verifier = Verifier::new(Chain::genesis());
-        for record in &node.records {
+        // A compacted log resumes the chain at its first record left.
+        let start = match node.records.get(node.floor) {
+            Some(first) if node.floor > 0 => {
+                let first = decode(first).unwrap();
+                Chain::resume(first.prev_hash, node.floor as u64, first.slot)
+            }
+            _ => Chain::genesis(),
+        };
+        let mut verifier = Verifier::new(start);
+        for record in &node.records[node.floor..] {
             verifier.feed(record).unwrap();
         }
         let tail = verifier.finish();
@@ -529,7 +551,26 @@ impl World {
         node.written = node.records.len();
         // Reopening makes what it recovered durable (D-43).
         node.durable = node.records.len();
-        node.state = State::new(LIMITS);
+        // From the snapshot, then the log after it: every lsn applied from
+        // here is checked against the other nodes' digests as before.
+        node.state = match &node.snapshot {
+            Some(bytes) => State::decode(LIMITS, bytes).unwrap(),
+            None => State::new(LIMITS),
+        };
+        let from = node.state.applied();
+        let end = node.records.len() as u64;
+        if from > end {
+            self.fail(&format!(
+                "node {id}: snapshot at {from} is ahead of its log, which ends at {end}"
+            ));
+        }
+        let node = &mut self.nodes[usize::from(id)];
+        if from > 0 {
+            self.stats.snapshot_restarts += 1;
+        }
+        if node.floor > 0 {
+            self.stats.compacted_restarts += 1;
+        }
         node.incarnation += 1;
         node.next_session = node.incarnation * 1000;
         node.live.clear();
@@ -542,6 +583,45 @@ impl World {
         // Whatever the previous incarnation's sessions left goes.
         self.send(id, Proposal::NodeReset { node: id, below });
         self.drain(id);
+    }
+
+    /// What the node does every `snapshot_every` records: encode the
+    /// applied state, if it is no further than the durable log.
+    fn snapshot(&mut self, id: u8) {
+        let node = &mut self.nodes[usize::from(id)];
+        if node.state.applied() > node.durable as u64 {
+            return;
+        }
+        let mut bytes = Vec::new();
+        node.state.encode(&mut bytes);
+        node.snapshot = Some(bytes);
+        self.stats.snapshots += 1;
+        // Then what the node gives back: below the snapshot, and below what
+        // the sequencer still ships to a replica or a replica has committed;
+        // at a batch's end, where a segment would start, and never the last
+        // durable record, which says where the log stands.
+        let Some(core) = node.core.as_ref() else {
+            return;
+        };
+        let floor = match core {
+            Core::Sequencer(s) => s.compaction_floor(0),
+            Core::Replica(r) => r.commit(),
+        };
+        let mut floor = usize::try_from(floor.min(node.state.applied()))
+            .unwrap()
+            .min(node.durable.saturating_sub(1));
+        while floor > node.floor
+            && decode(&node.records[floor]).unwrap().kind != journal::Kind::BatchHeader
+        {
+            floor -= 1;
+        }
+        if floor > node.floor {
+            for record in &mut node.records[node.floor..floor] {
+                *record = Vec::new();
+            }
+            node.floor = floor;
+            self.stats.compactions += 1;
+        }
     }
 
     fn crash(&mut self, id: u8, power: bool) {
@@ -580,6 +660,14 @@ impl World {
                     Step::Read { to, from } => {
                         let node = &self.nodes[usize::from(id)];
                         let start = usize::try_from(from - 1).unwrap();
+                        if start < node.floor {
+                            if let Some(Core::Sequencer(s)) =
+                                self.nodes[usize::from(id)].core.as_mut()
+                            {
+                                s.on_read_missing(to, from);
+                            }
+                            continue;
+                        }
                         let header = decode(&node.records[start]).unwrap();
                         let count = journal::BatchHeader::decode(header.body).unwrap().records;
                         let batch =
@@ -591,6 +679,10 @@ impl World {
                     }
                     Step::Committed(lsn) if id == SEQUENCER => self.freeze(lsn),
                     Step::Committed(_) | Step::ReadDone { .. } | Step::Lost { .. } => {}
+                    // A fixed sequencer and its replicas never take a slot over.
+                    Step::Promise { .. } | Step::Truncate { .. } => {
+                        unreachable!("no takeover in a fixed-owner cluster")
+                    }
                 }
             }
         }
@@ -669,7 +761,11 @@ impl World {
         let holding = self
             .nodes
             .iter()
-            .filter(|n| n.durable > index && n.records.get(index).is_some_and(|r| r == bytes))
+            // A record compacted after commit counts as held (D-57 A).
+            .filter(|n| {
+                n.floor > index
+                    || (n.durable > index && n.records.get(index).is_some_and(|r| r == bytes))
+            })
             .count();
         if holding < usize::from(NODES) / 2 + 1 {
             self.fail(&format!(
@@ -897,6 +993,9 @@ impl World {
                 if self.up(id) {
                     let sync = self.rng.chance(70);
                     self.write(id, sync);
+                    if self.rng.chance(15) {
+                        self.snapshot(id);
+                    }
                 }
             }
             43..=74 => {
@@ -1063,9 +1162,13 @@ fn effects_follow_commit_and_mean_what_the_committed_log_means() {
         total.restarts += s.restarts;
         total.power_losses += s.power_losses;
         total.forwards_dropped += s.forwards_dropped;
+        total.snapshots += s.snapshots;
+        total.snapshot_restarts += s.snapshot_restarts;
+        total.compactions += s.compactions;
+        total.compacted_restarts += s.compacted_restarts;
     }
     println!(
-        "committed {} effects checked {} deliveries {} acked {} slow-consumer closes {} subscriptions refused {} restarts {} power losses {} forwards dropped {}",
+        "committed {} effects checked {} deliveries {} acked {} slow-consumer closes {} subscriptions refused {} restarts {} power losses {} forwards dropped {} snapshots {} restarts from a snapshot {} compactions {} restarts of a compacted log {}",
         total.committed,
         total.effects,
         total.deliveries,
@@ -1074,11 +1177,16 @@ fn effects_follow_commit_and_mean_what_the_committed_log_means() {
         total.refused,
         total.restarts,
         total.power_losses,
-        total.forwards_dropped
+        total.forwards_dropped,
+        total.snapshots,
+        total.snapshot_restarts,
+        total.compactions,
+        total.compacted_restarts
     );
     if std::env::var("STRAUM_SIM_SEED").is_err() {
         assert!(total.committed > 0 && total.deliveries > 0 && total.acked > 0);
         assert!(total.closes > 0 && total.refused > 0 && total.restarts > 0);
         assert!(total.power_losses > 0 && total.forwards_dropped > 0);
+        assert!(total.snapshot_restarts > 0 && total.compacted_restarts > 0);
     }
 }

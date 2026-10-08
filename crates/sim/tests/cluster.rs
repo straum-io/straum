@@ -102,6 +102,7 @@ fn config(id: u8, seed: u64) -> Config {
         } else {
             1_000_000
         },
+        takeover_ticks: 3,
     }
 }
 
@@ -324,6 +325,9 @@ impl World {
                 self.check_against_oracle(id);
             }
             Effect::Send { to, message } => self.network.push((id, to, message)),
+            Effect::Promise { .. } | Effect::Truncate { .. } => {
+                self.fail(&format!("node {id}: a fixed-owner core took a slot over"));
+            }
             Effect::Read { to, from } => self.nodes[usize::from(id)].reads.push_back((to, from)),
             Effect::ReadDone { to } => {
                 let node = &mut self.nodes[usize::from(id)];

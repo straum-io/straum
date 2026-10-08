@@ -1,8 +1,7 @@
 # ADR-0008: Rewrite the broker and replication for gateway/sequencer now
 
-- Status: accepted (direction); steps 1, 2, 3a, 3b-1 and 3b-2 done, step 4
-  done in part (see Progress); D-49…D-66 decided or withdrawn; open: D-67,
-  D-68, D-69
+- Status: accepted (direction); steps 1, 2, 3a, 3b-1, 3b-2, 4 and 5 done
+  (see Progress); D-49…D-69 decided or withdrawn
 - Date: 2026-10-04
 - Decided by: Stanislav (D-48: C)
 - Deviations from: docs/architecture/unified-stream.md §6 (the order of
@@ -87,8 +86,9 @@ touch; the old path keeps working until a step replaces it (D-49).
    only, which is enough while no remote input reaches it);
    `sim`: invariant 4. Invariant 7 at this step means one gateway: at most one
    live session per client id within it; across gateways it waits for step 7.
-4. The runtime driver for cluster mode: inter-node links, forwarding,
-   configuration and its startup checks (ADR-0006); e2e tests over TCP.
+4. The runtime driver for cluster mode: inter-node links, forwarding; e2e
+   tests over TCP. Its configuration and startup checks (ADR-0006) moved to
+   step 7, where the server stops refusing cluster mode (D-68 A).
 5. Ungraceful takeover: durable promises with fsync before the reply, the
    slot table and truncation; `sim`: invariants 2 and 6, partitions. A
    sequencer restart becomes a takeover, and only then may the sequencer
@@ -98,14 +98,17 @@ touch; the old path keeps working until a step replaces it (D-49).
 7. Sessions, takeover across gateways, expiry and will through the log
    (the gateway proposes; the sequencer writes `SessionExpired`,
    `MessageExpired`, `WillPublished`); Assigned Client Identifier; `sim`:
-   invariants 7 and 8.
+   invariants 7 and 8. Cluster configuration from the environment and its
+   startup checks (ADR-0006), moved here from step 4 (D-68 A).
    7b. State copy (D-60 A): a replica lost below the compaction floor
    rejoins from a snapshot of the applied state at a committed lsn — a
    deterministic function of the committed log (§1) — plus the log after it,
    resuming with `Chain::resume` there. After step 7 because sessions,
-   expiry and wills enter the log only then; a snapshot format fixed earlier
-   would change again. `sim`: a lost replica comes back and the cluster
-   commits with it.
+   expiry and wills enter the log only then. Local snapshots exist from
+   step 4 (D-67 B, revising D-60 A for them): every node restarts from its
+   own; 7b ships one to a replica that lost the log, and the format, which
+   is versioned, changes at step 7. `sim`: a lost replica comes back and the
+   cluster commits with it.
 8. The old leader/follower path is removed (D-51 A): a single node runs as
    a cluster of one on the new path (commit = local fsync, delivery after
    commit; `memory` and `written` go, revising ADR-0006, D-36 A and the D-42
@@ -419,7 +422,7 @@ and `crates/apply/tests/state.rs` (pass-through), and the MQTT simulation,
 which derives each message's properties from its payload and checks them at
 every MQTT 5 delivery; 1000 seeds.
 
-**Step 4 (2026-10-07): done in part, test-only; open: D-67, D-68.** Crate `node`: one tokio task per
+**Step 4 (2026-10-07): done, test-only; D-67 B, D-68 A.** Crate `node`: one tokio task per
 node owns the core, the applied state and the gateway; the log on disk runs
 on a thread of its own (recovery verifies the chain and cuts a torn batch,
 appends are group-committed); links carry `cluster::wire` frames, one TCP
@@ -441,18 +444,40 @@ publishes a record's effects before its gateway acts on them. The cluster
 simulation runs one seed in three with an uncommitted bound of 4–16; 1000
 seeds pass; how often the bound held a batch back is not counted.
 
+**D-67 B (2026-10-07): snapshots and compaction on the new path.**
+`apply::State::encode`/`decode` write the applied state at its lsn in a
+versioned format that recomputes every derived counter and refuses other
+limits or another version. Every `snapshot_every` applied records the node
+loop encodes the state, if it is no further than the local durable log; the
+WAL thread writes it as one file (`[magic][crc32][body]`, written aside,
+synced, renamed, directory synced) and only then removes the segments
+wholly below `min(snapshot, floor)`. The floor is the sequencer's
+`compaction_floor` over the byte bound `retain_bytes` (D-57 A); a replica
+keeps the same byte bound's worth below its commit point, since in step 5
+it may take the slot over and serve catch-up. No pins: a catch-up read is
+one batch, read whole by the WAL thread, which also does the removal, in
+order, so no removal can cut a read in half; a replica whose next batch
+went is lost, as in D-57 A. A start loads the snapshot and applies the log after
+it, and refuses one that does not meet the log. Range reads for that start
+from the segment holding their first record, no longer from the first
+segment. Evidence: two properties in `crates/apply/tests/state.rs` (a
+snapshot anywhere plus the rest of the log gives the whole log's state and
+effects; damaged or short snapshots refused, with a mutation caught); the
+apply simulation takes snapshots at random durable points, compacts its
+in-memory log below them (a compacted record is emptied, so reading one
+fails the run), and restarts nodes from snapshot and suffix, every lsn
+after checked against the other nodes (1000 seeds: 9052 restarts from a
+snapshot, 8141 of them over a compacted log; a node ignoring its snapshot
+fails); `crates/node/tests/cluster.rs`
+`compacted_nodes_restart_from_their_snapshots` — every node removes the
+start of its log, the sequencer and a replica restart and converge with the
+node that did not; a node ignoring its snapshot fails to start there.
+
 Not yet in step 4:
 
-- **The log is never compacted (D-67).** A node rebuilds its applied state
-  from lsn 1 on every start, so removing segments would leave it nothing to
-  rebuild from until state copy (step 7b). Disk use grows with the log
-  (CLAUDE.md §7); recovery memory does not. A restart reads the log back
-  1024 records at a time, each read scanning from the first segment:
-  restart time is quadratic in the log's length.
-- **Configuration and its startup checks (D-68).** `NodeConfig` is built by
-  tests; nothing reads the environment, and the server refuses cluster mode
-  until step 7. The one startup check done is the limits digest at every
-  link.
+- Configuration and its startup checks moved to step 7 (D-68 A):
+  `NodeConfig` is built by tests; the one startup check done is the limits
+  digest at every link.
 - A proposal the sequencer's full queue refuses is dropped, not held. No
   acknowledgement is lost: the gateway closes a publisher whose publish does
   not commit within `commit_timeout` and resends its lifecycle proposals.
@@ -462,5 +487,82 @@ Not yet in step 4:
   on Linux.
 - `Status.digest` hashes the whole applied state whenever it changed: a
   test hook, to be taken off the loop before an end-to-end baseline.
-- A sequencer that stops stops the cluster until it returns (takeover is
-  step 5).
+- A snapshot is encoded whole on the node loop and held whole in memory
+  until written: a pause and a buffer as large as the state, which
+  `apply::Limits` bound. Streaming it is for when a measurement asks.
+- ~~A sequencer that stops stops the cluster~~: step 5, below.
+
+**Step 5 (2026-10-08): done, test-only; D-69 A.** `cluster::Voter` runs a
+node across slots (unified-stream §2.2, §2.4 ungraceful):
+
+- **Schedule.** `owner_of(slot)`: the configured owner for the first slot,
+  then the voters in turn. After `takeover_ticks` heartbeats without the
+  owner, the next node in the schedule takes the next slot; each further
+  period of silence passes the turn on (a dead successor). Time only
+  starts a takeover.
+- **Durable promise.** `Effect::Promise` is made durable by the driver
+  (`node`: a `promise` file, synced) before `on_promised` lets the node
+  answer; from then it takes, acknowledges and leads nothing of a lower
+  slot (invariant 6).
+- **Takeover.** The candidate collects promises and log ends from a
+  majority, catches up (`Fetch`/`Fetched`, one batch at a time) from the
+  log that ends latest by `(slot, lsn)`, and writes `SlotStart` as the
+  slot's first batch (past the uncommitted bound, which an inherited tail
+  can fill).
+- **Commit.** A sequencer commits only through a record of its own slot:
+  the commit point must reach its `SlotStart`, and only replicas whose
+  logs end in its slot count. Older records commit with it, never by
+  counting their copies (Raft's current-term rule).
+- **Truncation by the slot table.** A replica whose log ends in an older
+  slot is placed where the slot tables say the logs meet; every `Append`
+  and `Fetched` carries the slot of the sender's record at `prev`, and
+  the receiver cuts only where slots prove the records differ, at batch
+  boundaries, never below what it knows committed
+  (`storage::Segments::truncate_after`, across segments). A replica that
+  cut says so in every report until it takes a batch (`Ack.cut`); a
+  sequencer probes a replica whose last slot it does not have before
+  shipping to it.
+- **Restart.** A restarted node follows; it never leads its old slot
+  again, and starts knowing as committed what it has applied (snapshot
+  and log), so its cut guard is not blind until the first append.
+- **Reading of the step plan.** The successor schedule, listed under step
+  6, comes with step 5: an ungraceful takeover needs it (§2.4, "мёртвый
+  преемник: следующий по расписанию"). Step 6 keeps `SlotEnd` and planned
+  rotation. The schedule is the configured first owner, then the voters
+  in list order, until the metadata log (§2.5) holds it. The sequencer still syncs before it ships (D-58's parallel ship
+  is not taken).
+
+Found by the takeover simulation and fixed, each with its seed in the
+code: a `SlotStart` held back by the uncommitted bound (deadlock); a meet
+point computed from one side's slot table only; a replica's position and
+durability that could not go back after it cut; cuts on agreement rather
+than proven difference (lost committed copies to a stale report); cuts
+inside a batch; a takeover started while a cut was pending; a slot
+committing an older slot's records by counting copies. The apply
+simulation found that a stale report of an empty log placed a replica
+below the compaction floor (a missing read for a replica in repair now
+waits for the next report instead of losing it).
+
+Evidence: `crates/sim/tests/takeover.rs` — three voters on in-memory logs
+with crashes, power losses, promises made durable by nodes that die
+before answering, partitions, loss and reordering, cuts and reads a
+crash can fall between; invariants 1 (no copy of a committed record is
+ever cut), 2, 3, 5, 6 (by durability when a majority's promises take
+effect) after every step, and convergence after healing; 200 000 seeds
+pass (686 820 takeovers, 170 939 cuts, 26 952 of them below the commit
+point, 899 548 promises never answered). Three mutations — counting every
+replica toward commit, catching up from the shortest log, taking a lower
+slot after a promise — and the own-slot commit rule are each caught.
+`crates/cluster/tests/voter.rs` (5 rules), `crates/storage/tests/
+segments.rs` (a cut across segments), `crates/node/tests/cluster.rs`
+`another_node_takes_the_slot_over_when_the_sequencer_stops` (real
+sockets and files; disabling takeover fails it); the existing cluster,
+apply and gateway simulations (fixed owner) pass 1000 seeds.
+
+Not yet in step 5: the cluster simulation with compaction still runs a
+fixed owner, so compaction during takeover is covered only by the node
+test; the apply and MQTT simulations run a fixed owner too; graceful
+handoff is step 6; a candidate whose source compacted what it needs waits
+for a later slot (state copy, 7b); `Status.digest` and the effects hook
+are still on the node loop.
+

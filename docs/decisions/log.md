@@ -543,3 +543,21 @@ Date: 2026-10-06
 Choice: A — step 4 (runtime driver), starting with baselines of `codec`, `apply`, `gateway`, and refusing links between nodes whose `apply` limits differ; D-65 A first.
 Rejected options: B — step 5 in simulation first.
 Card: docs/decisions/archive/cards.md
+
+## D-67. How the new path keeps its log bounded on disk before state copy exists
+Date: 2026-10-07
+Choice: B — a local snapshot of the applied state now: `apply::State` encodes and decodes at a committed lsn, the node writes it atomically and compacts below min(compaction floor, snapshot lsn), a restart loads the snapshot and then the log after it. Revises D-60 A for local snapshots; a format version refuses an old snapshot.
+Rejected options: A — a hard cap on the log (terminal when full); C — defer to 7b (§7 gap stays).
+Card: docs/decisions/archive/cards.md
+
+## D-68. Where step 4's "configuration and its startup checks" go
+Date: 2026-10-07
+Choice: A — to step 7, where the server stops refusing cluster mode; recorded in ADR-0008.
+Rejected options: B — now (configuration nothing reaches, written twice).
+Card: docs/decisions/archive/cards.md
+
+## D-69. The next step after D-67 and D-68
+Date: 2026-10-07
+Choice: A — step 5, ungraceful takeover, on the log as D-67 B leaves it.
+Rejected options: B — step-4 leftovers first; C — defer.
+Card: docs/decisions/archive/cards.md

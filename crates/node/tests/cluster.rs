@@ -53,6 +53,17 @@ fn gateway() -> gateway::Config {
     }
 }
 
+/// Segment size, retention bytes and snapshot interval: small for the
+/// compaction test, so its log spans many segments; roomy elsewhere, with
+/// snapshots still taken.
+fn disk(test: &str) -> (u64, u64, u64) {
+    if test == "compaction" {
+        (2048, 8192, 16)
+    } else {
+        (64 * 1024, 1 << 20, 64)
+    }
+}
+
 fn config(
     test: &str,
     id: u8,
@@ -71,6 +82,7 @@ fn config(
             max_batch: 64,
             recent_batches: 16,
             max_uncommitted: 4096,
+            takeover_ticks: 3,
         },
         listen: addresses[usize::from(id)],
         peers: (0..NODES)
@@ -80,7 +92,7 @@ fn config(
         data: data_dir(test, id),
         segments: SegmentLimits {
             wal: WalLimits::default(),
-            segment_bytes: 64 * 1024,
+            segment_bytes: disk(test).0,
         },
         limits,
         heartbeat: Duration::from_millis(50),
@@ -95,7 +107,24 @@ fn config(
             gateway: gateway(),
             write_queue: 1024,
         }),
+        retain_bytes: disk(test).1,
+        snapshot_every: disk(test).2,
     }
+}
+
+/// The lowest segment key left in a node's data directory, and whether it
+/// holds a snapshot.
+fn on_disk(test: &str, id: u8) -> (u64, bool) {
+    let dir = data_dir(test, id);
+    let lowest = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| {
+            let path = e.unwrap().path();
+            (path.extension()? == "seg").then(|| path.file_stem()?.to_str()?.parse::<u64>().ok())?
+        })
+        .min()
+        .unwrap();
+    (lowest, dir.join("snapshot").exists())
 }
 
 impl Cluster {
@@ -418,5 +447,91 @@ async fn an_mqtt_publish_on_one_node_reaches_a_subscriber_on_another() {
     }
     // Every node applied the same log, client sessions included.
     cluster.converged(1).await;
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compacted_nodes_restart_from_their_snapshots() {
+    let mut cluster = Cluster::start("compaction").await;
+    for request in 0..150u64 {
+        cluster.publish((request % 3) as u8, request).await;
+    }
+    let before = cluster.converged(300).await;
+    // Every node gave back the start of its log, and kept a snapshot.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let disks: Vec<(u64, bool)> = (0..NODES).map(|id| on_disk("compaction", id)).collect();
+        if disks
+            .iter()
+            .all(|&(lowest, snapshot)| lowest > 1 && snapshot)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "not compacted: {disks:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // A replica and the sequencer restart from snapshot and log; each
+    // restart commits its gateway's NodeReset, and the state they then
+    // reach must equal that of node 1, which never stopped.
+    cluster.restart(2, Limits::default()).await;
+    cluster.restart(0, Limits::default()).await;
+    cluster.converged(before.applied + 2).await;
+    for request in 150..160u64 {
+        cluster.publish((request % 3) as u8, request).await;
+    }
+    cluster.converged(before.applied + 20).await;
+    cluster.shutdown().await;
+}
+
+/// Ungraceful takeover (ADR-0008 step 5): the sequencer stops, the next
+/// node in the schedule takes a new slot over and the cluster commits again;
+/// the old sequencer comes back as a follower of that slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_node_takes_the_slot_over_when_the_sequencer_stops() {
+    let mut cluster = Cluster::start("takeover").await;
+    for request in 0..10 {
+        cluster.publish(1, request).await;
+    }
+    let before = cluster.converged(20).await;
+    let leading = |cluster: &Cluster| -> Vec<u8> {
+        (0..NODES)
+            .filter(|&id| {
+                cluster.nodes[usize::from(id)]
+                    .as_ref()
+                    .is_some_and(|n| n.status().borrow().leading)
+            })
+            .collect()
+    };
+    let old = leading(&cluster);
+    assert_eq!(old.len(), 1, "one sequencer: {old:?}");
+    let old = old[0];
+    cluster.stop(old).await;
+
+    let other = (0..NODES).find(|&id| id != old).unwrap();
+    for request in 10..20 {
+        cluster.publish(other, request).await;
+    }
+    let after = cluster.converged(before.applied + 20).await;
+    assert!(
+        after.slot > before.slot,
+        "no new slot: {before:?} {after:?}"
+    );
+    let now = leading(&cluster);
+    assert_eq!(now.len(), 1, "one sequencer: {now:?}");
+    assert_ne!(now[0], old);
+
+    cluster.restart(old, Limits::default()).await;
+    for request in 20..25 {
+        cluster.publish(old, request).await;
+    }
+    let last = cluster.converged(after.applied + 10).await;
+    // The old sequencer never resumes its old slot. Another takeover in
+    // between is allowed — the schedule moves on whenever a heartbeat is
+    // late — but there is one sequencer, of a slot no older than before.
+    assert_eq!(leading(&cluster).len(), 1, "one sequencer");
+    assert!(last.slot >= after.slot, "{after:?} {last:?}");
     cluster.shutdown().await;
 }

@@ -108,6 +108,7 @@ fn cluster_config(id: u8) -> Config {
         max_batch: 8,
         recent_batches: 8,
         max_uncommitted: 1_000_000,
+        takeover_ticks: 3,
     }
 }
 
@@ -389,6 +390,10 @@ impl World {
                     }
                     Step::Committed(lsn) if id == SEQUENCER => self.freeze(lsn),
                     Step::Committed(_) | Step::ReadDone { .. } | Step::Lost { .. } => {}
+                    // A fixed sequencer and its replicas never take a slot over.
+                    Step::Promise { .. } | Step::Truncate { .. } => {
+                        unreachable!("no takeover in a fixed-owner cluster")
+                    }
                 }
             }
         }

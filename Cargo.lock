@@ -585,6 +585,7 @@ dependencies = [
  "bytes",
  "cluster",
  "codec",
+ "crc32fast",
  "domain",
  "gateway",
  "journal",

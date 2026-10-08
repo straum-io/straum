@@ -8,171 +8,112 @@ skill. When the user answers `D-<n>: <choice>`, the card moves to
 
 
 
-## D-67. How the new path keeps its log bounded on disk before state copy exists
 
-**Context.** `node` never removes a segment (`crates/node/src/wal.rs`), so disk use grows with the log (CLAUDE.md §7; D-57 A rejected "unbounded disk"). It cannot simply call `Sequencer::compaction_floor` and `Segments::remove_through`. A node rebuilds `apply::State` from lsn 1 at every start (`crates/node/src/lib.rs`, the `Range` reads), and a removed segment would leave it nothing to rebuild from. Recovery memory is already bounded: the log is now verified record by record (`wal::start`).
-**Why now.** This is a §7 invariant gap in step 4, which the vision review found. Every later step builds on this log.
-**Vision.** unified-stream §1 (the state is a deterministic function of the committed log), §3 (segmented WAL, compaction); D-57 A; D-60 A (state copy at 7b); CLAUDE.md §7.
+## D-70. The next step after step 5
 
-### A. A hard cap on the log until 7b — recommended
+**Context.** Steps 1–5 of ADR-0008 are done, but only in tests.
+
+What the evidence covers:
+- `cluster::Voter` passes 200 000 seeds of the takeover simulation, with invariants 1, 2, 3, 5 and 6.
+- The node takes a slot over on real sockets and files.
+
+What it does not cover:
+- The simulations that compact (`sim/tests/cluster.rs`) and that run gateways (`apply.rs`, `gateway.rs`) still use a fixed owner.
+- Takeover under compaction, and gateways forwarding to an owner that changes, are covered only by the node's loopback tests.
+
+ADR-0008 lists step 6 (graceful handoff) next.
+**Why now.** Step 6, and step 7 even more so, build on takeover. unified-stream §5 asks for "compaction during catch-up" and session takeover across gateways during a change of sequencer, and neither has run in simulation yet.
+**Vision.** unified-stream §1 (correctness is shown by deterministic simulation), §5; ADR-0008 step plan.
+
+### A. Harden step 5 in simulation first — recommended
 - **What we do:**
-  - add `NodeConfig.max_log_bytes`, read against `Segments::sizes`;
-  - at the cap minus a reserve, the sequencer refuses publishes and subscribes, and gateways close those publishers through `commit_timeout`;
-  - lifecycle records (`Ack`, `SessionGone`, `NodeReset`) still commit into the reserve;
-  - at the cap itself, everything is refused, with one `error` log line and a `Status.full` flag;
-  - one test fills a small cap and checks that nothing grows past it, that lifecycle records commit in the reserve, and that restart rebuilds the state.
-- **Result:** disk is bounded by `max_log_bytes` plus one segment. A full cluster stops taking publishes instead of growing.
-- **Cost:** S.
-- **Risks:** once the reserve is used up too, a full log is terminal until its data is wiped. Inflight is never released, and a restarted gateway's `NodeReset` never commits, so it accepts no connections. This is acceptable only while cluster mode is test-only (until step 7), and it is visible through `Status.full`.
-- **Invariants:** CLAUDE.md §7 holds. Invariants 1, 3 and 5 are untouched because nothing is removed.
-- **Reversibility:** easy. Step 7b replaces it with compaction plus snapshots.
-- **Check:** `cargo test -p node`, with a new test `a_full_log_refuses_and_still_restarts`.
+  - `sim/tests/cluster.rs` runs three `Voter`s instead of a fixed owner, with sequencer crashes, partitions and compaction during catch-up and during takeover (invariants 1, 2, 3, 5 and 6, and the D-57 A floor checks);
+  - `sim/tests/apply.rs` and `gateway.rs` run on `Voter`s, so gateways forward to an owner that changes; invariant 4 and per-session order must hold across takeovers;
+  - nothing else. The step-4 test hooks (`Status.digest`, the effects clone) stay for a later card.
+- **Result (done when):** all three simulations pass 1000 seeds with takeovers counted, at least one per hundred steps, and compactions during a takeover counted.
+- **Cost:** M.
+- **Risks:** a new protocol bug, which is the point. It is fixed with its seed, as in step 5.
+- **Invariants:** none change; more of them are checked across takeovers.
+- **Reversibility:** easy (tests only).
+- **Check:** `STRAUM_SIM_SEEDS=1000 cargo test --release -p sim`.
+- **Fact / hypothesis:** It is a fact that these paths are untested in simulation. It is a hypothesis that bugs remain there; step 5's simulation found eight.
+
+### B. Step 6: graceful handoff
+- **What we do:**
+  - `SlotEnd(k, last_lsn, hash)` is written by a sequencer that fences itself; its successor writes `SlotStart(k+1)` without a promise round;
+  - planned rotation is optional, off by default (§2.4);
+  - the takeover simulation gains crashes before, during and after `SlotEnd`.
+- **Result:** maintenance without a timeout.
+- **Cost:** M.
+- **Risks:** it builds on paths A would have checked first. The open risks above stay open.
+- **Invariants:** 1, 2, 3 and 6.
+- **Reversibility:** a new record kind is used (reserved since step 1).
+- **Check:** `cargo test -p sim --test takeover`, plus new scenarios.
 - **Fact / hypothesis:** fact.
 
-### B. A local snapshot of the applied state now
-- **What we do:**
-  - `apply::State` gains `encode`/`decode` at a committed lsn;
-  - the WAL thread writes the snapshot atomically before `remove_through(min(compaction_floor(bytes_floor), snapshot_lsn))`;
-  - restart loads the snapshot, then the log after it;
-  - pins on catch-up reads, as in `sim/tests/cluster.rs`.
-- **Result:** D-57 A retention on the real disk, and restarts work after compaction.
-- **Cost:** M–L: a snapshot format, its tests, and a `sim` scenario.
-- **Risks:** this revises D-60 A, which put state copy after step 7 because the snapshot format changes again there (sessions, wills, expiry). The mitigation is a format version that refuses old snapshots.
-- **Invariants:** 1 and 5 depend on the snapshot matching the log; checked by digest equality in `sim`.
-- **Reversibility:** changes an on-disk format.
-- **Check:** `cargo test -p node`, `cargo test -p apply`, and a new `sim` restart-after-compaction scenario.
-- **Fact / hypothesis:** It is a hypothesis that the format survives step 7 without breaking changes.
-
-### C. Defer to 7b, recorded as a known gap
-- **When this is right:** if cluster mode stays test-only until 7b and no test runs long enough to matter.
-- **Cost of waiting:** an unbounded-disk path exists in the code, against §7, recorded in ADR-0008.
+### C. Defer
+- **When this is right:** if the old path needs work first.
+- **Cost of waiting:** two paths to maintain for longer.
 
 **Comparison**
 
 | | A | B | C |
 |---|---|---|---|
-| Fit with vision | §7 holds; D-60 order kept | D-57 A in full; D-60 order broken | §7 gap stays |
-| Risk to invariants | none | snapshot ↔ log | none now |
-| Cost | S | M–L | none |
-| Reversibility | easy | on-disk format | — |
+| Fit with vision | §1, §5 scenarios not yet run | next in the ADR order | none |
+| Risk to invariants | finds, does not add | adds on unchecked ground | none |
+| Cost | M | M | none |
+| Reversibility | easy | record kind in use | — |
 
-**Recommendation.** A. It is the smallest change that makes §7 hold, and it keeps D-60 A's reason for doing state copy after step 7. Choose B if a long-running cluster test (a soak or a load generator) is wanted before step 7.
-**What would change it.** A need to run the new path for longer than a full log allows.
+**Recommendation.** A. Step 5's simulation found eight protocol bugs in paths that looked finished. The paths still outside simulation, compaction and gateways under takeover, are the ones every later step uses. Choose B if a planned failover for maintenance is needed soon.
+**What would change it.** A requirement for planned failover before anything else.
 **Rejected.**
-- Compacting without a snapshot: a restarted node could not rebuild its state, against unified-stream §1.
+- Step 7 before step 6: it reverses ADR-0008's order (unified-stream phase 3 before phase 2) with no concrete reason, while step 6 is unblocked.
 
-**Answer:** `D-67: A` · `D-67: B, but …` · `D-67: discuss` · `D-67: defer`
+**Answer:** `D-70: A` · `D-70: B, but …` · `D-70: discuss` · `D-70: defer`
 
-## D-68. Where step 4's "configuration and its startup checks" go
+## D-71. When the sequencer ships before its own sync (D-58)
 
-**Context.** ADR-0008 step 4 lists "configuration and its startup checks (ADR-0006)". `node::NodeConfig` exists, but only tests build it. Nothing reads `STRAUM_*`, and the server refuses cluster mode until step 7 (ADR-0008, "Cluster mode is test-only until step 7"). The one startup check done is the `apply` limits digest at every link.
-**Why now.** Step 4 cannot be called done while this is open and unrecorded.
-**Vision.** ADR-0006 (cluster mode, majority commit only); ADR-0008 step plan; CLAUDE.md §8 (every limit has an env var).
+**Context.** D-58 A: "sync, then ship, until step 5; step 5 … only then lifts the restriction". Its rejected option B was "sync-then-ship permanently".
 
-### A. Move it to step 7, recorded in ADR-0008 — recommended
-- **What we do:** ADR-0008's step plan moves "configuration and its startup checks" from step 4 to step 7, which is where the server stops refusing cluster mode. docs/configuration.md says so (it already does).
-- **Result:** step 4 is done apart from D-67, and the env names are chosen once, when they become reachable.
+Step 5 made it possible: a restarted node never leads its old slot again, so a sequencer that lost an unsynced tail cannot reuse its lsns. But step 5 did not take it. The sequencer still ships only what is locally durable (ADR-0008 step 5, "Restart").
+**Why now.** Without a decision, the code stays on D-58's rejected option B by default. Shipping in parallel saves one local sync per batch on the commit latency path.
+**Vision.** unified-stream §2.3 (commit = majority durable), §7 (no performance claim without a Linux measurement); D-58.
+
+### A. Defer it to unified-stream phase 5 (Linux performance), amending D-58 A — recommended
+- **What we do:** D-58 A is amended in log.md and ADR-0008. The parallel ship becomes a phase-5 candidate, taken only if a Linux measurement shows the commit latency gain. Today's behaviour stays.
+- **Result:** the deferral is recorded, and no rejected option is applied silently.
 - **Cost:** S (documentation).
-- **Risks:** settings later in steps 5–6 change `NodeConfig`. That is cheaper before the settings are public.
+- **Risks:** none now.
 - **Invariants:** none.
 - **Reversibility:** easy.
-- **Check:** ADR-0008 and docs/configuration.md agree.
-- **Fact / hypothesis:** fact.
+- **Check:** log.md and ADR-0008 agree.
+- **Fact / hypothesis:** It is a hypothesis that the gain matters; unmeasured.
 
-### B. Do it now
+### B. Take it now
 - **What we do:**
-  - the `STRAUM_CLUSTER_*` variables (`NODE`, `PEERS`, `LISTEN`, `DATA`) and the `apply`/gateway limits are parsed into `NodeConfig` by a `node::config` module;
-  - `server` gains an edge to `node` (a new row in the CLAUDE.md §2 table), but `runtime` does not, so the old path stays uncoupled (D-49 A);
-  - startup checks for an odd voter count, this node in the voter list, unique addresses, and limits within the validation ranges;
-  - the server still refuses to start in cluster mode.
-- **Result:** configuration code and tests exist, but nothing reaches them.
+  - the sequencer ships a batch as soon as it is handed to the log; its own durability counts toward commit only after its sync;
+  - the takeover simulation gains a power loss of the sequencer after shipping but before syncing;
+  - a container measurement, which is preliminary.
+- **Result:** one sync off the commit path, in principle.
 - **Cost:** M.
-- **Risks:** names and checks rewritten by steps 5–7.
-- **Invariants:** none.
-- **Reversibility:** changes the public configuration surface.
-- **Check:** unit tests of the parsing and the checks.
-- **Fact / hypothesis:** fact.
+- **Risks:** a sequencer that loses an unsynced tail its replicas hold. Takeover makes this safe in theory; the simulation would show it.
+- **Invariants:** 1 and 3 under that power loss.
+- **Reversibility:** easy behind a setting.
+- **Check:** takeover sim at 200 000 seeds, plus the new fault.
+- **Fact / hypothesis:** It is a hypothesis that it is faster; §7 forbids claiming so without Linux.
 
 **Comparison**
 
 | | A | B |
 |---|---|---|
-| Fit with vision | matches "test-only until step 7" | configuration that nothing uses |
-| Risk to invariants | none | none |
+| Fit with vision | §7: measure first | §2.3 as designed |
+| Risk to invariants | none | new fault to prove |
 | Cost | S | M |
-| Reversibility | easy | public surface |
+| Reversibility | easy | easy |
 
-**Recommendation.** A. Configuration that cannot be reached is configuration that gets written twice. Choose B if the server is to start a cluster before step 7, which the ADR forbids today.
-**What would change it.** A decision to run the new path outside tests before step 7.
-**Rejected.** none.
-
-**Answer:** `D-68: A` · `D-68: B, but …` · `D-68: discuss` · `D-68: defer`
-
-## D-69. The next step after D-67 and D-68
-
-**Context.** With D-67 and D-68 settled, step 4 is done and test-only. Step 5 (ungraceful takeover) is next in the plan. Smaller step-4 items are listed in ADR-0008 "Not yet in step 4":
-- proposals are dropped when the sequencer's queue is full;
-- `auth` is not wired;
-- metrics are not exported;
-- `Status.digest` is on the loop;
-- there is no Linux `storage/commit` baseline with the batch hash.
-
-**Why now.** A sequencer that stops stops the cluster. Until step 5 there is no fencing.
-**Vision.** unified-stream §1 (a change of sequencer is a committed record), §5 invariants 2 and 6; ADR-0008 step plan; D-58 A.
-
-### A. Step 5: ungraceful takeover — recommended
-- **What we do:**
-  - durable promises, with fsync before the reply;
-  - the slot table and log truncation in `cluster`;
-  - a sequencer restart becomes a takeover, after which the sequencer may ship a batch in parallel with its sync (D-58 A);
-  - `sim/tests/cluster.rs` gains partitions and sequencer loss, and checks invariants 2 and 6;
-  - `node` gains a test that stops the sequencer and checks that another node takes the slot.
-
-  Truncation runs on the log as D-67 leaves it.
-- **Result:** the cluster commits again after its sequencer dies. In `sim`, no committed record is lost or changed across takeovers, over 1000 seeds.
-- **Cost:** L.
-- **Risks:** split brain under partition. The `sim` checks for invariants 2 and 6 catch it at every step.
-- **Invariants:** 2 and 6 are introduced. 1, 3 and 5 must hold through truncation.
-- **Reversibility:** a protocol change, plus record kinds for the slot table. It is reversible while the path is test-only.
-- **Check:**
-  - `cargo test -p sim --test cluster`;
-  - `STRAUM_SIM_SEEDS=1000 cargo test --release -p sim`;
-  - `cargo test -p node`.
-- **Fact / hypothesis:** It is a fact that there is no takeover today. The size is an estimate.
-
-### B. The step-4 leftovers first
-- **What we do:**
-  - hold proposals the sequencer refuses, instead of dropping them, in a bounded queue that stops reading links and clients when it is full;
-  - wire `auth` into CONNECT;
-  - export the `node` metrics (CLAUDE.md §15);
-  - take the test hooks off the loop: `Status.digest`, and the per-record effects clone, which is already skipped when no test listens;
-  - add an e2e load generator over `node`, with a container baseline (preliminary).
-- **Result:** the new path checks credentials, can be observed, has a preliminary end-to-end number, and drops nothing at the sequencer.
-- **Cost:** M.
-- **Risks:** low. Container numbers are preliminary (§11).
-- **Invariants:** CLAUDE.md §8 "nothing dropped" is restored for proposals.
-- **Reversibility:** easy.
-- **Check:**
-  - `cargo test -p node`, with new tests for wrong credentials and a full sequencer queue;
-  - a baseline section in `docs/baselines/`.
-- **Fact / hypothesis:** It is a fact that these items are missing. It is a hypothesis that an early end-to-end number guides steps 5–7.
-
-### C. Defer
-- **When this is right:** if the old path needs work first.
-- **Cost of waiting:** two paths are maintained side by side for longer.
-
-**Comparison**
-
-| | A | B | C |
-|---|---|---|---|
-| Fit with vision | next in the plan; removes the single point of failure | closes gaps, nothing new in the protocol | none |
-| Risk to invariants | high, caught by `sim` | low | none |
-| Cost | L | M | none |
-| Reversibility | protocol, test-only | easy | — |
-
-**Recommendation.** A. B's items are not observable while cluster mode is test-only, and steps 5–7 change the gateway lifecycle that `auth` and metrics hook into. Choose B if you want an end-to-end number from the new path before its protocol grows.
-**What would change it.** A container measurement could show the node loop or the batch hash costing more than the old path on the same workload. Then B's baseline comes first.
+**Recommendation.** A. The gain is a latency claim that only a Linux host can make (§7), and phase 5 is where those measurements are taken. Choose B if commit latency on the new path becomes the bottleneck before then.
+**What would change it.** A Linux measurement showing the local sync dominating commit latency.
 **Rejected.**
-- Step 7 before step 5: no fencing before step 5 means effects outside the log (§1, ADR-0008).
+- Sync-then-ship forever without a decision: this is D-58's rejected option B.
 
-**Answer:** `D-69: A` · `D-69: B, but …` · `D-69: discuss` · `D-69: defer`
+**Answer:** `D-71: A` · `D-71: B` · `D-71: discuss` · `D-71: defer`

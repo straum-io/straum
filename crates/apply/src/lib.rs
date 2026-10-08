@@ -28,6 +28,10 @@
     clippy::cast_possible_truncation
 )]
 
+mod snapshot;
+
+pub use snapshot::SnapshotError;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
 
@@ -618,8 +622,8 @@ impl State {
     }
 
     /// Applies the next committed record and appends what it makes
-    /// observable to `out`. Batch headers advance the position and change
-    /// nothing else. Records must come in lsn order, each exactly once.
+    /// observable to `out`. Batch headers and `SlotStart` advance the
+    /// position and change nothing else. Records must come in lsn order, each exactly once.
     pub fn apply(&mut self, record: &Record<'_>, out: &mut Vec<Effect>) -> Result<(), ApplyError> {
         let expected = self.applied.checked_add(1).ok_or(ApplyError::OutOfOrder {
             lsn: record.lsn,
@@ -631,7 +635,9 @@ impl State {
                 expected,
             });
         }
-        if record.kind != Kind::BatchHeader {
+        // A slot's first record marks a change of sequencer: it is part of
+        // the log's order and changes no state (step 5).
+        if record.kind != Kind::BatchHeader && record.kind != Kind::SlotStart {
             let proposal = Proposal::decode(record)?;
             self.effect(proposal, record.lsn, out);
         }

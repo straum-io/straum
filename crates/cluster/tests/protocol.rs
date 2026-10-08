@@ -15,6 +15,7 @@ fn config(id: u8) -> Config {
         max_batch: 4,
         recent_batches: 2,
         max_uncommitted: 1_000_000,
+        takeover_ticks: 3,
     }
 }
 
@@ -54,8 +55,10 @@ fn started() -> Sequencer {
             id,
             Message::Ack {
                 slot: 1,
+                last_slot: 1,
                 end: 0,
                 durable: 0,
+                cut: false,
             },
         );
     }
@@ -92,8 +95,10 @@ fn commit_needs_a_majority_durable_and_only_grows() {
         1,
         Message::Ack {
             slot: 1,
+            last_slot: 1,
             end,
             durable: end,
+            cut: false,
         },
     );
     assert_eq!(s.commit(), end);
@@ -103,8 +108,10 @@ fn commit_needs_a_majority_durable_and_only_grows() {
         1,
         Message::Ack {
             slot: 1,
+            last_slot: 1,
             end: 0,
             durable: 0,
+            cut: false,
         },
     );
     assert_eq!(s.commit(), end);
@@ -136,8 +143,10 @@ fn a_replica_takes_the_owners_batches_in_order_and_reports_its_position() {
             0,
             Message::Ack {
                 slot: 1,
+                last_slot: 0,
                 end: 0,
-                durable: 0
+                durable: 0,
+                cut: false,
             }
         )]
     );
@@ -153,8 +162,10 @@ fn a_replica_takes_the_owners_batches_in_order_and_reports_its_position() {
             0,
             Message::Ack {
                 slot: 1,
+                last_slot: 1,
                 end: second,
-                durable: first
+                durable: first,
+                cut: false,
             }
         )]
     );
@@ -177,6 +188,8 @@ fn a_replica_refuses_another_node_another_slot_and_a_broken_chain() {
         2,
         Message::Append {
             slot: 1,
+            prev: 0,
+            prev_slot: 0,
             records: records.clone(),
             commit,
         },
@@ -185,6 +198,8 @@ fn a_replica_refuses_another_node_another_slot_and_a_broken_chain() {
         0,
         Message::Append {
             slot: 2,
+            prev: 0,
+            prev_slot: 0,
             records: records.clone(),
             commit,
         },
@@ -195,6 +210,8 @@ fn a_replica_refuses_another_node_another_slot_and_a_broken_chain() {
         0,
         Message::Append {
             slot: 1,
+            prev: 0,
+            prev_slot: 0,
             records: forged,
             commit,
         },
@@ -204,6 +221,8 @@ fn a_replica_refuses_another_node_another_slot_and_a_broken_chain() {
         0,
         Message::Append {
             slot: 1,
+            prev: 0,
+            prev_slot: 0,
             records: records[..1].to_vec(),
             commit,
         },
@@ -216,6 +235,8 @@ fn a_replica_refuses_another_node_another_slot_and_a_broken_chain() {
         0,
         Message::Append {
             slot: 1,
+            prev: 0,
+            prev_slot: 0,
             records,
             commit,
         },
@@ -230,6 +251,8 @@ fn a_replica_knows_the_commit_only_as_far_as_its_own_log() {
         0,
         Message::Append {
             slot: 1,
+            prev: 0,
+            prev_slot: 0,
             records: Vec::new(),
             commit: 50,
         },
@@ -293,8 +316,10 @@ fn a_replica_is_sent_no_more_than_its_window_beyond_its_durable() {
         1,
         Message::Ack {
             slot: 1,
+            last_slot: 1,
             end: 0,
             durable: 0,
+            cut: false,
         },
     );
     let mut end = 0;
@@ -360,8 +385,10 @@ fn only_the_heartbeat_sends_again_what_a_replica_did_not_report() {
             1,
             Message::Ack {
                 slot: 1,
+                last_slot: 1,
                 end: 0,
                 durable: 0,
+                cut: false,
             },
         );
     }
@@ -397,16 +424,20 @@ fn the_compaction_floor_waits_for_the_slowest_replica_up_to_the_byte_bound() {
         1,
         Message::Ack {
             slot: 1,
+            last_slot: 1,
             end,
             durable: end,
+            cut: false,
         },
     );
     s.on_message(
         2,
         Message::Ack {
             slot: 1,
+            last_slot: 1,
             end: 2,
             durable: 2,
+            cut: false,
         },
     );
     assert_eq!(s.commit(), end);
@@ -441,8 +472,10 @@ fn the_heartbeat_never_goes_back_below_what_a_replica_reported_durable() {
         1,
         Message::Ack {
             slot: 1,
+            last_slot: 1,
             end: 0,
             durable: 0,
+            cut: false,
         },
     );
     let mut end = 0;
@@ -454,8 +487,10 @@ fn the_heartbeat_never_goes_back_below_what_a_replica_reported_durable() {
         1,
         Message::Ack {
             slot: 1,
+            last_slot: 1,
             end,
             durable: end,
+            cut: false,
         },
     );
     s.take_effects();
@@ -464,8 +499,10 @@ fn the_heartbeat_never_goes_back_below_what_a_replica_reported_durable() {
         1,
         Message::Ack {
             slot: 1,
+            last_slot: 1,
             end: 2,
             durable: 2,
+            cut: false,
         },
     );
     s.tick();
@@ -490,8 +527,10 @@ fn a_stale_read_that_misses_does_not_lose_the_replica() {
         1,
         Message::Ack {
             slot: 1,
+            last_slot: 1,
             end: 0,
             durable: 0,
+            cut: false,
         },
     );
     let mut end = 0;
@@ -505,8 +544,10 @@ fn a_stale_read_that_misses_does_not_lose_the_replica() {
         1,
         Message::Ack {
             slot: 1,
+            last_slot: 1,
             end,
             durable: end,
+            cut: false,
         },
     );
     s.take_effects();
@@ -538,8 +579,10 @@ fn no_batch_beyond_the_uncommitted_bound() {
         1,
         Message::Ack {
             slot: 1,
+            last_slot: 1,
             end: 4,
             durable: 4,
+            cut: false,
         },
     );
     s.flush().unwrap();

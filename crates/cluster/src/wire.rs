@@ -3,9 +3,15 @@
 //! ```text
 //! frame    [ length u32 ][ type u8 ][ payload ]     length = 1 + payload
 //! HELLO    1  [ node u8 ][ slot u64 ][ limits u64 ]
-//! APPEND   2  [ slot u64 ][ commit u64 ][ count u32 ]( [ len u32 ][ record ] ){count}
-//! ACK      3  [ slot u64 ][ end u64 ][ durable u64 ]
+//! APPEND   2  [ slot u64 ][ prev u64 ][ prev_slot u64 ][ commit u64 ][ records ]
+//! ACK      3  [ slot u64 ][ last_slot u64 ][ end u64 ][ durable u64 ][ cut u8 ]
 //! FORWARD  4  [ kind u8 ][ properties_len u32 ][ properties ][ body ]
+//! PROMISE  5  [ slot u64 ]
+//! PROMISED 6  [ slot u64 ][ last_slot u64 ][ end u64 ]
+//! FETCH    7  [ slot u64 ][ last_slot u64 ][ end u64 ]
+//! FETCHED  8  [ slot u64 ][ asked u64 ][ after u64 ][ after_slot u64 ][ records ]
+//!
+//! records  [ count u32 ]( [ len u32 ][ record ] ){count}
 //! ```
 //!
 //! A link carries one direction: the dialling node sends, the accepting
@@ -32,6 +38,10 @@ const HELLO: u8 = 1;
 const APPEND: u8 = 2;
 const ACK: u8 = 3;
 const FORWARD: u8 = 4;
+const PROMISE: u8 = 5;
+const PROMISED: u8 = 6;
+const FETCH: u8 = 7;
+const FETCHED: u8 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -57,11 +67,28 @@ pub enum WireError {
     UnknownType(u8),
     #[error("unknown record kind {0}")]
     UnknownKind(u8),
+    #[error("a field holds a value no version writes")]
+    Malformed,
 }
 
 fn put_u32(value: usize, out: &mut Vec<u8>) -> Result<(), WireError> {
     let value = u32::try_from(value).map_err(|_| WireError::TooLarge)?;
     out.extend_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+fn put_u64s(values: &[u64], out: &mut Vec<u8>) {
+    for value in values {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+}
+
+fn put_records(records: &[Vec<u8>], out: &mut Vec<u8>) -> Result<(), WireError> {
+    put_u32(records.len(), out)?;
+    for record in records {
+        put_u32(record.len(), out)?;
+        out.extend_from_slice(record);
+    }
     Ok(())
 }
 
@@ -78,23 +105,56 @@ pub fn encode(frame: &Frame, out: &mut Vec<u8>) -> Result<(), WireError> {
         }
         Frame::Message(Message::Append {
             slot,
+            prev,
+            prev_slot,
             records,
             commit,
         }) => {
             out.push(APPEND);
-            out.extend_from_slice(&slot.to_be_bytes());
-            out.extend_from_slice(&commit.to_be_bytes());
-            put_u32(records.len(), out)?;
-            for record in records {
-                put_u32(record.len(), out)?;
-                out.extend_from_slice(record);
-            }
+            put_u64s(&[*slot, *prev, *prev_slot, *commit], out);
+            put_records(records, out)?;
         }
-        Frame::Message(Message::Ack { slot, end, durable }) => {
+        Frame::Message(Message::Ack {
+            slot,
+            last_slot,
+            end,
+            durable,
+            cut,
+        }) => {
             out.push(ACK);
-            out.extend_from_slice(&slot.to_be_bytes());
-            out.extend_from_slice(&end.to_be_bytes());
-            out.extend_from_slice(&durable.to_be_bytes());
+            put_u64s(&[*slot, *last_slot, *end, *durable], out);
+            out.push(u8::from(*cut));
+        }
+        Frame::Message(Message::Promise { slot }) => {
+            out.push(PROMISE);
+            put_u64s(&[*slot], out);
+        }
+        Frame::Message(Message::Promised {
+            slot,
+            last_slot,
+            end,
+        }) => {
+            out.push(PROMISED);
+            put_u64s(&[*slot, *last_slot, *end], out);
+        }
+        Frame::Message(Message::Fetch {
+            slot,
+            last_slot,
+            end,
+        }) => {
+            out.push(FETCH);
+            put_u64s(&[*slot, *last_slot, *end], out);
+        }
+        Frame::Message(Message::Fetched {
+            slot,
+            asked,
+            after,
+            after_slot,
+            records,
+        }) => {
+            out.push(FETCHED);
+            put_u64s(&[*slot, *asked, *after, *after_slot], out);
+            put_records(records, out)?;
         }
         Frame::Forward(proposal) => {
             out.push(FORWARD);
@@ -138,6 +198,20 @@ impl<'a> Reader<'a> {
         let bytes: [u8; 8] = self.take(8)?.try_into().map_err(|_| WireError::Truncated)?;
         Ok(u64::from_be_bytes(bytes))
     }
+    fn records(&mut self) -> Result<Vec<Vec<u8>>, WireError> {
+        let count = self.u32()?;
+        // Each record takes at least its four length bytes: a count the
+        // frame cannot hold is refused before anything is allocated.
+        if count > self.0.len() / 4 {
+            return Err(WireError::Truncated);
+        }
+        let mut records = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = self.u32()?;
+            records.push(self.take(len)?.to_vec());
+        }
+        Ok(records)
+    }
     fn finish(self) -> Result<(), WireError> {
         if self.0.is_empty() {
             Ok(())
@@ -171,30 +245,41 @@ pub fn decode(buf: &[u8], max_frame: usize) -> Result<Option<(Frame, usize)>, Wi
             slot: r.u64()?,
             limits: r.u64()?,
         },
-        APPEND => {
-            let slot = r.u64()?;
-            let commit = r.u64()?;
-            let count = r.u32()?;
-            // Each record takes at least its four length bytes: a count the
-            // frame cannot hold is refused before anything is allocated.
-            if count > r.0.len() / 4 {
-                return Err(WireError::Truncated);
-            }
-            let mut records = Vec::with_capacity(count);
-            for _ in 0..count {
-                let len = r.u32()?;
-                records.push(r.take(len)?.to_vec());
-            }
-            Frame::Message(Message::Append {
-                slot,
-                records,
-                commit,
-            })
-        }
+        APPEND => Frame::Message(Message::Append {
+            slot: r.u64()?,
+            prev: r.u64()?,
+            prev_slot: r.u64()?,
+            commit: r.u64()?,
+            records: r.records()?,
+        }),
         ACK => Frame::Message(Message::Ack {
             slot: r.u64()?,
+            last_slot: r.u64()?,
             end: r.u64()?,
             durable: r.u64()?,
+            cut: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(WireError::Malformed),
+            },
+        }),
+        PROMISE => Frame::Message(Message::Promise { slot: r.u64()? }),
+        PROMISED => Frame::Message(Message::Promised {
+            slot: r.u64()?,
+            last_slot: r.u64()?,
+            end: r.u64()?,
+        }),
+        FETCH => Frame::Message(Message::Fetch {
+            slot: r.u64()?,
+            last_slot: r.u64()?,
+            end: r.u64()?,
+        }),
+        FETCHED => Frame::Message(Message::Fetched {
+            slot: r.u64()?,
+            asked: r.u64()?,
+            after: r.u64()?,
+            after_slot: r.u64()?,
+            records: r.records()?,
         }),
         FORWARD => {
             let kind = r.u8()?;

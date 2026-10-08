@@ -15,23 +15,47 @@ fn frames() -> Vec<Frame> {
         },
         Frame::Message(Message::Append {
             slot: 1,
+            prev: 0,
+            prev_slot: 0,
             records: vec![b"header".to_vec(), Vec::new(), vec![7; 300]],
             commit: 42,
         }),
         Frame::Message(Message::Append {
             slot: 1,
+            prev: 0,
+            prev_slot: 0,
             records: Vec::new(),
             commit: 9,
         }),
         Frame::Message(Message::Ack {
             slot: 1,
+            last_slot: 1,
             end: 10,
             durable: 8,
+            cut: false,
         }),
         Frame::Forward(Proposal {
             kind: Kind::Publish,
             properties: vec![1, 0, 1, 1],
             body: b"body".to_vec(),
+        }),
+        Frame::Message(Message::Promise { slot: 7 }),
+        Frame::Message(Message::Promised {
+            slot: 7,
+            last_slot: 5,
+            end: 90,
+        }),
+        Frame::Message(Message::Fetch {
+            slot: 7,
+            last_slot: 4,
+            end: 60,
+        }),
+        Frame::Message(Message::Fetched {
+            slot: 7,
+            asked: 60,
+            after: 60,
+            after_slot: 4,
+            records: vec![b"header".to_vec(), vec![1; 40]],
         }),
     ]
 }
@@ -90,12 +114,12 @@ fn malformed_frames_are_refused() {
     );
     // An APPEND claiming more records than its bytes could hold.
     let mut append = vec![2];
-    append.extend_from_slice(&[0; 16]);
+    append.extend_from_slice(&[0; 32]);
     append.extend_from_slice(&u32::MAX.to_be_bytes());
     assert_eq!(decode(&frame(&append), 1 << 20), Err(WireError::Truncated));
     // An ACK with a byte too many.
     let mut ack = vec![3];
-    ack.extend_from_slice(&[0; 25]);
+    ack.extend_from_slice(&[0; 34]);
     assert_eq!(decode(&frame(&ack), 1 << 20), Err(WireError::Trailing));
     // A FORWARD of a kind no version knows.
     assert_eq!(

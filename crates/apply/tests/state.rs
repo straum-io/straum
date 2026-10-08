@@ -481,6 +481,77 @@ proptest! {
             }
         }
     }
+
+    /// A snapshot taken anywhere in the log, decoded, and followed by the
+    /// rest of the log gives the state and effects of applying the whole
+    /// log (D-67 B): a node that restarts from one is indistinguishable.
+    #[test]
+    fn a_snapshot_and_the_log_after_it_give_the_whole_log(
+        proposals in proptest::collection::vec(any_proposal(), 0..60),
+        cut in any::<prop::sample::Index>(),
+    ) {
+        let limits = Limits { max_inflight: 2, max_backlog: 2, ..Limits::default() };
+        let records = log(&proposals);
+        let (whole, effects) = run_with(limits, &proposals);
+        let at = cut.index(records.len() + 1);
+        let mut state = State::new(limits);
+        let mut before = Vec::new();
+        for record in &records[..at] {
+            state.apply(&decode(record).unwrap(), &mut before).unwrap();
+        }
+        let mut bytes = Vec::new();
+        state.encode(&mut bytes);
+        let mut restored = State::decode(limits, &bytes).unwrap();
+        prop_assert_eq!(&restored, &state);
+        let mut after = Vec::new();
+        for record in &records[at..] {
+            restored.apply(&decode(record).unwrap(), &mut after).unwrap();
+        }
+        prop_assert_eq!(&restored, &whole);
+        before.extend(after);
+        prop_assert_eq!(before, effects);
+    }
+
+    /// Arbitrary bytes never panic the decoder, and every strict prefix of a
+    /// real snapshot is refused.
+    #[test]
+    fn a_damaged_snapshot_is_refused(
+        proposals in proptest::collection::vec(any_proposal(), 0..20),
+        noise in proptest::collection::vec(any::<u8>(), 0..64),
+        cut in any::<prop::sample::Index>(),
+    ) {
+        let limits = Limits::default();
+        let _ = State::decode(limits, &noise);
+        let (state, _) = run_with(limits, &proposals);
+        let mut bytes = Vec::new();
+        state.encode(&mut bytes);
+        let short = cut.index(bytes.len());
+        prop_assert!(State::decode(limits, &bytes[..short]).is_err());
+    }
+}
+
+/// A snapshot is refused under other limits or another format version.
+#[test]
+fn a_snapshot_under_other_limits_or_version_is_refused() {
+    let (state, _) = run_with(
+        Limits::default(),
+        &[subscribe(origin(1, 1), "a", G::AtLeastOnce)],
+    );
+    let mut bytes = Vec::new();
+    state.encode(&mut bytes);
+    let other = Limits {
+        max_inflight: 3,
+        ..Limits::default()
+    };
+    assert_eq!(
+        State::decode(other, &bytes),
+        Err(apply::SnapshotError::Limits)
+    );
+    bytes[0] = 99;
+    assert_eq!(
+        State::decode(Limits::default(), &bytes),
+        Err(apply::SnapshotError::Version(99))
+    );
 }
 
 /// An at-most-once message does not overtake an earlier at-least-once one
@@ -578,4 +649,38 @@ fn properties_travel_with_the_message() {
         &[with(b"kept", true), subscribe(a, "t", G::AtMostOnce)],
     );
     assert!(!effects.iter().any(|e| matches!(e, Effect::Deliver { .. })));
+}
+
+/// A new slot's `SlotStart` advances the position and changes nothing.
+#[test]
+fn a_slot_start_changes_no_state() {
+    let (before, _) = run_with(
+        Limits::default(),
+        &[subscribe(origin(1, 1), "a", G::AtLeastOnce)],
+    );
+    let mut chain = Chain::genesis();
+    let mut records = Vec::new();
+    let proposal = subscribe(origin(1, 1), "a", G::AtLeastOnce);
+    let mut body = Vec::new();
+    proposal.encode(&mut body).unwrap();
+    let entry = Entry {
+        kind: proposal.kind(),
+        properties: proposal.properties(),
+        body: &body,
+    };
+    chain.batch(1, &[entry], &mut records).unwrap();
+    let start = Entry {
+        kind: Kind::SlotStart,
+        properties: &[],
+        body: &2u64.to_be_bytes(),
+    };
+    chain.batch(2, &[start], &mut records).unwrap();
+    let mut state = State::new(Limits::default());
+    let mut effects = Vec::new();
+    for record in &records {
+        state.apply(&decode(record).unwrap(), &mut effects).unwrap();
+    }
+    assert_eq!(state.applied(), 4);
+    assert_eq!(state.sessions(), before.sessions());
+    assert_eq!(effects.len(), 1, "only the subscription's own effect");
 }

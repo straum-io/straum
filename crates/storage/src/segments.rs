@@ -193,6 +193,52 @@ impl<D: Disk + Clone> Segments<D> {
         Ok(())
     }
 
+    /// Removes every record after `last`, keys being record numbers:
+    /// segments that start after it go whole, the one that holds it is cut
+    /// as [`Segments::truncate_tail`] cuts, and the segment before becomes
+    /// the one written to. For a tail the log must give up — records of an
+    /// older slot the new owner's log does not have (ADR-0008 step 5) — so
+    /// `last` is a batch boundary and nothing is staged. A crash part way
+    /// leaves the log ending somewhere at or after `last`, a prefix of what
+    /// it was: the cut is asked again.
+    pub fn truncate_after(&mut self, last: u64) -> Result<(), StorageError> {
+        if self.staged_records != 0 {
+            return Err(StorageError::StagedDuringCompaction);
+        }
+        let mut removed = false;
+        while let Some(key) = self.active.as_ref().map(|active| active.key) {
+            if key <= last {
+                break;
+            }
+            self.active = None;
+            self.disk.remove(&segment_path(&self.directory, key))?;
+            removed = true;
+            if let Some((key, _)) = self.sealed.pop() {
+                let path = segment_path(&self.directory, key);
+                let (wal, recovery) = Wal::open_on(self.disk.clone(), &path, self.limits.wal)?;
+                self.active = Some(Active {
+                    key,
+                    wal,
+                    records: recovery.records,
+                    bytes: recovery.durable_offset,
+                });
+            }
+        }
+        if removed {
+            self.disk
+                .sync_directory(&self.directory)
+                .map_err(StorageError::DirectoryNotDurable)?;
+        }
+        let beyond = self.active.as_ref().map_or(0, |active| {
+            active
+                .key
+                .saturating_add(active.records)
+                .saturating_sub(1)
+                .saturating_sub(last)
+        });
+        self.truncate_tail(beyond)
+    }
+
     /// Keys of every segment, oldest first, the active one last.
     pub fn keys(&self) -> impl Iterator<Item = u64> + '_ {
         self.sealed
@@ -203,7 +249,7 @@ impl<D: Disk + Clone> Segments<D> {
 
     /// Every segment's key and size in bytes, oldest first: what a retention
     /// bound in bytes is measured against.
-    pub fn sizes(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+    pub fn sizes(&self) -> impl DoubleEndedIterator<Item = (u64, u64)> + '_ {
         self.sealed.iter().copied().chain(
             self.active
                 .as_ref()

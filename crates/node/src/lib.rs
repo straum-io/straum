@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use apply::{Effect, Limits, State};
 use cluster::wire::Frame;
-use cluster::{Config as CoreConfig, Effect as Step, Proposal, Replica, Sequencer};
+use cluster::{Config as CoreConfig, Effect as Step, Proposal, Voter};
 use gateway::{Action, Gateway};
 use storage::SegmentLimits;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -44,6 +44,15 @@ pub enum NodeError {
     Storage(#[from] storage::StorageError),
     #[error("the log does not recover as one chain: {0}")]
     Recovery(#[from] journal::ChainError),
+    #[error("the snapshot is refused: {0}")]
+    Snapshot(#[from] apply::SnapshotError),
+    #[error("the snapshot file is torn or damaged")]
+    SnapshotDamaged,
+    /// The log was compacted past a snapshot, or the snapshot is ahead of
+    /// what the log holds: neither is left by this node's own order of
+    /// writes, so the data directory is not one node's.
+    #[error("the snapshot at lsn {snapshot} does not meet the log, which holds {first}..{end}")]
+    SnapshotGap { snapshot: u64, first: u64, end: u64 },
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("transport: {0}")]
@@ -78,6 +87,14 @@ pub struct NodeConfig {
     pub link_queue: usize,
     pub transport: TransportConfig,
     pub mqtt: Option<MqttConfig>,
+    /// The retention bound of D-57 A: the log keeps no more than this many
+    /// bytes behind a replica that is only slow; a replica further behind
+    /// is lost (it needs a state copy, step 7b).
+    pub retain_bytes: u64,
+    /// Applied records between two snapshots. The log below the last
+    /// durable snapshot may go (D-67 B); a snapshot encodes the whole
+    /// state on the node loop, so this trades disk for that pause.
+    pub snapshot_every: u64,
 }
 
 /// What a node reports about itself.
@@ -88,6 +105,9 @@ pub struct Status {
     pub applied: u64,
     /// `apply::State::digest` at `applied`.
     pub digest: u64,
+    /// The highest slot this node has promised, and whether it sequences it.
+    pub slot: u64,
+    pub leading: bool,
 }
 
 /// A running node. Dropping it does not stop it; `shutdown` does.
@@ -149,40 +169,9 @@ fn incarnation(data: &Path) -> Result<u64, NodeError> {
     Ok(next)
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one per node: its size is never multiplied"
-)]
-enum Core {
-    Sequencer(Sequencer),
-    Replica(Replica),
-}
-
-impl Core {
-    fn take(&mut self) -> Vec<Step> {
-        match self {
-            Core::Sequencer(s) => s.take_effects(),
-            Core::Replica(r) => r.take_effects(),
-        }
-    }
-    fn commit(&self) -> u64 {
-        match self {
-            Core::Sequencer(s) => s.commit(),
-            Core::Replica(r) => r.commit(),
-        }
-    }
-    fn end(&self) -> u64 {
-        match self {
-            Core::Sequencer(s) => s.end(),
-            Core::Replica(r) => r.end(),
-        }
-    }
-}
-
 /// What the node loop owns besides the applied state.
 struct Loop {
-    core: Core,
-    owner: u8,
+    core: Voter,
     links: BTreeMap<u8, mpsc::Sender<Frame>>,
     gateway: Option<Gateway>,
     conns: HashMap<u64, mqtt::Conn>,
@@ -197,24 +186,28 @@ impl Loop {
     }
 
     fn propose(&mut self, proposal: Proposal) {
-        match &mut self.core {
-            Core::Sequencer(s) => {
-                // ponytail: dropped, not held. Nothing is acknowledged that
-                // was not committed: the gateway closes a publisher whose
-                // proposal does not commit within `commit_timeout`, and
-                // resends its lifecycle proposals. Holding them back is a
-                // card (D-69).
-                if s.propose(proposal).is_err() {
-                    tracing::warn!("proposal refused: the sequencer's queue is full");
-                }
+        if self.core.leading() {
+            // ponytail: dropped, not held. Nothing is acknowledged that
+            // was not committed: the gateway closes a publisher whose
+            // proposal does not commit within `commit_timeout`, and
+            // resends its lifecycle proposals. Holding them back is open
+            // (ADR-0008, "Not yet in step 4").
+            if self.core.propose(proposal).is_err() {
+                tracing::warn!("proposal refused: the sequencer's queue is full");
             }
-            Core::Replica(_) => {
-                // Forwarded over a link that keeps order
-                // (gateway::Action::Propose).
-                if let Some(link) = self.links.get(&self.owner) {
+            return;
+        }
+        // Forwarded to the owner of the promised slot, over a link that
+        // keeps order (gateway::Action::Propose). While no one sequences —
+        // a takeover in progress, or this node about to — it is dropped,
+        // as above.
+        match self.core.owner() {
+            Some(owner) if owner != self.core.id() => {
+                if let Some(link) = self.links.get(&owner) {
                     let _ = link.try_send(Frame::Forward(proposal));
                 }
             }
+            _ => {}
         }
     }
 
@@ -331,8 +324,27 @@ impl Loop {
 impl Node {
     pub async fn start(config: NodeConfig) -> Result<Self, NodeError> {
         let (wal_events, mut wal_rx) = mpsc::channel(1024);
-        let (chain, wal, wal_thread) =
-            wal::start(config.data.clone(), config.segments, wal_events)?;
+        let (recovered, wal, wal_thread) = wal::start(
+            config.data.clone(),
+            config.segments,
+            config.retain_bytes,
+            wal_events,
+        )?;
+        let chain = recovered.chain;
+        // The snapshot, then the log after it, with nothing between them.
+        let end = chain.next_lsn().saturating_sub(1);
+        let state = match &recovered.snapshot {
+            Some(bytes) => State::decode(config.limits, bytes)?,
+            None => State::new(config.limits),
+        };
+        let first = recovered.first.unwrap_or(end.saturating_add(1));
+        if state.applied().saturating_add(1) < first || state.applied() > end {
+            return Err(NodeError::SnapshotGap {
+                snapshot: state.applied(),
+                first,
+                end,
+            });
+        }
 
         let budget = Arc::new(BufferBudget::new(
             config.transport.total_connection_buffer_bytes,
@@ -349,7 +361,6 @@ impl Node {
         let limits = limits_digest(&config.limits);
         let slot = config.core.slot;
         let id = config.core.id;
-        let owner = config.core.owner;
 
         let (inbound, mut inbound_rx) = mpsc::channel::<link::Inbound>(1024);
         let mut tasks = vec![tokio::spawn(link::listen(
@@ -410,14 +421,17 @@ impl Node {
         let (status_tx, status) = watch::channel(Status::default());
         let (stop, mut stop_rx) = oneshot::channel::<()>();
 
-        let core = if id == owner {
-            Core::Sequencer(Sequencer::new(config.core.clone(), chain))
-        } else {
-            Core::Replica(Replica::new(config.core.clone(), chain))
-        };
+        // A follower, whatever it was before: a sequencer that restarts
+        // does not lead its old slot again; the schedule moves on (step 5).
+        let core = Voter::new(
+            config.core.clone(),
+            chain,
+            recovered.slots,
+            recovered.promised,
+        )
+        .knowing_commit(state.applied());
         let mut node = Loop {
             core,
-            owner,
             links,
             gateway,
             conns: HashMap::new(),
@@ -428,9 +442,12 @@ impl Node {
         node.gateway_actions();
         let effects_tx = effects.clone();
         let heartbeat = config.heartbeat;
-        let limits_config = config.limits;
+        let snapshot_every = config.snapshot_every.max(1);
+        let mut state = state;
         tasks.push(tokio::spawn(async move {
-            let mut state = State::new(limits_config);
+            let mut snapshot = state.applied();
+            let mut snapshotting = false;
+            let mut retained_floor = 0u64;
             // Appended by this process and not yet applied: bounded by the
             // sequencer's uncommitted bound and the replication window.
             let mut recent: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
@@ -441,9 +458,7 @@ impl Node {
                 tokio::select! {
                     _ = &mut stop_rx => break,
                     _ = tick.tick() => {
-                        if let Core::Sequencer(s) = &mut node.core {
-                            s.tick();
-                        }
+                        node.core.tick();
                         let now = node.now();
                         if let Some(g) = node.gateway.as_mut() {
                             g.tick(now);
@@ -451,21 +466,43 @@ impl Node {
                         node.gateway_actions();
                     }
                     Some(event) = mqtt_rx.recv() => node.mqtt(event),
-                    Some((from, frame)) = inbound_rx.recv() => match (frame, &mut node.core) {
-                        (Frame::Message(message), Core::Sequencer(s)) => s.on_message(from, message),
-                        (Frame::Message(message), Core::Replica(r)) => r.on_message(from, message),
-                        (Frame::Forward(proposal), Core::Sequencer(_)) => node.propose(proposal),
+                    Some((from, frame)) = inbound_rx.recv() => match frame {
+                        Frame::Message(message) => node.core.on_message(from, message),
+                        // One hop only: a node that no longer sequences
+                        // drops it rather than pass it on to a view of the
+                        // owner that may point back.
+                        Frame::Forward(proposal) if node.core.leading() => node.propose(proposal),
                         _ => {}
                     },
                     Some(proposal) = proposals_rx.recv() => node.propose(proposal),
-                    Some(event) = wal_rx.recv() => match (event, &mut node.core) {
-                        (wal::Event::Durable(lsn), Core::Sequencer(s)) => s.on_durable(lsn),
-                        (wal::Event::Durable(lsn), Core::Replica(r)) => r.on_durable(lsn),
-                        (wal::Event::Read { to, from, batch }, Core::Sequencer(s)) => match batch {
-                            Some(batch) => s.on_read(to, batch),
-                            None => s.on_read_missing(to, from),
+                    Some(event) = wal_rx.recv() => match event {
+                        wal::Event::Durable { lsn, bytes_floor } => {
+                            retained_floor = bytes_floor;
+                            node.core.on_durable(lsn);
+                        }
+                        wal::Event::Promised(slot) => node.core.on_promised(slot),
+                        wal::Event::Truncated(chain) => {
+                            // What was appended past the cut is not the log.
+                            drop(recent.split_off(&chain.next_lsn()));
+                            node.core.on_truncated(chain);
+                        }
+                        wal::Event::Snapshot(lsn) => {
+                            snapshotting = false;
+                            snapshot = lsn;
+                            // Never below what a restart needs: the log after
+                            // the durable snapshot. A sequencer also keeps what
+                            // its replicas still read, up to the byte bound
+                            // (D-57 A). A replica keeps the byte bound's worth
+                            // too: when it takes the slot over (step 5) it is
+                            // the one others catch up from.
+                            let floor = node.core.compaction_floor(retained_floor);
+                            let _ = wal.send(wal::Command::Compact { floor: floor.min(lsn) });
+                        }
+                        wal::Event::Read { to, from, batch } => match batch {
+                            Some(batch) => node.core.on_read(to, batch),
+                            None => node.core.on_read_missing(to, from),
                         },
-                        (wal::Event::Range(records), _) => {
+                        wal::Event::Range(records) => {
                             reading = false;
                             for record in records {
                                 if let Ok(r) = journal::decode(&record) {
@@ -473,19 +510,16 @@ impl Node {
                                 }
                             }
                         }
-                        (wal::Event::Failed(error), _) => {
+                        wal::Event::Failed(error) => {
                             tracing::error!(%error, "the log failed; the node stops");
                             break;
                         }
-                        _ => {}
                     },
                 }
-                if let Core::Sequencer(s) = &mut node.core {
-                    let _ = s.flush();
-                }
+                let _ = node.core.flush();
                 // Carry out what the core asked for, until it asks nothing.
                 loop {
-                    let steps = node.core.take();
+                    let steps = node.core.take_effects();
                     if steps.is_empty() {
                         break;
                     }
@@ -508,6 +542,12 @@ impl Node {
                             }
                             Step::Lost { to } => {
                                 tracing::error!(replica = to, "replica below the log's floor; it needs a state copy");
+                            }
+                            Step::Promise { slot } => {
+                                let _ = wal.send(wal::Command::Promise { slot });
+                            }
+                            Step::Truncate { after } => {
+                                let _ = wal.send(wal::Command::Truncate { after });
                             }
                             Step::Committed(_) | Step::ReadDone { .. } => {}
                         }
@@ -553,6 +593,20 @@ impl Node {
                     node.gateway_actions();
                 }
                 node.resume();
+                // Only what is durable here: a restart must find the log up
+                // to the snapshot, or it could not check the two meet.
+                if !snapshotting
+                    && state.applied().saturating_sub(snapshot) >= snapshot_every
+                    && state.applied() <= node.core.durable()
+                {
+                    let mut bytes = Vec::new();
+                    state.encode(&mut bytes);
+                    let _ = wal.send(wal::Command::Snapshot {
+                        lsn: state.applied(),
+                        bytes,
+                    });
+                    snapshotting = true;
+                }
                 // The digest hashes the whole state: only when it changed.
                 let digest = if state.applied() == last.applied {
                     last.digest
@@ -564,6 +618,8 @@ impl Node {
                     commit,
                     applied: state.applied(),
                     digest,
+                    slot: node.core.slot(),
+                    leading: node.core.leading(),
                 };
                 status_tx.send_if_modified(|current| {
                     let changed = *current != last;
