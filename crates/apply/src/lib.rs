@@ -622,7 +622,7 @@ impl State {
     }
 
     /// Applies the next committed record and appends what it makes
-    /// observable to `out`. Batch headers and `SlotStart` advance the
+    /// observable to `out`. Batch headers, `SlotStart` and `SlotEnd` advance the
     /// position and change nothing else. Records must come in lsn order, each exactly once.
     pub fn apply(&mut self, record: &Record<'_>, out: &mut Vec<Effect>) -> Result<(), ApplyError> {
         let expected = self.applied.checked_add(1).ok_or(ApplyError::OutOfOrder {
@@ -635,9 +635,12 @@ impl State {
                 expected,
             });
         }
-        // A slot's first record marks a change of sequencer: it is part of
-        // the log's order and changes no state (step 5).
-        if record.kind != Kind::BatchHeader && record.kind != Kind::SlotStart {
+        // A slot's first and last records mark a change of sequencer: they
+        // are part of the log's order and change no state (steps 5, 6).
+        if !matches!(
+            record.kind,
+            Kind::BatchHeader | Kind::SlotStart | Kind::SlotEnd
+        ) {
             let proposal = Proposal::decode(record)?;
             self.effect(proposal, record.lsn, out);
         }
@@ -852,20 +855,25 @@ impl State {
 
     fn ack(&mut self, origin: Origin, delivery: u64, lsn: u64, out: &mut Vec<Effect>) {
         let max_inflight = self.limits.max_inflight;
-        let Some(session) = self.sessions.get_mut(&origin) else {
-            return;
-        };
-        // An acknowledgement retried after it was applied is a no-op.
-        let Some(acked) = session.inflight.remove(&delivery) else {
-            return;
-        };
-        let mut released = acked.size();
-        session.inflight_bytes = session.inflight_bytes.saturating_sub(released);
+        // Every committed acknowledgement is answered, also one retried
+        // after it was applied or one for a session that is gone: the
+        // gateway retries an acknowledgement until it sees `Acked`, and
+        // with no answer it retried for ever, holding a retry slot (found by
+        // the MQTT simulation, seed 1189, D-81).
         out.push(Effect::Acked {
             to: origin,
             delivery,
             lsn,
         });
+        let Some(session) = self.sessions.get_mut(&origin) else {
+            return;
+        };
+        // An acknowledgement retried after it was applied changes nothing.
+        let Some(acked) = session.inflight.remove(&delivery) else {
+            return;
+        };
+        let mut released = acked.size();
+        session.inflight_bytes = session.inflight_bytes.saturating_sub(released);
         // The backlog drains in order until an at-least-once message finds
         // the window full again. A message moving into the window stays in
         // the queued budget; one going out at most once leaves it.

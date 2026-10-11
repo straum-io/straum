@@ -12,7 +12,7 @@ name = "straum-server"
 path = "src/main.rs"
 
 [dependencies]
-runtime = { path = "../runtime" }
+node = { path = "../node" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros"] }
 tracing = "0.1"

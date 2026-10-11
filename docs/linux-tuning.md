@@ -1,5 +1,7 @@
 # Linux Tuning
 
+> **Partly history.** The old broker read these kernel parameters at startup and resolved `auto` values from them; that went with it at step 8 (D-111), and the server does not probe the kernel yet. The parameters and their meaning still apply to a production host; the probes remain in `transport/src/sys/`.
+
 Production hosts run Linux. This document covers what the broker checks and
 what the operator sets.
 

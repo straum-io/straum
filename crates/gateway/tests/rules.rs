@@ -622,3 +622,77 @@ fn message_properties_reach_mqtt_5_subscribers() {
     };
     assert_eq!(received, vec![(1, Some(Box::new(expected))), (2, None)]);
 }
+
+/// Step 7a (D-78 A): what this gateway cannot keep is refused at CONNECT,
+/// not silently dropped — a will, a 3.1.1 session that outlives its
+/// connection, an MQTT 5 session expiry. An MQTT 5 CleanStart=0 with no
+/// expiry asks to keep nothing, and is accepted with SessionPresent=0.
+#[test]
+fn wills_persistent_sessions_and_expiry_are_refused_at_connect() {
+    let will = || {
+        Some(codec::Will {
+            topic: Topic::new(Bytes::from_static(b"gone")).unwrap(),
+            payload: Bytes::from_static(b"bye"),
+            qos: Qos::AtMostOnce,
+            retain: false,
+            properties: codec::WillProperties::default(),
+        })
+    };
+    let expiring = ConnectProperties {
+        session_expiry_secs: 60,
+        ..ConnectProperties::default()
+    };
+    let cases = [
+        (
+            Version::V5,
+            true,
+            will(),
+            ConnectProperties::default(),
+            false,
+        ),
+        (
+            Version::V311,
+            true,
+            will(),
+            ConnectProperties::default(),
+            false,
+        ),
+        (
+            Version::V311,
+            false,
+            None,
+            ConnectProperties::default(),
+            false,
+        ),
+        (Version::V5, true, None, expiring, false),
+        (Version::V5, false, None, ConnectProperties::default(), true),
+    ];
+    for (conn, (version, clean_start, will, properties, accepted)) in (1..).zip(cases) {
+        let mut rig = Rig::ready();
+        rig.versions.insert(conn, version);
+        assert!(rig.gateway.accept(conn, T0));
+        let connect = Packet::Connect(Box::new(Connect {
+            version,
+            client_id: ClientId::new(Bytes::from_static(b"c")).unwrap(),
+            clean_start,
+            keep_alive_secs: 0,
+            will,
+            username: None,
+            password: None,
+            properties,
+        }));
+        rig.client(conn, connect, version);
+        let expected = if accepted {
+            ReasonCode::Success
+        } else if version == Version::V311 {
+            ReasonCode::ServerUnavailable
+        } else {
+            ReasonCode::ImplementationSpecificError
+        };
+        assert_eq!(
+            connack_reason(&rig.take_sent(), conn),
+            Some(expected),
+            "case {conn}: {version:?}, clean start {clean_start}"
+        );
+    }
+}

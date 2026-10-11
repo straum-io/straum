@@ -754,3 +754,38 @@ there); why is not investigated. Medians of divan's 100 samples:
 | apply_publish_at_least_once 1 / 10 / 100 subscribers | 597.7 ns / 3.122 µs / 39.23 µs | 7 / 1.922 KB, 16 / 14.45 KB, 106 / 139.7 KB |
 | gateway_publish_in 64 B / 1 KiB | 275 / 384.6 ns | 3.9 / 714.7 B, 2.9 / 1.551 KB |
 | gateway_deliver_out 64 B / 1 KiB | 414.9 / 488.4 ns | 3 / 528 B |
+
+## `node/benches/cap.rs` — `max_uncommitted` against throughput and failover (D-84 A), preliminary
+
+2026-10-09, Linux container (`scripts/linux.sh`, podman on Apple M1), so
+**preliminary**: a VM's time and network (CLAUDE.md §11). Not a basis
+for the default; D-84 A needs a quiet Linux host. Three nodes on
+loopback, 64 B publishes, a closed loop of 512 in flight, 2 s × 3 rounds
+(median); 10 failovers per cap: the sequencer is stopped while the load
+runs (an orderly `shutdown` — no process kill in-process), timed to a
+commit in a later slot on the others; heartbeat 50 ms, takeover after 3
+heartbeats. The lag column is the largest survivor lag sampled just
+before a stop, from separate nodes' status channels — an approximation.
+
+```text
+cap   publishes/s  failovers ≤ 1 s  p50 / max (ms)  survivor lag before the stop (records)
+64        254 727       6 of 10      195 / 4 141           58 175
+96        312 829       2 of 10      195 / 7 037           80 275
+128       275 952       7 of 10      245 / 2 676           26 910
+256       307 270       8 of 10      236 / 1 157           15 015
+1024       16 261       0 of 10        - / -              231 985
+4096        6 723      10 of 10      165 / 205                 64
+```
+
+What it shows, as a hypothesis until a Linux host repeats it:
+
+- Failover misses 1 s where a survivor lagged far behind: a new slot
+  commits only once the new majority holds the whole log, and while the
+  old sequencer lived the slow replica was outside the majority that
+  committed, so nothing kept it close. The lag does not follow the cap.
+  `max_uncommitted` bounds the tail past the commit point, not how far a
+  replica that is not needed for commit falls behind (D-85).
+- Throughput collapses at caps 1024 and 4096 (16 k and 7 k against about
+  300 k), the same in four runs; cause not found.
+- A single run on macOS (one round, 3 failovers) gave 4 216 publishes/s at
+  cap 64 and 2 237 at 4096, every failover ≈ 200 ms.

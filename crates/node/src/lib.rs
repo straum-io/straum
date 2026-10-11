@@ -23,12 +23,16 @@ mod link;
 mod mqtt;
 mod wal;
 
+pub mod experimental;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+pub use experimental::{ConfigError, Experimental};
 
 use apply::{Effect, Limits, State};
 use cluster::wire::Frame;
@@ -53,10 +57,19 @@ pub enum NodeError {
     /// writes, so the data directory is not one node's.
     #[error("the snapshot at lsn {snapshot} does not meet the log, which holds {first}..{end}")]
     SnapshotGap { snapshot: u64, first: u64, end: u64 },
+    /// The data directory was first used by a cluster with another
+    /// configuration digest (`cluster_digest`), or its `cluster` file is
+    /// damaged (`pinned` is `None`).
+    #[error(
+        "the data directory belongs to another cluster: pinned {pinned:x?}, this configuration {digest:x}"
+    )]
+    OtherCluster { pinned: Option<u64>, digest: u64 },
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("transport: {0}")]
     Transport(#[from] transport::TransportError),
+    #[error("configuration: {0}")]
+    Config(#[from] ConfigError),
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +108,24 @@ pub struct NodeConfig {
     /// durable snapshot may go (D-67 B); a snapshot encodes the whole
     /// state on the node loop, so this trades disk for that pause.
     pub snapshot_every: u64,
+    /// Leading, hand the slot over to the next owner every this many
+    /// heartbeats (§2.4 planned rotation, ADR-0008 step 6). `None`, the
+    /// default: a sequencer is stable.
+    pub rotate_every: Option<u32>,
+    /// Bytes one read of the log hands back at most — or one batch, if that
+    /// alone is larger: a catch-up or a candidate's fetch moves this much
+    /// per round trip (D-81 A). At most half of `max_frame`, which carries it;
+    /// more is refused at startup (D-83 A).
+    pub read_bytes: usize,
 }
+
+/// The starting `retain_bytes` (D-91 A): 64 MiB, the old path's
+/// `STRAUM_WAL_RETAIN_BYTES`. Compatible, not shown optimal: what share of
+/// failovers it sends to a state copy on a real workload is not measured.
+/// In the cluster simulation, 100 000 bytes already left no fault cycle
+/// needing one (10 000 seeds; D-87 A). Used once step 7a reads
+/// configuration.
+pub const DEFAULT_RETAIN_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What a node reports about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -116,10 +146,77 @@ pub struct Node {
     pub mqtt: Option<SocketAddr>,
     proposals: mpsc::Sender<Proposal>,
     effects: broadcast::Sender<(u64, Vec<Effect>)>,
+    /// Operator handoffs, each with where its answer goes.
+    hand_offs: mpsc::Sender<oneshot::Sender<Result<(), cluster::ClusterError>>>,
     status: watch::Receiver<Status>,
     stop: Option<oneshot::Sender<()>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     wal: Option<std::thread::JoinHandle<()>>,
+}
+
+/// The snapshot file's body, this node's format (D-79 A):
+/// `[version=2][slots u32] { [slot u64][first lsn u64] } [apply::State]`.
+/// The slot table is the committed log's, through the snapshot's lsn and
+/// pruned by compaction; the state is `apply`'s own encoding. Version 2:
+/// before D-79 the body was `apply`'s alone, which starts with its own
+/// version 1, so an old body is refused here rather than misread. The
+/// table goes first because `apply`'s body carries no length of its own.
+const SNAPSHOT_VERSION: u8 = 2;
+
+fn encode_snapshot(slots: &[(u64, u64)], state: &State) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(5 + slots.len() * 16);
+    bytes.push(SNAPSHOT_VERSION);
+    bytes.extend_from_slice(&u32::try_from(slots.len()).unwrap_or(u32::MAX).to_be_bytes());
+    for &(slot, first) in slots {
+        bytes.extend_from_slice(&slot.to_be_bytes());
+        bytes.extend_from_slice(&first.to_be_bytes());
+    }
+    state.encode(&mut bytes);
+    bytes
+}
+
+/// The slot table and the state's bytes. A table the log could not have
+/// produced — not ascending in both — is refused, as is a count past the
+/// bytes that are there.
+/// A slot table: (slot, first lsn), ascending.
+type Slots = Vec<(u64, u64)>;
+
+fn decode_snapshot(bytes: &[u8]) -> Result<(Slots, &[u8]), NodeError> {
+    let u64_at = |at: usize| -> Option<u64> {
+        Some(u64::from_be_bytes(
+            bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
+        ))
+    };
+    if bytes.first() != Some(&SNAPSHOT_VERSION) {
+        return Err(NodeError::SnapshotDamaged);
+    }
+    let count = bytes
+        .get(1..5)
+        .and_then(|b| b.try_into().ok())
+        .map(u32::from_be_bytes)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or(NodeError::SnapshotDamaged)?;
+    let end = count
+        .checked_mul(16)
+        .and_then(|n| n.checked_add(5))
+        .filter(|&end| end <= bytes.len())
+        .ok_or(NodeError::SnapshotDamaged)?;
+    let mut slots: Slots = Vec::with_capacity(count);
+    for index in 0..count {
+        let at = 5 + index * 16;
+        let entry = u64_at(at)
+            .zip(u64_at(at + 8))
+            .ok_or(NodeError::SnapshotDamaged)?;
+        if slots
+            .last()
+            .is_some_and(|&(slot, first)| entry.0 <= slot || entry.1 <= first)
+        {
+            return Err(NodeError::SnapshotDamaged);
+        }
+        slots.push(entry);
+    }
+    let state = bytes.get(end..).ok_or(NodeError::SnapshotDamaged)?;
+    Ok((slots, state))
 }
 
 /// A digest of the limits, compared at every link: a fixed function of the
@@ -143,6 +240,81 @@ pub fn limits_digest(limits: &Limits) -> u64 {
         }
     }
     hash
+}
+
+/// What every node of one cluster must share, as one number (ADR-0008
+/// step 7a, D-104 A): the voters, the first slot and its owner — they fix
+/// the schedule — the timing and the bounds that decide liveness and what
+/// a batch may hold, and the `apply` limits, part of what the log means.
+/// Sent in every HELLO; a link with another digest is refused, and a data
+/// directory keeps the digest it was first used with. Addresses are not in
+/// it: a node may listen on `0.0.0.0` while its peers name it by host.
+pub fn cluster_digest(config: &NodeConfig) -> u64 {
+    let core = &config.core;
+    let mut voters = core.nodes.clone();
+    voters.sort_unstable();
+    let (lag_records, lag_ticks) = core
+        .lag_bound
+        .map_or((0, 0), |b| (b.records, u64::from(b.ticks)));
+    let fields = voters.iter().map(|&v| u64::from(v)).chain([
+        u64::MAX,
+        u64::from(core.owner),
+        core.slot,
+        u64::try_from(config.heartbeat.as_millis()).unwrap_or(u64::MAX),
+        u64::from(core.takeover_ticks),
+        core.max_uncommitted,
+        core.window,
+        core.max_batch as u64,
+        config.max_frame as u64,
+        lag_records,
+        lag_ticks,
+        limits_digest(&config.limits),
+    ]);
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for field in fields {
+        for byte in field.to_be_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+/// A data directory belongs to the cluster it was first used with: its
+/// `cluster` file keeps that cluster's digest, written aside, synced and
+/// renamed before anything else is written there. A node started over
+/// another cluster's data — another schedule, other limits — would read
+/// its promises and log as its own; it is refused instead (D-104 A).
+fn pin_cluster(data: &Path, digest: u64) -> Result<(), NodeError> {
+    std::fs::create_dir_all(data)?;
+    let path = data.join("cluster");
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let pinned = <[u8; 8]>::try_from(bytes.as_slice())
+                .map(u64::from_be_bytes)
+                .map_err(|_| NodeError::OtherCluster {
+                    pinned: None,
+                    digest,
+                })?;
+            if pinned != digest {
+                return Err(NodeError::OtherCluster {
+                    pinned: Some(pinned),
+                    digest,
+                });
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let next = data.join("cluster.next");
+            let mut file = std::fs::File::create(&next)?;
+            file.write_all(&digest.to_be_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&next, &path)?;
+            std::fs::File::open(data)?.sync_all()?;
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The next incarnation of this node, durable before it is used: the
@@ -323,6 +495,10 @@ impl Loop {
 
 impl Node {
     pub async fn start(config: NodeConfig) -> Result<Self, NodeError> {
+        // Before the log is opened or anything listens: a configuration
+        // that breaks a rule is refused, not corrected (D-83 A, D-104 A).
+        config.check()?;
+        pin_cluster(&config.data, cluster_digest(&config))?;
         let (wal_events, mut wal_rx) = mpsc::channel(1024);
         let (recovered, wal, wal_thread) = wal::start(
             config.data.clone(),
@@ -333,9 +509,12 @@ impl Node {
         let chain = recovered.chain;
         // The snapshot, then the log after it, with nothing between them.
         let end = chain.next_lsn().saturating_sub(1);
-        let state = match &recovered.snapshot {
-            Some(bytes) => State::decode(config.limits, bytes)?,
-            None => State::new(config.limits),
+        let (snapshot_slots, state) = match &recovered.snapshot {
+            Some(bytes) => {
+                let (slots, state) = decode_snapshot(bytes)?;
+                (slots, State::decode(config.limits, state)?)
+            }
+            None => (Vec::new(), State::new(config.limits)),
         };
         let first = recovered.first.unwrap_or(end.saturating_add(1));
         if state.applied().saturating_add(1) < first || state.applied() > end {
@@ -358,7 +537,7 @@ impl Node {
             None,
         )?;
         let listen = listener.local_addr()?;
-        let limits = limits_digest(&config.limits);
+        let digest = cluster_digest(&config);
         let slot = config.core.slot;
         let id = config.core.id;
 
@@ -367,7 +546,7 @@ impl Node {
             listener,
             config.core.nodes.clone(),
             slot,
-            limits,
+            digest,
             config.max_frame,
             inbound,
         ))];
@@ -378,9 +557,10 @@ impl Node {
             tasks.push(tokio::spawn(link::dial(
                 address,
                 Frame::Hello {
+                    version: cluster::wire::WIRE_VERSION,
                     node: id,
                     slot,
-                    limits,
+                    config: digest,
                 },
                 rx,
                 config.transport,
@@ -388,12 +568,15 @@ impl Node {
             )));
         }
 
+        // This process's life, durable before use: numbers the gateway's
+        // sessions and orders this node's reports past its restarts.
+        let life = incarnation(&config.data)?;
         let started = tokio::time::Instant::now();
         let (mqtt_tx, mut mqtt_rx) = mpsc::channel::<mqtt::Event>(1024);
         let mut mqtt_listen = None;
         let gateway = match &config.mqtt {
             Some(m) => {
-                let first_session = incarnation(&config.data)? << 32;
+                let first_session = life << 32;
                 let listener = Listener::bind(
                     TransportConfig {
                         listen: m.listen,
@@ -420,16 +603,23 @@ impl Node {
         let (effects, _) = broadcast::channel(4096);
         let (status_tx, status) = watch::channel(Status::default());
         let (stop, mut stop_rx) = oneshot::channel::<()>();
+        let (hand_offs, mut hand_offs_rx) =
+            mpsc::channel::<oneshot::Sender<Result<(), cluster::ClusterError>>>(4);
 
         // A follower, whatever it was before: a sequencer that restarts
         // does not lead its old slot again; the schedule moves on (step 5).
         let core = Voter::new(
             config.core.clone(),
             chain,
-            recovered.slots,
+            cluster::merge_slots(&snapshot_slots, &recovered.slots),
             recovered.promised,
         )
-        .knowing_commit(state.applied());
+        .knowing_commit(state.applied())
+        .incarnation(life);
+        let core = match config.rotate_every {
+            Some(ticks) => core.rotate_every(ticks),
+            None => core,
+        };
         let mut node = Loop {
             core,
             links,
@@ -443,7 +633,14 @@ impl Node {
         let effects_tx = effects.clone();
         let heartbeat = config.heartbeat;
         let snapshot_every = config.snapshot_every.max(1);
+        // At most half a frame (`NodeConfig::check`): the batches read go
+        // out in one.
+        let read_bytes = config.read_bytes;
         let mut state = state;
+        // The committed log's slot table, from committed records only, kept
+        // to go into the next snapshot and pruned by each compaction
+        // (D-73 A, D-79 A).
+        let mut committed_slots = snapshot_slots;
         tasks.push(tokio::spawn(async move {
             let mut snapshot = state.applied();
             let mut snapshotting = false;
@@ -475,6 +672,9 @@ impl Node {
                         _ => {}
                     },
                     Some(proposal) = proposals_rx.recv() => node.propose(proposal),
+                    Some(reply) = hand_offs_rx.recv() => {
+                        let _ = reply.send(node.core.hand_off());
+                    }
                     Some(event) = wal_rx.recv() => match event {
                         wal::Event::Durable { lsn, bytes_floor } => {
                             retained_floor = bytes_floor;
@@ -497,6 +697,10 @@ impl Node {
                             // the one others catch up from.
                             let floor = node.core.compaction_floor(retained_floor);
                             let _ = wal.send(wal::Command::Compact { floor: floor.min(lsn) });
+                        }
+                        wal::Event::Compacted(floor) => {
+                            cluster::prune_slots(&mut committed_slots, floor);
+                            node.core.on_compacted(floor);
                         }
                         wal::Event::Read { to, from, batch } => match batch {
                             Some(batch) => node.core.on_read(to, batch),
@@ -537,8 +741,13 @@ impl Node {
                                     let _ = link.try_send(Frame::Message(message));
                                 }
                             }
-                            Step::Read { to, from } => {
-                                let _ = wal.send(wal::Command::Read { to, from });
+                            Step::Read { to, from, upto } => {
+                                let _ = wal.send(wal::Command::Read {
+                                    to,
+                                    from,
+                                    upto,
+                                    bytes: read_bytes,
+                                });
                             }
                             Step::Lost { to } => {
                                 tracing::error!(replica = to, "replica below the log's floor; it needs a state copy");
@@ -570,6 +779,9 @@ impl Node {
                         tracing::error!(lsn = next, "a committed record does not decode; the node stops");
                         return;
                     };
+                    if committed_slots.last().is_none_or(|&(slot, _)| slot < decoded.slot) {
+                        committed_slots.push((decoded.slot, decoded.lsn));
+                    }
                     let mut out = Vec::new();
                     if let Err(error) = state.apply(&decoded, &mut out) {
                         tracing::error!(%error, "a committed record does not apply; the node stops");
@@ -599,8 +811,7 @@ impl Node {
                     && state.applied().saturating_sub(snapshot) >= snapshot_every
                     && state.applied() <= node.core.durable()
                 {
-                    let mut bytes = Vec::new();
-                    state.encode(&mut bytes);
+                    let bytes = encode_snapshot(&committed_slots, &state);
                     let _ = wal.send(wal::Command::Snapshot {
                         lsn: state.applied(),
                         bytes,
@@ -633,6 +844,7 @@ impl Node {
             listen,
             mqtt: mqtt_listen,
             proposals,
+            hand_offs,
             effects,
             status,
             stop: Some(stop),
@@ -645,6 +857,34 @@ impl Node {
     /// the link to it otherwise.
     pub async fn propose(&self, proposal: Proposal) {
         let _ = self.proposals.send(proposal).await;
+    }
+
+    /// Asks this node to hand its slot over to the next owner in the
+    /// schedule (ADR-0008 step 6; the operator's command, D-105 A): a
+    /// protocol handoff — the queue is written, then `SlotEnd`, and the
+    /// sequencer steps down once it has committed and the successor holds
+    /// it, or after `takeover_ticks` heartbeats; fencing, the majority and
+    /// the committed prefix rule as in any slot change. It neither stops
+    /// the node nor forces a leader: the node goes on serving, and if the
+    /// successor fails the next one takes over by silence.
+    ///
+    /// # Errors
+    /// `NotLeader` when this node is not sequencing (or has stopped),
+    /// `NoSuccessor` when the next slot is its own again.
+    pub async fn hand_off(&self) -> Result<(), cluster::ClusterError> {
+        let (reply, answer) = oneshot::channel();
+        if self.hand_offs.send(reply).await.is_err() {
+            return Err(cluster::ClusterError::NotLeader);
+        }
+        answer
+            .await
+            .unwrap_or(Err(cluster::ClusterError::NotLeader))
+    }
+
+    /// Where proposals go, as [`Node::propose`], for a task that outlives
+    /// a borrow of the node (the cap benchmark's load, D-84 A).
+    pub fn proposer(&self) -> mpsc::Sender<Proposal> {
+        self.proposals.clone()
     }
 
     pub fn status(&self) -> watch::Receiver<Status> {
@@ -670,6 +910,34 @@ impl Node {
         }
         if let Some(wal) = self.wal.take() {
             let _ = tokio::task::spawn_blocking(move || wal.join()).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_snapshot_body_carries_the_slot_table_and_refuses_a_damaged_one() {
+        let state = State::new(Limits::default());
+        let slots = vec![(3, 20), (4, 30)];
+        let bytes = encode_snapshot(&slots, &state);
+        let (decoded, rest) = decode_snapshot(&bytes).unwrap();
+        assert_eq!(decoded, slots);
+        assert_eq!(State::decode(Limits::default(), rest).unwrap(), state);
+
+        // Another version, a count past the bytes, a table not ascending.
+        let mut other = bytes.clone();
+        other[0] = 1;
+        assert!(decode_snapshot(&other).is_err());
+        let mut long = bytes.clone();
+        long[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_snapshot(&long).is_err());
+        let backwards = encode_snapshot(&[(4, 30), (3, 20)], &state);
+        assert!(decode_snapshot(&backwards).is_err());
+        for cut in 0..5 {
+            assert!(decode_snapshot(&bytes[..cut]).is_err());
         }
     }
 }

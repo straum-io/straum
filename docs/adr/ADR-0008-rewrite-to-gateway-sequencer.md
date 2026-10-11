@@ -1,7 +1,7 @@
 # ADR-0008: Rewrite the broker and replication for gateway/sequencer now
 
-- Status: accepted (direction); steps 1, 2, 3a, 3b-1, 3b-2, 4 and 5 done
-  (see Progress); D-49…D-69 decided or withdrawn
+- Status: accepted (direction); steps 1–6 done, 7a experimental, step 8 (the
+  old path removed) done early, D-111 (see Progress); 7b and 7c open
 - Date: 2026-10-04
 - Decided by: Stanislav (D-48: C)
 - Deviations from: docs/architecture/unified-stream.md §6 (the order of
@@ -93,7 +93,8 @@ touch; the old path keeps working until a step replaces it (D-49).
    slot table and truncation; `sim`: invariants 2 and 6, partitions. A
    sequencer restart becomes a takeover, and only then may the sequencer
    ship a batch in parallel with its own sync; until here it syncs first
-   (D-58 A).
+   (D-58 A). Taking it waits for unified-stream phase 5 and a Linux
+   measurement (D-71 A, amending D-58 A).
 6. Graceful handoff: `SlotEnd`/`SlotStart`, the successor schedule.
 7. Sessions, takeover across gateways, expiry and will through the log
    (the gateway proposes; the sequencer writes `SessionExpired`,
@@ -114,13 +115,23 @@ touch; the old path keeps working until a step replaces it (D-49).
    commit; `memory` and `written` go, revising ADR-0006, D-36 A and the D-42
    draft). The two-node `quorum` pair stays on the old path until a witness
    exists (phase 4 of unified-stream §6), so step 8 removes the old path only
-   after that.
+   after that. Until then the old path is frozen — bug fixes only (D-75).
+   Two more conditions come before removal (D-75): the guarantees of the
+   D-28 chain (C1–C4, today `sim/tests/chain.rs` over the old broker and
+   runtime) are carried into simulation invariants of the new path, and the
+   new path has a durability benchmark comparable with the old path's
+   baseline (`e2e/benches/durability.rs`, docs/baselines/).
 
-**Cluster mode is test-only until step 7.** Before it, wills and sessions are
+**Cluster mode was test-only until step 7a; since then it is experimental
+and off by default.** Before it, wills and sessions are
 not yet in the log, and before step 5 there is no fencing: a cluster would have
 observable effects outside the log (§1). Until then cluster mode is reachable
 from the simulation and the e2e tests only, and refused by the server's
-configuration.
+configuration. Since step 7a (D-78 A, D-102 A–D-105 A) the server can start
+a node on the new path behind `STRAUM_EXPERIMENTAL_CLUSTER=1`: experimental
+and off by default, not production-ready, flow control off. It refuses
+wills, persistent sessions and session expiry at CONNECT rather than handle
+them locally, until step 7c puts them in the log.
 
 Phases 4–6 of unified-stream §6 (metadata log and witness; Linux performance;
 MQTT 5 extensions) are unchanged and follow step 8.
@@ -529,8 +540,9 @@ node across slots (unified-stream §2.2, §2.4 ungraceful):
   6, comes with step 5: an ungraceful takeover needs it (§2.4, "мёртвый
   преемник: следующий по расписанию"). Step 6 keeps `SlotEnd` and planned
   rotation. The schedule is the configured first owner, then the voters
-  in list order, until the metadata log (§2.5) holds it. The sequencer still syncs before it ships (D-58's parallel ship
-  is not taken).
+  in list order, until the metadata log (§2.5) holds it. The sequencer
+  still syncs before it ships: D-71 A defers D-58's parallel ship to
+  unified-stream phase 5, where a Linux measurement decides it.
 
 Found by the takeover simulation and fixed, each with its seed in the
 code: a `SlotStart` held back by the uncommitted bound (deadlock); a meet
@@ -559,10 +571,946 @@ segments.rs` (a cut across segments), `crates/node/tests/cluster.rs`
 sockets and files; disabling takeover fails it); the existing cluster,
 apply and gateway simulations (fixed owner) pass 1000 seeds.
 
-Not yet in step 5: the cluster simulation with compaction still runs a
-fixed owner, so compaction during takeover is covered only by the node
-test; the apply and MQTT simulations run a fixed owner too; graceful
-handoff is step 6; a candidate whose source compacted what it needs waits
-for a later slot (state copy, 7b); `Status.digest` and the effects hook
-are still on the node loop.
+**D-70 A (2026-10-08): step 5 hardened in simulation.** The cluster
+simulation (segmented log on simulated disks, compaction, pinned
+catch-up readers) and the apply and MQTT simulations run three
+`cluster::Voter`s instead of a fixed owner: promises, cuts and takeovers
+alongside compaction, snapshots and gateways forwarding to a changing
+owner. They found, and the code now handles, each with its seed in a
+comment:
+
+- *Batch boundaries:* a cut point is a boundary only in the log that
+  named it; the voter now names where logs provably differ and the driver
+  rounds down to a boundary of its own (safe: within a slot a batch is
+  the same batch everywhere). `Effect::Truncate` says so.
+- *Compaction and cuts:* compaction stops one record short of the commit
+  point, so a cut never leaves a log with no record to say where it
+  stands; a restarted voter knows as committed what its node applied
+  (`knowing_commit`); the committed prefix agrees whatever a compacted
+  slot table says; an unknown slot (0) at a record proves nothing.
+- *Stale reports:* reports are ordered (`Ack.report`: the node's
+  incarnation, durable, in the high bits, a count below) and a report not
+  newer than the last one taken is ignored; a fresh cut always
+  repositions a replica, a repeat reships nothing; a replica with a cut in
+  flight does not report; a fetch answer echoes the asker's whole
+  position, slot included.
+- *Placement:* a replica's durability holds back compaction only once
+  its log ends in the sequencer's slot (the meet point is an estimate); a
+  replica whose log meets this one below what is kept is lost (D-57 A);
+  one that holds records past what is kept in a slot this log no longer
+  knows is lost too — a deviation from D-57 A, below; a missing
+  read for a replica in repair forgets its position once, then loses it.
+- *Liveness:* lost replicas still hear heartbeats, so they do not fall
+  silent and break every slot at their turn; deliveries in the
+  simulations keep queue order (a newest-first queue livelocked a replica
+  that needed the oldest append).
+- *Step-down:* a sequencer that steps down hands over its pending
+  effects (defensive: no driver leaves effects pending, and no seed
+  shows it).
+
+Evidence: `STRAUM_SIM_SEEDS=10000` passes for the cluster simulation
+(retention bound 1000 bytes, 100 seeds by default: 45 533 takeovers,
+14 042 cuts, 2 873 segments removed, 677 compactions during a takeover,
+640 held by a pin, 941 replicas lost within D-57's rules), the apply
+simulation (36 139 takeovers, 12 579 cuts, 5 789 restarts of a compacted
+log, 62 935 deliveries checked) and the MQTT simulation (39 059 slot
+takeovers, 9 298 cuts, 49 217 deliveries checked), and 100 000 seeds for
+the takeover simulation. Mutations caught by sweeps: unordered reports, a fetch answer
+checked by end alone, compaction counting replicas not in the slot. The
+apply and MQTT simulations use `takeover_ticks = 6`. **Criterion not
+met:** takeovers run at about 0.2–0.3 per hundred steps, below the
+card's "at least one per hundred"; biasing crashes and partitions toward
+the sequencer moved the cluster simulation only to 0.32, since faults
+themselves are a few percent of events. Raising it further is a choice
+between takeover rate and what else the runs check (D-72). D-72 B was measured
+and failed: sequencer faults 4–16 per hundred events lifted fault-heavy seeds
+only to 0.40–0.42, and extra heartbeats lowered the rate, since a takeover
+needs a hundred-plus events of round trips. D-80 B, liveness per fault, was
+measured too: within 600 events a later slot committed after 50% of
+sequencer faults with other faults paused (86% within 6 000), and 4% with
+them running. Failed quiet cycles show a long uncommitted tail fetched one
+batch per round trip (cause not established). Open as D-81.
+
+**D-81 A (2026-10-09): the criterion is liveness after a fault.** The
+cluster simulation runs fault cycles in two seeds in three: the sequencer
+crashes or is cut off, nobody else is meanwhile (loss, reordering,
+compaction and its restart go on), and a later slot must commit within
+2 000 events in at least 9 cycles in 10 — asserted. 10 000 seeds:
+
+| | before | reads of several batches |
+|---|---|---|
+| all cycles | 80.4% (one seed group) | 93.5% (6 807 of 7 281) |
+| uncommitted bound 4–16 | — | 98.4% |
+| no uncommitted bound | 80.4% | 87.7% |
+
+Failover correlates with the uncommitted tail a new sequencer must move:
+with `max_uncommitted` bounded, 98.4% of faults are followed within the
+bound; without one, 87.7%. The mechanism behind the remaining
+unbounded-group failures is not traced. **Deviation, recorded:** the
+gate holds over both groups pooled (one to one by seed); the unbounded
+group alone misses 9 in 10 (D-82; closed by D-82 A below, with that
+group gated at its measured level). Cycles allow no second crash or
+partition while they run, so a cycle in which a second node fails and a
+majority survives is not measured. The change that moved the
+rate: `Effect::Read` carries `upto` (the sequencer's durable log and the
+replica's window), and the driver hands back whole batches within a byte
+bound — or one batch, if that alone is larger (`cluster::ReadBatches`,
+`NodeConfig.read_bytes`, which has no default yet, D-83) — instead of one;
+catch-up and a candidate's fetch take fewer round trips. Two hypotheses
+measured and dropped: a candidate keeping followers from counting silence
+while it catches up (88.9% against 87.7%), and a window of 64 instead of
+24 (89.2%). The sweep also found a liveness bug in `apply`: an
+acknowledgement retried after it was applied, or for a session that is
+gone, was answered with nothing, and the gateway retried it for ever
+(MQTT simulation, seed 1189); every committed `Ack` is now answered with
+`Acked`.
+
+**D-82 A (2026-10-09): `max_uncommitted` bounds failover too, and the
+gate is per group.** The cluster simulation runs three seed groups, all
+with fault cycles: an uncommitted bound of 4–16, none (coverage), and the
+default `cluster::DEFAULT_MAX_UNCOMMITTED`. Measured at 10 000 seeds for
+candidate defaults: 64 → 94.1%, 96 → 91.1%, 128 → 89.1%, 256 and above
+the same as none (87.7%; tails in a 1 500-step run rarely grow longer).
+The default is 64, the largest with a margin above 9 in 10; 96, the
+largest that passes, is the decision's literal wording — the choice is
+open (D-84). Gates: 9 in
+10 for the 4–16 group (98.4%) and the default group (94.1%); 85% for the
+group with no bound (87.1%) — for that group alone the measured level,
+amending D-81 A. A group's gate is asserted from 300 cycles: the default
+run's 30 or so move 3 points a cycle, so the sweep carries the gate. The
+default is in records and in simulation events; its cost in throughput
+on a real host is not measured (D-84), and `node` does not use it until
+configuration from the environment arrives in step 7a, with `read_bytes`
+(D-83 A).
+
+**Liveness contract (D-85, 2026-10-09).** What the new path promises after a
+sequencer fails, and under which assumptions.
+
+1. *Safety* — always, under any schedule of crashes, power losses,
+   partitions, loss, duplication and reordering: invariants 1–6 of
+   unified-stream §5 (one committed history, nothing committed beyond what a
+   majority holds durably, no commit by a sequencer of slot k once a majority
+   promised past k, every recovered log one chain), D-57 A (a replica lost
+   only past the byte bound), and PUBACK only after commit. Checked after
+   every simulation event; no liveness change below weakens any of them.
+
+2. *Eventual liveness* — once the following hold from some point on, the
+   commit point advances again:
+   - a majority of voters is up, mutually reachable, and *able*: not lost
+     and not behind every log's compaction floor (such a replica needs a
+     copy of the state, step 7b, not built);
+   - every message is delivered eventually if resent often enough
+     (fair-lossy links: loss, duplication and reordering allowed, as the
+     heartbeat resends);
+   - every log write and sync completes or fails, and every read of the
+     local log is answered;
+   - every node keeps taking heartbeats and events;
+   - the uncommitted tail is within `max_uncommitted`, the retained log
+     within its byte bound.
+   - a takeover's promise round — `Promise` out, the promises made
+     durable and back — fits within `takeover_ticks` heartbeats once in a
+     while, and its remaining round trips — a catch-up of the uncommitted
+     tail, `SlotStart` made durable — within `takeover_ticks × 64`: a
+     takeover's wait for silence doubles after each one that a majority
+     promised and that did not end in a commit (`patience`, D-88 A),
+     capped at 64× so that a dead sequencer is still passed over within a
+     bounded time. A takeover no majority answers leaves the wait as it
+     was, so a partition does not lengthen the recovery after it; the
+     price is that the promise round itself gets no doubling. Past either
+     bound, eventual progress is not guaranteed.
+   No bound on time follows from these: messages may take arbitrarily
+   long, and progress comes once a takeover's round trips fit the wait.
+
+3. *Bounded liveness* — progress within a stated time needs, on top: a
+   round trip, a log sync and a catch-up of the uncommitted tail each
+   shorter than `takeover_ticks` heartbeats, and patience at 1 (a commit
+   since the last failed takeover). Under them a takeover finishes in about
+   `takeover_ticks` heartbeats plus the catch-up. Nothing in the
+   simulation's event counts maps to wall-clock time.
+
+4. *Performance objectives* — throughput, and failover time from a
+   sequencer's stop to the next commit (proposed: 9 in 10 within 1 s,
+   D-84 A). Measured only on a quiet Linux host; not measured yet.
+
+A scenario that does not meet (2)'s assumptions is classified, never counted
+as recovered: in the cluster simulation, a fault cycle whose live nodes hold
+no able majority is reported as "needs a state copy (7b)" with its seed.
+
+**Failover stalls: causes found and fixed (2026-10-09).** The fault
+cycles were changed from a bounded rate to the eventual criterion above:
+a cycle counts from the moment a majority is up and reachable, runs until
+a later slot commits, and stalls when nothing progresses for 20 000
+events — progress being a higher commit point, or a node not sequencing
+whose log passes the furthest it reached while not sequencing — or when
+nothing has committed by 500 000 events. Healing works the same way and
+has settled once every node able to catch up has committed through the
+cluster's commit point at the first new commit. (Two coarser measures,
+the lowest end and the summed ends, mistook a change of sequencer for a
+stall: seeds 160, 6376.) Before the fixes, 3 000 seeds gave 173 cycles
+with no commit after 100 000 events. Each fix below is shown by a seed
+that fails without it, the others in place; candidate fixes that a
+10 000-seed sweep showed unneeded were taken out again (progress
+keepalives on serving a fetch, on appending fetched records, and a
+candidate's `Promise` re-sent to the other voters — the last one also let
+a candidate that can send but never hear keep every peer from counting
+silence).
+
+1. *A fixed wait for silence* (`Voter::tick`). A takeover needs round
+   trips — promises, a catch-up, `SlotStart` made durable — and the next
+   node in the schedule started the next slot after `takeover_ticks` of
+   silence whatever stage the running one had reached. Where a round trip
+   outlasts that wait every candidate is passed over before it finishes,
+   for ever: seed 4, slots 10 to 1 268 in 100 000 events; without the
+   fix, healing churns through 3 520 slots (seed 643), and 3 000 seeds
+   take 2 826 s instead of 8. Fix: `patience`, doubled by every takeover
+   started by silence, up to 64×, back to 1 once the commit point moves;
+   since D-88 A, by every such takeover that a majority promised (seeds 4
+   and 643 still recover).
+2. *Stale read answers taken* (`Sequencer::on_read`). An answer to a read
+   given up since cleared the read outstanding and asked again, queueing
+   one more read behind the rest for every stale answer; a catch-up moved
+   one batch in many reads, and a replica it needed for commit never
+   caught up (seed 160: `reading: Some(302)` behind dozens of reads for
+   297). Fix: only the answer to the read outstanding is taken.
+3. *Reads matched by replica only* (`Voter::on_read`). The answer to a
+   sequencer's catch-up read went to a fetch from the same replica still
+   held from before this node led; the sequencer waited for it for ever
+   (seed 1 384). Fix: matched by replica and position, and given to both
+   when both asked for it.
+4. *A fetch for an older slot served across a promise* (`Voter::serve`),
+   a safety fault. A candidate passed over still fetched; the node it
+   asked, by then the next slot's sequencer, served it from its log,
+   records not yet synced included. The replica held them durably first,
+   so once a majority had promised past the slot the sequencer's own later
+   sync still let it commit them — invariant 6 (seed 4 629: slot 9 raised
+   the commit point to 23 past the fence at 21; reached once the other
+   fixes changed the schedules). Fix: a fetch for a slot below the one
+   promised is not served.
+5. *A handoff stepping down before its successor held `SlotEnd`*
+   (`Voter::tick`). A successor that had just cut its log was left with no
+   one to catch up from, and the slot went by silence (takeover
+   simulation, seed 4 905). Fix: the sequencer keeps heartbeating until
+   the successor holds `SlotEnd` durably, at most `takeover_ticks`
+   heartbeats.
+6. *Checks that could not settle or judged too early* (the simulations,
+   not the protocol): a rotating sequencer is never quiet at one end
+   (seed 1); a stale sequencer's uncommitted end was taken as healing's
+   goal (seeds 15, 16); healing went on proposing while a follower caught
+   up; a commit handed over at step-down was judged by the role after it
+   (seed 4 629 — now judged by the committed record's slot, which must
+   have been this node's in this life, and still under that slot's
+   fence).
+
+A cycle that stops without a majority able to catch up — a replica lost
+past the byte bound, needing a state copy (step 7b) — is classified, not
+counted recovered, and only when that came within `LOSS_GRACE` (5 000)
+events of the last progress, above the 99th percentile of recovery
+(2 933): a replica passed by compaction after progress had been absent
+longer would count as a stall. In the sweep the latest such loss came 572
+events after the last progress; 146 of the 162 nearest cases had made no
+progress yet, the replica being compacted past a median of 214 events
+into the cycle (this simulation keeps 1 000 bytes behind commit).
+
+Checked, 2026-10-10 (D-87 A): every node keeping a classified cycle's
+majority from catching up had been passed by the byte bound, as D-57 A
+allows (forced, or lost below the byte-bound floor) — any other would
+count as a stall; once the node cut off comes back, 500 of the 504
+cycles regain a majority able to catch up and commit, as the test now
+requires, 3 still have none, and 1 is the slow case below. With a
+realistic bound, 100 000 bytes instead of 1 000, no cycle of 18 524 needs
+a state copy and none stalls (`a_realistic_retention_bound_needs_no_
+state_copy`, 100 seeds, in every `cargo test`); within 2 000 events
+100%, 99.9%, 93.5% for the three groups. One cycle (seed 8956, no
+uncommitted bound) is still getting further at the 500 000-event cap:
+its sequencer appends faster than the only replica it can commit with
+catches up — what `max_uncommitted` bounds, off in that group — and it
+commits at about 1 300 000 events (an ignored test reruns it with the cap
+raised); such "slow" cycles are reported apart and allowed only where
+there is no uncommitted bound. Patience after recovery (D-86 A): at the
+start of healing, runs whose most patient node was at 16×, 32× or 64× took
+up to 300, 389 and 1 790 rounds (heartbeats) to the first commit, against
+at most 66–188 below that: patience grown while takeovers failed for want
+of a reachable majority makes recovery after the partition heals slow
+(D-88). Both readings were corrected the same day — see "D-88 A, D-90 B"
+below: the long heals were catch-ups, not patience, and the slow cycles
+are now stalls unless they commit within a derived cap.
+
+After them, 10 000 seeds: 17 934 cycles recovered, 0 stalled, 1 slow
+(seed 8956), 504 classified as needing a state copy (the first ten seeds
+are printed, all are in the run's statistics); events from a majority up to the next
+commit: p50 353, p90 855, p99 2 933, max 125 134. Within 2 000 events:
+98.4% (uncommitted bound 4–16), 96.1% (64), 91.0% (none) — a simulation
+measure, not time. Regression, in every `cargo test`:
+`sim/tests/cluster.rs::every_seed_that_stalled_recovers` (seeds 1, 4, 7,
+15, 16, 22, 79, 91, 160, 643, 1 384, 4 629, every invariant checked),
+the main sweep's "no stall" assertion,
+`sim/tests/takeover.rs::a_handoff_waits_for_a_successor_catching_up`;
+unit tests in `cluster/tests/protocol.rs` (a stale read answer) and
+`cluster/tests/voter.rs` (patience, read routing, an older slot's fetch,
+the bounded handoff wait), each failing without its fix.
+`STRAUM_SIM_TRACE=1` prints the cluster simulation's trace, and each
+node's state at a stall.
+
+**D-88 A, D-90 B (2026-10-10).** *Patience* now doubles only for a
+takeover a majority promised (`Voter::decide`), not for every takeover
+started by silence. Compared on the same 10 000 seeds, with healing split
+by seed group: under the old rule, every heal over 105 rounds was in the
+group without an uncommitted bound (up to 7 790 rounds), and in the
+bounded groups 64 runs reached 64× and healed within 41 rounds — the
+1 790 rounds that motivated D-88 were a catch-up across an unbounded
+tail, not patience. Under D-88 A no node in a bounded group passes 16×
+(once; it healed in 1 round), against 64× in 64 runs before; the bounded
+groups' heals are unchanged (at most 105 rounds); 0 stalls; 98.5%,
+96.3%, 90.4% within 2 000 events (98.4%, 96.1%, 91.0% before); takeover
+(20 000), apply and MQTT (10 000) sweeps pass. Regression:
+`a_takeover_no_majority_answers_leaves_the_wait_as_it_was` (cluster/tests/voter.rs).
+The contract above now asks the promise round to fit `takeover_ticks`.
+
+*Slow cycles* are no longer allowed (D-90 B). Raising the cap to
+50 000 000, every cycle of 10 000 seeds commits. The long ones are all in
+the group without an uncommitted bound: a sequencer without a majority
+kept appending (0.55 records an event), the next slot that commits starts
+past that whole tail, and takeovers during the catch-up move that start
+further on; the catch-up then runs at a steady rate — measured from the
+start of the slot that commits, 10.8–13.0 events a record per replica
+caught up over the 24 catch-ups of 2 000 records or more (the sequencer
+reads its log for one replica at a time: two caught up together take
+twice as long). The longest: 50 675 records, 602 635 events (seed 1 831).
+So the cap is 5 000 000 events, a cycle at it is a stall, and every
+catch-up of 2 000 records or more must cost at most 24 events a record
+per replica — twice the typical cost, so a catch-up at half speed fails;
+at that cost the cap admits 4.1 times the longest catch-up seen. The
+seeds that outlasted the old cap (802, 1 831, 4 714; seed 8 956 no longer
+does under D-88 A) run to their commit in the ignored
+`a_tail_outrunning_its_catch_up_commits_eventually` (about 100 s);
+`without_an_uncommitted_bound_a_new_slot_must_first_cover_the_whole_tail`
+(cluster/tests/protocol.rs) shows the mechanism in milliseconds. The
+default `max_uncommitted` (64) makes it impossible: the tail is bounded.
+
+**D-91 A.** `node::DEFAULT_RETAIN_BYTES` = 64 MiB, the old path's default,
+read once step 7a reads configuration; a starting value, not a measured
+optimum.
+
+**D-85 B, D-89 A1 (2026-10-10): bounding replica lag — invariants and
+their proof; built as D-89 A2, below.** D-85 chose flow control as the direction on
+condition that what it bounds is defined first and shown never to block
+commit for a majority able to commit. D-89 A1 fixes the definitions and
+the rule, and proves the user's six conditions; implementing them is D-89
+A2, a separate step.
+
+*Definitions.* A slot `k` with sequencer `S`, `N` voters, majority
+`M = ⌊N/2⌋ + 1`. `E` is the last lsn `S` appended; `C` its commit point;
+`D_S` its durable end. A replica `r` is *placed* when its last report ended
+in slot `k` (`in_slot`), is not lost and not probing — its log is then a
+prefix of `S`'s — and `D_r` is the durable end it last reported; an
+unplaced replica has no `D_r`. `C` and every `D_r` only grow. `F` is `S`'s
+compaction floor.
+
+- Three candidate measures: **unacknowledged** `E − D_r` — in flight it is
+  already bounded by `window`; owed, it is lag plus the uncommitted tail
+  `E − C`, which `max_uncommitted` bounds; **lag** `C − D_r` — how far `r`
+  is behind what is committed; **catch-up room** `D_r − F` — whether `S`'s
+  log still holds what `r` needs (below `F`, `r` is lost and needs a state
+  copy, D-57 A). The one bounded is **lag**: a survivor in the next slot's
+  majority must hold everything to `C` before that slot commits (§2.3,
+  `SlotStart`), so lag is the catch-up a failover owes. Catch-up room is
+  not bounded by flow control: it is retention's (D-57 A, D-91 A).
+- An **able majority** is `M` voters, `S` counted, that are up, reach
+  each other, and are placed. Only an able majority's durability moves
+  `C`. A replica that is reachable but unplaced — its log ends in an older
+  slot, it is probing, cut back, or lost — counts toward no commit, with or
+  without flow control: network availability is not enough.
+
+*The rule.* Parameters `L` (records) and `T` (heartbeats of `S`), and
+`max_uncommitted` set, with `L ≥ max_uncommitted + max_batch`. Each
+replica is *attached* or *detached*; only `S` holds this, per slot.
+
+- **R1 — start.** At the start of a slot every replica is detached.
+- **R2 — attach.** A detached replica attaches when it is placed, its lag
+  is 0 (`D_r ≥ C`), and `C` has reached the slot's first lsn
+  (`SlotStart` committed).
+- **R3 — hold.** `flush` makes no batch of queued proposals while some
+  attached replica has lag `> L`. `SlotStart` and the batches of a sealed
+  slot (`SlotEnd`) are never held. Nothing else reads attachment. With
+  nothing queued nothing is held and R4 counts nothing: an idle sequencer
+  detaches no one.
+- **R4 — detach.** When, since the last batch, `flush` has been held for
+  `T` heartbeats in all — across holds, however each ended — every
+  attached replica with lag `> 0` detaches; only a batch resets the
+  count. A replica that becomes unplaced or lost detaches at once. (Counted
+  per hold, a replica that catches up part of the way would end a hold and
+  the commit point could pass it again with no batch made, each hold
+  starting from zero; found by the review of D-89 A2.)
+
+*Lemma 1 — at most `N − M` replicas lag.* `C` is the `M`-th highest of
+`D_S` and the placed replicas' `D_r` (or lower, until the slot's first
+record commits), so at least `M` of those values are `≥ C`, and at most
+`N − M` placed replicas have `D_r < C`. Each replica whose durability `C`
+rests on has lag 0. Flow control can only ever name a replica outside the
+majority that committed. For three voters: at most one.
+
+*Lemma 2 — an attached replica cannot start a hold within one.* While
+`C` is at or past the slot's first lsn, every batch is made with
+`E − C < max_uncommitted` and adds at most `max_batch`, and `C` only
+grows, so `E − C < max_uncommitted + max_batch ≤ L` at every point after.
+During a hold `E` does not move. A replica with lag 0 at any moment of the
+hold — attached then (R2), or kept at R4 — has `D_r ≥ C` then, so for the
+rest of the hold its lag is at most `E − D_r ≤ E − C < L`.
+
+*The six conditions (D-89).*
+
+1. **Commit of records already appended is never delayed by a lagging
+   replica.** `C` is computed from `D_S` and the placed replicas' `D_r`
+   (`advance_commit`); shipping (`ship`, `tick`'s resend), syncing
+   (`on_durable`) and the reports do not read attachment or the hold (R3).
+   A record appended commits once an able majority holds it durably —
+   with no later append needed, because the slot's own first record, which
+   `C` must reach first, is `SlotStart`, never held. Flow control cannot
+   remove, delay or reorder a message, a write or a sync that commit
+   depends on.
+2. **The wait before new appends is bounded by `T`.** A hold exists only
+   while some attached replica has lag `> L`. At the `T`-th held heartbeat
+   since the last batch, R4 detaches every attached replica with lag
+   `> 0`; those left have lag 0 and, by Lemma 2, cannot exceed `L` before
+   `E` moves; nor can a replica attaching meanwhile. So between two
+   batches flow control holds at most `T` heartbeats of `S` in all. The
+   bound is per batch, not per proposal: a proposal queued behind others
+   waits up to `T` before each batch ahead of it, at least one batch
+   being made between those waits.
+3. **After `T` the lagging replica is detached and holds nothing.** R4,
+   and R3 names attached replicas only. It re-attaches only at lag 0 (R2).
+4. **Detachment changes nothing in quorum, durability, fencing or
+   acknowledgement safety.** Attachment is read by `flush` alone. The
+   commit rule (quorum), what is written and synced (durability), the
+   slot, promise and fetch rules (`Voter`, fencing, invariant 6), and
+   `Effect::Committed` — the only source of a PUBACK — are untouched;
+   compaction still keeps a detached replica's records up to the byte bound
+   (D-57 A). A hold only makes a batch later than it would have been, the
+   same as proposals arriving later: a schedule every simulation already
+   produces. Invariants 1–6 and D-57 A hold with flow control as without.
+5. **No bounded failover without a state copy is promised where the
+   remaining replicas cannot form the majority it needs.** When `S` fails,
+   the next slot commits once an able majority of the survivors holds
+   everything to `C` and `SlotStart` (§2.3). A bound on that catch-up,
+   `L + max_uncommitted + max_batch` records per survivor plus the
+   uncommitted tail, holds only if every survivor the new majority needs
+   was attached at the fault — an attached replica's lag is below `L` when
+   a batch is made, and grows by at most `E − C` after it. With three
+   voters, both survivors. If one was detached, the catch-up spans its
+   whole lag: bounded by retention, not by `L`. If it is below the floor,
+   it needs a state copy (7b) and only the other survivors' majority, if
+   any, is promised anything (eventual liveness, "able majority", above).
+   Flow control does not change which majority is able.
+6. **A detached replica's return is safe.** It is shipped as any replica
+   — from memory, or read from the log within `window` — since shipping
+   does not read attachment. Its catch-up uses only the paths it uses
+   today; if its position is below `F` it is lost (`Effect::Lost`) and
+   needs the state copy (7b, D-57 A). It holds nothing until it re-attaches
+   at lag 0, and by Lemma 2 cannot then start a hold until the next batch.
+
+*Not a decision by time.* `T` counts heartbeats and only triggers a
+transition — a replica detaching — which changes no committed state and
+no safety rule (§1). A stale report understates `D_r` and can only
+detach a replica earlier: the failover bound of (5) is lost for it, never
+safety (4). Without `max_uncommitted` (the simulation's uncapped seed
+group) Lemma 2 does not hold and neither does (2)'s bound: flow control
+requires an uncommitted bound.
+
+*What it costs.* Throughput while an attached replica is slow: up to `T`
+heartbeats of no new batch per hold. `L`, `T` and that cost come from the
+Linux measurement (D-84 A, D-89 A2); the cap benchmark must show failover
+within the target with every survivor attached. A2's simulation checks:
+no fault cycle with an able majority stalls (D-85), no hold lasts more
+than `T` heartbeats, and every safety invariant, with flow control on.
+
+**D-89 A2 (2026-10-10): built, off by default.** `cluster::Config::
+lag_bound: Option<LagBound>` (`records` = `L`, raised to
+`max_uncommitted + max_batch`; `ticks` = `T`); `None` everywhere outside
+the simulation until the Linux measurement sets `L` and `T`. R1–R4 are in
+`Sequencer` alone: `attached` per replica, set by R2 after every commit
+computation and cleared where a replica stops being placed or is lost;
+`holding_back` (R3) read only by `flush`, and never for a sealed slot;
+R4 in `tick`, its count reset only by a batch. Checked: the cluster
+simulation runs it in half of each bounded seed group, `L` at most 7
+above its floor and `T` 2–8, and after every heartbeat counts the
+heartbeats a sequencer held with its slot and end unchanged — whatever
+ended a hold in between — and asserts they stay below `T`: a hold that
+started again without a batch, which is what a failure of Lemma 2 would
+produce, fails the run (checked: attaching without the lag-0 condition of
+R2 fails it); every safety invariant is checked as for every seed. 10 000
+seeds: 0 stalls, 64 heartbeats held in 21 stretches between batches,
+none reaching `T`; liveness
+per group as without it. Unit tests (cluster/tests/protocol.rs): holds last at most `T` heartbeats
+between two batches, counted across holds; the replica detaches, stays
+detached while behind, and attaches again once caught up; commit of what
+is appended goes on during a hold — each failing without its rule
+(R2's lag-0 condition, R3, R4, the count across holds). Not
+measured: throughput and failover on Linux (D-84 A), and holds are rare
+at this simulation's sizes — 21 stretches in 10 000 seeds.
+
+**D-93 A, D-95 A, D-97 A (2026-10-10): checks before 7a.**
+
+*D-93 A — a slow replica, where flow control must act*
+(`a_slow_replica_is_detached_at_t_and_rejoins_while_the_majority_commits`,
+cluster simulation). Each run, four times:
+- proposals pause until one sequencer counts both replicas;
+- one replica's disk turns slow for 3 000 events — 99 of its 100 writes
+  are deferred to a later write, its promises with them, as `node`'s WAL thread syncs
+  appends before a promise;
+- then fast again, 10 000 events under the same load;
+- then proposals pause until it is counted again.
+
+No crash, partition or message loss; retention 100 000 bytes; no
+rotation and 30 heartbeats of silence before a takeover (see the
+takeover finding below). 200 seeds with flow control on, 800 windows:
+- **Detach and majority progress:** in every window the sequencer held
+  new batches, and R4 detached the slow replica at the `T`-th held
+  heartbeat — checked as that replica, by the sequencer the window settled
+  on. The commit point moved after the moment of the detach in all 800,
+  with the other replica. No takeover, no replica lost.
+- **Rejoin:** with proposals paused, the replica caught up and was counted
+  again in every window (p50 3 201, max 8 502 events).
+- **Under continuing load** it is caught up from the log but closed the gap
+  to the commit point in only 74 of 800 windows; the largest lag after
+  the slowness was p50 295, max 550 records. Its catch-up runs at about
+  the rate the sequencer appends: the race of D-90 B, in a bounded group
+  this time. `max_uncommitted` bounds the uncommitted tail, not how far a
+  detached replica trails, and L2 forbids holding appends for a detached
+  replica. So under sustained load a detached replica is safe and served,
+  but may not re-attach: it keeps no bounded failover (condition 5) until
+  the load drops, and with a slower catch-up it would fall behind until
+  retention passes it and it needs a state copy. A design decision (D-100).
+- **Settling was needed:** under load the slower replica is rarely at
+  lag 0, which R2 asks before attaching, so flow control often counts
+  only one replica.
+**Closed only at that timing.** With the base timing (3 heartbeats,
+rotation) majority progress is not shown: a slow disk deposes healthy
+sequencers (the finding below), with flow control on or off. Whether that
+keeps 7a waiting is D-101's question.
+The default `cargo test` runs 5 seeds (20 windows); `STRAUM_SIM_SLOW_SEEDS=200` is
+the sweep.
+
+*A takeover finding.* With the base timing, three heartbeats of
+silence, this simulation's random delivery takes the slot over about every
+300 events even with no fault (several times in a 3 000-event window), and
+every new slot starts with all replicas detached (R1). A slow disk triples
+that (145–200 takeovers a run against 35–53, 95 of 100 writes deferred, the same with flow control off
+and under the patience rule before D-88 A, so neither caused it). The
+mechanism: a replica whose promise of the newer slot is not durable yet
+takes that slot's appends as a reason to promise, not as a heartbeat —
+`on_append` resets silence only when following — so on a slow disk it
+counts silence while the sequencer is talking to it, starts takeovers of
+its own it cannot finish, and its patience stays at 1 because no majority
+ever answers them (D-88 A). Safety is untouched; a healthy sequencer can
+be deposed (D-98, D-99).
+
+*D-95 A — a takeover during a catch-up*
+(`a_takeover_during_a_catch_up_builds_on_no_stale_prefix_and_keeps_the_fence`,
+cluster/tests/voter.rs). Three voters with their logs and reads served
+from them, run twice — once with node 1 (the whole committed log) taking
+the slot over, once with node 2 (the stale prefix), only the taker
+counting silence, and the taker asserted:
+- slot 1 commits three batches with node 1 while node 2 is cut off;
+- node 2 gets one batch of its catch-up, then node 0 dies;
+- nodes 1 and 2 take the next slot over.
+
+Checked:
+- every record committed in slot 1 is in place, byte for byte, on both
+  logs;
+- the new slot's `SlotStart` follows the committed log directly;
+- it commits only once node 2 holds it (with node 0 down this follows
+  from the majority of two; it is asserted on the final state);
+- node 0, back and still believing it leads slot 1, has its late batch
+  refused by both, and commits nothing past the fence;
+- no log is ever cut.
+
+Mutations: a candidate catching up from the shortest log instead of the
+longest, or a follower taking an older slot's appends, each fail it.
+
+*D-92 A — what the misses of the 2 000-event measure are.* A correction
+first: the 90.4% that D-92 called a 0.4-point margin over the 90% gate
+belongs to the group without an uncommitted bound, whose gate is 85% (D-82
+A); the default-bound group (64) is at 96.3%. The 10 000-seed sweep's
+misses, every fault cycle classified:
+
+| Group (gate) | Within 2 000 events | Never committed in the cycle (state copy) | Committed after 2 000 |
+|---|---|---|---|
+| bound 4–16 (90%) | 98.5% | 100 | 0 |
+| bound 64 (90%) | 96.3% | 211 | 1 |
+| none (85%) | 90.4% | 171 | 361 |
+
+- **State-copy cycles.** Every cycle that never commits within the cycle
+  is on the state-copy path: a replica passed by the simulation's
+  1 000-byte retention bound, with no majority left that can catch up.
+  With 100 000 bytes there are none (D-87 A). The contract promises
+  nothing here until 7b.
+- **The long cycles of the group without a bound.** 324 of the 361 spend
+  most of their time catching up the uncommitted tail of the slot that
+  commits (mean 289 records). The other 37 spend it reaching that slot:
+  - 7.7 slots tried and 2.6 takeovers on average, patience 4–8;
+  - a tail of 134 records at the fault;
+  - candidates passed over while catching up that tail, so patience grows
+    as D-88 A intends.
+- **The one long cycle of the group with bound 64** (seed 203, 2 037
+  events) is tail-driven as well. The surviving replica held the isolated
+  sequencer's uncommitted slot-1 tail (66 records), was cut back when the
+  new slot's log proved it different, and caught up 71 records from the
+  log in about 1 250 events. The table's catch-up measure took its end
+  before the cut and so undercounts it.
+  Both are covered by eventual liveness (the contract's assumptions
+  hold); a bound on time needs `max_uncommitted`, which production
+  always sets.
+
+No category is unexplained and none stalls; patience is not changed.
+
+*D-97 A — the run that did not finish.* The machine slept: the power log
+shows "Entering Sleep state due to 'Idle Sleep'" at 03:26:56, seconds
+after the run started at 03:26, and sleep until 04:32 but for a 6-second
+maintenance wake. The background job was stopped at its one-hour limit
+inside that sleep; the next run, started at 04:33, took 189 s. Evidence
+that nothing else was involved:
+- the code of that run, reconstructed (the tree had no commit; the diff
+  is in `docs/decisions/d97-unfinished-run.md`) and rerun alone, took
+  201 s;
+- two copies under contention (with a third sweep beside them) took 378
+  and 382 s;
+- all three gave identical per-seed outcomes for all 10 000 seeds, so the
+  simulation is deterministic and no seed hangs;
+- slowest seed 1 831, 33 s alone and 78 s under contention; peak resident
+  memory 171 MB;
+- one voluntary context switch, so no waiting on a lock;
+- no disk I/O, as the disks are simulated.
+Long runs are now wrapped in `caffeinate -i`.
+Its parameters, the code it ran and the power log are kept in
+`docs/decisions/d97-unfinished-run.md`.
+What stays uncertain: the code is a reconstruction, not a commit; the
+cause rests on the power log, and no run reproduced a hang.
+
+**D-98 A (2026-10-10): an append from a newer slot's owner is a sign of
+life.** In `Voter::on_append`, an append from the owner of a slot above
+the one promised now resets silence while the promise of that slot is made
+durable. It changes nothing else: the node still promises first, and
+appends, acknowledges and commits nothing before the promise is durable.
+A sign of life is not a durable promise, and only the second enters the
+commit rules (the user's condition).
+
+Checked against D-98's conditions, at the standard timing (3 heartbeats,
+rotation where the seed rotates), against the same runs without a slow
+disk:
+
+The 10% allowance in the gate is a stated allowance, taken from the spread
+of the fixed build (+3% over 20 seeds, −6% over 100), not a measured noise
+floor; before D-98 A the same comparison is +47% to +57%.
+
+| 400 windows (100 seeds) | Takeovers started by silence | Won | Started by the slowed replica | Won by it |
+|---|---|---|---|---|
+| no slow disk | 4 313 | 2 228 | 1 520 | 787 |
+| slow disk, before D-98 A | 6 543 | 1 023 | 4 781 | 36 |
+| slow disk, after D-98 A | 4 074 | 970 | 2 492 | 31 |
+
+1. **The scenario reproduces at the standard timing:** +47% takeovers
+   started by silence before D-98 A.
+2. **Takeovers are back at the level without a slow disk:** −6% (+3% over
+   20 seeds). The slowed replica still starts more takeovers than it would
+   on a fast disk, but wins fewer than the baseline. They are attempts its
+   own slow promise cannot finish, and they depose no one.
+3. **Commit while the sequencer is healthy:** the commit point moved after
+   every detach (173 of 173). A replica heard by a newer slot's owner
+   appends, acknowledges and commits nothing before its promise is durable
+   (`a_newer_slots_append_is_heard_but_takes_nothing_before_the_promise`,
+   which fails without D-98 A). Every simulation still checks invariants
+   1–6 after every event.
+4. **Fencing and late messages:** unchanged code paths. The D-95 test (an
+   old sequencer's late batch refused, nothing committed past the fence),
+   `a_fetch_for_an_older_slot_than_promised_is_not_served` and
+   `after_a_promise_nothing_of_a_lower_slot_is_taken_or_acknowledged` all
+   pass, as do the cluster (10 000), takeover (20 000), apply and MQTT
+   (10 000) sweeps.
+5. **A dead sequencer is still taken over:** being heard resets silence
+   once, it does not stop the count. Shown with the promise already
+   durable (`a_newer_slots_owner_heard_once_then_silent_is_taken_over`) and
+   in the state D-98 A changes: the owner dies while the promise is still
+   pending, and once it lands the node takes over
+   (`a_newer_slots_owner_dying_while_the_promise_is_pending_is_taken_over`); every
+   fault cycle of the cluster sweep crashes or cuts off its sequencer, and
+   none stalls.
+
+The comparison is `a_slow_disk_adds_no_takeovers_at_the_standard_timing`:
+- it fails at +10% takeovers over the baseline, if the slowed replica wins
+  more than it does on a fast disk, or if commit stops after a detach;
+- before D-98 A it fails at +57% (20 seeds);
+- it is ignored in the default debug run (four minutes) and takes 9 s in
+  release: `cargo test --release -p sim --test cluster -- --ignored
+  a_slow_disk`.
+
+The cluster sweep after D-98 A, 10 000 seeds, every schedule shifted by it:
+17 624 cycles recovered, 0 stalled, 490 on the state-copy path (486
+committed once the node cut off came back); within 2 000 events 98.5%,
+96.3%, 90.5% (98.5%, 96.3%, 90.4% before). The D-92 classification above
+was made before D-98 A.
+
+**Step 7a (D-78 A, D-102 A–D-105 A), 2026-10-10.** The server can start a
+node on the new path. Experimental and off by default, not production-ready:
+flow control is off (`lag_bound: None`), timing defaults are placeholders,
+nothing is measured on Linux.
+- **The switch** (D-103 A): `STRAUM_EXPERIMENTAL_CLUSTER=1`.
+  - `server` depends on `node` directly.
+  - `runtime`, the frozen old path, may not reach `node`, and `node` may not
+    reach `runtime`; `check-boundaries.sh` enforces both, so `server` alone
+    joins the two paths.
+  - In this mode the broker is not started.
+  - D-78 A's precondition, D-72 settled, holds: D-80 B replaced the rate
+    criterion with liveness per fault cycle, made concrete by D-81 A and
+    D-82 A (now under the D-85 contract).
+- **Configuration** (D-104 A):
+  - variables: `STRAUM_CLUSTER_NODE_ID`, `_PEERS` (`id=address,…`, every
+    voter), `_LISTEN` (default: this node's address in the peers),
+    `_MQTT_LISTEN`, `_DATA_DIR`, `_HEARTBEAT_MS` (50), `_TAKEOVER_TICKS` (3),
+    `_RETAIN_BYTES` (64 MiB, D-91 A), and `STRAUM_READ_BYTES` (64 KiB,
+    D-83 A); `max_uncommitted` 64 (D-82 A);
+  - any other `STRAUM_*` variable is refused as unused by this path, never
+    ignored;
+  - the internal sizes are fixed and untuned (`node::experimental`):
+    batches of 16, packets up to 256 KiB, frames up to 8 MiB.
+- **Refused before anything opens** (`NodeConfig::check`, run by the server
+  and by `Node::start`):
+  - fewer than three voters, or an even count; a voter listed twice; this
+    node not among them;
+  - a heartbeat outside 1 ms–10 s, a takeover after 0 heartbeats (the
+    server also bounds the operator's setting to 1–1000; tests may wait
+    longer), `max_uncommitted` of 0;
+  - `read_bytes` above half the frame — this replaces the silent clamp
+    (D-83 A);
+  - a largest batch that does not fit one frame.
+- **Consistency across nodes:** HELLO now carries
+  `[ version u16 ][ node u8 ][ slot u64 ][ config u64 ]`.
+  - `config` is `node::cluster_digest`: the voters, the first slot and its
+    owner, heartbeat, `takeover_ticks`, `max_uncommitted`, `window`,
+    `max_batch`, `max_frame`, flow control, and the apply limits.
+  - Left out as local to each node: `retain_bytes` and `read_bytes` (how
+    much one node keeps and reads), addresses, and the data directory.
+  - A link with another version or digest is refused.
+  - A data directory keeps the digest it was first used with (its
+    `cluster` file), and a node started over another cluster's data is
+    refused before it opens its log.
+- **Refused at CONNECT** (`gateway`): a will, a 3.1.1 CleanSession=0, an
+  MQTT 5 session expiry. Answered `ImplementationSpecificError`, or
+  "server unavailable" in 3.1.1. Message expiry stays carried, not enforced
+  (D-65).
+- **Operator handoff** (D-105 A): SIGUSR1 calls `Node::hand_off`.
+  - It is a protocol handoff: the queue, then `SlotEnd`; the sequencer
+    steps down once that is committed and the successor holds it.
+  - A node that is not sequencing logs the refusal. SIGTERM and Ctrl-C stop
+    the node.
+
+Checked:
+- **Tests:**
+  - node: `a_link_from_another_frame_version_is_refused`,
+    `a_data_directory_of_another_cluster_is_refused`,
+    `an_operator_handoff_moves_the_slot_and_every_node_keeps_serving`, and
+    `config.rs` (every startup rule);
+  - gateway: `wills_persistent_sessions_and_expiry_are_refused_at_connect`;
+  - server: the switch, a missing setting, an old-path setting, and invalid
+    voters, timing and read sizes, each refused.
+- **A manual smoke run,** three server processes on loopback:
+  - a QoS 1 publish on node 2 reached a subscriber on node 0;
+  - SIGUSR1 handed the slot over from node 0, and the other two logged
+    that they do not sequence;
+  - a publish on node 1 then reached node 2;
+  - a will and a CleanSession=0 CONNECT were refused (return code 3);
+  - SIGTERM stopped all three cleanly.
+
+**Since 2026-10-11 (D-106, D-107, D-108):**
+- **End to end:** `crates/server/tests/cluster.rs` starts three real
+  server processes and checks: a QoS 1 publish acknowledged and delivered
+  across nodes; a will and a CleanSession=0 refused; PUBACK waits for the
+  commit — with the sequencer (node 0) alive and both replicas stopped, a
+  publish is neither acknowledged nor delivered, and once one replica
+  restarts over its data the same publish, on the same connection, is
+  acknowledged and delivered (a gateway that acknowledged on receipt fails
+  it); the SIGUSR1 handoff and publishing after it, at most one resend; a node refused over another cluster's
+  data, and its links refused from fresh data; a clean rejoin and clean
+  stops. About 11 s.
+- **Found by it:** the first publish after a handoff is dropped, not held,
+  every time — a proposal made while the slot changes hands goes nowhere
+  (ADR-0008, "Not yet in step 4"). No PUBACK comes for it; the gateway
+  closes the connection after `commit_timeout` (30 s), and an
+  at-least-once client resends. The test resends as such a client does and
+  asserts it takes no more than one resend (D-109).
+- **D-108, the unstable start:** not reproduced. The failure was one run of
+  the container's node tests, two tests failing at a node's start with no
+  error text kept. Since then:
+  - the tests report `Node::start`'s error;
+  - 24 container runs and every host run passed, so the cause is not
+    established;
+  - one candidate is removed anyway: the helper bound port 0 and released
+    it before the node bound it, so a test running in parallel could be
+    handed the same port. Each test binary now takes ports from a block of
+    its own below the ephemeral range, numbered by a counter. Nothing
+    retries: a port taken by anything else still fails the start, with its
+    error.
+- **Exposure:** the MQTT listener defaults to loopback; any address beyond
+  loopback — MQTT, links or peers — is refused at startup unless
+  `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1` says so on purpose. Acceptable
+  use until credentials and TLS exist (D-110): an isolated, trusted
+  network.
+
+Not yet:
+- TLS and credentials on the new path (D-110);
+- metrics;
+- step 7c (sessions, expiry and wills through the log);
+- any Linux measurement.
+
+**Step 8 (D-111), 2026-10-11: the old path is removed — early.** At the
+user's request, to end conflicts in decision-making, before its conditions
+held. D-51 A and D-75 had set three:
+- a witness for the two-node `quorum` pair;
+- D-28 C1–C4 carried into new-path invariants;
+- a durability benchmark comparable with the old path's.
+None held, and all three are overridden.
+
+Removed:
+- the crates `broker`, `protocol`, `mqtt`, `replication`, `runtime` and
+  `e2e`;
+- the old leader/follower simulation (`sim`'s library, `sim/tests/seeds.rs`)
+  and the D-28 chain check (`sim/tests/chain.rs`);
+- the fuzz targets on `mqtt`;
+- `scripts/compare-brokers.sh` and `scripts/crash-survival.sh`;
+- the broker half of `server`.
+
+Kept: `storage` (its `Wal` is each segment of the new log), `transport`,
+`domain`, and `auth`, for D-110.
+
+The server now runs only the cluster path. It refuses to start without
+`STRAUM_EXPERIMENTAL_CLUSTER=1`: the switch is the operator's acknowledgment
+that the path is experimental, not a security mechanism (D-107).
+
+Lost with the old path, until rebuilt on the new one:
+- a single-node mode — the new path needs three voters (D-104 A);
+- client TLS and credentials (D-110);
+- metrics (`STRAUM_METRICS_ADDR`);
+- kernel probes at startup;
+- ADR-0006's durability levels (`memory`, `written`, `fsynced`, `quorum`)
+  — the new path acknowledges once a majority holds a record durably;
+- the old benchmarks and their baselines, kept in `docs/` as history.
+
+The docs that described only the old path carry a "History" banner. The
+code is in git history (commit ffeda02 and earlier).
+
+**D-84 A (2026-10-09): the production cap comes from a Linux host.**
+`node/benches/cap.rs` measures throughput and failover (the sequencer
+stopped in order while the load runs, timed to a commit in a later slot)
+per cap, and the largest survivor lag sampled just before the stop. No Linux host was available;
+container runs are preliminary (docs/baselines/apple-m1-dev.md). They
+suggest what the simulation does not show: failover misses 1 s where a
+survivor lagged tens of thousands of records at the fault, whatever the
+cap — `max_uncommitted` bounds the tail past the commit point, not how
+far a replica outside the committing majority falls behind (D-85).
+
+The new seed group also found a recovery bug in `node`: a log holding
+only a torn batch of a newer slot came back as an empty log claiming
+that slot, and refused for ever the committed log of an older one
+(cluster simulation, seed 4045). Recovery now starts the chain at slot
+0 — `prev_hash` binds the first batch, and complete records set the
+slot as they are fed (`wal::tests::a_torn_first_batch_leaves_a_log_of_no_slot`,
+which fails with the old rule). Compactions
+during a takeover are counted in the cluster simulation (677 at 10 000
+seeds); the apply simulation counts them and finds none, since only a
+sequencer compacts there, and the MQTT simulation does not compact.
+
+Not yet in step 5:
+
+- **Deviation from D-57 A — unplaceable replicas. Closed by D-73 A and
+  D-79 A (2026-10-09).** A slot table rebuilt from a compacted log no
+  longer knew where older slots began, and a replica whose log ended in
+  such a slot was lost inside the byte bound (488 of 941 losses in the
+  cluster sweep, exempted from the D-57 A check). Now the node keeps the
+  committed log's slot table — built from the committed records it
+  applies — and writes it in its snapshot file ahead of `apply`'s state
+  (`[version=2][slots u32]{[slot][first lsn]}[state]`; `apply`'s own
+  snapshot format is unchanged, and a body from before, which starts with
+  `apply`'s version 1, is refused). Deviation from the D-79 card, which
+  put the table after the state: it goes first, because `apply`'s body
+  carries no length of its own to find the table after it. A restarted node starts from
+  `cluster::merge_slots`: the snapshot's table, then the slots the log
+  after it begins. Every compaction reports the floor it reached
+  (`wal::Event::Compacted`), and `cluster::prune_slots` drops from the
+  node's table and from the voter's and sequencer's in-memory tables
+  (`Voter::on_compacted`) the slots that ended below it, keeping the one
+  that holds the floor. So every table is bounded by the slot changes in
+  the retained log, with no count bound and no remainder. Keeping the
+  entry at the floor matters: dropping it too (the rule one lsn looser)
+  loses a replica inside the bound at seed 1678, as does a restart
+  without the snapshot's table. Evidence: the cluster simulation, which
+  models the node's tables and calls `on_compacted`, has no exemption;
+  10 000 seeds pass with every loss inside the D-57 A rule (1 016
+  losses), and three rotating runs of 1 000 000 steps cross about 2 000
+  slot changes each with no table longer than 9 entries. The apply
+  simulation keeps the table as the node does. `crates/node/tests/cluster.rs`:
+  nodes that rotated and compacted past slot changes restart from their
+  snapshots and converge; a node unit test round-trips the snapshot body
+  and refuses a damaged one.
+- The ACK and FETCHED frames changed layout without a frame version: no
+  deployment speaks them yet; step 7, which wires the path into the
+  server, needs a version or a HELLO refusal.
+- A candidate whose source compacted what it
+  needs waits for a later slot (state copy, 7b); `Status.digest` and the
+  effects hook are still on the node loop.
+
+**Step 6 (2026-10-08): done, test-only.** Planned handoff (unified-stream
+§2.4 graceful) on `cluster::Voter`:
+
+- **`hand_off()`** seals the sequencer: proposals are refused
+  (`NotLeader`), what was queued is written, then `SlotEnd` alone in its
+  batch — body `last_lsn`, and its `prev_hash` is the hash of the whole
+  log before it, so the record is the handoff certificate
+  `SlotEnd(k, last_lsn, hash)`. Refused with `NoSuccessor` when the next
+  slot's owner is the node itself (a cluster of one).
+- **Step-down.** The sequencer leads until `SlotEnd` commits, sends the
+  heartbeat that carries that commit point, and then follows. That
+  heartbeat is its last in the slot; if it is lost, the successor takes
+  over by silence, through the ungraceful path of step 5.
+- **Successor.** A follower whose log holds its slot's `SlotEnd`
+  committed — its commit point applies only to a log ending in the
+  owner's slot, and nothing follows `SlotEnd` there, so the log holds the
+  whole slot — and which owns the next slot makes its promise of that
+  slot durable and writes `SlotStart` at once, asking no one. That is
+  what the promise round of a takeover finds out: a log holding every
+  committed record. A majority that promised past the slot meanwhile
+  refuses the new slot as it would any older one (invariant 6).
+- **Rotation.** `Voter::rotate_every(ticks)` and
+  `NodeConfig.rotate_every` hand the slot over every so many heartbeats;
+  off by default (§2.4: a sequencer is stable).
+- `apply` and the reference models treat `SlotEnd` as they treat
+  `SlotStart`: a position in the log, no state.
+
+Evidence: `crates/cluster/tests/voter.rs` (a handoff ends the slot and
+the successor starts the next without any `Promise` message; only a
+committed `SlotEnd` is taken over; who may hand off); the takeover
+simulation hands slots over at random (5% of proposal events), so
+crashes, power losses and partitions fall before, during and after
+`SlotEnd`, and `SlotEnd`s are written and never committed (both counted
+and required by the sweep, unified-stream §5). It checks a new
+invariant 2a, "a `SlotEnd` closes its slot" — nothing of slot k follows
+slot k's `SlotEnd` in the committed log — and ends every seed with a planned handoff in the healed
+cluster that must pass the next slot to its owner without a promise
+round; 20 000 seeds pass (68 334 handoffs started, 33 374 `SlotEnd`s
+committed, 10 556 slots whose `SlotEnd` was written and never committed,
+70 951 crashes of a node holding an uncommitted `SlotEnd`, 20 762 slots
+handed over without a promise round — 762 of
+them amid faults, the rest after healing). The cluster simulation rotates every fourth seed
+every 4 heartbeats (segments, compaction and cuts around `SlotEnd`);
+10 000 seeds pass, as do 10 000 of the apply and MQTT simulations. `crates/node/tests/cluster.rs`: three nodes over TCP with
+takeovers by silence out of reach rotate at least three times while
+publishes commit, on one log.
+
+The `hash` of `SlotEnd(k, last_lsn, hash)` is the record's `prev_hash`,
+not a body field: alone in its batch, that header field is the hash of
+the whole log before it. Before D-73 A and D-79 A closed the D-57 A deviation, 2 000 cluster
+seeds lost 92 replicas as unplaceable with rotation on one seed in four,
+89 without.
+
+Not in step 6: an operator command to hand off (it comes with the
+server wiring, step 7); a successor that restarts between learning the
+commit and promising forgets the `SlotEnd` and takes over by silence.
 

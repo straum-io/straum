@@ -24,6 +24,17 @@
 //!   table (Kafka's leader-epoch rule), and cuts its tail there
 //!   ([`Effect::Truncate`]) — never below what it knows committed.
 //!
+//! A planned handoff (step 6, §2.4 graceful) needs no promise round:
+//! [`Voter::hand_off`] seals the slot and writes `SlotEnd` as its last
+//! batch; the sequencer steps down at the first heartbeat after it
+//! commits. The next owner, seeing it committed in its own log — which then
+//! holds the whole slot, since nothing follows `SlotEnd` in it — promises
+//! the next slot durably and writes `SlotStart` at once. A log holding
+//! every committed record is all a takeover's promise round finds out; a
+//! majority that promised past the slot meanwhile refuses the new one as
+//! it would any older slot. If the successor does not act, the silence
+//! starts the usual takeover.
+//!
 //! Time only starts a takeover: `takeover_ticks` heartbeats of silence, then
 //! as many again for each node after it in the schedule (a dead successor).
 //! A restarted node never leads the slot it led before; it follows, and the
@@ -35,6 +46,10 @@ use journal::{Chain, Kind, Verifier, decode};
 use crate::{
     ClusterError, Config, Effect, Message, NodeId, Proposal, Sequencer, end_of_slot, slot_at,
 };
+
+/// The most `patience` grows to: a dead sequencer is passed over within
+/// `takeover_ticks × MAX_PATIENCE` heartbeats per turn at worst.
+const MAX_PATIENCE: u32 = 64;
 
 /// The local log while this node is not sequencing.
 #[derive(Debug)]
@@ -67,6 +82,9 @@ struct Take {
     /// Decided once a majority promised: the voter to catch up from and
     /// where its log ends.
     source: Option<(NodeId, u64, u64)>,
+    /// Handed over by a committed `SlotEnd`: leads once its own promise is
+    /// durable, asking no one.
+    handoff: bool,
 }
 
 #[derive(Debug)]
@@ -90,15 +108,36 @@ pub struct Voter {
     log: Log,
     /// The local log's slot table: (slot, first lsn), ascending.
     slots: Vec<(u64, u64)>,
+    /// The latest `SlotEnd` in the local log: (slot, lsn).
+    slot_end: Option<(u64, u64)>,
+    /// Leading, hand the slot over every this many heartbeats (rotation,
+    /// off unless set).
+    rotate: Option<u32>,
+    /// The silence a takeover waits for, in multiples of `takeover_ticks`:
+    /// doubled by each takeover started by silence that a majority promised
+    /// (D-88 A), back to 1 once the commit point moves (D-85). A fixed wait shorter than a takeover's
+    /// round trips has each candidate passed over before it finishes, and
+    /// the next one too, for ever (cluster simulation, seed 4); the doubling
+    /// outgrows round trips up to `takeover_ticks × MAX_PATIENCE` heartbeats
+    /// without knowing them (the liveness contract, ADR-0008). Time still only
+    /// starts a takeover.
+    patience: u32,
+    /// The commit point when `patience` last went back to 1.
+    patient_since: u64,
+    /// Leading, heartbeats since `SlotEnd` committed while the successor
+    /// does not hold it yet.
+    handing: u32,
     /// Heartbeats since the slot's owner was last heard from.
     silent: u32,
     /// A cut handed to the driver and not yet done.
     truncating: bool,
     /// Cut back, and nothing taken since: every report says so.
     cut: bool,
+    /// The next report's number: the incarnation in the high bits.
+    report: u64,
     /// Fetches waiting for a read of the local log: (asker, slot, the
-    /// asker's end).
-    serving: Vec<(NodeId, u64, u64)>,
+    /// asker's last slot and end).
+    serving: Vec<(NodeId, u64, (u64, u64))>,
     refused: u64,
     effects: Vec<Effect>,
 }
@@ -116,9 +155,15 @@ impl Voter {
             role: Role::Follow,
             log: Log::new(chain, end, 0),
             slots,
+            slot_end: None,
+            rotate: None,
             silent: 0,
+            handing: 0,
+            patience: 1,
+            patient_since: 0,
             truncating: false,
             cut: false,
+            report: 1,
             serving: Vec::new(),
             refused: 0,
             effects: Vec::new(),
@@ -134,8 +179,58 @@ impl Voter {
         self
     }
 
+    /// Which life of this node this is: a number that grows across
+    /// restarts, durable before use (`node` keeps one). It orders this
+    /// node's reports past its restarts; without it a restarted node's
+    /// reports would look older than its previous life's.
+    pub fn incarnation(mut self, incarnation: u64) -> Self {
+        self.report = (incarnation << 40) | 1;
+        self
+    }
+
+    /// Leading, hand the slot over every `ticks` heartbeats (§2.4: planned
+    /// rotation, "continuous failover drill" with long windows). Off by
+    /// default: a sequencer is stable.
+    pub fn rotate_every(mut self, ticks: u32) -> Self {
+        self.rotate = Some(ticks.max(1));
+        self
+    }
+
     pub fn id(&self) -> NodeId {
         self.config.id
+    }
+
+    /// How many times `takeover_ticks` this node now waits for silence
+    /// before a takeover: 1, or more after takeovers that did not commit
+    /// (D-85, D-86).
+    pub fn patience(&self) -> u32 {
+        self.patience
+    }
+
+    /// Leading, whether flow control holds new batches now, and how many
+    /// replicas it counts (D-89).
+    pub fn flow(&self) -> Option<(bool, usize)> {
+        match &self.role {
+            Role::Lead(s) => Some((s.holding_back(), s.attached())),
+            _ => None,
+        }
+    }
+
+    /// The slot this node is taking over by silence — not a planned
+    /// handoff — if it is (D-98).
+    pub fn taking(&self) -> Option<u64> {
+        match &self.role {
+            Role::Take(take) if !take.handoff => Some(take.slot),
+            _ => None,
+        }
+    }
+
+    /// Leading, whether flow control counts replica `id` (D-89).
+    pub fn counts(&self, id: NodeId) -> Option<bool> {
+        match &self.role {
+            Role::Lead(s) => Some(s.counts(id)),
+            _ => None,
+        }
     }
 
     /// The highest slot this node has promised.
@@ -183,10 +278,35 @@ impl Voter {
     /// How far the local log may be compacted: the sequencer's floor
     /// (D-57 A), or, following, the commit point less what the byte bound
     /// keeps — a follower may lead next and serve catch-up.
+    ///
+    /// Never the commit point itself: a cut can go back to it, and the log
+    /// must still hold a record at or below the cut to say where it stands
+    /// (found by the cluster simulation, seed 229: compacted to 16, cut to
+    /// 16, a restart found no log at all).
     pub fn compaction_floor(&self, bytes_floor: u64) -> u64 {
-        match &self.role {
+        let floor = match &self.role {
             Role::Lead(s) => s.compaction_floor(bytes_floor),
             _ => self.log.commit.min(bytes_floor),
+        };
+        floor.min(self.commit().saturating_sub(1))
+    }
+
+    /// Leading: the durable position known for replica `id`, unless lost
+    /// (`Sequencer::replica_durable`).
+    pub fn replica_durable(&self, id: NodeId) -> Option<u64> {
+        match &self.role {
+            Role::Lead(s) => s.replica_durable(id),
+            _ => None,
+        }
+    }
+
+    /// The local log was compacted through `floor`: the slot tables forget
+    /// the slots that ended there (`prune_slots`, D-79 A), so they are
+    /// bounded by the slot changes in the retained log.
+    pub fn on_compacted(&mut self, floor: u64) {
+        crate::prune_slots(&mut self.slots, floor);
+        if let Role::Lead(s) = &mut self.role {
+            s.compacted(floor);
         }
     }
 
@@ -195,7 +315,7 @@ impl Voter {
             let effects = s.take_effects();
             for effect in &effects {
                 if let Effect::Append { records, .. } = effect {
-                    note_slots(&mut self.slots, records);
+                    note_slots(&mut self.slots, &mut self.slot_end, records);
                 }
             }
             self.effects.extend(effects);
@@ -217,14 +337,63 @@ impl Voter {
         }
     }
 
+    /// Hands the slot over to the next owner in the schedule (§2.4
+    /// graceful): refuses proposals from now on, writes what is queued and
+    /// then `SlotEnd`, and steps down at the first heartbeat after
+    /// `SlotEnd` commits. Repeating it changes nothing.
+    pub fn hand_off(&mut self) -> Result<(), ClusterError> {
+        let Role::Lead(s) = &mut self.role else {
+            return Err(ClusterError::NotLeader);
+        };
+        if self.config.owner_of(s.slot().saturating_add(1)) == Some(self.config.id) {
+            return Err(ClusterError::NoSuccessor);
+        }
+        s.end_slot();
+        s.flush()
+    }
+
     /// The heartbeat. A sequencer sends its own; anyone else counts the
     /// silence and, at its turn in the schedule, takes the next slot over.
     pub fn tick(&mut self) {
         if let Role::Lead(s) = &mut self.role {
             s.tick();
+            // This heartbeat carried the commit point past `SlotEnd`. The
+            // slot is handed over once the successor holds `SlotEnd`
+            // durably — then this heartbeat lets it take over, and it is the
+            // last one this slot sends. A successor still catching up keeps
+            // the heartbeats coming for up to `takeover_ticks` of them:
+            // stepping down at once left one that had just cut its log with
+            // no one to catch up from, and the slot went by silence instead
+            // (takeover simulation, seed 4905; D-85). Lost, or past that,
+            // the successor or the next node takes over by silence.
+            if let Some((slot, lsn)) = self
+                .slot_end
+                .filter(|&(slot, lsn)| slot == s.slot() && s.commit() >= lsn)
+            {
+                let holds = self
+                    .config
+                    .owner_of(slot.saturating_add(1))
+                    .and_then(|next| s.replica_durable(next))
+                    .is_some_and(|durable| durable >= lsn);
+                self.handing = self.handing.saturating_add(1);
+                if holds || self.handing > self.config.takeover_ticks {
+                    self.handing = 0;
+                    self.step_down();
+                }
+                return;
+            }
+            self.silent = self.silent.saturating_add(1);
+            if self.rotate.is_some_and(|every| self.silent % every == 0) {
+                let _ = self.hand_off();
+            }
             return;
         }
         self.silent = self.silent.saturating_add(1);
+        let commit = self.commit();
+        if commit > self.patient_since {
+            self.patient_since = commit;
+            self.patience = 1;
+        }
         if let Role::Take(take) = &self.role {
             let slot = take.slot;
             // Lost requests are asked again, every heartbeat.
@@ -245,7 +414,12 @@ impl Voter {
             // A fresh cluster: the first slot's owner takes it at once.
             self.config.slot
         } else {
-            let turns = self.silent / self.config.takeover_ticks.max(1);
+            let wait = self
+                .config
+                .takeover_ticks
+                .max(1)
+                .saturating_mul(self.patience);
+            let turns = self.silent / wait;
             self.slot.saturating_add(u64::from(turns))
         };
         let taking = match &self.role {
@@ -264,6 +438,7 @@ impl Voter {
                 slot: target,
                 promised: Vec::new(),
                 source: None,
+                handoff: false,
             });
             self.promise(target, None);
         }
@@ -283,7 +458,9 @@ impl Voter {
                     s.on_message(from, message);
                 }
             }
-            Message::Promise { slot } => self.promise(slot, Some(from)),
+            Message::Promise { slot } => {
+                self.promise(slot, Some(from));
+            }
             Message::Promised {
                 slot,
                 last_slot,
@@ -296,11 +473,18 @@ impl Voter {
             } => self.serve(from, slot, last_slot, end),
             Message::Fetched {
                 slot,
+                asked_slot,
                 asked,
                 after,
                 after_slot,
                 records,
-            } => self.on_fetched(from, slot, asked, (after, after_slot), records),
+            } => self.on_fetched(
+                from,
+                slot,
+                (asked_slot, asked),
+                (after, after_slot),
+                records,
+            ),
         }
     }
 
@@ -311,7 +495,7 @@ impl Voter {
             return;
         }
         self.log.durable = self.log.durable.max(lsn.min(self.log.end));
-        if matches!(self.role, Role::Follow) {
+        if matches!(self.role, Role::Follow) && !self.truncating {
             self.ack();
         }
     }
@@ -330,16 +514,19 @@ impl Voter {
             self.silent = 0;
         }
         // A sequencer of an older slot steps down: its slot can commit
-        // nothing once a majority has promised past it.
+        // nothing once a majority has promised past it. What it handed over
+        // and the driver has not taken yet — batches to write among them,
+        // which its chain already counts — goes out first.
         if let Role::Lead(s) = &self.role {
             if s.slot() < self.slot {
-                self.log = Log::new(s.chain(), s.durable(), s.commit());
-                self.role = Role::Follow;
+                self.step_down();
             }
         }
         if let Role::Take(take) = &mut self.role {
             if take.slot < self.slot {
                 self.role = Role::Follow;
+            } else if take.slot == slot && take.handoff {
+                self.lead(slot);
             } else if take.slot == slot {
                 let own = (self.config.id, self.log.last_slot, self.log.end);
                 if !take.promised.iter().any(|p| p.0 == own.0) {
@@ -376,6 +563,9 @@ impl Voter {
         let end = chain.next_lsn().saturating_sub(1);
         self.log = Log::new(chain, self.log.durable.min(end), self.log.commit);
         self.slots.retain(|&(_, first)| first <= end);
+        if self.slot_end.is_some_and(|(_, lsn)| lsn > end) {
+            self.slot_end = None;
+        }
         match &self.role {
             Role::Take(Take {
                 slot,
@@ -391,27 +581,37 @@ impl Voter {
         }
     }
 
-    /// The batch a read asked for: a fetch being served, or the sequencer's
-    /// catch-up.
+    /// The batches a read asked for: a fetch being served, the
+    /// sequencer's catch-up, or both. A read is matched by whom it is for
+    /// and where it starts: matched by whom alone, the answer to a
+    /// sequencer's catch-up read went to a fetch from the same replica
+    /// still waiting from before this node led, and the sequencer waited
+    /// for it for ever, shipping that replica nothing (found by the cluster
+    /// simulation, seed 160; D-85).
     pub fn on_read(&mut self, to: NodeId, records: Vec<Vec<u8>>) {
-        if let Some(index) = self.serving.iter().position(|&(asker, ..)| asker == to) {
-            let (_, slot, asked) = self.serving.remove(index);
-            let after = records
-                .first()
-                .and_then(|r| decode(r).ok())
-                .map_or(0, |r| r.lsn.saturating_sub(1));
+        let from = records
+            .first()
+            .and_then(|r| decode(r).ok())
+            .map_or(0, |r| r.lsn);
+        if let Some(index) = self
+            .serving
+            .iter()
+            .position(|&(asker, _, (_, asked))| asker == to && asked.saturating_add(1) == from)
+        {
+            let (_, slot, (asked_slot, asked)) = self.serving.remove(index);
+            let after = from.saturating_sub(1);
             let after_slot = slot_at(&self.slots, after);
             self.send(
                 to,
                 Message::Fetched {
                     slot,
+                    asked_slot,
                     asked,
                     after,
                     after_slot,
-                    records,
+                    records: records.clone(),
                 },
             );
-            return;
         }
         if let Role::Lead(s) = &mut self.role {
             s.on_read(to, records);
@@ -419,11 +619,14 @@ impl Voter {
     }
 
     pub fn on_read_missing(&mut self, to: NodeId, from: u64) {
-        if let Some(index) = self.serving.iter().position(|&(asker, ..)| asker == to) {
+        if let Some(index) = self
+            .serving
+            .iter()
+            .position(|&(asker, _, (_, asked))| asker == to && asked.saturating_add(1) == from)
+        {
             // Compacted away: the candidate cannot catch up from here, and
             // waits for a later slot's owner (state copy is step 7b).
             self.serving.remove(index);
-            return;
         }
         if let Role::Lead(s) = &mut self.role {
             s.on_read_missing(to, from);
@@ -439,6 +642,49 @@ impl Voter {
 
     fn send(&mut self, to: NodeId, message: Message) {
         self.effects.push(Effect::Send { to, message });
+    }
+
+    /// Stops sequencing and follows. What the sequencer handed over and
+    /// the driver has not taken yet — batches to write among them, which
+    /// its chain already counts — goes out first.
+    fn step_down(&mut self) {
+        let Role::Lead(s) = &mut self.role else {
+            return;
+        };
+        let pending = s.take_effects();
+        for effect in &pending {
+            if let Effect::Append { records, .. } = effect {
+                note_slots(&mut self.slots, &mut self.slot_end, records);
+            }
+        }
+        self.effects.extend(pending);
+        self.log = Log::new(s.chain(), s.durable(), s.commit());
+        self.role = Role::Follow;
+        self.silent = 0;
+    }
+
+    /// Following a slot whose `SlotEnd` this log holds committed, and named
+    /// next in the schedule: take the next slot over without a promise
+    /// round (§2.4 graceful).
+    fn succeed(&mut self) {
+        let next = self.slot.saturating_add(1);
+        let handed = self
+            .slot_end
+            .is_some_and(|(slot, lsn)| slot == self.slot && lsn <= self.log.commit);
+        if handed
+            && matches!(self.role, Role::Follow)
+            && !self.truncating
+            && self.promising.is_none()
+            && self.config.owner_of(next) == Some(self.config.id)
+        {
+            self.role = Role::Take(Take {
+                slot: next,
+                promised: Vec::new(),
+                source: None,
+                handoff: true,
+            });
+            self.promise(next, None);
+        }
     }
 
     /// Promises `slot`, durably, and answers `to` once it is.
@@ -491,22 +737,36 @@ impl Voter {
         if lsn > self.log.end {
             return None;
         }
-        if slot_at(&self.slots, lsn) != slot {
-            // This record differs, and so does all that follows it: cut back
-            // to the end of this log's latest slot not after the other's, or
-            // to `lsn` — both batch boundaries; a cut inside a batch would
-            // leave half of one (found by the takeover simulation, seed 551).
-            // Cut at `lsn`, the record there still differs: the next append
-            // fails the chain, and the report that follows moves the other
-            // side back to where the slots say the logs meet.
-            let cut = end_of_slot(&self.slots, slot, self.log.end).min(lsn);
+        // Slot 0 at a record: the other side's slot table no longer covers
+        // it — compacted. Unknown proves nothing (found by the cluster
+        // simulation, seed 197: read as a difference, it cut a committed
+        // copy).
+        if lsn > 0 && slot == 0 {
+            return None;
+        }
+        // The committed prefix is the same in every log, whatever this
+        // log's slot table still says of it after compaction (found by the
+        // cluster simulation, seed 64).
+        let committed = |at: u64| at <= self.log.commit;
+        if !committed(lsn) && slot_at(&self.slots, lsn) != slot {
+            // This record differs, and so does all that follows it: cut
+            // before it, and back to the end of this log's latest slot not
+            // after the other's. `lsn` is a batch boundary only in the other
+            // log; the driver rounds the cut down to one in this log (found
+            // by the takeover simulation, seed 551, and the cluster
+            // simulation, seed 33). Safe: within a slot a batch is the same
+            // batch in every log, so the whole batch around a differing
+            // record differs.
+            let cut = end_of_slot(&self.slots, slot, self.log.end).min(lsn.saturating_sub(1));
             return (cut < self.log.end).then_some(cut);
         }
         if lsn == self.log.end {
             return None;
         }
+        let following = lsn.saturating_add(1);
         match next {
-            Some(next) if slot_at(&self.slots, lsn.saturating_add(1)) == next => None,
+            _ if committed(following) => None,
+            Some(next) if slot_at(&self.slots, following) == next => None,
             _ => Some(lsn),
         }
     }
@@ -536,7 +796,12 @@ impl Voter {
         }
         if slot > self.slot {
             // A newer slot's owner: promise it first; its next heartbeat
-            // finds this node following.
+            // finds this node following. Meanwhile it is alive, and heard:
+            // counting silence while the promise is made durable — long, on
+            // a slow disk — started takeovers this node could not finish and
+            // deposed a healthy sequencer (D-98 A). Only silence: nothing is
+            // appended or acknowledged before the promise is durable.
+            self.silent = 0;
             self.promise(slot, None);
             return;
         }
@@ -544,6 +809,12 @@ impl Voter {
             return;
         }
         self.silent = 0;
+        // A cut in flight: this log's end is about to change, and a report
+        // of the old one would place it wrong (found by the cluster
+        // simulation, seed 12). The report after the cut tells.
+        if self.truncating {
+            return;
+        }
         // A log ending in the owner's slot is a prefix of the owner's. One
         // ending in an older slot may hold records the owner's does not: cut
         // back where they provably differ, then take what follows. A
@@ -575,6 +846,7 @@ impl Voter {
             }
         }
         self.ack();
+        self.succeed();
     }
 
     /// Takes one whole batch that continues the chain, or nothing.
@@ -593,7 +865,7 @@ impl Voter {
         self.log.end = last.lsn;
         self.log.last_slot = last.slot;
         self.cut = false;
-        note_slots(&mut self.slots, &records);
+        note_slots(&mut self.slots, &mut self.slot_end, &records);
         self.effects.push(Effect::Append { first, records });
         true
     }
@@ -605,6 +877,7 @@ impl Voter {
         if owner == self.config.id {
             return;
         }
+        self.report = self.report.saturating_add(1);
         self.send(
             owner,
             Message::Ack {
@@ -613,6 +886,7 @@ impl Voter {
                 end: self.log.end,
                 durable: self.log.durable,
                 cut: self.cut,
+                report: self.report,
             },
         );
     }
@@ -652,6 +926,17 @@ impl Voter {
         };
         take.source = Some((source, last_slot, end));
         let slot = take.slot;
+        // A takeover a majority answered: if it does not commit, the round
+        // trips outgrew the wait, and the next one waits longer, until a
+        // commit shows takeovers finishing again. One no majority answered
+        // says nothing about round trips — a partition — and leaves the
+        // wait as it was, so a partition does not lengthen the recovery
+        // after it (D-88 A). The simulation showed patience was not what
+        // made recovery long: under the old rule 64 runs of the bounded
+        // seed groups healed at 64× within 41 rounds.
+        if !take.handoff {
+            self.patience = self.patience.saturating_mul(2).min(MAX_PATIENCE);
+        }
         if source == id {
             self.lead(slot);
         } else {
@@ -670,6 +955,15 @@ impl Voter {
 
     /// Answers a candidate's fetch from the local log.
     fn serve(&mut self, to: NodeId, slot: u64, last_slot: u64, end: u64) {
+        // A fetch for a slot older than the one promised is from a candidate
+        // passed over since: serving it handed a sequencer's records not yet
+        // durable to a replica, which then held them durably first, and the
+        // sequencer's own later sync committed a record of its slot after a
+        // majority had promised past it — invariant 6 (found by the cluster
+        // simulation, seed 4629; D-85).
+        if slot < self.slot {
+            return;
+        }
         let (_, own_end) = self.position();
         let meets = end_of_slot(&self.slots, last_slot, own_end).min(end);
         if meets < end || end >= own_end {
@@ -678,6 +972,7 @@ impl Voter {
                 to,
                 Message::Fetched {
                     slot,
+                    asked_slot: last_slot,
                     asked: end,
                     after: meets,
                     after_slot,
@@ -687,10 +982,11 @@ impl Voter {
             return;
         }
         if !self.serving.iter().any(|&(asker, ..)| asker == to) {
-            self.serving.push((to, slot, end));
+            self.serving.push((to, slot, (last_slot, end)));
             self.effects.push(Effect::Read {
                 to,
                 from: end.saturating_add(1),
+                upto: own_end,
             });
         }
     }
@@ -699,7 +995,7 @@ impl Voter {
         &mut self,
         from: NodeId,
         slot: u64,
-        asked: u64,
+        asked: (u64, u64),
         at: (u64, u64),
         records: Vec<Vec<u8>>,
     ) {
@@ -714,7 +1010,11 @@ impl Voter {
         let (taking, source) = (*taking, *source);
         // An answer to an older question is about a log this one no longer
         // is.
-        if taking != slot || source != from || self.truncating || asked != self.log.end {
+        if taking != slot
+            || source != from
+            || self.truncating
+            || asked != (self.log.last_slot, self.log.end)
+        {
             return;
         }
         let next = records.first().and_then(|r| decode(r).ok()).map(|r| r.slot);
@@ -764,12 +1064,15 @@ impl Voter {
     }
 }
 
-/// Adds the slots `records` start to `slots`.
-fn note_slots(slots: &mut Vec<(u64, u64)>, records: &[Vec<u8>]) {
+/// Adds the slots `records` start to `slots`, and notes a `SlotEnd`.
+fn note_slots(slots: &mut Vec<(u64, u64)>, slot_end: &mut Option<(u64, u64)>, records: &[Vec<u8>]) {
     for record in records {
         let Ok(record) = decode(record) else { continue };
         if slots.last().is_none_or(|&(slot, _)| slot < record.slot) {
             slots.push((record.slot, record.lsn));
+        }
+        if record.kind == Kind::SlotEnd {
+            *slot_end = Some((record.slot, record.lsn));
         }
     }
 }

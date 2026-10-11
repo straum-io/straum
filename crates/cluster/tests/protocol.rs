@@ -1,7 +1,7 @@
 //! The sequencer and the replica, driven by hand: one rule per test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use cluster::{ClusterError, Config, Effect, Message, Proposal, Replica, Sequencer};
+use cluster::{ClusterError, Config, Effect, LagBound, Message, Proposal, Replica, Sequencer};
 use journal::{Chain, Kind};
 
 fn config(id: u8) -> Config {
@@ -16,6 +16,7 @@ fn config(id: u8) -> Config {
         recent_batches: 2,
         max_uncommitted: 1_000_000,
         takeover_ticks: 3,
+        lag_bound: None,
     }
 }
 
@@ -59,6 +60,7 @@ fn started() -> Sequencer {
                 end: 0,
                 durable: 0,
                 cut: false,
+                report: 0,
             },
         );
     }
@@ -99,6 +101,7 @@ fn commit_needs_a_majority_durable_and_only_grows() {
             end,
             durable: end,
             cut: false,
+            report: 0,
         },
     );
     assert_eq!(s.commit(), end);
@@ -112,6 +115,7 @@ fn commit_needs_a_majority_durable_and_only_grows() {
             end: 0,
             durable: 0,
             cut: false,
+            report: 0,
         },
     );
     assert_eq!(s.commit(), end);
@@ -147,6 +151,7 @@ fn a_replica_takes_the_owners_batches_in_order_and_reports_its_position() {
                 end: 0,
                 durable: 0,
                 cut: false,
+                report: 0,
             }
         )]
     );
@@ -166,6 +171,7 @@ fn a_replica_takes_the_owners_batches_in_order_and_reports_its_position() {
                 end: second,
                 durable: first,
                 cut: false,
+                report: 0,
             }
         )]
     );
@@ -272,7 +278,9 @@ fn a_replica_behind_memory_is_caught_up_from_the_log_and_lost_below_it() {
     s.on_durable(end);
     let effects = s.take_effects();
     assert!(
-        effects.contains(&Effect::Read { to: 2, from: 1 }),
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Read { to: 2, from: 1, .. })),
         "{effects:?}"
     );
 
@@ -293,15 +301,20 @@ fn a_replica_behind_memory_is_caught_up_from_the_log_and_lost_below_it() {
     s.on_read(2, records);
     let effects = s.take_effects();
     assert!(
-        effects.contains(&Effect::Read { to: 2, from: 3 }),
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Read { to: 2, from: 3, .. })),
         "{effects:?}"
     );
 
     s.on_read_missing(2, 3);
     assert!(s.take_effects().contains(&Effect::Lost { to: 2 }));
     s.tick();
+    // It still hears the heartbeat, so it does not fall silent and take
+    // a slot over; it is shipped no records.
     assert!(
-        sends(&s.take_effects()).iter().all(|(to, _)| *to != 2),
+        sends(&s.take_effects()).iter().all(|(to, m)| *to != 2
+            || matches!(m, Message::Append { records, .. } if records.is_empty())),
         "a lost replica is not shipped to"
     );
 }
@@ -320,6 +333,7 @@ fn a_replica_is_sent_no_more_than_its_window_beyond_its_durable() {
             end: 0,
             durable: 0,
             cut: false,
+            report: 0,
         },
     );
     let mut end = 0;
@@ -389,6 +403,7 @@ fn only_the_heartbeat_sends_again_what_a_replica_did_not_report() {
                 end: 0,
                 durable: 0,
                 cut: false,
+                report: 0,
             },
         );
     }
@@ -428,6 +443,7 @@ fn the_compaction_floor_waits_for_the_slowest_replica_up_to_the_byte_bound() {
             end,
             durable: end,
             cut: false,
+            report: 0,
         },
     );
     s.on_message(
@@ -438,6 +454,7 @@ fn the_compaction_floor_waits_for_the_slowest_replica_up_to_the_byte_bound() {
             end: 2,
             durable: 2,
             cut: false,
+            report: 0,
         },
     );
     assert_eq!(s.commit(), end);
@@ -476,6 +493,7 @@ fn the_heartbeat_never_goes_back_below_what_a_replica_reported_durable() {
             end: 0,
             durable: 0,
             cut: false,
+            report: 0,
         },
     );
     let mut end = 0;
@@ -491,6 +509,7 @@ fn the_heartbeat_never_goes_back_below_what_a_replica_reported_durable() {
             end,
             durable: end,
             cut: false,
+            report: 0,
         },
     );
     s.take_effects();
@@ -503,6 +522,7 @@ fn the_heartbeat_never_goes_back_below_what_a_replica_reported_durable() {
             end: 2,
             durable: 2,
             cut: false,
+            report: 0,
         },
     );
     s.tick();
@@ -531,6 +551,7 @@ fn a_stale_read_that_misses_does_not_lose_the_replica() {
             end: 0,
             durable: 0,
             cut: false,
+            report: 0,
         },
     );
     let mut end = 0;
@@ -538,7 +559,11 @@ fn a_stale_read_that_misses_does_not_lose_the_replica() {
         end = batch(&mut s, body);
     }
     s.on_durable(end);
-    assert!(s.take_effects().contains(&Effect::Read { to: 1, from: 1 }));
+    assert!(
+        s.take_effects()
+            .iter()
+            .any(|e| matches!(e, Effect::Read { to: 1, from: 1, .. }))
+    );
     // The replica turns out to hold everything already.
     s.on_message(
         1,
@@ -548,6 +573,7 @@ fn a_stale_read_that_misses_does_not_lose_the_replica() {
             end,
             durable: end,
             cut: false,
+            report: 0,
         },
     );
     s.take_effects();
@@ -583,8 +609,354 @@ fn no_batch_beyond_the_uncommitted_bound() {
             end: 4,
             durable: 4,
             cut: false,
+            report: 0,
         },
     );
     s.flush().unwrap();
     assert_eq!(s.end(), 6, "room again once committed");
+}
+
+/// A read hands back whole batches from `from`: the first always, more
+/// while they end at or below `upto` and the bytes are under the bound,
+/// and nothing without a whole batch at `from` (D-81 A).
+#[test]
+fn a_read_hands_back_whole_batches_within_its_bounds() {
+    use journal::{Chain, Entry, Kind};
+    let mut chain = Chain::genesis();
+    let mut records = Vec::new();
+    for body in [b"a", b"b", b"c"] {
+        let entries = [
+            Entry {
+                kind: Kind::Publish,
+                properties: &[],
+                body,
+            },
+            Entry {
+                kind: Kind::Publish,
+                properties: &[],
+                body,
+            },
+        ];
+        chain.batch(1, &entries, &mut records).unwrap();
+    }
+    // Batches at 1..=3, 4..=6, 7..=9.
+    let read = |from: u64, upto: u64, bound: usize| {
+        let mut batches = cluster::ReadBatches::new(from, upto, bound);
+        for record in &records {
+            batches.feed(record);
+        }
+        batches.finish().map(|r| {
+            r.iter()
+                .map(|r| journal::decode(r).unwrap().lsn)
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(read(1, 100, 1 << 20), Some((1..=9).collect()));
+    assert_eq!(read(1, 6, 1 << 20), Some((1..=6).collect()), "past upto");
+    assert_eq!(
+        read(1, 1, 1 << 20),
+        Some((1..=3).collect()),
+        "the first batch always"
+    );
+    assert_eq!(
+        read(1, 100, 1),
+        Some((1..=3).collect()),
+        "past the byte bound"
+    );
+    // Two batches' worth of bytes, less one: never past the bound.
+    let two: usize = records[..6].iter().map(Vec::len).sum();
+    assert_eq!(read(1, 100, two - 1), Some((1..=3).collect()));
+    assert_eq!(read(1, 100, two), Some((1..=6).collect()));
+    assert_eq!(read(4, 100, 1 << 20), Some((4..=9).collect()));
+    assert_eq!(read(5, 100, 1 << 20), None, "not a batch's start");
+    // A batch cut short by the end of what was fed is dropped.
+    let mut short = cluster::ReadBatches::new(1, 100, 1 << 20);
+    for record in &records[..7] {
+        short.feed(record);
+    }
+    assert_eq!(short.finish().map(|r| r.len()), Some(6));
+}
+
+/// An answer to a read other than the one outstanding is ignored: it
+/// neither clears the read that counts nor asks again. Taking it queued one
+/// more read behind the rest for every stale answer, and a catch-up moved
+/// one batch in many reads (D-85, cluster simulation seed 160).
+#[test]
+fn a_stale_read_answer_neither_clears_the_read_nor_asks_again() {
+    let mut s = started();
+    let mut end = 0;
+    for body in [b"a", b"b", b"c", b"d"] {
+        end = batch(&mut s, body);
+    }
+    s.on_durable(end);
+    let effects = s.take_effects();
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Read { to: 2, from: 1, .. })),
+        "{effects:?}"
+    );
+    // The log as written: batches at 1–2 and 3–4.
+    let mut chain = Chain::genesis();
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    for (body, out) in [(b"a", &mut first), (b"b", &mut second)] {
+        chain
+            .batch(
+                1,
+                &[journal::Entry {
+                    kind: Kind::Publish,
+                    properties: &[],
+                    body,
+                }],
+                out,
+            )
+            .unwrap();
+    }
+    // An answer for a read from 3, as from one given up earlier.
+    s.on_read(2, second);
+    let effects = s.take_effects();
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Read { .. })),
+        "a stale answer asked again: {effects:?}"
+    );
+    // The read that counts still counts.
+    s.on_read(2, first);
+    let effects = s.take_effects();
+    assert!(
+        sends(&effects)
+            .iter()
+            .any(|(to, m)| *to == 2 && matches!(m, Message::Append { prev: 0, .. })),
+        "{effects:?}"
+    );
+}
+
+fn ack(s: &mut Sequencer, id: u8, at: u64) {
+    s.on_message(
+        id,
+        Message::Ack {
+            slot: 1,
+            last_slot: 1,
+            end: at,
+            durable: at,
+            cut: false,
+            report: 0,
+        },
+    );
+}
+
+/// Flow control (D-89 A2, ADR-0008 R1–R4): an attached replica more than
+/// `L` behind the commit point holds new batches — never the commit of
+/// what is appended — for at most `T` heartbeats, after which it is
+/// detached; caught up again, it attaches again.
+#[test]
+fn flow_control_holds_new_batches_at_most_t_heartbeats_and_never_commit() {
+    let mut cfg = config(0);
+    cfg.max_uncommitted = 4;
+    cfg.max_batch = 1;
+    // Raised to `max_uncommitted + max_batch` = 5.
+    cfg.lag_bound = Some(LagBound {
+        records: 0,
+        ticks: 2,
+    });
+    let mut s = Sequencer::new(cfg, Chain::genesis());
+    for id in [1, 2] {
+        ack(&mut s, id, 0);
+    }
+    // Both replicas catch up to the first commit and attach.
+    let end = batch(&mut s, b"a");
+    s.on_durable(end);
+    ack(&mut s, 1, end);
+    ack(&mut s, 2, end);
+    let fell_behind = s.commit();
+    assert_eq!(s.attached(), 2);
+    // Replica 2 goes silent; replica 1 and the sequencer commit on.
+    while s.commit() - fell_behind <= 5 {
+        assert!(!s.holding_back());
+        let end = batch(&mut s, b"b");
+        s.on_durable(end);
+        ack(&mut s, 1, end);
+    }
+    // Nothing queued, nothing held: an idle sequencer detaches no one.
+    assert!(s.commit() - fell_behind > 5);
+    assert!(!s.holding_back());
+    for _ in 0..3 {
+        s.tick();
+    }
+    assert_eq!(s.attached(), 2);
+    // A proposal waits: held.
+    let before = s.end();
+    s.propose(publish(b"c")).unwrap();
+    assert!(
+        s.holding_back(),
+        "replica 2 is {} behind",
+        s.commit() - fell_behind
+    );
+    s.flush().unwrap();
+    assert_eq!(s.end(), before, "a new batch made while held");
+    s.tick();
+    assert!(s.holding_back());
+    // The `T`-th heartbeat detaches it (2, 3); the batch goes out.
+    s.tick();
+    assert!(!s.holding_back());
+    assert_eq!(s.attached(), 1);
+    s.flush().unwrap();
+    assert!(s.end() > before);
+    // Heard from again but still behind, it stays detached: attaching it
+    // would start the hold again at once (R2, Lemma 2).
+    ack(&mut s, 2, fell_behind);
+    assert_eq!(s.attached(), 1);
+    assert!(!s.holding_back());
+    // Back and caught up to the commit point, it attaches again (6).
+    let end = s.end();
+    s.on_durable(end);
+    ack(&mut s, 1, end);
+    ack(&mut s, 2, end);
+    assert_eq!(s.attached(), 2);
+}
+
+/// Commit is never held (D-89 (1)): during a hold, what is appended
+/// commits once a majority holds it.
+#[test]
+fn a_hold_does_not_hold_the_commit_of_what_is_appended() {
+    let mut cfg = config(0);
+    cfg.max_uncommitted = 4;
+    cfg.max_batch = 1;
+    cfg.lag_bound = Some(LagBound {
+        records: 0,
+        ticks: 100,
+    });
+    let mut s = Sequencer::new(cfg, Chain::genesis());
+    for id in [1, 2] {
+        ack(&mut s, id, 0);
+    }
+    let end = batch(&mut s, b"a");
+    s.on_durable(end);
+    ack(&mut s, 1, end);
+    ack(&mut s, 2, end);
+    let fell_behind = s.commit();
+    // Replica 1 acknowledges everything but the last batch.
+    let mut last = end;
+    loop {
+        let end = batch(&mut s, b"b");
+        if s.holding_back() {
+            break;
+        }
+        s.on_durable(end);
+        ack(&mut s, 1, last);
+        last = end;
+    }
+    assert!(s.commit() < s.end(), "nothing appended is uncommitted");
+    let end = s.end();
+    ack(&mut s, 1, end);
+    assert_eq!(
+        s.commit(),
+        end,
+        "the hold kept a majority's record from committing"
+    );
+    assert!(s.commit() - fell_behind > 5);
+}
+
+/// The mechanism behind the cluster simulation's long cycles (D-90 B):
+/// without an uncommitted bound, a sequencer that hears no replica keeps
+/// appending, and the next slot commits only once a replica holds
+/// everything up to that slot's first record — the whole tail. With the
+/// bound, the tail stops at it.
+#[test]
+fn without_an_uncommitted_bound_a_new_slot_must_first_cover_the_whole_tail() {
+    let mut cfg = config(0);
+    cfg.max_queue = 1;
+    let mut s = Sequencer::new(cfg.clone(), Chain::genesis());
+    for _ in 0..500 {
+        batch(&mut s, b"t");
+        s.on_durable(s.end());
+    }
+    let tail = s.end();
+    assert!(tail >= 500 && s.commit() == 0, "a tail of {tail}");
+    // With the bound, the same sequencer stops at it.
+    let mut bounded = cfg.clone();
+    bounded.max_uncommitted = 16;
+    let mut b = Sequencer::new(bounded, Chain::genesis());
+    for _ in 0..500 {
+        b.propose(publish(b"t")).ok();
+        b.flush().unwrap();
+        b.on_durable(b.end());
+    }
+    assert!(b.end() <= 16 + 2, "a bounded tail of {}", b.end());
+    // The next slot starts after the tail; a replica that holds all of it
+    // but that slot's first record counts for nothing yet.
+    let mut next = cfg;
+    next.slot = 2;
+    let mut s2 = Sequencer::with(next, s.chain(), tail, 0, vec![(1, 1)]);
+    batch(&mut s2, b"slot 2");
+    s2.on_durable(s2.end());
+    let report = |s2: &mut Sequencer, last_slot, at| {
+        s2.on_message(
+            1,
+            Message::Ack {
+                slot: 2,
+                last_slot,
+                end: at,
+                durable: at,
+                cut: false,
+                report: 0,
+            },
+        );
+    };
+    report(&mut s2, 1, tail);
+    assert_eq!(s2.commit(), 0, "committed before the replica held slot 2");
+    let end = s2.end();
+    report(&mut s2, 2, end);
+    assert_eq!(s2.commit(), end);
+}
+
+/// R4 counts held heartbeats since the last batch, across holds: a replica
+/// that catches up part of the way ends a hold, and the commit point can
+/// pass it again with no batch made. Counted per hold, the wait would grow
+/// past `T` (D-89 A2; found by the review).
+#[test]
+fn flow_control_counts_t_across_holds_until_a_batch() {
+    let mut cfg = config(0);
+    cfg.max_uncommitted = 4;
+    cfg.max_batch = 1;
+    // `L` raised to 5.
+    cfg.lag_bound = Some(LagBound {
+        records: 0,
+        ticks: 2,
+    });
+    let mut s = Sequencer::new(cfg, Chain::genesis());
+    for id in [1, 2] {
+        ack(&mut s, id, 0);
+    }
+    let end = batch(&mut s, b"a");
+    s.on_durable(end);
+    ack(&mut s, 1, end);
+    ack(&mut s, 2, end);
+    // Replica 2 goes silent; replica 1 stays one batch behind the end, so
+    // what is appended is not all committed when the hold starts.
+    let mut last = end;
+    loop {
+        let end = batch(&mut s, b"b");
+        if s.holding_back() {
+            break;
+        }
+        s.on_durable(end);
+        ack(&mut s, 1, last);
+        last = end;
+    }
+    assert!(s.commit() < s.end());
+    s.tick();
+    assert!(s.holding_back());
+    // Replica 2 catches up part of the way: the hold ends.
+    let partway = s.commit() - 5;
+    ack(&mut s, 2, partway);
+    assert!(!s.holding_back());
+    s.tick();
+    // The commit point passes it again: held again, no batch made since.
+    let end = s.end();
+    ack(&mut s, 1, end);
+    assert!(s.holding_back());
+    // The second held heartbeat since the last batch is the `T`-th.
+    s.tick();
+    assert!(!s.holding_back(), "held past T heartbeats without a batch");
 }

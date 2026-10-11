@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use apply::{Limits, Proposal, State};
 use bytes::{Bytes, BytesMut};
-use cluster::{Config, Effect as Step, Message, Replica, Sequencer};
+use cluster::{Config, Effect as Step, Message, Voter};
 use codec::{
     Connect, ConnectProperties, Packet, PacketId, PubAck, Publish, Qos, ReasonCode, Sender,
     Subscribe, SubscriptionOptions, Unsubscribe, Version,
@@ -46,7 +46,9 @@ use gateway::{Action, Gateway};
 use journal::{Chain, Verifier, decode};
 
 const NODES: u8 = 3;
-const SEQUENCER: u8 = 0;
+/// Bytes one read of the log hands back at most, or one batch if that
+/// alone is larger (D-81 A).
+const READ_BYTES: usize = 4096;
 const STEPS: usize = 2000;
 const CLIENTS: usize = 6;
 const TOPICS: [&str; 3] = ["a", "a/b", "z"];
@@ -101,14 +103,17 @@ fn cluster_config(id: u8) -> Config {
     Config {
         id,
         nodes: (0..NODES).collect(),
-        owner: SEQUENCER,
+        owner: 0,
         slot: 1,
         window: 24,
         max_queue: 64,
         max_batch: 8,
         recent_batches: 8,
         max_uncommitted: 1_000_000,
-        takeover_ticks: 3,
+        // As the apply simulation: frequent faults would otherwise spend the
+        // run on takeovers.
+        takeover_ticks: 6,
+        lag_bound: None,
     }
 }
 
@@ -133,39 +138,18 @@ fn gateway_config(node: u8, first_session: u64) -> gateway::Config {
     }
 }
 
-enum Core {
-    Sequencer(Sequencer),
-    Replica(Replica),
-}
-
-impl Core {
-    fn take(&mut self) -> Vec<Step> {
-        match self {
-            Core::Sequencer(s) => s.take_effects(),
-            Core::Replica(r) => r.take_effects(),
-        }
-    }
-    fn commit(&self) -> u64 {
-        match self {
-            Core::Sequencer(s) => s.commit(),
-            Core::Replica(r) => r.commit(),
-        }
-    }
-    fn end(&self) -> u64 {
-        match self {
-            Core::Sequencer(s) => s.end(),
-            Core::Replica(r) => r.end(),
-        }
-    }
-}
-
 enum Wire {
     Cluster(Message),
     Forward(Proposal),
 }
 
 struct Node {
-    core: Option<Core>,
+    core: Option<Voter>,
+    /// The promise as the disk holds it, and one asked and not yet synced.
+    promised: u64,
+    promising: Option<u64>,
+    /// A cut asked and not yet done.
+    truncate: Option<u64>,
     gateway: Option<Gateway>,
     records: Vec<Vec<u8>>,
     written: usize,
@@ -204,6 +188,8 @@ struct Stats {
     power_losses: u64,
     v5: u64,
     v311: u64,
+    cuts: u64,
+    slot_takeovers: u64,
 }
 
 struct World {
@@ -220,7 +206,11 @@ struct World {
     /// while the gateway was still being handed an earlier record's
     /// effects, which reordered them (a harness bug the ordering check
     /// found). A driver handles effects one after another.
-    loopback: std::collections::VecDeque<Proposal>,
+    /// A sequencing node's own gateway's proposals, with the node: they
+    /// loop back after the step that made them.
+    loopback: std::collections::VecDeque<(u8, Proposal)>,
+    /// Slot → the (node, incarnation) that sequenced it (invariant 2).
+    leaders: BTreeMap<u64, (u8, u64)>,
     oracle: BTreeMap<u64, Vec<u8>>,
     commit: u64,
     clients: Vec<Client>,
@@ -270,6 +260,9 @@ impl World {
             nodes: (0..NODES)
                 .map(|_| Node {
                     core: None,
+                    promised: 0,
+                    promising: None,
+                    truncate: None,
                     gateway: None,
                     records: Vec::new(),
                     written: 0,
@@ -282,6 +275,7 @@ impl World {
             isolated: None,
             calm: false,
             loopback: std::collections::VecDeque::new(),
+            leaders: BTreeMap::new(),
             oracle: BTreeMap::new(),
             commit: 0,
             clients: (0..CLIENTS)
@@ -323,11 +317,19 @@ impl World {
         node.durable = node.records.len();
         node.state = State::new(LIMITS);
         node.incarnation += 1;
-        node.core = Some(if id == SEQUENCER {
-            Core::Sequencer(Sequencer::new(cluster_config(id), tail.chain))
-        } else {
-            Core::Replica(Replica::new(cluster_config(id), tail.chain))
-        });
+        let mut slots: Vec<(u64, u64)> = Vec::new();
+        for record in &node.records {
+            let r = decode(record).unwrap();
+            if slots.last().is_none_or(|&(slot, _)| slot < r.slot) {
+                slots.push((r.slot, r.lsn));
+            }
+        }
+        node.promising = None;
+        node.truncate = None;
+        node.core = Some(
+            Voter::new(cluster_config(id), tail.chain, slots, node.promised)
+                .incarnation(node.incarnation),
+        );
         node.gateway = Some(Gateway::new(
             gateway_config(id, node.incarnation * 1_000_000),
             self.now,
@@ -360,7 +362,7 @@ impl World {
     fn drain(&mut self, id: u8) {
         loop {
             let steps = match self.nodes[usize::from(id)].core.as_mut() {
-                Some(core) => core.take(),
+                Some(core) => core.take_effects(),
                 None => return,
             };
             if steps.is_empty() {
@@ -376,38 +378,71 @@ impl World {
                     Step::Send { to, message } => {
                         self.network.push((id, to, Wire::Cluster(message)));
                     }
-                    Step::Read { to, from } => {
+                    Step::Read { to, from, upto } => {
                         let node = &self.nodes[usize::from(id)];
                         let start = usize::try_from(from - 1).unwrap();
-                        let header = decode(&node.records[start]).unwrap();
-                        let count = journal::BatchHeader::decode(header.body).unwrap().records;
-                        let batch =
-                            node.records[start..=start + usize::try_from(count).unwrap()].to_vec();
-                        if let Some(Core::Sequencer(s)) = self.nodes[usize::from(id)].core.as_mut()
-                        {
-                            s.on_read(to, batch);
+                        let mut batches = cluster::ReadBatches::new(from, upto, READ_BYTES);
+                        for record in node.records.iter().skip(start) {
+                            if batches.done() {
+                                break;
+                            }
+                            batches.feed(record);
+                        }
+                        let batch = batches.finish();
+                        let core = self.nodes[usize::from(id)].core.as_mut().unwrap();
+                        match batch {
+                            Some(batch) => core.on_read(to, batch),
+                            None => core.on_read_missing(to, from),
                         }
                     }
-                    Step::Committed(lsn) if id == SEQUENCER => self.freeze(lsn),
-                    Step::Committed(_) | Step::ReadDone { .. } | Step::Lost { .. } => {}
-                    // A fixed sequencer and its replicas never take a slot over.
-                    Step::Promise { .. } | Step::Truncate { .. } => {
-                        unreachable!("no takeover in a fixed-owner cluster")
+                    Step::Committed(lsn) => {
+                        let leading = self.nodes[usize::from(id)]
+                            .core
+                            .as_ref()
+                            .is_some_and(Voter::leading);
+                        if leading {
+                            self.freeze(id, lsn);
+                        }
                     }
+                    Step::ReadDone { .. } | Step::Lost { .. } => {}
+                    Step::Promise { slot } => {
+                        let node = &mut self.nodes[usize::from(id)];
+                        node.promising = Some(node.promising.map_or(slot, |p| p.max(slot)));
+                    }
+                    Step::Truncate { after } => self.nodes[usize::from(id)].truncate = Some(after),
+                }
+            }
+        }
+        if let Some(core) = self.nodes[usize::from(id)]
+            .core
+            .as_ref()
+            .filter(|c| c.leading())
+        {
+            let me = (id, self.nodes[usize::from(id)].incarnation);
+            let slot = core.slot();
+            match self.leaders.get(&slot) {
+                Some(&other) if other != me => {
+                    self.fail(&format!(
+                        "slot {slot} has two sequencers: {other:?} and {me:?}"
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    self.leaders.insert(slot, me);
+                    self.stats.slot_takeovers += 1;
                 }
             }
         }
         self.apply(id);
     }
 
-    fn freeze(&mut self, lsn: u64) {
+    fn freeze(&mut self, leader: u8, lsn: u64) {
         if lsn <= self.commit {
             return;
         }
         for at in self.commit + 1..=lsn {
-            let record = self.nodes[usize::from(SEQUENCER)].records
-                [usize::try_from(at - 1).unwrap()]
-            .clone();
+            let record =
+                self.nodes[usize::from(leader)].records[usize::try_from(at - 1).unwrap()].clone();
             self.oracle.insert(at, record);
         }
         self.commit = lsn;
@@ -531,16 +566,50 @@ impl World {
 
     fn write(&mut self, id: u8, sync: bool) {
         let node = &mut self.nodes[usize::from(id)];
-        let Some(core) = node.core.as_mut() else {
+        if node.core.is_none() {
             return;
-        };
+        }
         node.written = node.records.len();
+        if let Some(after) = node.truncate.take() {
+            // To the last batch boundary at or below `after`, as the node's
+            // WAL thread cuts; never a copy of a committed record.
+            let mut after = usize::try_from(after).unwrap();
+            while after > 0
+                && decode(&node.records[after]).unwrap().kind != journal::Kind::BatchHeader
+            {
+                after -= 1;
+            }
+            if let Some(index) = (after..node.records.len())
+                .find(|&i| self.oracle.get(&(i as u64 + 1)) == Some(&node.records[i]))
+            {
+                self.fail(&format!(
+                    "node {id}: cut to {after}, removing its copy of committed lsn {}",
+                    index + 1
+                ));
+            }
+            let node = &mut self.nodes[usize::from(id)];
+            let chain = if after == 0 {
+                Chain::genesis()
+            } else {
+                let next = decode(&node.records[after]).unwrap();
+                let last = decode(&node.records[after - 1]).unwrap();
+                Chain::resume(next.prev_hash, after as u64, last.slot)
+            };
+            node.records.truncate(after);
+            node.written = after;
+            node.durable = node.durable.min(after);
+            self.stats.cuts += 1;
+            node.core.as_mut().unwrap().on_truncated(chain);
+            self.drain(id);
+        }
+        let node = &mut self.nodes[usize::from(id)];
+        let core = node.core.as_mut().unwrap();
         if sync {
             node.durable = node.written;
-            let durable = node.durable as u64;
-            match core {
-                Core::Sequencer(s) => s.on_durable(durable),
-                Core::Replica(r) => r.on_durable(durable),
+            core.on_durable(node.durable as u64);
+            if let Some(slot) = node.promising.take() {
+                node.promised = node.promised.max(slot);
+                core.on_promised(slot);
             }
         }
         self.drain(id);
@@ -567,18 +636,23 @@ impl World {
             return;
         }
         match wire {
-            Wire::Cluster(message) => match self.nodes[usize::from(to)].core.as_mut() {
-                Some(Core::Sequencer(s)) => s.on_message(from, message),
-                Some(Core::Replica(r)) => r.on_message(from, message),
-                None => {}
-            },
-            Wire::Forward(proposal) => self.propose(proposal),
+            Wire::Cluster(message) => {
+                if let Some(core) = self.nodes[usize::from(to)].core.as_mut() {
+                    core.on_message(from, message);
+                }
+            }
+            // One hop: a node that no longer sequences drops it.
+            Wire::Forward(proposal) => self.propose(to, proposal),
         }
         self.drain(to);
     }
 
-    fn propose(&mut self, proposal: Proposal) {
-        let Some(Core::Sequencer(s)) = self.nodes[usize::from(SEQUENCER)].core.as_mut() else {
+    fn propose(&mut self, at: u8, proposal: Proposal) {
+        let Some(s) = self.nodes[usize::from(at)]
+            .core
+            .as_mut()
+            .filter(|c| c.leading())
+        else {
             return;
         };
         let mut body = Vec::new();
@@ -593,20 +667,27 @@ impl World {
         if self.rng.chance(50) {
             s.flush().unwrap();
         }
-        self.drain(SEQUENCER);
+        self.drain(at);
     }
 
     fn loopback(&mut self) {
-        while let Some(proposal) = self.loopback.pop_front() {
-            self.propose(proposal);
+        while let Some((at, proposal)) = self.loopback.pop_front() {
+            self.propose(at, proposal);
         }
     }
 
+    /// A gateway's proposal: to its own log if its node sequences (after
+    /// the step that made it), else to the owner of the slot it promised.
     fn send(&mut self, id: u8, proposal: Proposal) {
-        if id == SEQUENCER {
-            self.loopback.push_back(proposal);
-        } else {
-            self.network.push((id, SEQUENCER, Wire::Forward(proposal)));
+        let Some(core) = self.nodes[usize::from(id)].core.as_ref() else {
+            return;
+        };
+        if core.leading() {
+            self.loopback.push_back((id, proposal));
+            return;
+        }
+        if let Some(owner) = core.owner().filter(|&owner| owner != id) {
+            self.network.push((id, owner, Wire::Forward(proposal)));
         }
     }
 
@@ -888,10 +969,12 @@ impl World {
     }
 
     fn tick(&mut self) {
-        if let Some(Core::Sequencer(s)) = self.nodes[usize::from(SEQUENCER)].core.as_mut() {
-            s.flush().unwrap();
-            s.tick();
-            self.drain(SEQUENCER);
+        for id in 0..NODES {
+            if let Some(core) = self.nodes[usize::from(id)].core.as_mut() {
+                core.flush().unwrap();
+                core.tick();
+                self.drain(id);
+            }
         }
         for id in 0..NODES {
             let now = self.now;
@@ -981,11 +1064,15 @@ impl World {
             for c in 0..CLIENTS {
                 self.client_read(c);
             }
-            let end = self.nodes[usize::from(SEQUENCER)]
-                .core
-                .as_ref()
-                .unwrap()
-                .end();
+            let Some(leader) = (0..NODES).find(|&id| {
+                self.nodes[usize::from(id)]
+                    .core
+                    .as_ref()
+                    .is_some_and(Voter::leading)
+            }) else {
+                continue;
+            };
+            let end = self.nodes[usize::from(leader)].core.as_ref().unwrap().end();
             let settled = self.nodes.iter().all(|n| {
                 let core = n.core.as_ref().unwrap();
                 core.commit() == end && n.state.applied() == end
@@ -1122,13 +1209,15 @@ fn mqtt_clients_see_only_what_is_committed() {
         total.pubacks += s.pubacks;
         total.properties_checked += s.properties_checked;
         total.takeovers += s.takeovers;
+        total.cuts += s.cuts;
+        total.slot_takeovers += s.slot_takeovers;
         total.restarts += s.restarts;
         total.power_losses += s.power_losses;
         total.v5 += s.v5;
         total.v311 += s.v311;
     }
     println!(
-        "committed {} packets checked {} deliveries {} properties checked {} pubacks {} takeovers {} restarts {} power losses {} connections v5 {} v3.1.1 {}",
+        "committed {} packets checked {} deliveries {} properties checked {} pubacks {} takeovers {} restarts {} power losses {} connections v5 {} v3.1.1 {} slot takeovers {} cuts {}",
         total.committed,
         total.packets_checked,
         total.deliveries,
@@ -1138,10 +1227,13 @@ fn mqtt_clients_see_only_what_is_committed() {
         total.restarts,
         total.power_losses,
         total.v5,
-        total.v311
+        total.v311,
+        total.slot_takeovers,
+        total.cuts
     );
     if std::env::var("STRAUM_SIM_SEED").is_err() {
         assert!(total.deliveries > 0 && total.pubacks > 0 && total.takeovers > 0);
+        assert!(total.slot_takeovers > 0 && total.cuts > 0);
         assert!(total.properties_checked > 0);
         assert!(total.restarts > 0 && total.v5 > 0 && total.v311 > 0);
     }

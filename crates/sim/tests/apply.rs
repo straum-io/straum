@@ -37,19 +37,23 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use apply::{Effect, Limits, Options, Origin, Proposal, RetainHandling, State};
 use bytes::Bytes;
-use cluster::{Config, Effect as Step, Message, Replica, Sequencer};
+use cluster::{Config, Effect as Step, Message, Voter};
 use domain::{DeliveryGuarantee as G, Topic, TopicFilter};
 use journal::{Chain, Verifier, decode};
 
 const NODES: u8 = 3;
-const SEQUENCER: u8 = 0;
+/// Bytes one read of the log hands back at most, or one batch if that
+/// alone is larger (D-81 A).
+const READ_BYTES: usize = 4096;
 const STEPS: usize = 1500;
 const TOPICS: [&str; 4] = ["a", "a/b", "a/c", "z"];
 const FILTERS: [&str; 5] = ["a", "a/+", "a/#", "#", "z"];
 /// Small, so the simulation reaches them.
 const LIMITS: Limits = Limits {
-    max_subscriptions_per_session: 3,
-    max_subscriptions: 12,
+    // Low enough to be reached when takeovers drop many proposals: the
+    // refusal path stays in every default run (D-70 A).
+    max_subscriptions_per_session: 2,
+    max_subscriptions: 5,
     max_retained: 2,
     max_retained_bytes: 16,
     max_inflight: 2,
@@ -96,51 +100,34 @@ fn config(id: u8) -> Config {
     Config {
         id,
         nodes: (0..NODES).collect(),
-        owner: SEQUENCER,
+        owner: 0,
         slot: 1,
         window: 24,
         max_queue: 32,
         max_batch: 4,
         recent_batches: 4,
         max_uncommitted: 1_000_000,
-        takeover_ticks: 3,
-    }
-}
-
-enum Core {
-    Sequencer(Sequencer),
-    Replica(Replica),
-}
-
-impl Core {
-    fn take(&mut self) -> Vec<Step> {
-        match self {
-            Core::Sequencer(s) => s.take_effects(),
-            Core::Replica(r) => r.take_effects(),
-        }
-    }
-    fn commit(&self) -> u64 {
-        match self {
-            Core::Sequencer(s) => s.commit(),
-            Core::Replica(r) => r.commit(),
-        }
-    }
-    fn end(&self) -> u64 {
-        match self {
-            Core::Sequencer(s) => s.end(),
-            Core::Replica(r) => r.end(),
-        }
+        // Twice the node's: faults here are frequent enough that three
+        // heartbeats of silence took most of the run up with takeovers.
+        takeover_ticks: 6,
+        lag_bound: None,
     }
 }
 
 enum Wire {
     Cluster(Message),
-    /// A gateway's proposal on its way to the sequencer.
+    /// A gateway's proposal on its way to the sequencer: one hop, to the
+    /// owner of the slot its gateway promised.
     Forward(Proposal),
 }
 
 struct Node {
-    core: Option<Core>,
+    core: Option<Voter>,
+    /// The promise as the disk holds it, and one asked and not yet synced.
+    promised: u64,
+    promising: Option<u64>,
+    /// A cut asked and not yet done.
+    truncate: Option<u64>,
     /// Every record handed to this node's log, lsn i + 1 at index i.
     records: Vec<Vec<u8>>,
     written: usize,
@@ -149,6 +136,11 @@ struct Node {
     /// The last snapshot of `state`, taken only at a durable lsn; survives
     /// crashes and power losses, as the node's snapshot file does (D-67 B).
     snapshot: Option<Vec<u8>>,
+    /// The committed slot table the snapshot was taken with, durable with
+    /// it; and the one kept as records apply, pruned by compaction — what
+    /// the node keeps beside its snapshot (D-79 A).
+    snapshot_slots: Vec<(u64, u64)>,
+    committed_slots: Vec<(u64, u64)>,
     /// Records below this index are compacted away: emptied, so any read of
     /// one fails the run, and a restart can only rebuild from the snapshot
     /// and the log after it.
@@ -271,7 +263,10 @@ impl Reference {
         assert_eq!(lsn, self.applied + 1);
         self.applied = lsn;
         let record = decode(record).unwrap();
-        if record.kind == journal::Kind::BatchHeader {
+        if matches!(
+            record.kind,
+            journal::Kind::BatchHeader | journal::Kind::SlotStart | journal::Kind::SlotEnd
+        ) {
             return;
         }
         let mut out = Vec::new();
@@ -402,14 +397,15 @@ impl Reference {
                 });
             }
             Proposal::Ack { origin, delivery } => {
+                // Answered whatever it finds (D-81, seed 1189).
+                out.push(Effect::Acked {
+                    to: origin,
+                    delivery,
+                    lsn,
+                });
                 if let Some(s) = self.session(origin) {
                     if let Some(at) = s.inflight.iter().position(|(id, _)| *id == delivery) {
                         s.inflight.remove(at);
-                        out.push(Effect::Acked {
-                            to: origin,
-                            delivery,
-                            lsn,
-                        });
                         while !s.backlog.is_empty() {
                             let waiting_qos1 = s.backlog[0].0.is_some();
                             if waiting_qos1 && s.inflight.len() >= LIMITS.max_inflight {
@@ -467,6 +463,9 @@ struct Stats {
     snapshot_restarts: u64,
     compactions: u64,
     compacted_restarts: u64,
+    cuts: u64,
+    takeovers: u64,
+    compactions_during_takeover: u64,
 }
 
 struct World {
@@ -483,6 +482,8 @@ struct World {
     commit: u64,
     reference: Reference,
     digests: BTreeMap<u64, u64>,
+    /// Slot → the (node, incarnation) that sequenced it (invariant 2).
+    leaders: BTreeMap<u64, (u8, u64)>,
     request: u64,
     stats: Stats,
 }
@@ -503,11 +504,16 @@ impl World {
             nodes: (0..NODES)
                 .map(|_| Node {
                     core: None,
+                    promised: 0,
+                    promising: None,
+                    truncate: None,
                     records: Vec::new(),
                     written: 0,
                     durable: 0,
                     state: State::new(LIMITS),
                     snapshot: None,
+                    snapshot_slots: Vec::new(),
+                    committed_slots: Vec::new(),
                     floor: 0,
                     incarnation: 0,
                     next_session: 0,
@@ -521,6 +527,7 @@ impl World {
             commit: 0,
             reference: Reference::default(),
             digests: BTreeMap::new(),
+            leaders: BTreeMap::new(),
             request: 0,
             stats: Stats::default(),
         };
@@ -537,7 +544,8 @@ impl World {
         let start = match node.records.get(node.floor) {
             Some(first) if node.floor > 0 => {
                 let first = decode(first).unwrap();
-                Chain::resume(first.prev_hash, node.floor as u64, first.slot)
+                // Slot 0, as `node` (D-82).
+                Chain::resume(first.prev_hash, node.floor as u64, 0)
             }
             _ => Chain::genesis(),
         };
@@ -575,11 +583,29 @@ impl World {
         node.next_session = node.incarnation * 1000;
         node.live.clear();
         let below = node.next_session;
-        node.core = Some(if id == SEQUENCER {
-            Core::Sequencer(Sequencer::new(config(id), tail.chain))
+        let mut slots: Vec<(u64, u64)> = Vec::new();
+        for record in &node.records[node.floor..] {
+            let r = decode(record).unwrap();
+            if slots.last().is_none_or(|&(slot, _)| slot < r.slot) {
+                slots.push((r.slot, r.lsn));
+            }
+        }
+        node.promising = None;
+        node.truncate = None;
+        // A follower whatever it was; it knows as committed what it applied.
+        // The snapshot's slot table, then the slots the log after it begins
+        // (D-73 A, D-79 A), as `node` does.
+        node.committed_slots = if node.snapshot.is_some() {
+            node.snapshot_slots.clone()
         } else {
-            Core::Replica(Replica::new(config(id), tail.chain))
-        });
+            Vec::new()
+        };
+        let slots = cluster::merge_slots(&node.committed_slots, &slots);
+        node.core = Some(
+            Voter::new(config(id), tail.chain, slots, node.promised)
+                .knowing_commit(node.state.applied())
+                .incarnation(node.incarnation),
+        );
         // Whatever the previous incarnation's sessions left goes.
         self.send(id, Proposal::NodeReset { node: id, below });
         self.drain(id);
@@ -595,6 +621,7 @@ impl World {
         let mut bytes = Vec::new();
         node.state.encode(&mut bytes);
         node.snapshot = Some(bytes);
+        node.snapshot_slots = node.committed_slots.clone();
         self.stats.snapshots += 1;
         // Then what the node gives back: below the snapshot, and below what
         // the sequencer still ships to a replica or a replica has committed;
@@ -603,10 +630,9 @@ impl World {
         let Some(core) = node.core.as_ref() else {
             return;
         };
-        let floor = match core {
-            Core::Sequencer(s) => s.compaction_floor(0),
-            Core::Replica(r) => r.commit(),
-        };
+        // No byte bound here: a sequencer keeps what any replica still
+        // needs, a follower keeps everything a next sequencer may serve.
+        let floor = core.compaction_floor(0);
         let mut floor = usize::try_from(floor.min(node.state.applied()))
             .unwrap()
             .min(node.durable.saturating_sub(1));
@@ -620,7 +646,18 @@ impl World {
                 *record = Vec::new();
             }
             node.floor = floor;
+            cluster::prune_slots(&mut node.committed_slots, floor as u64);
+            if let Some(core) = node.core.as_mut() {
+                core.on_compacted(floor as u64);
+            }
             self.stats.compactions += 1;
+            if !self
+                .nodes
+                .iter()
+                .any(|n| n.core.as_ref().is_some_and(Voter::leading))
+            {
+                self.stats.compactions_during_takeover += 1;
+            }
         }
     }
 
@@ -641,7 +678,7 @@ impl World {
     fn drain(&mut self, id: u8) {
         loop {
             let steps = match self.nodes[usize::from(id)].core.as_mut() {
-                Some(core) => core.take(),
+                Some(core) => core.take_effects(),
                 None => return,
             };
             if steps.is_empty() {
@@ -657,46 +694,103 @@ impl World {
                     Step::Send { to, message } => {
                         self.network.push((id, to, Wire::Cluster(message)));
                     }
-                    Step::Read { to, from } => {
+                    Step::Read { to, from, upto } => {
                         let node = &self.nodes[usize::from(id)];
                         let start = usize::try_from(from - 1).unwrap();
-                        if start < node.floor {
-                            if let Some(Core::Sequencer(s)) =
-                                self.nodes[usize::from(id)].core.as_mut()
-                            {
-                                s.on_read_missing(to, from);
+                        let mut batches = cluster::ReadBatches::new(from, upto, READ_BYTES);
+                        if start >= node.floor {
+                            for record in node.records.iter().skip(start) {
+                                if batches.done() {
+                                    break;
+                                }
+                                batches.feed(record);
                             }
-                            continue;
                         }
-                        let header = decode(&node.records[start]).unwrap();
-                        let count = journal::BatchHeader::decode(header.body).unwrap().records;
-                        let batch =
-                            node.records[start..=start + usize::try_from(count).unwrap()].to_vec();
-                        if let Some(Core::Sequencer(s)) = self.nodes[usize::from(id)].core.as_mut()
-                        {
-                            s.on_read(to, batch);
+                        let batch = batches.finish();
+                        let core = self.nodes[usize::from(id)].core.as_mut().unwrap();
+                        match batch {
+                            Some(batch) => core.on_read(to, batch),
+                            None => core.on_read_missing(to, from),
                         }
                     }
-                    Step::Committed(lsn) if id == SEQUENCER => self.freeze(lsn),
-                    Step::Committed(_) | Step::ReadDone { .. } | Step::Lost { .. } => {}
-                    // A fixed sequencer and its replicas never take a slot over.
-                    Step::Promise { .. } | Step::Truncate { .. } => {
-                        unreachable!("no takeover in a fixed-owner cluster")
+                    Step::Committed(lsn) => {
+                        let leading = self.nodes[usize::from(id)]
+                            .core
+                            .as_ref()
+                            .is_some_and(Voter::leading);
+                        if leading {
+                            self.freeze(id, lsn);
+                        } else if lsn > self.commit {
+                            self.fail(&format!(
+                                "node {id}: learned commit {lsn} before a sequencer reached it"
+                            ));
+                        }
                     }
+                    Step::ReadDone { .. } | Step::Lost { .. } => {}
+                    Step::Promise { slot } => {
+                        let node = &mut self.nodes[usize::from(id)];
+                        node.promising = Some(node.promising.map_or(slot, |p| p.max(slot)));
+                    }
+                    Step::Truncate { after } => self.nodes[usize::from(id)].truncate = Some(after),
+                }
+            }
+        }
+        if let Some(core) = self.nodes[usize::from(id)].core.as_ref() {
+            let n = &self.nodes[usize::from(id)];
+            if core.end() != n.records.len() as u64 && n.truncate.is_none() {
+                let tail: Vec<(u64, u64)> = n
+                    .records
+                    .iter()
+                    .rev()
+                    .take(4)
+                    .filter(|r| !r.is_empty())
+                    .map(|r| {
+                        let d = decode(r).unwrap();
+                        (d.lsn, d.slot)
+                    })
+                    .collect();
+                self.fail(&format!(
+                    "node {id}: voter end {} but log holds {} ({tail:?}), leading {}",
+                    core.end(),
+                    n.records.len(),
+                    core.leading()
+                ));
+            }
+        }
+        // Invariant 2: one sequencer per slot.
+        if let Some(core) = self.nodes[usize::from(id)]
+            .core
+            .as_ref()
+            .filter(|c| c.leading())
+        {
+            let me = (id, self.nodes[usize::from(id)].incarnation);
+            match self.leaders.get(&core.slot()) {
+                Some(&other) if other != me => {
+                    let slot = core.slot();
+                    self.fail(&format!(
+                        "slot {slot} has two sequencers: {other:?} and {me:?}"
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    self.leaders.insert(core.slot(), me);
+                    self.stats.takeovers += 1;
                 }
             }
         }
         self.apply(id);
     }
 
-    fn freeze(&mut self, lsn: u64) {
+    fn freeze(&mut self, leader: u8, lsn: u64) {
         if lsn <= self.commit {
             return;
         }
         for at in self.commit + 1..=lsn {
-            let record = self.nodes[usize::from(SEQUENCER)].records
-                [usize::try_from(at - 1).unwrap()]
-            .clone();
+            let record =
+                self.nodes[usize::from(leader)].records[usize::try_from(at - 1).unwrap()].clone();
+            if record.is_empty() {
+                self.fail(&format!("committed {at}, which the sequencer compacted"));
+            }
             self.reference.apply(at, &record);
             self.oracle.insert(at, record);
         }
@@ -717,7 +811,15 @@ impl World {
             let bytes = node.records[usize::try_from(next - 1).unwrap()].clone();
             let mut effects = Vec::new();
             let node = &mut self.nodes[usize::from(id)];
-            if let Err(e) = node.state.apply(&decode(&bytes).unwrap(), &mut effects) {
+            let record = decode(&bytes).unwrap();
+            if node
+                .committed_slots
+                .last()
+                .is_none_or(|&(slot, _)| slot < record.slot)
+            {
+                node.committed_slots.push((record.slot, record.lsn));
+            }
+            if let Err(e) = node.state.apply(&record, &mut effects) {
                 self.fail(&format!("node {id}: lsn {next} did not apply: {e}"));
             }
             let digest = node.state.digest();
@@ -821,23 +923,72 @@ impl World {
 
     fn write(&mut self, id: u8, sync: bool) {
         let node = &mut self.nodes[usize::from(id)];
-        let Some(core) = node.core.as_mut() else {
+        if node.core.is_none() {
             return;
-        };
+        }
         node.written = node.records.len();
+        if let Some(after) = node.truncate.take() {
+            // To the last batch boundary at or below `after`, as the node's
+            // WAL thread cuts; never a copy of a committed record.
+            let asked = after;
+            let mut after = usize::try_from(after).unwrap();
+            while after > 0
+                && decode(&node.records[after]).unwrap().kind != journal::Kind::BatchHeader
+            {
+                after -= 1;
+            }
+            let around: Vec<(u64, u64, journal::Kind, bool)> = node.records
+                [after.saturating_sub(2)..node.records.len().min(after + 6)]
+                .iter()
+                .filter(|r| !r.is_empty())
+                .map(|r| {
+                    let d = decode(r).unwrap();
+                    (d.lsn, d.slot, d.kind, self.oracle.get(&d.lsn) == Some(r))
+                })
+                .collect();
+            if let Some(index) = (after..node.records.len())
+                .find(|&i| self.oracle.get(&(i as u64 + 1)) == Some(&node.records[i]))
+            {
+                let commit = node.core.as_ref().map(Voter::commit);
+                self.fail(&format!(
+                    "node {id}: cut to {after} (asked {asked}, its commit {commit:?}, cluster {}), removing its copy of committed lsn {}: around {around:?}",
+                    self.commit,
+                    index + 1
+                ));
+            }
+            let node = &mut self.nodes[usize::from(id)];
+            let chain = if after == 0 {
+                Chain::genesis()
+            } else {
+                let next = decode(&node.records[after]).unwrap();
+                let last = decode(&node.records[after - 1]).unwrap();
+                Chain::resume(next.prev_hash, after as u64, last.slot)
+            };
+            node.records.truncate(after);
+            node.written = after;
+            node.durable = node.durable.min(after);
+            self.stats.cuts += 1;
+            node.core.as_mut().unwrap().on_truncated(chain);
+            self.drain(id);
+        }
+        let node = &mut self.nodes[usize::from(id)];
+        let core = node.core.as_mut().unwrap();
         if sync {
             node.durable = node.written;
             let durable = node.durable as u64;
-            match core {
-                Core::Sequencer(s) => s.on_durable(durable),
-                Core::Replica(r) => r.on_durable(durable),
+            core.on_durable(durable);
+            if let Some(slot) = node.promising.take() {
+                node.promised = node.promised.max(slot);
+                core.on_promised(slot);
             }
         }
         self.drain(id);
     }
 
     fn deliver(&mut self, index: usize) {
-        let (from, to, wire) = self.network.swap_remove(index);
+        // `remove`, not `swap_remove`: delivering one message must not move
+        // the newest ahead of all the others.
+        let (from, to, wire) = self.network.remove(index);
         if self.isolated.is_some_and(|i| i == from || i == to) || !self.up(to) {
             if matches!(wire, Wire::Forward(_)) {
                 self.stats.forwards_dropped += 1;
@@ -845,18 +996,24 @@ impl World {
             return;
         }
         match wire {
-            Wire::Cluster(message) => match self.nodes[usize::from(to)].core.as_mut() {
-                Some(Core::Sequencer(s)) => s.on_message(from, message),
-                Some(Core::Replica(r)) => r.on_message(from, message),
-                None => {}
-            },
-            Wire::Forward(proposal) => self.propose(proposal),
+            Wire::Cluster(message) => {
+                if let Some(core) = self.nodes[usize::from(to)].core.as_mut() {
+                    core.on_message(from, message);
+                }
+            }
+            // One hop: a node that no longer sequences drops it.
+            Wire::Forward(proposal) => self.propose(to, proposal),
         }
         self.drain(to);
     }
 
-    fn propose(&mut self, proposal: Proposal) {
-        let Some(Core::Sequencer(s)) = self.nodes[usize::from(SEQUENCER)].core.as_mut() else {
+    fn propose(&mut self, at: u8, proposal: Proposal) {
+        let Some(s) = self.nodes[usize::from(at)]
+            .core
+            .as_mut()
+            .filter(|c| c.leading())
+        else {
+            self.stats.forwards_dropped += 1;
             return;
         };
         let mut body = Vec::new();
@@ -873,14 +1030,22 @@ impl World {
         if self.rng.chance(50) {
             s.flush().unwrap();
         }
-        self.drain(SEQUENCER);
+        self.drain(at);
     }
 
+    /// A gateway's proposal: to its own log if it sequences, else to the
+    /// owner of the slot it promised.
     fn send(&mut self, id: u8, proposal: Proposal) {
-        if id == SEQUENCER {
-            self.propose(proposal);
-        } else {
-            self.network.push((id, SEQUENCER, Wire::Forward(proposal)));
+        let Some(core) = self.nodes[usize::from(id)].core.as_ref() else {
+            return;
+        };
+        if core.leading() {
+            self.propose(id, proposal);
+            return;
+        }
+        match core.owner() {
+            Some(owner) if owner != id => self.network.push((id, owner, Wire::Forward(proposal))),
+            _ => self.stats.forwards_dropped += 1,
         }
     }
 
@@ -974,10 +1139,12 @@ impl World {
     }
 
     fn tick(&mut self) {
-        if let Some(Core::Sequencer(s)) = self.nodes[usize::from(SEQUENCER)].core.as_mut() {
-            s.flush().unwrap();
-            s.tick();
-            self.drain(SEQUENCER);
+        for id in 0..NODES {
+            if let Some(core) = self.nodes[usize::from(id)].core.as_mut() {
+                core.flush().unwrap();
+                core.tick();
+                self.drain(id);
+            }
         }
     }
 
@@ -1046,11 +1213,15 @@ impl World {
                 }
                 self.deliver(0);
             }
-            let end = self.nodes[usize::from(SEQUENCER)]
-                .core
-                .as_ref()
-                .unwrap()
-                .end();
+            let Some(leader) = (0..NODES).find(|&id| {
+                self.nodes[usize::from(id)]
+                    .core
+                    .as_ref()
+                    .is_some_and(Voter::leading)
+            }) else {
+                continue;
+            };
+            let end = self.nodes[usize::from(leader)].core.as_ref().unwrap().end();
             let settled = self.nodes.iter().all(|n| {
                 let core = n.core.as_ref().unwrap();
                 core.commit() == end && n.state.applied() == end
@@ -1059,7 +1230,26 @@ impl World {
                 return;
             }
         }
-        self.fail("the cluster did not settle after healing");
+        let state: Vec<String> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                let c = n.core.as_ref().unwrap();
+                format!(
+                    "leading {} slot {} end {} commit {} applied {} floor {} refused {}",
+                    c.leading(),
+                    c.slot(),
+                    c.end(),
+                    c.commit(),
+                    n.state.applied(),
+                    n.floor,
+                    c.refused()
+                )
+            })
+            .collect();
+        self.fail(&format!(
+            "the cluster did not settle after healing: {state:?}"
+        ));
     }
 
     /// Everything comes back; then every session ends. Every node applies
@@ -1166,9 +1356,12 @@ fn effects_follow_commit_and_mean_what_the_committed_log_means() {
         total.snapshot_restarts += s.snapshot_restarts;
         total.compactions += s.compactions;
         total.compacted_restarts += s.compacted_restarts;
+        total.takeovers += s.takeovers;
+        total.cuts += s.cuts;
+        total.compactions_during_takeover += s.compactions_during_takeover;
     }
     println!(
-        "committed {} effects checked {} deliveries {} acked {} slow-consumer closes {} subscriptions refused {} restarts {} power losses {} forwards dropped {} snapshots {} restarts from a snapshot {} compactions {} restarts of a compacted log {}",
+        "committed {} effects checked {} deliveries {} acked {} slow-consumer closes {} subscriptions refused {} restarts {} power losses {} forwards dropped {} snapshots {} restarts from a snapshot {} compactions {} restarts of a compacted log {} takeovers {} cuts {} compactions during a takeover {}",
         total.committed,
         total.effects,
         total.deliveries,
@@ -1181,12 +1374,16 @@ fn effects_follow_commit_and_mean_what_the_committed_log_means() {
         total.snapshots,
         total.snapshot_restarts,
         total.compactions,
-        total.compacted_restarts
+        total.compacted_restarts,
+        total.takeovers,
+        total.cuts,
+        total.compactions_during_takeover
     );
     if std::env::var("STRAUM_SIM_SEED").is_err() {
         assert!(total.committed > 0 && total.deliveries > 0 && total.acked > 0);
         assert!(total.closes > 0 && total.refused > 0 && total.restarts > 0);
         assert!(total.power_losses > 0 && total.forwards_dropped > 0);
         assert!(total.snapshot_restarts > 0 && total.compacted_restarts > 0);
+        assert!(total.takeovers > 0 && total.cuts > 0);
     }
 }

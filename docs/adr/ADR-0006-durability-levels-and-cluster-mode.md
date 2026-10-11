@@ -1,6 +1,8 @@
 # ADR-0006: Durability levels on a single node, majority commit in a cluster
 
-- Status: accepted
+- Status: superseded for the server by step 8 of ADR-0008 (D-111, 2026-10-11):
+  the durability levels went with the old path; a cluster commits by majority
+  only, as this ADR already required
 - Date: 2026-10-04
 - Amended by: ADR-0008 (D-48 C: the broker and replication are rewritten for gateway/sequencer now, ahead of the phase order); D-51 A: at ADR-0008 step 8 a single node becomes a cluster of one and the levels go, once a witness carries the two-node pair (ADR-0008, step 8)
 - Decided by: Stanislav (D-36: A)

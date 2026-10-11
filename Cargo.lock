@@ -149,19 +149,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "broker"
-version = "0.0.0"
-dependencies = [
- "auth",
- "bytes",
- "divan",
- "domain",
- "proptest",
- "protocol",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -346,18 +333,6 @@ dependencies = [
  "divan",
  "proptest",
  "thiserror 2.0.20",
-]
-
-[[package]]
-name = "e2e"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "replication",
- "rumqttc",
- "runtime",
- "storage",
- "tokio",
 ]
 
 [[package]]
@@ -566,18 +541,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mqtt"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "divan",
- "domain",
- "proptest",
- "protocol",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "node"
 version = "0.0.0"
 dependencies = [
@@ -736,15 +699,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "protocol"
-version = "0.0.0"
-dependencies = [
- "auth",
- "bytes",
- "domain",
-]
-
-[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -856,16 +810,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "replication"
-version = "0.0.0"
-dependencies = [
- "crc32fast",
- "divan",
- "proptest",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -891,25 +835,6 @@ dependencies = [
  "log",
  "thiserror 1.0.69",
  "tokio",
-]
-
-[[package]]
-name = "runtime"
-version = "0.0.0"
-dependencies = [
- "auth",
- "broker",
- "bytes",
- "divan",
- "domain",
- "mqtt",
- "protocol",
- "replication",
- "storage",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "transport",
 ]
 
 [[package]]
@@ -1020,7 +945,7 @@ dependencies = [
 name = "server"
 version = "0.0.0"
 dependencies = [
- "runtime",
+ "node",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -1063,7 +988,6 @@ dependencies = [
  "domain",
  "gateway",
  "journal",
- "replication",
  "storage",
 ]
 

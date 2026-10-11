@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use journal::{BatchHeader, Chain, ChainError, Kind, Verifier, decode};
+use journal::{Chain, ChainError, Kind, Verifier, decode};
 use storage::{OsDisk, SegmentLimits, Segments};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -18,8 +18,14 @@ use crate::NodeError;
 pub enum Command {
     /// One batch, as the core handed it over.
     Append { first: u64, records: Vec<Vec<u8>> },
-    /// The batch that starts at `from`, for catch-up.
-    Read { to: u8, from: u64 },
+    /// Whole batches from the one at `from`, none past `upto`, at most
+    /// `bytes` past the first: for catch-up (D-81 A).
+    Read {
+        to: u8,
+        from: u64,
+        upto: u64,
+        bytes: usize,
+    },
     /// Records `from..=upto`, for applying what this process did not
     /// append itself; at most `MAX_RANGE` of them.
     Range { from: u64, upto: u64 },
@@ -42,6 +48,9 @@ pub enum Event {
         bytes_floor: u64,
     },
     Snapshot(u64),
+    /// Compacted: the log now holds nothing at or below this lsn — the
+    /// floor reached, which whole segments can leave below the one asked.
+    Compacted(u64),
     Promised(u64),
     Truncated(Chain),
     Read {
@@ -97,21 +106,39 @@ fn write_promise(directory: &Path, slot: u64) -> std::io::Result<()> {
     std::fs::File::open(directory)?.sync_all()
 }
 
-/// Cuts the log back to `after` and returns the chain there: the record
-/// after it names the hash, the record at it the slot.
+/// Cuts the log back to the last batch boundary at or below `after` and
+/// returns the chain there: the batch header after the boundary names the
+/// hash, the record at the boundary the slot. `after` is a boundary in the
+/// log the voter compared with; here it can fall inside a batch.
 fn truncate(log: &mut Segments<OsDisk>, after: u64) -> Result<Chain, storage::StorageError> {
-    let chain = if after == 0 {
+    let next = after.saturating_add(1);
+    // Segments start at batch boundaries: the batch holding `next` starts
+    // in the segment that holds it.
+    let segment = log
+        .segment_of(next)
+        .ok_or(storage::StorageError::NotFramedRecords)?;
+    let mut header: Option<(u64, u128)> = None;
+    log.read(segment, &mut |record| {
+        if let Ok(r) = decode(record) {
+            if r.kind == Kind::BatchHeader && r.lsn <= next {
+                header = Some((r.lsn, r.prev_hash));
+            }
+        }
+    })?;
+    let (start, prev_hash) = header.ok_or(storage::StorageError::NotFramedRecords)?;
+    let boundary = start.saturating_sub(1);
+    let chain = if boundary == 0 {
         Chain::genesis()
     } else {
-        let around = read_range(log, after, after.saturating_add(1));
-        let decoded: Vec<_> = around.iter().filter_map(|r| decode(r).ok()).collect();
-        match (decoded.first(), decoded.get(1)) {
-            (Some(at), Some(next)) => Chain::resume(next.prev_hash, after, at.slot),
-            // Nothing after it: there is nothing to cut.
-            _ => return Err(storage::StorageError::NotFramedRecords),
-        }
+        let at = read_range(log, boundary, boundary);
+        let slot = at
+            .first()
+            .and_then(|r| decode(r).ok())
+            .map(|r| r.slot)
+            .ok_or(storage::StorageError::NotFramedRecords)?;
+        Chain::resume(prev_hash, boundary, slot)
     };
-    log.truncate_after(after)?;
+    log.truncate_after(boundary)?;
     Ok(chain)
 }
 
@@ -188,11 +215,17 @@ pub fn start(
         if broken.is_some() {
             return;
         }
+        // Slot 0, not the first record's: `prev_hash` already binds the
+        // first batch to what came before, and complete records set the slot
+        // as they are fed. Taken from a first batch that turns out torn, an
+        // empty log claimed that batch's slot and refused for ever the
+        // committed log of an older one (found by the cluster simulation,
+        // seed 4045, D-82).
         let verifier = verifier.get_or_insert_with(|| match decode(record) {
             Ok(first) => Verifier::new(Chain::resume(
                 first.prev_hash,
                 first.lsn.saturating_sub(1),
-                first.slot,
+                0,
             )),
             // `feed` below reports the same record as malformed.
             Err(_) => Verifier::new(Chain::genesis()),
@@ -291,10 +324,15 @@ fn run(
         // Reads after the appends that came before them.
         for command in deferred {
             let event = match command {
-                Command::Read { to, from } => Event::Read {
+                Command::Read {
                     to,
                     from,
-                    batch: read_batch(&log, from),
+                    upto,
+                    bytes,
+                } => Event::Read {
+                    to,
+                    from,
+                    batch: read_batches(&log, from, upto, bytes),
                 },
                 Command::Range { from, upto } => Event::Range(read_range(&log, from, upto)),
                 Command::Snapshot { lsn, bytes } => match write_snapshot(&directory, &bytes) {
@@ -302,7 +340,9 @@ fn run(
                     Err(e) => Event::Failed(storage::StorageError::Io(e)),
                 },
                 Command::Compact { floor } => match log.remove_through(floor) {
-                    Ok(_) => continue,
+                    Ok(_) => Event::Compacted(
+                        log.keys().next().map_or(0, |first| first.saturating_sub(1)),
+                    ),
                     Err(e) => Event::Failed(e),
                 },
                 Command::Promise { slot } => match write_promise(&directory, slot) {
@@ -322,26 +362,19 @@ fn run(
     }
 }
 
-fn read_batch(log: &Segments<OsDisk>, from: u64) -> Option<Vec<Vec<u8>>> {
+/// Whole batches from the one at `from`, none past `upto`, under `bytes`
+/// past the first (`cluster::ReadBatches`, D-81 A); within the segment
+/// that holds `from`.
+fn read_batches(
+    log: &Segments<OsDisk>,
+    from: u64,
+    upto: u64,
+    bytes: usize,
+) -> Option<Vec<Vec<u8>>> {
     let segment = log.segment_of(from)?;
-    let mut batch = Vec::new();
-    let mut remaining: Option<u32> = None;
-    log.read(segment, &mut |record| {
-        let Ok(r) = decode(record) else { return };
-        match remaining {
-            None if r.lsn == from && r.kind == Kind::BatchHeader => {
-                remaining = BatchHeader::decode(r.body).ok().map(|h| h.records);
-                batch.push(record.to_vec());
-            }
-            Some(n) if n > 0 && r.lsn == from.saturating_add(batch.len() as u64) => {
-                remaining = Some(n.saturating_sub(1));
-                batch.push(record.to_vec());
-            }
-            _ => {}
-        }
-    })
-    .ok()?;
-    (remaining == Some(0)).then_some(batch)
+    let mut batches = cluster::ReadBatches::new(from, upto, bytes);
+    log.read(segment, &mut |record| batches.feed(record)).ok()?;
+    batches.finish()
 }
 
 fn read_range(log: &Segments<OsDisk>, from: u64, upto: u64) -> Vec<Vec<u8>> {
@@ -367,4 +400,107 @@ fn read_range(log: &Segments<OsDisk>, from: u64, upto: u64) -> Vec<Vec<u8>> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use journal::{Entry, Kind};
+
+    use super::*;
+
+    /// A cut inside a batch goes back to that batch's start, and the chain
+    /// reported is the one after the batch before it.
+    #[test]
+    fn a_cut_inside_a_batch_rounds_down_to_its_start() {
+        let dir = std::env::temp_dir().join(format!("straum-node-wal-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = SegmentLimits {
+            wal: storage::WalLimits::default(),
+            segment_bytes: 1 << 20,
+        };
+        let mut log = Segments::open(OsDisk, &dir, limits, &mut |_, _| {}).unwrap();
+        let mut chain = Chain::genesis();
+        let mut after_first = Chain::genesis();
+        for batch in 0..3u8 {
+            let entries = [
+                Entry {
+                    kind: Kind::Publish,
+                    properties: &[],
+                    body: &[batch, 1],
+                },
+                Entry {
+                    kind: Kind::Publish,
+                    properties: &[],
+                    body: &[batch, 2],
+                },
+            ];
+            let first = chain.next_lsn();
+            let mut records = Vec::new();
+            chain.batch(1, &entries, &mut records).unwrap();
+            log.begin(first).unwrap();
+            for record in &records {
+                log.stage(record).unwrap();
+            }
+            log.commit(true).unwrap();
+            if batch == 0 {
+                after_first = chain;
+            }
+        }
+        // Batches are lsns 1–3, 4–6, 7–9: 5 is inside the second.
+        let cut = truncate(&mut log, 5).unwrap();
+        assert_eq!(cut.next_lsn(), 4);
+        assert_eq!(cut.hash(), after_first.hash());
+        drop(log);
+        let mut seen = Vec::new();
+        Segments::open(OsDisk, &dir, limits, &mut |_, r| {
+            seen.push(decode(r).unwrap().lsn)
+        })
+        .unwrap();
+        assert_eq!(seen, vec![1, 2, 3]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A log holding only a torn batch of a newer slot recovers as an
+    /// empty log of no slot: the committed log of an older slot must still
+    /// chain onto it (D-82, cluster simulation seed 4045).
+    #[test]
+    fn a_torn_first_batch_leaves_a_log_of_no_slot() {
+        let dir = std::env::temp_dir().join(format!("straum-node-wal-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = SegmentLimits {
+            wal: storage::WalLimits::default(),
+            segment_bytes: 1 << 20,
+        };
+        let mut log = Segments::open(OsDisk, &dir, limits, &mut |_, _| {}).unwrap();
+        let mut chain = Chain::genesis();
+        let entries = [
+            Entry {
+                kind: Kind::SlotStart,
+                properties: &[],
+                body: &[0; 8],
+            },
+            Entry {
+                kind: Kind::Publish,
+                properties: &[],
+                body: &[1],
+            },
+        ];
+        let mut records = Vec::new();
+        chain.batch(5, &entries, &mut records).unwrap();
+        log.begin(1).unwrap();
+        // The header and one of its two records: torn.
+        for record in &records[..2] {
+            log.stage(record).unwrap();
+        }
+        log.commit(true).unwrap();
+        drop(log);
+        let (events, _rx) = tokio_mpsc::channel(8);
+        let (recovered, wal, thread) = start(dir.clone(), limits, 1 << 20, events).unwrap();
+        assert_eq!(recovered.chain, Chain::genesis());
+        drop(wal);
+        thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

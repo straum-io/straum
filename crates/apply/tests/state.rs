@@ -227,7 +227,8 @@ fn at_least_once_waits_for_acks_behind_the_window_and_a_full_backlog_closes_the_
                 origin: a,
                 delivery: 0,
             },
-            // A retried ack is a no-op.
+            // A retried ack changes nothing, and is answered all the same:
+            // the gateway retries until it sees `Acked` (D-81, seed 1189).
             Proposal::Ack {
                 origin: a,
                 delivery: 0,
@@ -246,7 +247,7 @@ fn at_least_once_waits_for_acks_behind_the_window_and_a_full_backlog_closes_the_
             .iter()
             .filter(|e| matches!(e, Effect::Acked { .. }))
             .count(),
-        1
+        2
     );
 
     // A third message finds the backlog full: the session is closed and gone.
@@ -651,9 +652,10 @@ fn properties_travel_with_the_message() {
     assert!(!effects.iter().any(|e| matches!(e, Effect::Deliver { .. })));
 }
 
-/// A new slot's `SlotStart` advances the position and changes nothing.
+/// A slot's `SlotEnd` and the next one's `SlotStart` advance the position
+/// and change nothing.
 #[test]
-fn a_slot_start_changes_no_state() {
+fn a_change_of_slot_changes_no_state() {
     let (before, _) = run_with(
         Limits::default(),
         &[subscribe(origin(1, 1), "a", G::AtLeastOnce)],
@@ -669,10 +671,16 @@ fn a_slot_start_changes_no_state() {
         body: &body,
     };
     chain.batch(1, &[entry], &mut records).unwrap();
+    let end = Entry {
+        kind: Kind::SlotEnd,
+        properties: &[],
+        body: &2u64.to_be_bytes(),
+    };
+    chain.batch(1, &[end], &mut records).unwrap();
     let start = Entry {
         kind: Kind::SlotStart,
         properties: &[],
-        body: &2u64.to_be_bytes(),
+        body: &4u64.to_be_bytes(),
     };
     chain.batch(2, &[start], &mut records).unwrap();
     let mut state = State::new(Limits::default());
@@ -680,7 +688,25 @@ fn a_slot_start_changes_no_state() {
     for record in &records {
         state.apply(&decode(record).unwrap(), &mut effects).unwrap();
     }
-    assert_eq!(state.applied(), 4);
+    assert_eq!(state.applied(), 6);
     assert_eq!(state.sessions(), before.sessions());
     assert_eq!(effects.len(), 1, "only the subscription's own effect");
+}
+
+/// An acknowledgement for a session that is gone is answered too: nothing
+/// else would end the gateway's retry of it (D-81, seed 1189).
+#[test]
+fn an_ack_for_a_gone_session_is_answered() {
+    let a = origin(1, 1);
+    let (_, effects) = run_with(
+        Limits::default(),
+        &[Proposal::Ack {
+            origin: a,
+            delivery: 7,
+        }],
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Acked { to, delivery: 7, .. }] if *to == a
+    ));
 }

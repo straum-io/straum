@@ -16,9 +16,18 @@ use transport::TransportConfig;
 
 const NODES: u8 = 3;
 
+/// A port of this test binary's own (D-108): a block below the ephemeral
+/// range chosen by the process id, numbered by a counter, so no two tests
+/// running in parallel here ever get the same one. Binding port 0 and
+/// releasing it before the node bound it left a window in which another
+/// test could be handed the same port. A port taken by something else still
+/// fails the node's start, loudly — nothing retries.
 fn free_port() -> SocketAddr {
-    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    socket.local_addr().unwrap()
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let block = u16::try_from(std::process::id() % 120).unwrap();
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(n < 100, "this test binary used up its block of ports");
+    SocketAddr::from(([127, 0, 0, 1], 20_000 + block * 100 + n))
 }
 
 fn data_dir(test: &str, id: u8) -> PathBuf {
@@ -57,7 +66,7 @@ fn gateway() -> gateway::Config {
 /// compaction test, so its log spans many segments; roomy elsewhere, with
 /// snapshots still taken.
 fn disk(test: &str) -> (u64, u64, u64) {
-    if test == "compaction" {
+    if test == "compaction" || test == "rotation-compaction" {
         (2048, 8192, 16)
     } else {
         (64 * 1024, 1 << 20, 64)
@@ -82,7 +91,9 @@ fn config(
             max_batch: 64,
             recent_batches: 16,
             max_uncommitted: 4096,
-            takeover_ticks: 3,
+            // Rotation: only a handoff may change the sequencer.
+            takeover_ticks: if test == "rotation" { 1_000_000 } else { 3 },
+            lag_bound: None,
         },
         listen: addresses[usize::from(id)],
         peers: (0..NODES)
@@ -96,7 +107,8 @@ fn config(
         },
         limits,
         heartbeat: Duration::from_millis(50),
-        max_frame: 1 << 20,
+        // Holds the largest batch: 64 records of the default 1 MiB packet.
+        max_frame: 1 << 27,
         link_queue: 1024,
         transport: TransportConfig {
             listen: addresses[usize::from(id)],
@@ -109,6 +121,8 @@ fn config(
         }),
         retain_bytes: disk(test).1,
         snapshot_every: disk(test).2,
+        rotate_every: test.starts_with("rotation").then_some(6),
+        read_bytes: 64 * 1024,
     }
 }
 
@@ -149,7 +163,7 @@ impl Cluster {
                 Limits::default(),
             ))
             .await
-            .unwrap();
+            .unwrap_or_else(|e| panic!("{test}: node {id} did not start: {e}"));
             cluster.nodes.push(Some(node));
         }
         cluster
@@ -161,7 +175,7 @@ impl Cluster {
         }
         let node = Node::start(config(self.test, id, &self.addresses, &self.mqtt, limits))
             .await
-            .unwrap();
+            .unwrap_or_else(|e| panic!("{}: node {id} did not restart: {e}", self.test));
         self.nodes[usize::from(id)] = Some(node);
     }
 
@@ -313,6 +327,10 @@ async fn a_node_with_other_limits_is_refused_and_the_others_go_on() {
         max_inflight: 7,
         ..Limits::default()
     };
+    // A node configured differently from the start: over its old data
+    // directory it would not start at all (`a_data_directory_of_another_cluster_is_refused`).
+    cluster.stop(2).await;
+    let _ = std::fs::remove_dir_all(data_dir("other-limits", 2));
     cluster.restart(2, other).await;
     for request in 0..5 {
         cluster.publish(0, request).await;
@@ -533,5 +551,201 @@ async fn another_node_takes_the_slot_over_when_the_sequencer_stops() {
     // late — but there is one sequencer, of a slot no older than before.
     assert_eq!(leading(&cluster).len(), 1, "one sequencer");
     assert!(last.slot >= after.slot, "{after:?} {last:?}");
+    cluster.shutdown().await;
+}
+
+/// Planned rotation (ADR-0008 step 6): the sequencer hands its slot over
+/// every few heartbeats, by `SlotEnd`, with takeovers by silence out of
+/// reach; publishes keep committing through the changes, on one log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rotation_hands_the_slot_over_and_commits_go_on() {
+    let cluster = Cluster::start("rotation").await;
+    let first = cluster.converged(2).await;
+    let mut request = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        cluster
+            .publish((request % u64::from(NODES)) as u8, request)
+            .await;
+        request += 1;
+        let now = *cluster.node(0).status().borrow();
+        if now.slot >= first.slot + 3 && request >= 10 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no rotation: {first:?} {now:?}"
+        );
+    }
+    let last = cluster.converged(first.applied + request).await;
+    assert!(last.slot >= first.slot + 3, "{first:?} {last:?}");
+    cluster.shutdown().await;
+}
+
+/// Nodes that compacted past slot changes restart from their snapshots
+/// (D-79 A): the snapshot carries the committed slot table, pruned by
+/// compaction, and the restarted node places itself and the others by it.
+/// Rotation makes the slot changes; takeovers by silence stay in reach, so
+/// a handoff to a stopped node is taken over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nodes_compacted_past_slot_changes_restart_from_their_snapshots() {
+    let test = "rotation-compaction";
+    let mut cluster = Cluster::start(test).await;
+    let first = cluster.converged(2).await;
+    for request in 0..150u64 {
+        cluster.publish((request % 3) as u8, request).await;
+    }
+    let before = cluster.converged(first.applied + 150).await;
+    assert!(
+        before.slot >= first.slot + 3,
+        "no rotation: {first:?} {before:?}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let disks: Vec<(u64, bool)> = (0..NODES).map(|id| on_disk(test, id)).collect();
+        if disks
+            .iter()
+            .all(|&(lowest, snapshot)| lowest > 1 && snapshot)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "not compacted: {disks:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    cluster.restart(2, Limits::default()).await;
+    cluster.restart(0, Limits::default()).await;
+    for request in 150..160u64 {
+        cluster.publish((request % 3) as u8, request).await;
+    }
+    let after = cluster.converged(before.applied + 10).await;
+    assert!(after.slot > before.slot, "{before:?} {after:?}");
+    cluster.shutdown().await;
+}
+
+/// A link opens with HELLO, which carries the frame version (ADR-0008 step
+/// 7a): a node closes a link from another version at once, and keeps one
+/// from its own version open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_from_another_frame_version_is_refused() {
+    use cluster::wire::{Frame, WIRE_VERSION, encode};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let cluster = Cluster::start("other-version").await;
+    let hello = |version| {
+        let mut bytes = Vec::new();
+        encode(
+            &Frame::Hello {
+                version,
+                node: 2,
+                slot: 1,
+                config: node::cluster_digest(&config(
+                    "other-version",
+                    2,
+                    &cluster.addresses,
+                    &cluster.mqtt,
+                    Limits::default(),
+                )),
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        bytes
+    };
+    // Nothing comes back on a link: a refused one ends, an accepted one
+    // waits for frames.
+    let open_after = |version| {
+        let address = cluster.addresses[0];
+        let bytes = hello(version);
+        async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+            let mut byte = [0u8; 1];
+            match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte)).await {
+                Ok(Ok(0) | Err(_)) => false,
+                Ok(Ok(_)) => panic!("a node wrote on an inbound link"),
+                Err(_) => true,
+            }
+        }
+    };
+    assert!(
+        !open_after(WIRE_VERSION.wrapping_add(1)).await,
+        "a link from another frame version stayed open"
+    );
+    assert!(
+        open_after(WIRE_VERSION).await,
+        "a link from this version was closed"
+    );
+    cluster.shutdown().await;
+}
+
+/// A data directory keeps the configuration digest of the cluster it was
+/// first used with (D-104 A): a node started over it with other cluster
+/// parameters or limits is refused before it opens its log or listens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_data_directory_of_another_cluster_is_refused() {
+    let mut cluster = Cluster::start("other-cluster").await;
+    cluster.stop(2).await;
+    let other = Limits {
+        max_inflight: 7,
+        ..Limits::default()
+    };
+    let refused = Node::start(config(
+        "other-cluster",
+        2,
+        &cluster.addresses,
+        &cluster.mqtt,
+        other,
+    ))
+    .await;
+    assert!(
+        matches!(refused, Err(node::NodeError::OtherCluster { .. })),
+        "started over another cluster's data: {:?}",
+        refused.err()
+    );
+    // The same configuration starts again.
+    cluster.restart(2, Limits::default()).await;
+    cluster.shutdown().await;
+}
+
+/// The operator's handoff (D-105 A): asked of a node that does not
+/// sequence, it is refused; asked of the sequencer, the slot passes to the
+/// next owner by `SlotEnd` while every node keeps serving — commits go on,
+/// and the old sequencer applies them as a follower.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_operator_handoff_moves_the_slot_and_every_node_keeps_serving() {
+    let cluster = Cluster::start("hand-off").await;
+    let first = cluster.converged(2).await;
+    let leader = (0..NODES)
+        .find(|&id| cluster.node(id).status().borrow().leading)
+        .expect("a sequencer");
+    let other = (leader + 1) % NODES;
+    assert_eq!(
+        cluster.node(other).hand_off().await,
+        Err(cluster::ClusterError::NotLeader)
+    );
+    cluster.node(leader).hand_off().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let successor = loop {
+        if let Some(id) = (0..NODES).find(|&id| {
+            let s = *cluster.node(id).status().borrow();
+            id != leader && s.leading && s.slot > first.slot
+        }) {
+            break id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no successor took the slot"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    for request in 0..5 {
+        cluster.publish(successor, request).await;
+    }
+    let last = cluster.converged(first.applied + 10).await;
+    assert!(last.slot > first.slot);
+    assert!(!cluster.node(leader).status().borrow().leading);
     cluster.shutdown().await;
 }

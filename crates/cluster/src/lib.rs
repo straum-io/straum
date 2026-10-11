@@ -15,7 +15,7 @@
 //!   takes the next slot over when that owner falls silent (durable
 //!   promises from a majority, the longest of their logs, `SlotStart`), and
 //!   cuts a tail from an older slot where the slot table proves it differs.
-//!   Planned handoff (`SlotEnd`) is step 6.
+//!   Planned handoff (`SlotEnd`, [`Voter::hand_off`]) is step 6.
 //! * Star topology: the sequencer sends to every replica directly (§2.6).
 //! * Commit is a majority of voters durable (§2.3), as a prefix: the highest
 //!   lsn that a majority holds durably. It only grows.
@@ -72,7 +72,39 @@ pub struct Config {
     /// further period of silence passes the turn to the node after it.
     /// Time only starts a takeover; the promises decide it (§1).
     pub takeover_ticks: u32,
+    /// Flow control on replica lag (D-85 B, D-89; ADR-0008): off when
+    /// `None`. Needs `max_uncommitted`; see [`LagBound`].
+    pub lag_bound: Option<LagBound>,
 }
+
+/// Flow control on replica lag (ADR-0008, D-89 A1, rules R1–R4): while a
+/// replica the sequencer has *attached* is more than `records` behind the
+/// commit point, no new batch of proposals is made; a hold that lasts
+/// `ticks` heartbeats detaches every attached replica still behind, so no
+/// proposal waits longer for it. Only new batches wait: commit, shipping
+/// and every safety rule never read it. A replica attaches once it is
+/// placed in the slot and has caught up to the commit point, after the
+/// slot's first record committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LagBound {
+    /// `L`: raised to `max_uncommitted + max_batch` if below — under it an
+    /// attached replica could start a hold within a hold, and the wait would
+    /// not be bounded by `ticks` (ADR-0008, Lemma 2).
+    pub records: u64,
+    /// `T`, in heartbeats.
+    pub ticks: u32,
+}
+
+/// The default `max_uncommitted` (D-82 A): it bounds the memory an
+/// uncommitted tail holds and also how long a takeover takes — a new
+/// sequencer moves that tail before it commits. Measured in the cluster
+/// simulation (10 000 seeds; a later slot committing within 2 000 events
+/// after a sequencer fault, with a majority up): 64 → 94.1%, 96 → 91.1%,
+/// 128 → 89.1%, 256 and above as with no bound, 87.7%. 64 keeps a margin
+/// above 9 in 10. The simulation's events are not time on a real host:
+/// this number is in records, and what it costs in throughput is not
+/// measured yet (D-84).
+pub const DEFAULT_MAX_UNCOMMITTED: u64 = 64;
 
 impl Config {
     /// The smallest number of voters that is a majority.
@@ -100,6 +132,134 @@ pub(crate) fn end_of_slot(slots: &[(u64, u64)], slot: u64, end: u64) -> u64 {
         .iter()
         .find(|&&(s, _)| s > slot)
         .map_or(end, |&(_, first)| first.saturating_sub(1))
+}
+
+/// Drops the entries of `slots` that end below `floor`, keeping the one
+/// that holds `floor` itself (D-79 A). A replica whose log ends in a
+/// dropped slot meets this log before `floor`: by the kept table it is
+/// placed no later than the first kept entry's start less one, so its
+/// catch-up reads from at or below `floor` — compacted — and it is lost, as
+/// it would be with the whole table. Keeping the entry at `floor` keeps
+/// `slot_at(floor)` known: dropped too, a replica ending exactly at
+/// `floor` in an older slot would be shipped what its chain refuses, and
+/// never lost. The table is then bounded by the slot changes in the
+/// retained log.
+pub fn prune_slots(slots: &mut Vec<(u64, u64)>, floor: u64) {
+    let gone = slots
+        .windows(2)
+        .take_while(|pair| pair[1].1 <= floor)
+        .count();
+    slots.drain(..gone);
+}
+
+/// What a driver hands back for [`Effect::Read`] (D-81 A): fed the log's
+/// records in order, it keeps whole batches starting with the one at
+/// `from` — the first always, then more while each ends at or below `upto`
+/// and all kept stay within `bound` bytes. So a read is at most `bound`
+/// bytes, or one batch if that alone is larger. A batch cut short by the
+/// end of what was fed is dropped; with no whole batch at `from` there is
+/// nothing to hand back, and the driver reports the read missing.
+#[derive(Debug)]
+pub struct ReadBatches {
+    from: u64,
+    upto: u64,
+    bound: usize,
+    records: Vec<Vec<u8>>,
+    /// Records the open batch still lacks.
+    remaining: u32,
+    /// Records in whole batches.
+    complete: usize,
+    bytes: usize,
+    done: bool,
+}
+
+impl ReadBatches {
+    pub fn new(from: u64, upto: u64, bound: usize) -> Self {
+        Self {
+            from,
+            upto,
+            bound,
+            records: Vec::new(),
+            remaining: 0,
+            complete: 0,
+            bytes: 0,
+            done: false,
+        }
+    }
+
+    /// Nothing more will be kept: the caller may stop feeding.
+    pub fn done(&self) -> bool {
+        self.done
+    }
+
+    pub fn feed(&mut self, record: &[u8]) {
+        if self.done {
+            return;
+        }
+        let Ok(r) = decode(record) else {
+            self.done = true;
+            return;
+        };
+        let next = self.from.saturating_add(self.records.len() as u64);
+        if r.lsn < next {
+            return;
+        }
+        if r.lsn > next {
+            self.done = true;
+            return;
+        }
+        if self.remaining == 0 {
+            // A batch starts here, or the read ends.
+            let Some(count) = (r.kind == Kind::BatchHeader)
+                .then(|| journal::BatchHeader::decode(r.body).ok())
+                .flatten()
+                .map(|h| h.records)
+            else {
+                self.done = true;
+                return;
+            };
+            let end = r.lsn.saturating_add(u64::from(count));
+            if self.complete > 0 && end > self.upto {
+                self.done = true;
+                return;
+            }
+            self.remaining = count;
+        } else {
+            self.remaining -= 1;
+        }
+        self.bytes = self.bytes.saturating_add(record.len());
+        if self.complete > 0 && self.bytes > self.bound {
+            // This batch would take the read past its bound: it is left
+            // for the next read.
+            self.done = true;
+            return;
+        }
+        self.records.push(record.to_vec());
+        if self.remaining == 0 {
+            self.complete = self.records.len();
+        }
+    }
+
+    /// The whole batches kept, or `None` without one.
+    pub fn finish(mut self) -> Option<Vec<Vec<u8>>> {
+        self.records.truncate(self.complete);
+        (!self.records.is_empty()).then_some(self.records)
+    }
+}
+
+/// The slot table a restarted node starts from (D-73 A): `committed`, the
+/// committed log's table as its snapshot kept it, then the slots of `log`,
+/// the table rebuilt from the records left after compaction, that begin
+/// past it. A compacted log starts its oldest slot where compaction left
+/// it, not where the slot began; the snapshot knows where.
+pub fn merge_slots(committed: &[(u64, u64)], log: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut slots = committed.to_vec();
+    for &(slot, first) in log {
+        if slots.last().is_none_or(|&(last, _)| last < slot) {
+            slots.push((slot, first));
+        }
+    }
+    slots
 }
 
 /// The slot of the record at `lsn` by the slot table; 0 for no record.
@@ -144,6 +304,12 @@ pub enum Message {
         end: u64,
         durable: u64,
         cut: bool,
+        /// Orders this replica's reports: its incarnation in the high bits,
+        /// a count of its reports in the low ones. A report not newer than
+        /// the last one taken is stale — reordered or duplicated — and
+        /// placing a replica by one lost it (found by the apply simulation,
+        /// seed 19). 0: unordered (a fixed-owner replica, which never cuts).
+        report: u64,
     },
     /// Candidate → every voter: promise to accept nothing of a slot below
     /// `slot`, and say where your log ends (§2.4, ungraceful).
@@ -157,8 +323,11 @@ pub enum Message {
     /// at the asker's end: nothing more.
     Fetched {
         slot: u64,
-        /// The asker's end this answers: an answer to an older question is
-        /// ignored.
+        /// The asker's position this answers, its last slot and its end: an
+        /// answer to an older question is ignored. The end alone is not
+        /// enough — a log cut and refilled can end at the same lsn with other
+        /// records (found by the apply simulation, seed 2546).
+        asked_slot: u64,
         asked: u64,
         after: u64,
         after_slot: u64,
@@ -178,12 +347,18 @@ pub enum Effect {
         to: NodeId,
         message: Message,
     },
-    /// Sequencer: read the batch that starts at `from` back from the local
-    /// log and hand it to `on_read`, or call `on_read_missing` if the log no
-    /// longer has it.
+    /// Read whole batches back from the local log, starting with the one at
+    /// `from`, and hand them to `on_read` — or call `on_read_missing` if the
+    /// log no longer has it. The first batch always; then more, in order,
+    /// while each ends at or below `upto` and what was read is still under
+    /// the driver's byte bound for one read (a configured limit, D-81 A;
+    /// [`ReadBatches`] does it). One batch per round
+    /// trip made a takeover after a long uncommitted tail take thousands of
+    /// simulation events (D-81).
     Read {
         to: NodeId,
         from: u64,
+        upto: u64,
     },
     /// Sequencer: `to` is shipped from memory again; a reader held for it can
     /// be released.
@@ -204,9 +379,10 @@ pub enum Effect {
     Promise {
         slot: u64,
     },
-    /// Cut the local log back to end at `after` — a tail from an older slot
-    /// that the new owner's log does not have, never below the commit point —
-    /// then call [`Voter::on_truncated`] with the chain there.
+    /// Cut the local log back to the last batch boundary at or below
+    /// `after` — a tail from an older slot that the new owner's log does not
+    /// have, never below the commit point, which is a batch end — then call
+    /// [`Voter::on_truncated`] with the chain there.
     Truncate {
         after: u64,
     },
@@ -218,6 +394,8 @@ pub enum ClusterError {
     Full,
     #[error("this node is not the slot's sequencer")]
     NotLeader,
+    #[error("the next slot's owner is this node: there is no one to hand over to")]
+    NoSuccessor,
     #[error("{0}")]
     Chain(#[from] ChainError),
 }
@@ -262,12 +440,21 @@ struct Peer {
     /// both. It gets only heartbeats, which carry the slot at its position,
     /// until it cuts back into a slot both logs share.
     probing: bool,
+    /// In repair, the last read that found the log compacted, from here.
+    missed: Option<u64>,
+    /// The cut it reported that this sequencer has acted on: repeats of it
+    /// reship nothing, a new one always repositions it.
+    cut_at: Option<u64>,
+    /// The newest report taken from it.
+    report: u64,
     /// A read from the log is outstanding for it, starting here.
     reading: Option<u64>,
     /// Shipped from the log rather than from memory since the last
     /// `ReadDone`.
     from_log: bool,
     lost: bool,
+    /// Counted by flow control (D-89, R1–R4).
+    attached: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +484,13 @@ pub struct Sequencer {
     queue: VecDeque<Proposal>,
     recent: VecDeque<Batch>,
     effects: Vec<Effect>,
+    /// Handing the slot over (§2.4 graceful): proposals are refused, and
+    /// once the queue is drained `SlotEnd` goes out as the slot's last
+    /// batch; then `ended`.
+    sealed: bool,
+    ended: bool,
+    /// Heartbeats flow control has held since the last batch (D-89, R4).
+    holding: u32,
 }
 
 impl Sequencer {
@@ -336,9 +530,13 @@ impl Sequencer {
                 durable: 0,
                 in_slot: false,
                 probing: false,
+                missed: None,
+                cut_at: None,
+                report: 0,
                 reading: None,
                 from_log: false,
                 lost: false,
+                attached: false,
             })
             .collect();
         Self {
@@ -351,6 +549,9 @@ impl Sequencer {
             queue: VecDeque::new(),
             recent: VecDeque::new(),
             effects: Vec::new(),
+            sealed: false,
+            ended: false,
+            holding: 0,
         }
     }
 
@@ -395,7 +596,7 @@ impl Sequencer {
             .peers
             .iter()
             .filter(|peer| !peer.lost)
-            .map(|peer| if peer.known { peer.durable } else { 0 })
+            .map(Self::held)
             .min()
             .unwrap_or(u64::MAX);
         self.commit.min(slowest.max(bytes_floor))
@@ -407,12 +608,88 @@ impl Sequencer {
         self.peers
             .iter()
             .find(|peer| peer.id == id && !peer.lost)
-            .map(|peer| if peer.known { peer.durable } else { 0 })
+            .map(Self::held)
+    }
+
+    /// What a replica is known to hold of this log: its durable position
+    /// once its log ends in this slot — a prefix of this log. Before, where
+    /// the two agree is an estimate, an upper bound by the slot tables, and
+    /// compacting on it lost a replica that agreed far less (found by the
+    /// cluster simulation, seed 348).
+    fn held(peer: &Peer) -> u64 {
+        if peer.known && peer.in_slot {
+            peer.durable
+        } else {
+            0
+        }
+    }
+
+    /// Flow control holds new batches (D-89, R3): proposals are queued, the
+    /// slot is not sealed, and an attached replica is more than `L` behind
+    /// the commit point. Read by `flush`, and by R4's count.
+    pub fn holding_back(&self) -> bool {
+        let Some(bound) = self.lag_bound() else {
+            return false;
+        };
+        // Held only when something waits: an idle sequencer detaches no
+        // one, and a sealed slot's last batches are never held (R3).
+        if self.sealed || self.queue.is_empty() {
+            return false;
+        }
+        self.peers
+            .iter()
+            .any(|peer| peer.attached && self.commit.saturating_sub(peer.durable) > bound.records)
+    }
+
+    /// Replicas flow control counts now (D-89).
+    pub fn attached(&self) -> usize {
+        self.peers.iter().filter(|peer| peer.attached).count()
+    }
+
+    /// Whether flow control counts replica `id` now (D-89).
+    pub fn counts(&self, id: NodeId) -> bool {
+        self.peers.iter().any(|peer| peer.id == id && peer.attached)
+    }
+
+    fn lag_bound(&self) -> Option<LagBound> {
+        let floor = self
+            .config
+            .max_uncommitted
+            .saturating_add(self.config.max_batch as u64);
+        self.config.lag_bound.map(|bound| LagBound {
+            records: bound.records.max(floor),
+            ticks: bound.ticks.max(1),
+        })
+    }
+
+    /// R2: a replica placed in this slot, caught up to the commit point,
+    /// once the slot's first record has committed.
+    fn attach(&mut self) {
+        if self.config.lag_bound.is_none() {
+            return;
+        }
+        let commit = self.commit;
+        let started = self
+            .slots
+            .iter()
+            .find(|&&(slot, _)| slot == self.config.slot)
+            .is_some_and(|&(_, first)| commit >= first);
+        if !started {
+            return;
+        }
+        for peer in &mut self.peers {
+            if peer.known && peer.in_slot && !peer.probing && !peer.lost && peer.durable >= commit {
+                peer.attached = true;
+            }
+        }
     }
 
     /// Queues a record for the next batch. Refused when the queue is full;
     /// the refused proposal is the caller's to hold or to give up on.
     pub fn propose(&mut self, proposal: Proposal) -> Result<(), ClusterError> {
+        if self.sealed {
+            return Err(ClusterError::NotLeader);
+        }
         if self.queue.len() >= self.config.max_queue {
             return Err(ClusterError::Full);
         }
@@ -425,7 +702,34 @@ impl Sequencer {
         if self.end().saturating_sub(self.commit) >= self.config.max_uncommitted {
             return Ok(());
         }
+        // R3: a sealed slot's last batches are never held — `SlotEnd`
+        // ends a handoff.
+        if self.holding_back() {
+            return Ok(());
+        }
+        if self.queue.is_empty() && self.sealed && !self.ended {
+            // Alone in its batch: its `prev_hash` is then the hash of the
+            // whole log before it, which makes it the handoff certificate
+            // `SlotEnd(k, last_lsn, hash)` (§2.4).
+            self.ended = true;
+            self.queue.push_back(Proposal {
+                kind: Kind::SlotEnd,
+                properties: Vec::new(),
+                body: self.end().to_be_bytes().to_vec(),
+            });
+        }
         self.batch()
+    }
+
+    /// The local log was compacted through `floor` (D-79 A).
+    pub(crate) fn compacted(&mut self, floor: u64) {
+        prune_slots(&mut self.slots, floor);
+    }
+
+    /// Seals the slot: no proposal is taken from now on, and the next
+    /// flushes drain the queue and then write `SlotEnd` (ADR-0008 step 6).
+    pub(crate) fn end_slot(&mut self) {
+        self.sealed = true;
     }
 
     /// The first batch of a slot taken over: alone, and past the
@@ -462,6 +766,8 @@ impl Sequencer {
             self.chain.batch(self.config.slot, &entries, &mut records)?;
         }
         self.queue.drain(..take);
+        // R4 counts held heartbeats since the last batch.
+        self.holding = 0;
         if self.slots.last().map(|&(slot, _)| slot) != Some(self.config.slot) {
             self.slots.push((self.config.slot, first));
         }
@@ -495,6 +801,7 @@ impl Sequencer {
             end,
             durable,
             cut,
+            report,
         } = message
         else {
             return;
@@ -507,6 +814,16 @@ impl Sequencer {
         let Some(peer) = self.peers.iter_mut().find(|peer| peer.id == from) else {
             return;
         };
+        // Lost stays lost until a state copy brings it back (step 7b).
+        if peer.lost {
+            return;
+        }
+        if report != 0 {
+            if report <= peer.report {
+                return;
+            }
+            peer.report = report;
+        }
         // An empty log holds nothing to repair: a stale report of one, taken
         // for a repair, moved a replica back below what was compacted and
         // lost it (the apply simulation, seed 19). A cut says so itself.
@@ -532,12 +849,46 @@ impl Sequencer {
                 .take_while(|&&(s, _)| s <= last_slot)
                 .last()
                 .map(|&(s, _)| s);
+            // Its last slot is older than every slot this log still holds,
+            // and this log was compacted: where the two meet is below what
+            // was removed. Lost, as below the floor (D-57) — shipping from
+            // the estimate looped forever (found by the cluster simulation,
+            // seed 1477).
+            // A log ending exactly where what is left here starts: the chain
+            // hash in the first record shipped tells whether the two agree
+            // (found by the apply simulation, seed 2499). A meet point below
+            // it needs what is gone; records past it in a slot no longer
+            // known here cannot be placed without a guess, and a guess cut
+            // committed copies before (cluster simulation, seed 9046).
+            let kept_from = self.slots.first().map_or(1, |&(_, first)| first);
+            if shared.is_none() && (at.saturating_add(1) < kept_from || end > at) && kept_from > 1 {
+                peer.lost = true;
+                peer.attached = false;
+                peer.reading = None;
+                self.effects.push(Effect::Lost { to: from });
+                return;
+            }
             // `at` is a batch boundary here if it ends a slot of this log;
             // the replica's end only if that slot is one both logs share.
             peer.probing = at < meets && shared != Some(last_slot);
             peer.in_slot = false;
-            peer.known = true;
+            peer.attached = false;
             peer.durable = durable.min(at);
+            // Placed there already, and shipped from there: a report that
+            // says so again reships nothing — every reordered batch draws a
+            // report, and each reship drew more, a storm (found by the
+            // cluster simulation, seed 12). A lost message is the
+            // heartbeat's to repair, as for any replica.
+            // A replica that cut says so until it takes a batch: the first
+            // such report always places it — the position before can look
+            // the same and be stale (found by the cluster simulation, seed
+            // 4621) — its repeats change nothing.
+            let fresh_cut = cut && peer.cut_at != Some(at);
+            if peer.known && peer.reported == at && !fresh_cut {
+                return;
+            }
+            peer.cut_at = cut.then_some(at);
+            peer.known = true;
             peer.end = at;
             peer.reported = at;
             peer.reading = None;
@@ -546,8 +897,26 @@ impl Sequencer {
             }
             return;
         }
+        // An empty log from a replica believed further on: stale, or it cut
+        // everything and restarted, which forgets that it cut (found by the
+        // cluster simulation, seed 4621). Either way placed at 0 as one in
+        // repair: a stale report is corrected by the next, and a read that
+        // misses then only forgets where it is.
+        if end == 0 && peer.known && peer.end > 0 && !peer.in_slot {
+            peer.end = 0;
+            peer.reported = 0;
+            peer.durable = 0;
+            peer.reading = None;
+            peer.cut_at = None;
+            if let Some(index) = self.peers.iter().position(|peer| peer.id == from) {
+                self.ship(index);
+            }
+            return;
+        }
+        peer.cut_at = None;
         // An empty log is a prefix of every log.
         peer.in_slot = last_slot == self.config.slot || end == 0;
+        peer.attached &= peer.in_slot;
         peer.probing = false;
         // Durable only grows: what a replica synced survives its restarts,
         // and an older report overtaken by a newer one says less, not other.
@@ -582,7 +951,21 @@ impl Sequencer {
             .first()
             .and_then(|record| decode(record).ok())
             .map(|record| record.lsn);
-        if peer.reading.take().is_none() || first != Some(peer.end.saturating_add(1)) {
+        match peer.reading {
+            Some(asked) if Some(asked) == first => peer.reading = None,
+            // The answer to a read given up since (a resend repositioned the
+            // replica) or superseded: the read that counts is still out.
+            // Taking it here cleared the one outstanding, `ship` asked
+            // again, and each stale answer queued one more read behind the
+            // rest — a catch-up that moved one batch in many reads (found
+            // by the cluster simulation, seed 160; D-85).
+            Some(_) => return,
+            None => {
+                self.ship(index);
+                return;
+            }
+        }
+        if first != Some(peer.end.saturating_add(1)) {
             // Stale: the replica's position moved while the read was out.
             self.ship(index);
             return;
@@ -621,17 +1004,19 @@ impl Sequencer {
         if let Some(peer) = self.peers.get_mut(index) {
             peer.reading = None;
             peer.from_log = false;
-            if !peer.in_slot {
+            if !peer.in_slot && peer.missed != Some(from) {
                 // A replica in repair is placed by each report, and a stale
                 // one can place it below what was compacted since: forget
                 // where it is and wait for the next, rather than lose it
-                // (found by the apply simulation, seed 19). One that really
-                // needs what is gone waits here, unshipped, as a lost one
-                // would, until state copy (step 7b).
+                // (found by the apply simulation, seed 19). The same miss
+                // after a fresh report is not stale: that one is lost
+                // (found by the cluster simulation, seed 11).
+                peer.missed = Some(from);
                 peer.known = false;
                 return;
             }
             peer.lost = true;
+            peer.attached = false;
             self.effects.push(Effect::Lost { to });
         }
     }
@@ -648,6 +1033,25 @@ impl Sequencer {
     /// disk space. If compaction takes that segment meanwhile, the next read
     /// finds it gone and the replica is lost (D-57).
     pub fn tick(&mut self) {
+        // R4: between two batches, holds last at most `T` heartbeats in
+        // all. Then every attached replica still behind the commit point
+        // detaches; those left have caught up, and cannot fall more than `L`
+        // behind before the next batch (ADR-0008, D-89 A1). Counted across
+        // holds, not per hold: a replica that catches up part of the way
+        // ends a hold, and the commit point can pass it again with no batch
+        // made — each such hold starting from zero would let the wait grow
+        // past `T`. Only a batch resets the count.
+        if let Some(bound) = self.lag_bound() {
+            if self.holding_back() {
+                self.holding = self.holding.saturating_add(1);
+                if self.holding >= bound.ticks {
+                    let commit = self.commit;
+                    for peer in &mut self.peers {
+                        peer.attached &= peer.durable >= commit;
+                    }
+                }
+            }
+        }
         for peer in &mut self.peers {
             // Never below what it reported durable: a late report from before
             // can say less than the replica holds, and going back that far
@@ -680,10 +1084,11 @@ impl Sequencer {
             }
             peer.reported_at_tick = peer.reported;
         }
+        // A lost replica hears the heartbeat too, records never: otherwise it
+        // falls silent, takes the next slot over at its turn, and as it can
+        // never catch up, keeps breaking the slot it interrupts (found by the
+        // apply simulation, seed 587).
         for peer in &self.peers {
-            if peer.lost {
-                continue;
-            }
             self.effects.push(Effect::Send {
                 to: peer.id,
                 message: Message::Append {
@@ -727,6 +1132,7 @@ impl Sequencer {
             self.commit = candidate;
             self.effects.push(Effect::Committed(candidate));
         }
+        self.attach();
     }
 
     fn ship_all(&mut self) {
@@ -773,7 +1179,16 @@ impl Sequencer {
                 Some(_) => return,
                 None => {
                     peer.reading = Some(from);
-                    self.effects.push(Effect::Read { to: peer.id, from });
+                    // Within what may be shipped: durable here, and the
+                    // replica's window.
+                    let upto = self
+                        .durable
+                        .min(peer.durable.saturating_add(self.config.window));
+                    self.effects.push(Effect::Read {
+                        to: peer.id,
+                        from,
+                        upto,
+                    });
                     return;
                 }
             }
@@ -903,6 +1318,7 @@ impl Replica {
                 end: self.end,
                 durable: self.durable,
                 cut: false,
+                report: 0,
             },
         });
     }

@@ -1,5 +1,7 @@
 # Benchmarks
 
+> **Partly history.** The harness and workload matrix below were built for the old broker (`e2e` load generators), removed at step 8 (D-111). The measurement protocol — baseline, alternating rounds, medians, Linux only — still applies; the new path has `node/benches/cap.rs` and `storage/benches/`, and no Linux baseline yet (D-84 A, D-94 C).
+
 Target: about 1,000,000 small messages/sec on modern server hardware for the
 in-memory broker benchmark. A target, not a production guarantee.
 

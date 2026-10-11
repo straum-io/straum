@@ -2,8 +2,10 @@
 
 Straum is a replicated message broker written in Rust: MQTT 3.1.1 and
 MQTT 5 over TCP, a Cargo workspace of crates with enforced dependency
-boundaries, sans-IO cores, a WAL with group commit and compaction, and
-durable leader/follower replication. This file is the working guide; the
+boundaries, sans-IO cores, a segmented log with group commit and compaction,
+and a gateway/sequencer cluster where the committed log is the only source
+of truth (ADR-0008). The old leader/follower broker was removed at step 8
+(D-111); what remains is experimental and not production-ready. This file is the working guide; the
 architecture is in `docs/architecture/unified-stream.md`.
 
 ## Sources, in order of precedence
@@ -24,7 +26,7 @@ contradict (1), and an ADR that replaces one of them says so.
 Details live in:
 
 ```text
-docs/architecture/current-implementation.md   what runs today (crates, task model, protocol contract, MQTT table, shutdown)
+docs/architecture/current-implementation.md   the old broker as it was (removed at step 8, D-111); history
 docs/adr/                 architecture decision records
 docs/configuration.md     every setting, env var, default and limit
 docs/testing.md           test layers, MQTT conformance, fuzzing, simulation
@@ -34,7 +36,7 @@ docs/memory.md            what a connection allocates, and what the budget reall
 docs/performance.md       the current measured baseline
 docs/profiling.md         which tool answers which question, per platform
 docs/storage.md           the write-ahead log: group commit, durability, compaction
-docs/replication.md       durable log replication as built: one leader, one follower
+docs/replication.md       the old leader/follower replication (removed at step 8, D-111); history
 docs/linux-tuning.md      kernel parameters and socket options for production hosts
 docs/baselines/           recorded benchmark baselines, one file per machine
 ```
@@ -54,9 +56,10 @@ docs/baselines/           recorded benchmark baselines, one file per machine
 
 ## Current phase
 
-The rewrite to gateway/sequencer, ADR-0008 (D-48 C): eight steps, new
-crates beside the old leader/follower path, which keeps working until step
-8 (D-49 A). Steps 1 (`journal`: record v4, every record carrying the previous batch's hash), 2
+The rewrite to gateway/sequencer, ADR-0008 (D-48 C). Step 8 — removing
+the old leader/follower path — was done early, on 2026-10-11 (D-111),
+overriding D-51 A's and D-75's conditions: the server now runs only the new
+path. Steps 1 (`journal`: record v4, every record carrying the previous batch's hash), 2
 (`storage::Segments`, `cluster`: sequencer and replica, three nodes in `sim`)
 3a (`codec`: MQTT 3.1.1 and 5 over one packet model), 3b-1 (`apply`: the apply
 function over committed records) and 3b-2 (`gateway`: MQTT clients over the
@@ -64,11 +67,24 @@ log, end to end in `sim`) are done; step 4 (`node`: the runtime driver —
 links, sequencer or replica, the log on disk, the gateway over TCP — three
 nodes on loopback in tests, local snapshots and compaction, D-67 B) is
 done; step 5 (`cluster::Voter`: ungraceful takeover by durable promises,
-`SlotStart` and truncation by the slot table, D-69 A) is done; none is
-wired into the server yet. The
-progress of each step is recorded in ADR-0008. ADR-0006
-keeps the durability levels for a single node and allows only majority
-commit in a cluster.
+`SlotStart` and truncation by the slot table, D-69 A) is done and runs
+in every simulation (D-70 A; its takeover criterion is liveness after a
+fault, 9 in 10 per bounded seed group, D-81 A and D-82 A, and no
+stall in any cycle a majority can recover, with the liveness contract in
+ADR-0008, D-85; patience grows only after a majority promised, D-88 A; an append
+from a newer slot's owner counts as heard, D-98 A;
+flow control on replica lag is built in `cluster`, off by default, with
+its invariants proved in ADR-0008, D-89; its D-57 A deviation is closed by D-73 A and
+D-79 A); step 6 (planned handoff by
+`SlotEnd`, optional rotation) is done.
+Step 7a (D-78 A, D-102 A–D-105 A): the server can start a node on the new
+path behind `STRAUM_EXPERIMENTAL_CLUSTER=1` — experimental, off by default,
+not production-ready, flow control off; wills, persistent sessions and
+expiry refused at CONNECT until 7c; MQTT and links on loopback unless an
+operator acknowledges an unauthenticated network (D-107). The progress of
+each step is recorded in ADR-0008. There is no single-node mode: the path
+needs three voters (D-104 A), and ADR-0006's durability levels went with
+the old path — a publish is acknowledged once a majority holds it.
 
 ## Scope
 
@@ -125,24 +141,18 @@ straum/
 ├── CONSTITUTION.md
 ├── clippy.toml
 ├── crates/
-│   ├── domain/
-│   ├── protocol/
-│   ├── auth/
-│   ├── mqtt/
-│   ├── transport/
-│   ├── storage/
-│   ├── replication/
+│   ├── domain/       # topics, client ids, shared value types
+│   ├── auth/         # credentials and ACL; not wired yet (D-110)
+│   ├── transport/    # TCP listener, socket options, TLS
+│   ├── storage/      # the segmented log: Wal per segment, group commit, compaction
 │   ├── journal/      # record v4 bodies and the prev_hash chain (ADR-0008)
-│   ├── cluster/      # sans-IO sequencer and replica (ADR-0008 step 2)
+│   ├── cluster/      # sans-IO sequencer, replica, voter (ADR-0008 steps 2, 5, 6)
 │   ├── codec/        # MQTT 3.1.1 and 5, one packet model (ADR-0008 step 3a)
 │   ├── apply/        # the apply function over committed records (ADR-0008 step 3b-1)
 │   ├── gateway/      # sans-IO MQTT gateway over codec and apply (ADR-0008 step 3b-2)
-│   ├── node/         # publish = false; runtime driver of the new path (ADR-0008 step 4)
-│   ├── broker/
-│   ├── runtime/
-│   ├── server/
-│   ├── sim/          # publish = false; deterministic simulation (ADR-0007)
-│   └── e2e/          # publish = false; e2e tests, network benchmarks
+│   ├── node/         # publish = false; the driver: links, log on disk, gateway over TCP (step 4)
+│   ├── server/       # the binary: one node of the cluster path (step 7a, D-111)
+│   └── sim/          # publish = false; deterministic simulation (ADR-0007, ADR-0008)
 ├── fuzz/                    # cargo-fuzz, separate workspace, nightly only
 ├── docs/
 └── scripts/
@@ -217,7 +227,7 @@ possible item:
 
 Root-level `tests/` and `benches/` are not used: in a virtual workspace they
 belong to no package and cargo does not run them. Cross-crate tests go to
-`e2e`.
+the crate that composes them (`node`, `server`).
 
 ---
 
@@ -225,59 +235,52 @@ belong to no package and cargo does not run them. Cross-crate tests go to
 
 ```text
 server
-└── runtime
-    ├── broker
-    │   ├── protocol ── domain, auth
-    │   └── domain
-    ├── mqtt
-    │   ├── protocol
-    │   └── domain
-    ├── transport
+└── node
+    ├── gateway ── apply, codec, domain, journal
+    ├── apply ──── domain, journal
+    ├── cluster ── journal
+    ├── codec ──── domain
     ├── storage
-    └── replication
+    └── transport
 
-e2e (dev only) → runtime, rumqttc
+sim (tests) → gateway, codec, apply, cluster, journal, storage, domain
+auth ──────── domain   (no dependents yet; D-110)
 ```
 
 | Crate | Internal deps | External deps (baseline) | Forbidden, including transitive |
 |---|---|---|---|
 | domain | — | bytes, thiserror | tokio, every other workspace crate |
 | auth | domain | bytes, thiserror, argon2 | tokio, every other workspace crate |
-| protocol | domain, auth | bytes, thiserror | tokio, mqtt, transport, broker, runtime, server |
-| mqtt | domain, protocol | bytes, thiserror | tokio, transport, broker, runtime, server |
-| transport | — | bytes, thiserror, tokio, tracing, socket2, tokio-rustls, rustls-pemfile | protocol, mqtt, broker, runtime, server |
-| storage | — | bytes, thiserror, crc32fast | tokio, protocol, mqtt, transport, replication, broker, runtime, server |
-| replication | — | thiserror, crc32fast | tokio, every other workspace crate |
+| transport | — | bytes, thiserror, tokio, tracing, socket2, tokio-rustls, rustls-pemfile | every other workspace crate |
+| storage | — | bytes, thiserror, crc32fast | tokio, every other workspace crate |
 | journal | — | thiserror, xxhash-rust | tokio, every other workspace crate |
 | cluster | journal | thiserror | tokio, every other workspace crate |
 | codec | domain | bytes, thiserror | tokio, every other workspace crate |
 | apply | domain, journal | bytes, thiserror | tokio, every other workspace crate |
 | gateway | apply, codec, domain, journal | bytes | tokio, every other workspace crate |
-| node | apply, cluster, gateway, journal, storage, transport | bytes, crc32fast, thiserror, tokio, tracing | protocol, mqtt, replication, broker, runtime, server, sim |
-| broker | domain, protocol, auth | bytes, thiserror, tracing | tokio, mqtt, transport, runtime, server, storage |
-| runtime | domain, protocol, mqtt, transport, broker, storage, replication | thiserror, tokio, tracing | server |
-| server | runtime | tokio, tracing, tracing-subscriber | — |
-| sim | storage, replication, journal, cluster, apply, codec, gateway, domain | — | tokio, runtime, transport, server, broker, mqtt, protocol |
+| node | apply, cluster, codec, gateway, journal, storage, transport | bytes, crc32fast, thiserror, tokio, tracing | server, sim |
+| server | node | thiserror, tokio, tracing, tracing-subscriber | — |
+| sim | storage, journal, cluster, apply, codec, gateway, domain | — | tokio, transport, node, server |
 
 `scripts/check-boundaries.sh` enforces the forbidden column. It is part of
 validation.
 
-Forbidding tokio in `mqtt` and `broker` is deliberate: the codec
-and the broker are synchronous, deterministic and benchmarkable without a
-runtime or a scheduler in the measurement.
+Keeping tokio out of the cores (`cluster`, `codec`, `apply`, `gateway`) is
+deliberate: they are synchronous, deterministic and benchmarkable without a
+runtime or a scheduler in the measurement, and the simulation drives them.
 
 `socket2` in transport: socket options tokio does not expose (TCP keepalive
 timing, `TCP_USER_TIMEOUT`). It is already a transitive dependency of tokio.
 
-`runtime` re-exports the config types that `server` needs, so the
-server depends only on the runtime.
+`node` re-exports what `server` needs (`NodeConfig`, `Experimental`,
+`ConfigError`), so the server depends only on `node`.
 
 Allowed dev-dependencies, each with a concrete use:
 
 ```text
-proptest                              core, mqtt, broker, replication, codec, journal, apply: codec round-trip, topic matching, routing invariants
+proptest                              domain, codec, journal, apply: codec round-trip, topic matching, apply invariants
 divan                                 micro benchmarks, allocation counting
-rumqttc (default-features = false)    e2e and node tests only: independent MQTT client
+rumqttc (default-features = false)    node tests only: independent MQTT client
 ```
 
 ```text
@@ -317,20 +320,22 @@ maintenance cost. State the reason in the change report.
 
 * **Ordering.** Messages published by one session to one topic are delivered to
   each subscriber in publish order. Any concurrency change must preserve this.
+* **Nothing is acknowledged before it is committed:** a PUBACK is the
+  application of a committed record, and a commit needs a majority of the
+  voters to hold it durably (unified-stream §1, §5).
 * **Memory is bounded** under any input: per connection, per session, and
-  globally: `STRAUM_TOTAL_QUEUED_BYTES` on the way out,
-  `STRAUM_TOTAL_CONNECTION_BUFFER_BYTES` on the way in — read and write
-  buffers together, because a budget that counts one half of a resource is
-  not a bound on it (docs/memory.md) — and `STRAUM_TOTAL_BACKLOG_BYTES`
-  for what the broker holds on behalf of sessions that are behind. Each
-  global budget exists because a per-session limit times the session count
-  is a product, not a bound.
+  globally — the gateway's pending proposals and waiting deliveries in total
+  (`max_total_pending_bytes`, `max_total_waiting_bytes`), `apply`'s queued
+  bytes in total, and the transport's connection-buffer budget for read and
+  write buffers together. Each global budget exists because a per-session
+  limit times the session count is a product, not a bound.
 * **Malformed input never panics**, never reads out of bounds, never allocates
-  from an unchecked remote length, never loops without progress.
-* **Fan-out does not copy payloads** in broker-held memory: N subscribers share
+  from an unchecked remote length, never loops without progress — MQTT
+  packets (`codec`), link frames (`cluster::wire`) and records (`journal`).
+* **Fan-out does not copy payloads** in held memory: N subscribers share
   one allocation.
-* **Closing a session** removes all of its subscriptions and inflight state in
-  the same `handle` call.
+* **Closing a session** removes all of its subscriptions and inflight state
+  through the log, as every effect.
 
 ---
 
@@ -343,29 +348,23 @@ Remote-controlled values are checked by the owning crate before allocation or
 insertion. There are no unbounded queues, including channels, `Vec`s grown from
 remote input, and maps keyed by remote data.
 
-Queued bytes are tracked per session and globally with atomic counters:
-incremented by the broker loop on enqueue, decremented by the writer on dequeue.
-The mechanism is in the runtime; the decision is in `Broker::on_overflow`.
-
-Overflow policy **(initial)**:
+Overflow policy **(initial)**, the new path:
 
 | Situation | Action |
 |---|---|
-| At-most-once delivery, session queue full (messages or bytes) | drop, `dropped_messages += 1`, exported as a counter |
-| At-least-once delivery, session backlog full (messages or bytes) | `Close(SlowConsumer)`, counted in `backlog_refused` and logged with the limit that was reached |
-| Reply cannot be enqueued | `Close(SlowConsumer)` |
-| Global queued-bytes budget exceeded | same as a full session queue |
-| Global backlog-bytes budget exceeded | same as a full session backlog |
-| Global connection-buffer budget exceeded | the growth is refused before it is allocated; the connection is closed |
-| Broker command queue full | reader awaits; nothing dropped |
-| WAL queue full | the submitter awaits; a publish is never acknowledged early to make room |
-| Pending acknowledgements at `STRAUM_MAX_PENDING_DURABLE` | that publisher's reader waits for a permit before its record goes to the log; no other client waits; nothing dropped |
-| Writer makes no progress for `STRAUM_WRITE_STALL_TIMEOUT_MS` | close connection |
-| Follower stops reading for `STRAUM_WRITE_STALL_TIMEOUT_MS` | the replication link is ended, `replication_errors += 1`, redialled; the follower is caught up from the log once it reads (D-27) |
-| Follower further behind than `STRAUM_WAL_RETAIN_BYTES`, below `quorum` | the log is rewritten past it; one `error` and `replication_followers_lost += 1`; refused when it next needs catching up (D-18) |
-| Follower away under `quorum` | the log is kept past its own reports, bounded by `STRAUM_MAX_PENDING_DURABLE` publishes plus session records (D-20) |
+| A publisher's proposals awaiting commit at `max_pending`/`max_pending_bytes`, or all at `max_total_pending_bytes` | the gateway stops reading that connection (`Gateway::wants_read`); nothing dropped |
+| A proposal not committed within `commit_timeout` | the publisher's connection is closed; the client resends (at-least-once); nothing uncommitted is acknowledged |
+| The sequencer's queue full (`max_queue`), or a proposal while the slot changes hands | the proposal is dropped, never acknowledged; `commit_timeout` closes its publisher (ADR-0008, "Not yet in step 4"; D-109) |
+| Uncommitted tail at `max_uncommitted` | the sequencer makes no new batch; proposals wait in its queue |
+| At-most-once deliveries behind a QoS 1 delivery at `max_waiting`/`max_waiting_bytes`, or all at `max_total_waiting_bytes` | dropped and counted (`Load::dropped`) |
+| A client's write queue full (`write_queue`) | the connection is closed (a writer that makes no progress) |
+| A peer's link queue full (`link_queue`) | the frame is dropped; the protocol resends at the next heartbeat |
+| Connection-buffer budget exceeded | the growth is refused before it is allocated; the connection is closed |
+| A replica further behind than `retain_bytes` | the log is compacted past it; it is lost and needs a state copy (D-57 A, step 7b) |
 
-Every path in this table has a test.
+Tests: the gateway's rules (`gateway/tests/rules.rs`), the uncommitted
+bound (`cluster/tests/protocol.rs`), retention and loss (the cluster
+simulation); not every row has a test of its own on the new path yet.
 
 ---
 
@@ -381,7 +380,7 @@ Every path in this table has a test.
 
 **Small payloads.** A payload sliced from the read buffer keeps the whole buffer
 chunk alive while it sits in a slow subscriber's queue: a 64 B message can pin
-16 KiB. Payloads ≤ `STRAUM_PAYLOAD_COPY_THRESHOLD_BYTES` are copied once at
+16 KiB. Payloads ≤ `codec::Limits::payload_copy_threshold_bytes` are copied once at
 ingress into an exact-size allocation. That is one copy per publish, not per
 subscriber. The threshold is chosen by benchmark and an RSS test.
 
@@ -400,7 +399,7 @@ or a benchmark shows it. Zero-copy is not automatically faster: one `memcpy` of
 Hot path:
 
 ```text
-TCP read → decode → validate → Message → route → enqueue → encode → TCP write
+TCP read → decode → validate → propose → sequence → append and replicate → commit → apply → route → encode → TCP write
 ```
 
 Every allocation, copy, clone, lock, channel hop, task spawn, syscall and
@@ -425,8 +424,9 @@ keeping it.
 * No lock-free structures without a benchmark against the simple version.
 * Syscalls are expensive boundaries; batch reads and writes. For network paths
   track messages/sec, syscalls/sec and bytes/sec separately.
-* A function is `async` only if it awaits I/O or another async operation. Core,
-  protocol, mqtt and broker are synchronous (enforced: no tokio).
+* A function is `async` only if it awaits I/O or another async operation. The
+  cores — `cluster`, `codec`, `apply`, `gateway` — are synchronous (enforced:
+  no tokio).
 * Moving code into a helper does not make the hot path smaller. Generated code
   is what matters.
 
@@ -567,20 +567,17 @@ pub fn somaxconn() -> Result<u32, SysError> { ... }
 
 Two layers, strictly separated:
 
-1. **Socket and process settings**: the broker applies them from `STRAUM_*`
-   env vars (`docs/configuration.md`).
+1. **Socket and process settings**: the node applies them (`transport`); the
+   server reads only the `STRAUM_CLUSTER_*` settings (`docs/configuration.md`).
 2. **Kernel parameters** (`sysctl`, `RLIMIT_NOFILE`): set by the operator.
-   The broker **never writes** them: it needs privileges and changes the whole
+   Straum **never writes** them: it needs privileges and changes the whole
    host.
 
-On Linux at startup the broker reads the relevant kernel parameters, logs them
-once at `info`, resolves `auto` values from them, and warns where configuration
-exceeds what the kernel allows (the kernel clamps silently, for example backlog
-above `net.core.somaxconn`). The full list is in `docs/linux-tuning.md`.
-
-On macOS the probes return "unavailable"; `auto` falls back to fixed defaults.
-A Linux-only option explicitly set on macOS is ignored with a warning at startup,
-so the same env file works on both.
+The old broker read the relevant kernel parameters at startup, resolved
+`auto` values from them and warned where configuration exceeded what the
+kernel allows; that went with it at step 8 (D-111), and the server does not
+probe the kernel yet. The probes (`transport/src/sys/`) and
+`docs/linux-tuning.md` remain.
 
 ## Developing on macOS
 
@@ -625,35 +622,14 @@ Metrics: plain atomics (`Relaxed`), no framework. An atomic per message is
 itself a cost: prefer per-task counters aggregated on read where a benchmark
 shows contention.
 
-```text
-counters: connections_accepted  protocol_errors  transport_errors
-          bytes_in  bytes_out  slow_consumer_closes  backlog_refused
-          dropped_messages
-          authentication_failures  keepalive_closes
-          wal_commits  wal_records_committed  wal_bytes_committed
-          wal_commit_failures  session_records_dropped  wal_compactions
-          replication_connections  replication_errors
-          replication_shipments_dropped  replication_catchups
-          replication_followers_lost
-gauges:   active_sessions  queued_messages  queued_bytes  backlog_bytes
-          pending_acknowledgements  quorum_unavailable
-          wal_durable_sequence  wal_sync_nanos
-          wal_retention_floor  wal_retained_bytes  wal_rewrite_nanos
-          replication_connected  replication_follower_sequence
-          replication_in_flight  replication_queued
-```
+A latency is a gauge of the latest value, not a counter: the average of a
+bimodal latency is a number that never happened.
 
-`wal_sync_nanos` is a gauge, not a counter: it is the latest sync, and the
-average of a bimodal latency is a number that never happened.
-
-They leave the process through `STRAUM_METRICS_ADDR`, in the Prometheus
-text exposition format over HTTP. Metrics nobody can read are metrics
-nobody acts on; printing thirty integers is not worth an HTTP framework
-(§2), so the format is written by hand.
-
-The broker keeps its own counters (`published_messages`,
-`delivered_messages`, `dropped_messages` and the rest of `broker::Stats`);
-the runtime mirrors out only what an operator acts on.
+The old broker's counters and their export (`STRAUM_METRICS_ADDR`, the
+Prometheus text format) went with it at step 8 (D-111). The new path
+exports no metrics yet: `node::Status` and `gateway::Load` are what it keeps.
+When it does, the rules above hold: Prometheus text written by hand, no
+framework (§2).
 
 ---
 
@@ -695,10 +671,9 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 scripts/linux.sh clippy --workspace --all-targets --all-features -- -D warnings
 # Benchmarks are built but not run. `harness = false` targets are plain
 # programs that `cargo test --all-targets` runs too. divan recognises that
-# and does one short pass; the hand-written load generators (e2e, and
-# storage/benches/commit.rs) refuse to run as a debug build, which is what
-# `cargo test` produces — before that guard the e2e ones alone cost 13
-# minutes (D-4). `--tests` selects every target with `test = true` — library
+# and does one short pass; the hand-written load generators
+# (storage/benches/commit.rs, node/benches/cap.rs) refuse to run as a debug
+# build, which is what `cargo test` produces (D-4). `--tests` selects every target with `test = true` — library
 # and binary unit tests, integration tests — and benches default to `false`.
 # Setting `test = false` on a bench does not help: `--all-targets` runs it
 # anyway (checked).
@@ -788,3 +763,13 @@ repeated measurement over one good number
 simple code over clever code
 ```
 
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+- Graphify resolves symbols by name, not by type: `mpsc::Sender` and `codec::Sender` become one node, and `use domain::Durability` an import of `durability.rs`. Check bridges, god nodes and import cycles by hand before acting on them (D-75).

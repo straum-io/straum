@@ -561,3 +561,268 @@ Date: 2026-10-07
 Choice: A — step 5, ungraceful takeover, on the log as D-67 B leaves it.
 Rejected options: B — step-4 leftovers first; C — defer.
 Card: docs/decisions/archive/cards.md
+
+## D-70. The next step after step 5
+Date: 2026-10-08
+Choice: A — harden step 5 in simulation first: the cluster simulation (compaction) and the apply and MQTT simulations run on `cluster::Voter`, with takeovers and compaction during takeover counted; 1000 seeds each. The step-4 test hooks stay for a later card.
+Rejected options: B — step 6 first (builds on paths not yet simulated); C — defer. Step 7 before step 6 was ruled out (reverses ADR-0008 order without a reason).
+Card: docs/decisions/archive/cards.md
+
+## D-71. When the sequencer ships before its own sync (D-58)
+Date: 2026-10-08
+Choice: A — defer to unified-stream phase 5 (Linux performance), amending D-58 A: the sequencer keeps syncing before it ships; the parallel ship is a phase-5 candidate, taken only on a Linux measurement of the commit-latency gain.
+Rejected options: B — take it now (an unmeasured latency claim, §7).
+Card: docs/decisions/archive/cards.md
+
+## D-75. What keeps the old replication path, and how it leaves
+Date: 2026-10-08
+Choice: A — follow ADR-0008 as planned — plus C's `.gitignore` for `graphify-out/`. Conditions:
+1. The old path is frozen: bug fixes only, no new features.
+2. Before the old path is removed, the guarantees of the D-28 chain (C1–C4, held today by `sim/tests/chain.rs` reading the old broker and runtime) are carried over into simulation invariants of the new path.
+3. Before it is removed, an equivalent durability benchmark exists for the new path, comparable with the current baseline (`e2e/benches/durability.rs`, docs/baselines/).
+4. Graphify resolves symbols by name: the docs say "check bridges manually".
+Rejected options: B — drop the two-node `quorum` mode now (reverses D-51 A; a supported deployment would disappear before the new path is in the server).
+Card: docs/decisions/archive/cards.md
+
+## D-74. The next step
+Date: 2026-10-08
+Choice: superseded — not answered by option. The D-75 answer said "then proceed to step 6 of ADR-0008", and step 6 went ahead without D-73 A's ordering; rotation is off by default, and 2 000 cluster seeds measured 92 unplaceable replicas with rotation against 89 without. D-73 stays open.
+Card: docs/decisions/archive/cards.md
+
+## D-76. Old-path e2e test that fails in the Linux container
+Date: 2026-10-09
+Choice: A — run it 20 times in the container, tell a test-sizing bug from a real stall-detection bug, fix it as a D-75 bug fix, and name any other container failure.
+Rejected options: ignoring it on Linux (removes the only production-platform test of the §8 stall row).
+Card: docs/decisions/archive/cards.md
+
+## D-77. The next step after step 6
+Date: 2026-10-09
+Choice: A — D-73 A first (slot table in the snapshot, version 2), then step 7 as its own card.
+Rejected options: none rejected outright; B (step 7 directly), C (D-28 C1–C4 port now) and D (step-6 gaps) stay possible later.
+Card: docs/decisions/archive/cards.md
+
+## D-73. Repairing "unplaceable" replicas (the open D-57 A deviation)
+Date: 2026-10-09
+Choice: A, through D-77 A — the slot table travels in the `apply` snapshot (version 2, version 1 refused), restart merges it with the table rebuilt from the log after it, and the cluster simulation's `unplaceable` exemption goes.
+Rejected options: compaction keeping each slot's first segment (the log would never compact under a stable sequencer); keeping the exemption permanently (contradicts D-57 A).
+Card: docs/decisions/archive/cards.md
+
+## D-79. The slot table past 4096 slot changes
+Date: 2026-10-09
+Choice: A — supersedes D-73 A's "in the `apply` snapshot" part: `apply::State` no longer keeps the table (its digest drops the term); the node keeps the committed slot table — built only from committed records — writes it in its snapshot file beside the state, and prunes it by the compaction floor, so no count bound and no remainder of the D-57 A deviation.
+Rejected options: none outright; B (raise the count bound, accept the rest) not chosen. No bound at all was rejected on the card (CLAUDE.md §7).
+Card: docs/decisions/archive/cards.md
+
+## D-78. Step 7 of ADR-0008
+Date: 2026-10-09
+Choice: A — after D-79: 7a, the server can start a node on the new path behind an experimental switch that refuses wills, persistent sessions and expiry (nothing handled locally), with config and startup checks, a HELLO frame version and an operator `hand_off`; ADR-0008:125 updated with it. Then 7c, sessions, expiry and will through the log. D-72 is settled before 7a makes the switch reachable.
+Rejected options: none outright; B (step 7 whole) and C (D-28 C1–C4 port first) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-72. D-70 A's takeover-rate criterion
+Date: 2026-10-09
+Choice: B — a fault mode per seed (one seed in three fault-heavy: sequencer crashes and partitions several times as frequent) in the cluster, apply and MQTT simulations; the summary asserts at least one takeover per hundred steps on the fault-heavy seeds and on average.
+Outcome (2026-10-09): B's hypothesis measured false, and the mode reverted; reopened as D-80. In the cluster simulation, 1 000 seeds, fault-heavy seeds reached 0.40, 0.40 and 0.42 takeovers per hundred steps with sequencer faults at 4, 8 and 16 per hundred events (0.36 without). Heartbeats added at 20 or 40 per hundred events lowered it to 0.20 and 0.09: they displace the deliveries and syncs a takeover needs. A takeover takes on the order of a hundred-plus events to complete, so the rate per step is bounded by the protocol's round trips, not by how often faults occur. The cluster simulation keeps printing its rate (0.34 over 1 000 seeds). Reverted mode, to rerun it:
+- seeds with `seed % 3 == 2`;
+- outside calm periods, at the start of `World::event`, `HEAVY` events in a hundred crash the sequencer (a power loss half the time) or isolate it, 50/50;
+- the heartbeat variant adds a `tick()` in `HEAVY_TICKS` events in a hundred, in every phase;
+- 1 500 steps per seed, `STRAUM_SIM_SEEDS=1000 cargo test --release -p sim --test cluster -- --nocapture`.
+Rejected options: A (accept the measured rate and amend D-70 A) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-80. The takeover-rate criterion after D-72 B was measured
+Date: 2026-10-09
+Choice: B — count per fault cycle: in one seed in three, a cycle crashes or cuts off the sequencer and runs events until a new slot commits or a bound is reached; the criterion becomes "a takeover follows at least 9 in 10 sequencer faults within the bound", replacing D-70 A's per-step rate.
+Outcome (2026-10-09): built in the cluster simulation and measured; 9 in 10 is not met, so it was not turned on as a gate and the code was removed; reopened as D-81. Over 1 000 seeds, the share of cycles in which a later slot commits within the bound:
+
+| Bound (events) | Other faults running | Faults paused during the cycle |
+|---|---|---|
+| 600 | 4% (17 of 444) | 50% (291 of 581) |
+| 2 000 | 9% | 75% |
+| 6 000 | 20% | 86% |
+
+What the failed cycles show:
+- With faults running, a majority is often down or cut off.
+- With faults paused, every node is up and slots keep advancing while nothing commits. The longest log holds a long uncommitted tail (hundreds of records; two seeds in three run with an effectively unbounded `max_uncommitted`), and candidates fetch it one batch per round trip.
+- A tested hypothesis was wrong: a candidate keeping followers silent-free while it catches up left the rate unchanged (53%); reverted.
+- The rest of the quiet failures is not yet explained.
+
+Cycle: `seed % 3 == 2`, 1 in 100 non-calm steps, crash (power loss half the time) or isolate the sequencer 50/50, success = the committed log's last record in a later slot; `STRAUM_SIM_SEEDS=1000 cargo test --release -p sim --test cluster -- --nocapture`.
+Rejected options: A (floors per sweep, = D-72 A) and C (drop the gate) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-81. Takeover liveness after a sequencer fault
+Date: 2026-10-09
+Choice: A — confirm the cycle rates on 10 000 seeds; trace the quiet failed cycles to a cause (the unexplained 14% first); make catch-up fetch up to a configured byte bound per round trip; gate the cycle rate at 9 in 10 within 2 000 events on cycles where a majority stays up, keeping the seeds with a near-unbounded uncommitted tail.
+Rejected options: B (gate at the measured level) and C (count floors, no liveness gate) not chosen.
+Outcome (2026-10-09), 10 000 cluster seeds: in fault cycles where a majority stays up, a later slot commits within 2 000 events in 93.5% (6 807 of 7 281); 98.4% with an uncommitted bound of 4–16, 87.7% without one (80.4% before reads of several batches). The gate (9 in 10) holds over both groups pooled; the unbounded group alone misses it, a recorded deviation (D-82). Tested and dropped: the candidate keepalive (88.9%) and window 64 (89.2%). Found on the way: `apply` left a retried acknowledgement unanswered, so the gateway retried it for ever (MQTT seed 1189), fixed; the takeover simulation asked for a sequencer at the instant one stepped down after `SlotEnd` (seed 6055), fixed.
+Card: docs/decisions/archive/cards.md
+
+## D-82. Failover with no bound on the uncommitted tail
+Date: 2026-10-09
+Choice: A — `max_uncommitted` gets a default chosen for failover as well as memory (the largest tail measured to keep 9 in 10); the cycle gate is per seed group; seeds left unbounded for coverage are gated at their measured level (for that group alone this amends D-81 A and revives D-81 B).
+Rejected options: none outright; B (trace first) and C (accept the pooled gate) not chosen.
+Outcome (2026-10-09): three seed groups with fault cycles; candidate defaults at 10 000 seeds: 64 → 94.1%, 96 → 91.1%, 128 → 89.1%, ≥256 = no bound (87.7%). Default 64 — a departure from the decision's wording ("the largest tail measured to keep 9 in 10" is 96, at 91.1%): 64 was taken for margin because 96 failed a default-run sample (28 of 32); put to the user in D-84. Gates per group from 300 cycles: 9 in 10 for 4–16 (98.4%) and default (94.1%), 85% for none (87.1%). Throughput cost unmeasured (D-84). Found on the way: `node` recovery left a torn newer-slot batch's slot on an empty log (seed 4045), fixed.
+Card: docs/decisions/archive/cards.md
+
+## D-83. A default for `read_bytes`
+Date: 2026-10-09
+Choice: A — `STRAUM_READ_BYTES`, default 64 KiB, checked at startup against `max_frame` and the largest batch (refusing what is now silently clamped); carried out with step 7a, where configuration from the environment arrives.
+Rejected options: none outright; B (derive from `max_frame`) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-84. The default for `max_uncommitted`: 64 or 96, and what it costs
+Date: 2026-10-09
+Choice: A — the production cap is chosen from Linux measurements, not from simulation alone: the cap with the highest throughput that meets the target "at least 9 in 10 failovers commit within 1 second". Measured at 64, 96, 128, 256, 1024 and 4096, both curves recorded in docs/baselines/. Until then 64 stays the simulation's default group and nothing in `node` uses it.
+Rejected options: B (take 64), C (96, the literal D-82 A), D (4096) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-85. What bounds failover time: a replica that falls behind
+Date: 2026-10-10
+Choice: B as the design direction, not final — bound the lag of a replica outside the committing majority by flow control. Conditions from the user: first define formally what is bounded (unacknowledged records, the lsn gap, or the log available to catch up from); the bound must never block commit for an available majority, and must give backpressure or an explicit move to a state copy rather than cost majority availability; implement only after the lag invariants are written down and it is shown that flow control cannot block majority progress. Until then the choice is not final. Production numbers come from Linux only; the container results are preliminary and choose nothing.
+Rejected options: none outright; A (measure first), C, D, E not chosen as the direction (A's host measurement is still needed for the cap, D-84 A).
+Card: docs/decisions/archive/cards.md
+
+## D-86. The cap on takeover patience
+Date: 2026-10-10
+Choice: A — keep 64× and measure. The ~9.6 s worst case (50 ms heartbeat, 3 ticks) is a known risk, not accepted by default; check whether repeated failed takeovers become prolonged unavailability once the network has recovered.
+Rejected options: none outright; B and C not chosen without more data.
+Card: docs/decisions/archive/cards.md
+
+## D-87. Fault cycles that need a state copy
+Date: 2026-10-10
+Choice: A — rerun with a realistic retention bound; bringing 7b forward on the strength of these 504 cycles is premature. Before closing: confirm that each such cycle's need for a state copy follows from the retention rule, not from a catch-up error or premature deletion.
+Rejected options: B (7b forward) premature; C not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-88. Patience grown during a partition slows recovery after it
+Date: 2026-10-10
+Choice: A — patience doubles only after a takeover that received a majority's promises; a partition without a majority must not inflate the wait of the next recovery. Order: first of D-88..D-91; with a regression test for a partition.
+Rejected options: none outright; B (reset on hearing a majority), C (keep and measure), D (lower cap) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-89. The replica-lag invariants for D-85 B
+Date: 2026-10-10
+Choice: A1 then A2 — first fix and justify L1–L4 in ADR-0008, then implement as a separate step with checks in simulation. Conditions from the user, L2 above all: before implementation prove that (1) commit of records already appended is never delayed by a lagging replica; (2) the wait before new appends is bounded by T; (3) after T the lagging replica is detached and no longer holds new appends; (4) detachment changes nothing in quorum, durability, fencing or acknowledgement safety; (5) if the remaining replica cannot form the needed majority, bounded failover without a state copy is not promised; (6) a detached replica's return is safe: it catches up from the available log or goes through the state copy. An available majority (network) is not the same as a majority that can safely continue commit.
+Rejected options: B (revise first), C (wait for Linux) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-90. Cycles still progressing at the cap ("slow")
+Date: 2026-10-10
+Choice: B — no standing allowance for seed 8956. Raising the limit alone fixes nothing: 8956 shows append speed racing catch-up speed. The long test may stay ignored in ordinary `cargo test`, but: a short regression test checks the mechanism behind the delay; an extended sweep checks seed 8956's actual outcome; the new limit is justified by observed behaviour, not chosen so the test passes.
+Rejected options: A (allowance listed by seed) — a known exception must not become an indefinite permission to hang; C not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-91. What retention bound is realistic for the new path
+Date: 2026-10-10
+Choice: A — 64 MiB as the starting default, compatible with the old path, set in step 7a; not considered a proven optimum.
+Rejected options: B (derived) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-92. The promise round no longer gets a longer wait (a consequence of D-88 A)
+Date: 2026-10-10
+Choice: A — accept the narrowed contract, keeping explicit the condition that a takeover's promise round fits `takeover_ticks` once in a while. 90.4% against the 90% gate is a small margin: monitor for regressions. Do not change patience merely to raise 90.4%: first find which scenarios make up the remaining 9.6% and which progress guarantees apply to them (mandatory before 7a).
+Correction (2026-10-10): the 90.4% belongs to the group without an uncommitted bound (gate 85%, D-82 A); the default-bound group is at 96.3%. The card misread the summary line. The misses are classified in ADR-0008 ("D-92 A — what the misses of the 2 000-event measure are").
+Rejected options: B (no effect at three voters), C (no new evidence) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-93. Flow control is rarely exercised in the simulation
+Date: 2026-10-10
+Choice: A — a slow-replica scenario in the simulation, in which flow control must reach the `T` boundary regularly; verify not only detachment but recovery, rejoin, catch-up and that majority progress is kept. Trigger frequency alone proves nothing: test scenarios where the mechanism is obliged to trigger. Mandatory before 7a.
+Rejected options: B (leave it).
+Card: docs/decisions/archive/cards.md
+
+## D-94. A Linux host for step 6
+Date: 2026-10-10
+Choice: C — defer. A cloud VM, if one is available, may serve preliminary diagnostics only, never the choice of production settings.
+Rejected options: A, B not chosen now.
+Card: docs/decisions/archive/cards.md
+
+## D-95. A short test of the takeover-during-catch-up race
+Date: 2026-10-10
+Choice: A — a `Voter`-level test, which must show that a takeover during catch-up uses no stale prefix and does not violate fencing. Mandatory before 7a.
+Rejected options: B (a ~210 000-event seed).
+Card: docs/decisions/archive/cards.md
+
+## D-96. Step 7a while there is no Linux host
+Date: 2026-10-10
+Choice: A, with a condition — continue the experimental server connection with `lag_bound: None`; flow control stays disabled; quorum, durability and fencing unchanged; unverified settings are not presented as production-ready. 7a continues only after the mandatory items of D-92, D-93, D-95 and D-97.
+Rejected options: B (wait for the host).
+Card: docs/decisions/archive/cards.md
+
+## D-97. One sweep that did not finish within an hour
+Date: 2026-10-10
+Choice: A — reproduce or localise the cause; do not attribute it to contention without evidence. Keep the parameters and trace of the unfinished run; check CPU starvation, locks, queue growth, disk activity and stuck tasks. If it cannot be reproduced, document the uncertainty rather than declare the case harmless. Mandatory before 7a.
+Rejected options: B (record as contention).
+Card: docs/decisions/archive/cards.md
+
+## D-98. A replica with a slow disk starts takeovers it cannot finish
+Date: 2026-10-10
+Choice: A — an append from the owner of a newer slot counts as the sequencer being alive while the promise of that slot is made durable. It eliminates false takeovers without weakening durability: the message alone permits no commit. Conditions before closing: (1) reproduce the slow-disk scenario at the standard timing; (2) takeovers back to the level without a slow disk; (3) commit keeps moving while the sequencer is healthy, and no replica commits records without the required durability; (4) fencing and the late-message checks of the previous sequencer preserved; (5) a sequencer that has actually died is still taken over — activity must not block a necessary takeover for ever. "The sequencer shows signs of life" and "the new slot is durably promised" are different states: the first may prevent a false suspicion, never stand in for the second in the commit rules.
+Rejected options: B (pre-vote), C (leave it) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-99. The simulation's base timing takes over every ~300 events with no fault
+Date: 2026-10-10
+Choice: A — base timings stay in the main sweep; the slow replica is tested separately with steady timings, so a parameter change cannot mask a protocol problem.
+Rejected options: B not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-100. A detached replica may never re-attach under sustained load
+Date: 2026-10-10
+Choice: C — defer: flow control is off by default, and changing catch-up or rejoin rules would add a variable before D-98 is resolved.
+Rejected options: A, B, D not chosen now.
+Card: docs/decisions/archive/cards.md
+
+## D-101. Does 7a wait for D-98?
+Date: 2026-10-10
+Choice: A — 7a waits until D-98's check passes at the standard timing; the fault affects operation with and without flow control, and starting the new server path now would complicate diagnosis. Not even experimentally until then. D-101 to be reassessed after D-98.
+Rejected options: B, C not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-102. D-101 reassessed: start 7a now?
+Date: 2026-10-10
+Choice: A — start 7a with flow control off (`lag_bound: None`), as an experimental, not production-ready path. Conditions: (1) flow control stays disabled — the new server path is not verified together with the lag policy; (2) D-98 and D-95 stay mandatory regressions: a sign of life never replaces a durable promise, late appends of an old sequencer never cross the fence; (3) the slow-disk gate runs explicitly in release (`cargo test --release -p sim --test cluster -- --ignored a_slow_disk`); (4) the cluster sweep (10 000), takeover (20 000), apply and MQTT (10 000) are repeated, and any safety regression blocks advancing; (5) no production cap and no bounded-failover claim before Linux measurements. 7a may begin; it is not complete or production-ready until the new server path passes its correctness checks and its performance and failover are measured on Linux. B (a second silence reset during this node's own takeover) is a hypothesis touching the candidate–owner interaction: after 7a's results, with the pending-promise test kept.
+Rejected options: B not now; C (wait for Linux) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-103. How the server reaches the new path (7a)
+Date: 2026-10-10
+Choice: A — `server` depends on `node`; the new path is not routed through `runtime`. Conditions: the new path stays explicitly experimental and off by default; the dependency table is checked so that the new edge creates no transitive bypass through `runtime`.
+Rejected options: B (a separate binary) not chosen; routing through `runtime` rejected on the card (D-75).
+Card: docs/decisions/archive/cards.md
+
+## D-104. The new path's configuration surface and defaults (7a)
+Date: 2026-10-10
+Choice: A — dedicated `STRAUM_CLUSTER_*` variables, not mixed with the old broker's. Invalid configuration is refused at startup, never silently corrected: an odd number of voters, at least three; cluster parameters consistent on all nodes; timing parameters and limits validated before any listener opens. Heartbeat 50 ms and a takeover after three heartbeats stay as experimental defaults, not declared optimal or production-grade. The frame version alone does not make nodes compatible: configuration is part of cluster compatibility.
+Rejected options: B (no timing defaults), C (a more conservative default) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-105. How an operator hands the slot over (7a)
+Date: 2026-10-10
+Choice: A, with a clarification — SIGUSR1 requests a protocol handoff (`SlotEnd`, the successor schedule) under the rules of fencing, quorum and the committed prefix; it never means "exit", nor a forced change of leader. The node keeps serving until the handoff completes or a failure the protocol provides for. Chosen over HTTP because the metrics listener has no authentication.
+Rejected options: B (HTTP on the metrics listener), C (rotation only) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-106. An automated end-to-end test of the server in cluster mode
+Date: 2026-10-11
+Choice: A (the user's direction, first in order; no letter given) — automate the three-node scenario with three real server processes. It must check: nodes connecting and a QoS 1 publish; delivery to a subscriber; the handoff by SIGUSR1; publications going on after it; stopping and restarting a node; refusal of an incompatible configuration; and that no publish is acknowledged before its commit condition is met — delivery alone does not prove the durability semantics. 7a is an unfinished experimental stage, not an operable cluster.
+Rejected options: B (rumqttc in server tests), C (defer) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-107. Credentials and TLS on the new path
+Date: 2026-10-11
+Choice: the user's direction, third in order — define the bounds of acceptable use of the experimental listener and design TLS and credentials. Until both exist the new path is acceptable only in an isolated trusted environment; external reach is limited at startup and by the network environment, never by treating the experimental switch as a security mechanism.
+Rejected options: none yet; the design is to come.
+Card: docs/decisions/archive/cards.md
+
+## D-108. Node tests that pick ports by binding and releasing them
+Date: 2026-10-11
+Choice: the user's direction, second in order — diagnose first: one failure and three passing runs do not establish a port race. If the cause is the test helper, the tests use isolated resources and release them reliably; if it is in node startup, it is fixed, never masked by retries.
+Rejected options: none.
+Card: docs/decisions/archive/cards.md
+
+## D-111. Step 8 now: remove the old broker path
+Date: 2026-10-11
+Choice: the user's request, confirmed against its consequences — remove the old leader/follower broker path completely now, to end conflicts in decision-making. Removed: the crates `broker`, `protocol`, `mqtt`, `replication`, `runtime` and `e2e`; the old leader/follower simulation (`sim`'s library and `tests/seeds.rs`) and the D-28 chain check (`sim/tests/chain.rs`); the fuzz targets on `mqtt`; the broker half of `server`. Kept: `storage` (its `Wal` is what each segment of the new log is), `transport`, `domain`, `auth` (planned for the new path's credentials, D-110). Overrides D-51 A's and D-75's conditions for step 8 — a witness for the two-node `quorum` pair, D-28 C1–C4 carried into new-path invariants, a durability benchmark comparable with the old path's — none of which holds. Consequences accepted: the server runs only the experimental cluster path (not production-ready, D-102 A); no single-node mode (the new path requires three voters, D-104 A); no TLS or credentials until D-110; the old durability levels (`memory`, `written`, `fsynced`, `quorum`) and the old benchmarks and baselines go with it. Reversible through git: the old crates are in commit ffeda02 and earlier.
+Rejected options: "stop deciding for it only" (keep the code, closed for decisions) and "remove after a cluster of one" not chosen.

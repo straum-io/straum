@@ -216,3 +216,24 @@ fn a_tail_is_cut_across_segments_and_writing_continues_after_it() {
     let (_, seen) = open(&disk);
     assert_eq!(numbers(&seen), vec![1, 2, 3]);
 }
+
+/// A cut is as durable as what it keeps: a power loss right after it, with
+/// nothing synced since, recovers the log exactly as cut.
+#[test]
+fn a_cut_survives_a_power_loss() {
+    for torn in [0, 1, 7, 40, 299] {
+        let disk = SimDisk::new();
+        let (mut log, _) = open(&disk);
+        // One segment: 14 records in batches of 1, 2, 3...
+        let mut key = 1;
+        for per in [1u64, 2, 3, 2, 3, 3] {
+            key = write(&mut log, key, 1, per, true);
+        }
+        assert_eq!(key, 15);
+        log.truncate_after(9).unwrap();
+        drop(log);
+        disk.power_loss(torn);
+        let (_, seen) = open(&disk);
+        assert_eq!(numbers(&seen), (1..=9).collect::<Vec<_>>(), "torn {torn}");
+    }
+}

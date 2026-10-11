@@ -8,9 +8,10 @@
 >   "memory / written / fsynced durability distinction") and the rule
 >   "existing architecture is authoritative". The unified stream replaces the
 >   architecture (ADR-0001) and the acknowledgement semantics (ADR-0005:
->   PUBACK and delivery only after commit by a majority); the durability
->   distinction remains for a single node and the current leader/follower,
->   while a cluster commits by majority only (ADR-0006, D-36). §1's
+>   PUBACK and delivery only after commit by a majority). The durability
+>   distinction went with the old single-node and leader/follower path at
+>   step 8 (D-111): the server now runs only the cluster path, which commits
+>   by majority only (ADR-0006, D-36). §1's
 >   requirement to name each invariant and show it is preserved or
 >   intentionally replaced still applies to every change that follows.
 > - §13: "Do not introduce quorum into local fsynced semantics" and "Do not

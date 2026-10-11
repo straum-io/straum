@@ -24,3 +24,6 @@ target
 .DS_Store
 .claude/state/
 .claude/scheduled_tasks.lock
+
+# graphify knowledge graph: generated, rebuilt with `graphify update .` (D-75)
+graphify-out/

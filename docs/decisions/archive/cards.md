@@ -820,3 +820,1397 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 
 **Answer:** `D-69: A` · `D-69: B, but …` · `D-69: discuss` · `D-69: defer`
 ````
+
+````markdown
+## D-70. The next step after step 5
+
+**Context.** Steps 1–5 of ADR-0008 are done, but only in tests.
+
+What the evidence covers:
+- `cluster::Voter` passes 200 000 seeds of the takeover simulation, with invariants 1, 2, 3, 5 and 6.
+- The node takes a slot over on real sockets and files.
+
+What it does not cover:
+- The simulations that compact (`sim/tests/cluster.rs`) and that run gateways (`apply.rs`, `gateway.rs`) still use a fixed owner.
+- Takeover under compaction, and gateways forwarding to an owner that changes, are covered only by the node's loopback tests.
+
+ADR-0008 lists step 6 (graceful handoff) next.
+**Why now.** Step 6, and step 7 even more so, build on takeover. unified-stream §5 asks for "compaction during catch-up" and session takeover across gateways during a change of sequencer, and neither has run in simulation yet.
+**Vision.** unified-stream §1 (correctness is shown by deterministic simulation), §5; ADR-0008 step plan.
+
+### A. Harden step 5 in simulation first — recommended
+- **What we do:**
+  - `sim/tests/cluster.rs` runs three `Voter`s instead of a fixed owner, with sequencer crashes, partitions and compaction during catch-up and during takeover (invariants 1, 2, 3, 5 and 6, and the D-57 A floor checks);
+  - `sim/tests/apply.rs` and `gateway.rs` run on `Voter`s, so gateways forward to an owner that changes; invariant 4 and per-session order must hold across takeovers;
+  - nothing else. The step-4 test hooks (`Status.digest`, the effects clone) stay for a later card.
+- **Result (done when):** all three simulations pass 1000 seeds with takeovers counted, at least one per hundred steps, and compactions during a takeover counted.
+- **Cost:** M.
+- **Risks:** a new protocol bug, which is the point. It is fixed with its seed, as in step 5.
+- **Invariants:** none change; more of them are checked across takeovers.
+- **Reversibility:** easy (tests only).
+- **Check:** `STRAUM_SIM_SEEDS=1000 cargo test --release -p sim`.
+- **Fact / hypothesis:** It is a fact that these paths are untested in simulation. It is a hypothesis that bugs remain there; step 5's simulation found eight.
+
+### B. Step 6: graceful handoff
+- **What we do:**
+  - `SlotEnd(k, last_lsn, hash)` is written by a sequencer that fences itself; its successor writes `SlotStart(k+1)` without a promise round;
+  - planned rotation is optional, off by default (§2.4);
+  - the takeover simulation gains crashes before, during and after `SlotEnd`.
+- **Result:** maintenance without a timeout.
+- **Cost:** M.
+- **Risks:** it builds on paths A would have checked first. The open risks above stay open.
+- **Invariants:** 1, 2, 3 and 6.
+- **Reversibility:** a new record kind is used (reserved since step 1).
+- **Check:** `cargo test -p sim --test takeover`, plus new scenarios.
+- **Fact / hypothesis:** fact.
+
+### C. Defer
+- **When this is right:** if the old path needs work first.
+- **Cost of waiting:** two paths to maintain for longer.
+
+**Comparison**
+
+| | A | B | C |
+|---|---|---|---|
+| Fit with vision | §1, §5 scenarios not yet run | next in the ADR order | none |
+| Risk to invariants | finds, does not add | adds on unchecked ground | none |
+| Cost | M | M | none |
+| Reversibility | easy | record kind in use | — |
+
+**Recommendation.** A. Step 5's simulation found eight protocol bugs in paths that looked finished. The paths still outside simulation, compaction and gateways under takeover, are the ones every later step uses. Choose B if a planned failover for maintenance is needed soon.
+**What would change it.** A requirement for planned failover before anything else.
+**Rejected.**
+- Step 7 before step 6: it reverses ADR-0008's order (unified-stream phase 3 before phase 2) with no concrete reason, while step 6 is unblocked.
+
+**Answer:** `D-70: A` · `D-70: B, but …` · `D-70: discuss` · `D-70: defer`
+````
+
+````markdown
+## D-71. When the sequencer ships before its own sync (D-58)
+
+**Context.** D-58 A: "sync, then ship, until step 5; step 5 … only then lifts the restriction". Its rejected option B was "sync-then-ship permanently".
+
+Step 5 made it possible: a restarted node never leads its old slot again, so a sequencer that lost an unsynced tail cannot reuse its lsns. But step 5 did not take it. The sequencer still ships only what is locally durable (ADR-0008 step 5, "Restart").
+**Why now.** Without a decision, the code stays on D-58's rejected option B by default. Shipping in parallel saves one local sync per batch on the commit latency path.
+**Vision.** unified-stream §2.3 (commit = majority durable), §7 (no performance claim without a Linux measurement); D-58.
+
+### A. Defer it to unified-stream phase 5 (Linux performance), amending D-58 A — recommended
+- **What we do:** D-58 A is amended in log.md and ADR-0008. The parallel ship becomes a phase-5 candidate, taken only if a Linux measurement shows the commit latency gain. Today's behaviour stays.
+- **Result:** the deferral is recorded, and no rejected option is applied silently.
+- **Cost:** S (documentation).
+- **Risks:** none now.
+- **Invariants:** none.
+- **Reversibility:** easy.
+- **Check:** log.md and ADR-0008 agree.
+- **Fact / hypothesis:** It is a hypothesis that the gain matters; unmeasured.
+
+### B. Take it now
+- **What we do:**
+  - the sequencer ships a batch as soon as it is handed to the log; its own durability counts toward commit only after its sync;
+  - the takeover simulation gains a power loss of the sequencer after shipping but before syncing;
+  - a container measurement, which is preliminary.
+- **Result:** one sync off the commit path, in principle.
+- **Cost:** M.
+- **Risks:** a sequencer that loses an unsynced tail its replicas hold. Takeover makes this safe in theory; the simulation would show it.
+- **Invariants:** 1 and 3 under that power loss.
+- **Reversibility:** easy behind a setting.
+- **Check:** takeover sim at 200 000 seeds, plus the new fault.
+- **Fact / hypothesis:** It is a hypothesis that it is faster; §7 forbids claiming so without Linux.
+
+**Comparison**
+
+| | A | B |
+|---|---|---|
+| Fit with vision | §7: measure first | §2.3 as designed |
+| Risk to invariants | none | new fault to prove |
+| Cost | S | M |
+| Reversibility | easy | easy |
+
+**Recommendation.** A. The gain is a latency claim that only a Linux host can make (§7), and phase 5 is where those measurements are taken. Choose B if commit latency on the new path becomes the bottleneck before then.
+**What would change it.** A Linux measurement showing the local sync dominating commit latency.
+**Rejected.**
+- Sync-then-ship forever without a decision: this is D-58's rejected option B.
+
+**Answer:** `D-71: A` · `D-71: B` · `D-71: discuss` · `D-71: defer`
+````
+
+````markdown
+## D-75. What keeps the old replication path, and how it leaves
+
+**Context.** The graph that graphify built (`graphify-out/`) showed `codec::Sender` bridging the runtime, node, gateway and old replication, and a cycle between `e2e/benches/durability.rs` and `runtime`. Both are name-resolution artifacts.
+- `mpsc`, `watch`, `oneshot` and `broadcast` senders in `runtime`, `node` and `storage` were matched to the only symbol named `Sender`, which is codec's two-variant enum.
+- `pub use domain::Durability` in `runtime/src/lib.rs` was matched to the file `durability.rs`.
+
+No new-path crate depends on the old one (`scripts/check-boundaries.sh`); `e2e` uses `runtime` only as a dev-dependency, through its public re-exports. The old replication (about 5 800 lines: `crates/replication`, `runtime/src/replication.rs`, the leader/follower simulation, `replication_matrix.rs`, `replicate.rs`) stays because ADR-0008 step 8 and D-51 A keep it until a single node runs on the new path and a witness exists for the two-node pair.
+**Options offered.** A, follow ADR-0008 as planned; B, drop the two-node `quorum` mode now (reverses D-51 A); C, fix the analysis tooling: ignore `graphify-out/`, and record that graphify resolves symbols by name.
+
+**Answer:** `D-75: A + C's .gitignore`, with conditions.
+````
+
+````markdown
+## D-74. The next step
+
+**Context.** Step 5 runs in every simulation (D-70 A), with D-72 and D-73 open.
+
+Still waiting:
+- step 6, graceful handoff with `SlotEnd`;
+- the step-4 test hooks that D-70 A left for "a later card" (`Status.digest` hashes the whole state on every change; the effects broadcast clones every applied record when a test listens);
+- auth wiring;
+- metrics.
+**Why now.** D-70 A's reason for putting step 6 second, "it builds on paths not yet simulated", no longer applies: takeover under compaction and gateways now runs in simulation. D-72 and D-73 are still open.
+**Vision.** ADR-0008 step plan; unified-stream §2.4 (graceful handoff); CLAUDE.md §10 (nothing accidental on the hot path).
+
+### A. D-73 first, then step 6 — recommended
+- **What we do:**
+  - D-73 as decided;
+  - then step 6: `SlotEnd(k, last_lsn, hash)` from a fencing sequencer, and the successor writes `SlotStart(k+1)` without a promise round;
+  - planned rotation, off by default;
+  - the takeover simulation gains crashes before, during and after `SlotEnd`.
+- **Result:** maintenance without a timeout, on a slot table that rotation cannot leave incomplete.
+- **Cost:** the chosen D-73 option (S–M for D-73 A) plus M for step 6.
+- **Risks:** rotation multiplies slots, so it depends on D-73.
+- **Invariants:** 1, 2, 3 and 6.
+- **Reversibility:** a record kind reserved since step 1.
+- **Check:** `cargo test -p sim --test takeover`, new scenarios, all sweeps.
+- **Fact / hypothesis:** fact.
+
+### B. The step-4 hooks and leftovers first
+- **What we do:**
+  - take `Status.digest` and the effects clone off the node loop, computing them on demand;
+  - hold refused proposals instead of dropping them;
+  - wire `auth` into CONNECT;
+  - export the `node` metrics;
+  - add an end-to-end load generator with a container baseline (preliminary).
+- **Result:** the new path is measurable and observable.
+- **Cost:** M.
+- **Risks:** low.
+- **Invariants:** CLAUDE.md §8, "nothing dropped", restored for proposals.
+- **Reversibility:** easy.
+- **Check:** `cargo test -p node`; a baseline in `docs/baselines/`.
+- **Fact / hypothesis:** It is a hypothesis that early numbers guide steps 6–7.
+
+### C. Defer
+- **When this is right:** if the old path needs work first, or D-72 and D-73 should settle before anything else.
+- **Cost of waiting:** two paths maintained side by side for longer, and the D-57 A deviation stays open.
+
+**Comparison**
+
+| | A | B | C |
+|---|---|---|---|
+| Fit with vision | ADR order, gap closed first | hot-path hygiene | none |
+| Risk to invariants | new handoff path, simulated | low | none |
+| Cost | D-73 + M | M | none |
+| Reversibility | record kind | easy | — |
+
+**Recommendation.** A. D-73 is a small fix to a known gap that rotation would widen, and step 6 is next in the plan. Choose B if you want end-to-end numbers before the protocol grows further.
+**What would change it.** A need for a measured baseline of the new path before more protocol.
+**Rejected.**
+- Step 7 before step 6: it reverses the ADR-0008 order with no reason (D-70).
+
+**Answer:** `D-74: A` · `D-74: B` · `D-74: discuss` · `D-74: defer`
+````
+
+````markdown
+## D-73. Repairing "unplaceable" replicas (the open D-57 A deviation)
+
+**Context.** After compaction, a node rebuilds its slot table from the records that are left, and it no longer knows where older slots began. A replica whose log holds records past the kept start, in a slot the sequencer no longer knows, cannot be placed. Placing it would take a guess, and a guess cut committed copies before (cluster simulation, seed 9046). So it is lost inside the byte bound, which deviates from D-57 A: 488 of 941 losses in the cluster sweep. The simulation exempts these and counts them (crates/sim/tests/cluster.rs, the `unplaceable` check). Liveness only.
+**Why now.** Step 6 (planned rotation) adds slots and makes this more frequent. Until it is fixed, D-57 A's "lost only past the byte bound" does not hold.
+**Vision.** unified-stream §1 (no state outside the log), §3 (compaction must not lose a replica that is only behind); D-57 A; D-67 B.
+
+### A. The slot table travels in the snapshot — recommended
+- **What we do:**
+  - `apply::State`'s snapshot (D-67 B: versioned, checksummed, refused when damaged, taken at a committed lsn) gains the node's slot table up to that lsn, which is derived only from committed `SlotStart` records;
+  - restart merges it with the table rebuilt from the records after the snapshot. Compaction already stops at the snapshot, so the merged table is complete;
+  - the snapshot format version goes to 2, and version 1 is refused;
+  - the cluster simulation's `unplaceable` exemption is removed.
+- **Result:** no unplaceable losses, and D-57 A checked in full, with no new file. A 10 000-seed sweep shows 0 unplaceable losses.
+- **Cost:** S–M: a snapshot field, its version, recovery, and tests.
+- **Risks:** a table that diverges from the log. Ruled out by construction: it is written from committed records only, at the snapshot's lsn, and checked against the log after it at restart.
+- **Invariants:** D-57 A is restored; §1 holds on the same footing as the D-67 B snapshot.
+- **Reversibility:** a snapshot format version.
+- **Check:**
+  - `cargo test -p apply` (round-trip with the table);
+  - `STRAUM_SIM_SEEDS=10000` for cluster and apply with the exemption removed.
+- **Fact / hypothesis:** fact.
+
+### B. A slot table file, derived from committed `SlotStart`s
+- **What we do:**
+  - the node appends `(slot, first lsn)` to a small versioned file when a `SlotStart` commits;
+  - the file is refused like the D-67 B snapshot if its version or checksum is wrong;
+  - recovery reads it before the log;
+  - the simulation's exemption is removed.
+- **Result:** as A, without keeping segments.
+- **Cost:** M: a new on-disk format, its recovery and tests, recorded in ADR-0008.
+- **Risks:** one more file to keep consistent, though it is derived from committed records like the snapshot. A covers the same ground without it.
+- **Invariants:** D-57 A is restored.
+- **Reversibility:** an on-disk format.
+- **Check:** as A, plus a file-damage test.
+- **Fact / hypothesis:** fact.
+
+### C. The sequencer answers with the slot boundaries it knows
+- **What we do:** the repair messages carry the sequencer's slot table near the meet point, so the replica places itself.
+- **Result:** fixes placement only when the sequencer still knows the boundary. A boundary that was compacted away stays unknown.
+- **Cost:** M (a wire change).
+- **Risks:** an incomplete fix.
+- **Invariants:** D-57 A is restored only partly.
+- **Reversibility:** a wire format.
+- **Check:** the sweep's unplaceable count.
+- **Fact / hypothesis:** It is a hypothesis that it covers most cases; it does not cover all.
+
+**Comparison**
+
+| | A | B | C |
+|---|---|---|---|
+| Fit with vision | in the snapshot, like the state | a derived file | partial |
+| Risk to invariants | none | one more file | none |
+| Cost | S–M | M | M |
+| Reversibility | snapshot version | format | wire |
+
+**Recommendation.** A. The snapshot already is the log-derived record that compaction relies on, so the slot table belongs with it, and no new file is needed. Choose B if snapshots are to stay pure application state.
+**What would change it.** A requirement that the snapshot hold only `apply`'s state.
+**Rejected.**
+- Compaction keeps each slot's first segment: segments go only from the front, so keeping one keeps every later one, and under a stable sequencer the log would never compact (CLAUDE.md §7; D-57's rejected "never compacting past a replica").
+- Keeping the exemption permanently: it contradicts D-57 A without a decision.
+
+**Answer:** `D-73: A` · `D-73: B` · `D-73: C` · `D-73: discuss` · `D-73: defer`
+````
+
+````markdown
+## D-76. Old-path e2e test that fails in the Linux container
+
+**Context.** `e2e/tests/replication_matrix.rs::a_follower_that_stops_reading_is_cut_off_and_caught_up` fails 2 of 3 isolated runs in `scripts/linux.sh` with "a follower that stopped reading was never cut off". It passes on macOS.
+- Nothing under e2e, runtime, replication or storage/src changed in step 6, so the failure is not caused by it. Whether it fails at BASE ffeda02 has not been run.
+- Separately, one full container run had one unnamed failure; two later full runs were clean (477 passed).
+- The test covers the CLAUDE.md §8 row "Follower stops reading for `STRAUM_WRITE_STALL_TIMEOUT_MS`". D-75 freezes the old path to bug fixes.
+**Vision.** CLAUDE.md §8: every path in the table has a test. §13: Linux is production.
+
+### A. Find out, then fix — recommended
+- **What we do:**
+  1. Run the test 20 times in the container at BASE and at HEAD.
+  2. Decide whether it is a test-sizing bug or a real stall-detection bug. Linux socket-buffer autotuning can absorb the fixed publish volume.
+  3. If it is sizing: publish until `replication_errors` moves, with a deadline, or shrink the follower's receive buffer in the test.
+  4. If it is real: fix the stall detection, as a D-75 bug fix.
+  5. Run the full container suite until any other failure is named.
+- **Cost:** S, or M if the bug is real.
+- **Risks:** a real bug in the old path's stall detection.
+- **Invariants:** §8 table row.
+- **Check:** 20/20 container runs.
+- **Fact / hypothesis:** the autotuning cause is a hypothesis.
+
+### C. Defer
+Container validation stays intermittently red until step 8 removes the old path.
+
+**Rejected.**
+- Ignoring it on Linux: it would remove the only test of that §8 row on the production platform.
+
+**Answer:** `D-76: A` · `D-76: C` · `D-76: discuss`
+````
+
+````markdown
+## D-77. The next step after step 6
+
+**Context.** Step 6 is done, test-only. Still open:
+- D-72, the takeover-rate criterion, which keeps its own card;
+- D-73, unplaceable replicas: rotation runs on that open D-57 A deviation, 92 unplaceable against 89 without rotation over 2 000 cluster seeds;
+- D-75's removal preconditions;
+- step-6 gaps: a successor that restarts between learning the commit and promising forgets `SlotEnd` and takes over by silence, and there is no operator `hand_off` command.
+**Vision.** ADR-0008 step plan; D-75; unified-stream §5.
+
+### A. D-73 A, then step 7 — recommended
+- **What we do:** the slot table goes into snapshot version 2 (D-73 A), which restores the full D-57 A check. Step 7 comes after it, as its own card: sessions, expiry and will through the log, config, server wiring with the operator `hand_off` command, and the frame version.
+- **Cost:** S–M now.
+- **Risks:** low.
+- **Invariants:** D-57 A, back to fully checked.
+- **Check:** the cluster sweep without the exemption.
+
+### B. Step 7 directly
+- **What we do:** the new path reaches the server sooner, and D-73 waits.
+- **Cost:** L.
+- **Risks:** rotation and takeovers keep running on the D-57 A deviation meanwhile (measured: 92 against 89).
+- **Check:** node and e2e tests.
+
+### C. Port D-28 C1–C4 to new-path simulation invariants now
+- **What we do:** the first D-75 precondition. It does not depend on step 7.
+- **Cost:** M.
+- **Note:** the durability benchmark, the second precondition, needs server wiring and belongs after step 7.
+- **Check:** the new invariants in the sims, and a mutation that breaks each one.
+
+### D. Close the step-6 gaps first
+- **What we do:**
+  - persist a pending handoff, so a successor that restarts after learning the commit still takes over without a promise round;
+  - count handoffs completed against handoffs started in the node's status.
+- **Cost:** S.
+- **Risks:** low. The gap costs liveness only, since the takeover by silence covers it.
+
+**Recommendation.** A. It is the dependency D-74 named, and it is small. Choose C if removing the old path is the priority.
+
+**Answer:** `D-77: A` · `D-77: B` · `D-77: C` · `D-77: D` · `D-77: discuss`
+````
+
+````markdown
+## D-79. The slot table past 4096 slot changes (what is left of the D-57 A deviation)
+
+**Context.** D-73 A puts the committed slot table in `apply::State` and its snapshot, and caps it at `apply::MAX_SLOTS` = 4096 entries, dropping the oldest. Past 4096 slot changes, a replica whose log ends in a dropped slot is lost inside the byte bound again. That is still a D-57 A deviation, liveness only.
+- Rotation every few heartbeats reaches the cap within hours.
+- No simulation reaches it.
+- `apply` cannot prune by the compaction floor: it does not see the floor, and its state is compared across nodes by digest.
+**Vision.** CLAUDE.md §7 (memory bounded); D-57 A (lost only past the byte bound).
+
+### A. Prune by the floor, outside `apply` — recommended
+- **Supersedes:** D-73 A's "in the `apply` snapshot" part. The new evidence is this card's remainder. D-73 A's rule stays: the table is built only from committed records.
+- **What we do:**
+  - `apply::State` stops keeping the table: `State::slots()` goes, and so does the `slots` term in `State::digest`. That changes the digest `Status` reports, which no released node depends on. HELLO compares the limits digest, not the state digest;
+  - the node keeps the table and writes it beside the snapshot, in the snapshot file, after the state bytes (file version 2);
+  - each compaction prunes the entries that end below the new floor, since a replica that needs them needs records that are already gone and is lost anyway;
+  - its size is then bounded by the slot changes inside the retained log.
+- **Cost:** S–M, a reshuffle of D-73 A's code.
+- **Risks:** low.
+- **Invariants:** D-57 A, closed with no count condition.
+- **Check:**
+  - a cluster-sim rotation mode that crosses thousands of slots;
+  - a node test that restarts after compacting past a slot change.
+
+### B. Keep the count bound and document it
+- **What we do:** raise `MAX_SLOTS` (for example to 65 536, 1 MiB) and record the remainder as an accepted deviation in ADR-0008.
+- **Cost:** XS.
+- **Risks:** rotation at short intervals still crosses the bound eventually.
+
+**Rejected.**
+- No bound at all: it breaks CLAUDE.md §7.
+
+**Answer:** `D-79: A` · `D-79: B` · `D-79: discuss`
+````
+
+````markdown
+## D-78. Step 7 of ADR-0008
+
+**Context.** Steps 1–6 are done, test-only. Still open:
+- D-79, the slot-table remainder;
+- D-72, the takeover-rate criterion.
+
+Step 7 per ADR-0008:
+- sessions, and takeover across gateways;
+- expiry and will through the log (the sequencer writes `SessionExpired` and `WillPublished`);
+- config and startup checks (ADR-0006, D-68 A);
+- server wiring.
+
+It also needs an operator `hand_off` command and a frame version, or a HELLO refusal, for the changed ACK and FETCHED layouts. ADR-0008:125 keeps cluster mode test-only until sessions and wills are in the log.
+**Vision.** unified-stream §1, §6 phase 3; ADR-0008:125; D-75.
+
+### A. Split: 7a wiring, then 7c sessions — recommended
+"7b" is already state copy (D-60 A).
+- **7a:**
+  - `server` can start a node on the new path behind a switch marked experimental;
+  - the old path stays the default (D-75);
+  - config and startup checks, the frame version in HELLO, operator `hand_off`;
+  - on the new path the switch refuses wills, persistent sessions and expiry, rather than handling them locally (§7);
+  - ADR-0008:125 is updated in the same change.
+- **7c:** sessions, expiry and will through the log; the refusals then go.
+- **Gate:** D-72 is resolved (accepted with its floors or raised) before 7a makes the switch reachable.
+- **Cost:** M + L.
+- **Risks:** an experimental mode in the server with a narrower MQTT surface.
+- **Check:** node and e2e tests; the sims for 7c.
+
+### B. Step 7 whole, as ADR-0008 words it
+- **What we do:** the same refusal statement applies if the wiring lands before sessions.
+- **Cost:** L–XL, one long task.
+
+### C. Port D-28 C1–C4 to new-path simulation invariants first
+- **What we do:** D-75 condition 2, independent of step 7.
+- **Cost:** M.
+
+**Recommendation.** A, after D-79. D-72 is the gate on making 7a reachable.
+
+**Answer:** `D-78: A` · `D-78: B` · `D-78: C` · `D-78: discuss`
+````
+
+````markdown
+## D-72. D-70 A's takeover-rate criterion
+
+**Context.** D-70 A's done criterion asks for "at least one takeover per hundred steps".
+
+Measured over 10 000 seeds each:
+- cluster simulation: 45 533 takeovers in 15 M steps, 0.30 per hundred;
+- apply simulation: about 0.24;
+- MQTT simulation: about 0.26.
+
+Biasing crashes and partitions toward the sequencer raised the cluster simulation only to 0.32. Faults are a few percent of all events, so the rate follows how often faults happen at all.
+**Why now.** Step 5 is recorded in ADR-0008 as "criterion not met" until this is decided.
+**Vision.** unified-stream §1 (correctness is shown by simulation), §5 (takeover scenarios); D-70 A.
+
+### A. Accept the measured rate, amending D-70 A — recommended
+- **What we do:** amend D-70 A in log.md to read "takeovers counted, about 0.25–0.3 per hundred steps; over a 10 000-seed sweep at least 40 000 in the cluster simulation, 30 000 in the apply simulation and 35 000 slot takeovers in the MQTT simulation", and update ADR-0008's criterion line. No code changes.
+- **Result:** the criterion matches what the runs show. A 10 000-seed sweep already holds tens of thousands of takeovers, 14 042 cuts, and 677 compactions during a takeover.
+- **Cost:** S (documentation).
+- **Risks:** takeovers are a smaller share of each run than the card intended. They are deeply tested by the takeover simulation (100 000 seeds, about 690 000 takeovers).
+- **Invariants:** none.
+- **Reversibility:** easy.
+- **Check:** log.md and ADR-0008 agree.
+- **Fact / hypothesis:** It is a fact that the measured rates are as above.
+
+### B. Raise it to one per hundred
+- **What we do:** a fault mode per seed (one seed in three crash-heavy, with sequencer crashes and partitions about 4× as frequent), in all three simulations; assert the rate in the summary.
+- **Result:** the criterion is met on the fault-heavy seeds and on average.
+- **Cost:** M.
+- **Risks:** fewer commits, deliveries and compactions per run. The cluster simulation already lost about 27% of its commits to a smaller bias. Default runs may need more seeds.
+- **Invariants:** none.
+- **Reversibility:** easy.
+- **Check:** `STRAUM_SIM_SEEDS=10000`, all three simulations, with a rate assertion.
+- **Fact / hypothesis:** It is a hypothesis that 4× is enough.
+
+**Comparison**
+
+| | A | B |
+|---|---|---|
+| Fit with vision | evidence already in the sweep | the card's number met |
+| Risk to invariants | none | none |
+| Cost | S | M |
+| Reversibility | easy | easy |
+
+**Recommendation.** A. The criterion was a proxy for "takeover under compaction and gateways is exercised". The sweeps show that is the case in tens of thousands of takeovers, and B buys the number by checking less of everything else. Choose B if you want the per-run rate itself as a gate.
+**What would change it.** A bug found later that only fault-heavy runs would have caught.
+**Rejected.** none.
+
+**Answer:** `D-72: A` · `D-72: B` · `D-72: discuss` · `D-72: defer`
+````
+
+````markdown
+## D-80. The takeover-rate criterion after D-72 B was measured
+
+**Context.** D-72 B, sequencer faults about 4× as frequent in one seed in three, did not reach one takeover per hundred steps. In the cluster simulation over 1 000 seeds:
+- fault-heavy seeds reached 0.40, 0.40 and 0.42 at 4, 8 and 16 faults per hundred events, against 0.36 without;
+- making time pass faster lowered the rate (0.20, then 0.09), because heartbeats displace the deliveries and syncs a takeover needs.
+
+A takeover needs about a hundred events or more: silence, a durable promise, a majority's answers, a catch-up, then `SlotStart` made durable and committed. The rate per step is therefore bounded by protocol round trips, not by how often faults happen. The mode was reverted; the simulation now prints its rate (0.34). Option A is D-72 A, which you did not choose; it is offered again because B was measured.
+**Why now.** D-78 A gates step 7a on this: the server switch becomes reachable only once the criterion is settled.
+**Vision.** unified-stream §1 (correctness shown by simulation), §5 (the takeover scenarios); D-70 A.
+
+### A. Accept the measured rate as the criterion — recommended
+- **What we do:** amend D-70 A to "takeovers counted; over a 10 000-seed sweep at least 40 000 in the cluster simulation, 30 000 in the apply simulation and 35 000 in the MQTT simulation", as D-72 A had it. Each simulation asserts its floor scaled to the seeds run, and ADR-0008's "criterion not met" goes.
+- **Result:** the gate checks what the runs actually do. Re-measured on the current code (2026-10-09, 10 000 seeds): cluster 51 272, apply 36 139, MQTT 39 059. The takeover simulation adds 91 743 per 20 000 seeds (the step-6 sweep).
+- **Cost:** S, a floor assertion in three simulations plus docs.
+- **Risks:** none new.
+- **Invariants:** none; it is a coverage gate.
+- **Reversibility:** easy.
+- **Check:** the three 10 000-seed sweeps with their floors.
+- **Fact / hypothesis:** fact (the counts above).
+
+### B. Count per fault cycle instead of per step
+- **What we do:** in one seed in three, a "cycle" crashes or cuts off the sequencer, then runs events until a new slot commits or a bound is reached. The criterion becomes "a takeover follows at least 9 in 10 sequencer faults within the bound".
+- **Result:** it measures the property directly, as liveness after a fault.
+- **Cost:** M.
+- **Risks:** those seeds interleave less while the cycle runs.
+- **Invariants:** none; liveness only, with no time-based safety.
+- **Reversibility:** easy.
+- **Check:** a rate assertion per cycle.
+- **Fact / hypothesis:** It is a hypothesis that 9 in 10 holds. Partitions and dead successors legitimately delay a takeover.
+
+### C. Drop the per-step rate and keep the deviation documented
+- **What we do:** D-70 A loses its rate criterion. ADR-0008 keeps the measured counts, and the takeover simulation stays the main evidence. Nothing is asserted.
+- **Result:** no gate. 7a goes ahead on the evidence as it stands.
+- **Cost:** XS.
+- **Risks:** a regression that removes takeovers from the three simulations would go unnoticed.
+
+**Comparison**
+
+| | A | B | C |
+|---|---|---|---|
+| Gate | floors per sweep | liveness per fault | none |
+| Cost | S | M | XS |
+| Risk | none new | fewer interleavings in those seeds | silent regression |
+
+**Recommendation.** A. The per-step number cannot be reached without changing what a step is, and every takeover scenario §5 lists is already exercised tens of thousands of times. Choose B if you want liveness after a fault as a gate of its own.
+**Rejected.**
+- Raising the share of heartbeats: measured to lower the rate.
+
+**Answer:** `D-80: A` · `D-80: B` · `D-80: discuss`
+````
+
+````markdown
+## D-81. Takeover liveness after a sequencer fault
+
+**Context.** D-80 B was measured in the cluster simulation, 1 000 seeds: share of fault cycles in which a later slot commits within the bound.
+
+| Bound (events) | Other faults running | Faults paused during the cycle |
+|---|---|---|
+| 600 | 4% | 50% |
+| 2 000 | 9% | 75% |
+| 6 000 | 20% | 86% |
+
+9 in 10 is not met, so it was not turned on as a gate (log: D-80 Outcome).
+- In quiet failed cycles every node is up, and slots keep advancing while nothing commits.
+- The longest log holds an uncommitted tail of hundreds of records, and a candidate fetches it one batch (`max_batch` = 4) per round trip. Whether that is the cause is not established.
+- Keeping followers from counting silence while a candidate catches up did not help (53%).
+- About 14% of quiet cycles fail even at 6 000 events.
+
+"Faults paused" is my reading of D-80 B; the card did not say which other faults run during a cycle. Neither unified-stream §5 nor ADR-0008 defines a bound for liveness after a fault, so which bound counts is your choice.
+**Why now.** D-78 A gates step 7a on D-72/D-80, and how long failover takes is what a cluster user sees first.
+**Vision.** unified-stream §1 (liveness through the log; time only triggers), §5; D-70 A.
+
+### A. Find and fix why a takeover stalls, then gate it — recommended
+- **What we do:**
+  1. confirm the rates on 10 000 seeds;
+  2. trace the quiet failed cycles to a cause, starting with the unexplained 14%;
+  3. make catch-up fetch up to a byte bound per round trip instead of one batch (a configured limit, CLAUDE.md §8);
+  4. gate the cycle rate at 9 in 10 within 2 000 events, on the cycles where a majority stays up. The near-unbounded uncommitted tail stays in the seeds that run it today: capping it would pass the gate by testing less.
+- **Cost:** M–L.
+- **Risks:** catch-up is on the takeover path, so every sweep reruns.
+- **Invariants:** 1, 2, 3, 6 are unchanged; this is liveness only.
+- **Reversibility:** the wire change is pre-release.
+- **Check:** the cycle measurement at 10 000 seeds, all sweeps, the node takeover test.
+- **Fact / hypothesis:** It is a hypothesis that batch-at-a-time catch-up explains most of it.
+
+### B. Gate at the measured level, investigate later
+- **What we do:**
+  - confirm on 10 000 seeds, then assert a regression floor on cycles where a majority stays up, set below the 10 000-seed rate by its seed-to-seed spread;
+  - this amends D-80's 9 in 10 and is recorded as a deviation in ADR-0008; a card follows to investigate.
+- **Cost:** S.
+- **Risks:** it records a weak property as the standard.
+
+### C. Count floors, no liveness gate
+- **What we do:** assert takeover counts per sweep. This is D-80 A, which you turned down in D-72 and D-80, offered again because D-80 B was measured short.
+- **Cost:** S.
+- **Risks:** a failover that is slow or stalls stays invisible.
+
+**Comparison**
+
+| | A | B | C |
+|---|---|---|---|
+| What is gated | liveness, after fixing it | today's liveness | coverage only |
+| Cost | M–L | S | S |
+| Risk | the takeover path changes | weak standard | blind to stalls |
+
+**Recommendation.** A. The measurement found a weakness, not a test artefact. Choose B to unblock 7a sooner, with the weakness on record.
+
+**Answer:** `D-81: A` · `D-81: B` · `D-81: C` · `D-81: discuss`
+````
+
+````markdown
+## D-82. Failover with no bound on the uncommitted tail
+
+**Context.** D-81 A's gate, a later slot committing within 2 000 events after 9 in 10 sequencer faults, holds at 93.5% only with both seed groups pooled:
+- with `max_uncommitted` bounded to 4–16, 98.4%;
+- with no bound (1 000 000), 87.7%, below 9 in 10. This is recorded as a deviation in ADR-0008.
+
+Failover correlates with the uncommitted tail a new sequencer must move. The mechanism behind the remaining unbounded-group failures is not traced.
+**Why now.** D-78 A gates step 7a on this criterion, and a server with no tail bound would fail over slower than the gate says.
+**Vision.** unified-stream §1 (liveness through the log), §5; D-81 A.
+
+### A. Bound the tail by default and gate per group — recommended
+- **What we do:**
+  - give `max_uncommitted` a default chosen for failover as well as memory, measured as the largest tail that keeps 9 in 10;
+  - gate each group on its own;
+  - keep the unbounded seeds for coverage, gated at 9 in 10 as well once they run under the new default. Seeds still unbounded for coverage are gated only at their measured level; for that group alone, this amends D-81 A and brings back D-81 B.
+- **Cost:** S–M.
+- **Risks:** a tighter bound makes proposals wait sooner under a slow majority.
+- **Invariants:** none.
+- **Reversibility:** a default.
+- **Check:** a sweep over tail bounds, and the gate per group.
+- **Fact / hypothesis:** It is a hypothesis that one default serves both memory and failover.
+
+### B. Trace the unbounded failures first
+- **What we do:** find what holds the remaining 12.3%, then decide between A and a protocol change.
+- **Cost:** M.
+- **Risks:** it may end in A anyway.
+
+### C. Accept the pooled gate
+- **What we do:** record that the unbounded group is gated only as part of the pool.
+- **Cost:** XS.
+- **Risks:** a regression in long-tail failover hides behind the bounded group.
+
+**Recommendation.** A. The measurement says the bound is the lever, and a default is needed for step 7a anyway.
+
+**Answer:** `D-82: A` · `D-82: B` · `D-82: C` · `D-82: discuss`
+````
+
+````markdown
+## D-83. A default for `read_bytes`
+
+**Context.** `NodeConfig.read_bytes`, the bytes one catch-up or fetch read moves per round trip (D-81 A), has no default; the node tests use 64 KiB. It is clamped to half of `max_frame`, and a batch larger than that alone still goes out whole. Step 7a brings configuration from the environment and needs a default.
+**Vision.** CLAUDE.md §8 (every limit has a default and an owner); docs/configuration.md.
+
+### A. 64 KiB default with an env var, in 7a — recommended
+- **What we do:** `STRAUM_READ_BYTES`, default 64 KiB, checked at startup against `max_frame` and the largest batch.
+- **Cost:** S, within 7a.
+- **Risks:** low.
+- **Check:** startup refuses a value above `max_frame / 2`. That replaces today's silent clamp (`crates/node/src/lib.rs`), a change of behaviour. It also closes the remaining gap: a single batch larger than the frame.
+
+### B. Derive it from `max_frame`
+- **What we do:** half of `max_frame`, no setting of its own.
+- **Cost:** XS.
+- **Risks:** catch-up and frame size become coupled for no measured reason.
+
+**Recommendation.** A.
+
+**Answer:** `D-83: A` · `D-83: B` · `D-83: discuss`
+````
+
+````markdown
+## D-84. The default for `max_uncommitted`: 64 or 96, and what it costs
+
+**Context.** D-82 A asked for "the largest tail measured to keep 9 in 10".
+
+| Tail (records) | Faults followed by a commit within 2 000 events (10 000 seeds) |
+|---|---|
+| 64 | 94.1% |
+| 96 | 91.1% |
+| 128 | 89.1% |
+| 256 and above | 87.7%, the same as no bound |
+
+The largest that keeps 9 in 10 is therefore 96. I shipped 64 instead, for margin, because 96 failed a default-run sample (28 of 32 cycles). That departs from the decision as worded (log: D-82 Outcome).
+- Both numbers are in records and simulation events, not time on a host.
+- A tail of 64 also caps what a sequencer has in flight: about 64 records per commit round trip. The node tests run with 4096.
+- `node` uses the default only once step 7a reads configuration.
+
+The gate for the group with no bound is 85%, the measured 87.1% less its spread.
+**Why now.** Step 7a makes this constant the server's default.
+**Vision.** CLAUDE.md §11 (no limit chosen without a measurement on Linux); unified-stream §1 (predictability before peak speed). unified-stream does not say whether a liveness criterion measured in simulation may set a production limit on its own; your answer here decides it.
+
+### A. Measure on Linux, then choose by a stated target — recommended
+- **What we do:** three nodes on a Linux host.
+  - Measure publish throughput and failover time (kill the sequencer, time to the next commit) at `max_uncommitted` 64, 96, 128, 256, 1024 and 4096.
+  - Choose the default by this target: 9 in 10 failovers commit within a stated time, proposed as 1 s, at the highest throughput that meets it.
+  - Record both curves in docs/baselines/; 64 stays in the simulation's default group until then.
+- **Cost:** M, plus one Linux host for about an hour.
+- **Risks:** none to correctness.
+- **Check:** a baseline file with both curves and the chosen point.
+- **Fact / hypothesis:** It is a hypothesis that 64 costs throughput on a real link.
+
+### B. Take 64 into 7a as is
+- **What we do:** the simulation's number with margin becomes the default; revisit it if it limits throughput.
+- **Cost:** XS.
+- **Risks:** a pipeline depth chosen by simulation events.
+
+### C. 96, the decision as worded
+- **What we do:** the largest that passes (91.1%) becomes the default; the default run keeps skipping the gate.
+- **Cost:** XS.
+- **Risks:** a thin margin, 1.1 points over 9 in 10.
+
+### D. 4096, as the node tests use
+- **What we do:** keep throughput. This reverses D-82 A and amends D-81 A for the shipped configuration: the shipped default would sit where the simulation measures 87.7%, outside the per-group gate.
+- **Cost:** XS.
+- **Risks:** shipped failover is below the criterion.
+
+**Recommendation.** A. A host is the only place both costs show, and the choice is a trade between them.
+
+**Answer:** `D-84: A` · `D-84: B` · `D-84: C` · `D-84: D` · `D-84: discuss`
+````
+
+````markdown
+## D-85. What bounds failover time: a replica that falls behind
+
+**Context.** D-84 A's benchmark (`crates/node/benches/cap.rs`) ran only in the Linux container, so its numbers are preliminary (docs/baselines/apple-m1-dev.md). The sequencer was stopped while the load ran, with an orderly shutdown; the lag is sampled just before the stop.
+
+| Cap | Failovers within 1 s | Largest survivor lag before the stop (records) |
+|---|---|---|
+| 64 | 6 of 10 | 58 175 |
+| 96 | 2 of 10 | 80 275 |
+| 128 | 7 of 10 | 26 910 |
+| 256 | 8 of 10 | 15 015 |
+| 1024 | 0 of 10 | 231 985 |
+| 4096 | 10 of 10 | 64 |
+
+A new slot commits only once the new majority holds the whole log. While the old sequencer lived, the slower replica was outside the majority that committed, and nothing kept it close. `max_uncommitted` bounds the tail past the commit point, not that lag. In the stuck states the new sequencer had written its `SlotStart` and was waiting for the other survivor. The simulation never showed this, because its replicas don't fall that far behind.
+
+Throughput also collapses at caps of 1024 and 4096 (16 k and 7 k against about 300 k), for a reason not found. unified-stream does not say whether a replica outside the committing majority may fall behind without bound.
+
+Update 2026-10-09, after the D-85 failover fixes (stale read answers, read routing, progress keepalives, patience, older-slot fetches; ADR-0008). In the same container: every failover commits again (max 8.6 s), and throughput rose to about 350–450 k at caps 64–256. But failovers within 1 s are 2, 7, 2, 5, 9 and 10 of 10 for caps 64, 96, 128, 256, 1024 and 4096, and the misses still go with a survivor 30 000–255 000 records behind. Eventual liveness is fixed; bounded failover time is not, and B is its lever. The collapse at caps of 1024 and up remains.
+**Why now.** D-84 A's target, 9 in 10 failovers within 1 s, may be unreachable by the cap alone, and step 7a is waiting on a default.
+**Vision.** unified-stream §1 (predictability before peak speed; time never decides), §2.3 (commit by majority); CLAUDE.md §11.
+
+### A. Repeat on a Linux host, then decide — recommended
+- **What we do:** run `cargo bench -p node --bench cap` on a quiet Linux host and record both curves and the lag. If the lag pattern holds, the next card is a lag bound (B). If it doesn't, the cap alone is chosen as D-84 A says.
+- **Cost:** about an hour of host time, plus S.
+- **Risks:** none.
+- **Fact / hypothesis:** It is a hypothesis that the container's pattern holds on a host.
+
+### B. Bound replica lag
+- **What we do:** the sequencer stops making batches while a replica it would need for a future majority is more than N records behind. A replica that is lost or needs a state copy (D-57 A, 7b) is excluded: counting it would stop batching for good, which would break liveness. N is a record count, never a time (§1), and comes from a Linux measurement, not this table. This changes the ADR-0008 sequencer protocol and needs an ADR entry. It is not runnable on today's preliminary evidence.
+- **Cost:** M, a protocol change with sweeps.
+- **Risks:** one slow disk slows the cluster. It trades throughput for failover time.
+- **Check:** the cap benchmark's lag column stays under N on the host; the simulations still pass.
+
+### C. Faster catch-up for the new majority partner
+- **What we do:** the new sequencer ships the lagging survivor's gap in larger reads before its `SlotStart` commits.
+- **Cost:** S–M, tied to `read_bytes` (D-83 A, step 7a).
+- **Risks:** it helps only if read or window size is the bottleneck, which nothing measured shows yet.
+- **Check:** failover time against lag on the host, before and after.
+
+### D. Investigate the throughput collapse at caps of 1024 and up
+- **What we do:** profile the 1024 and 4096 runs (on the host if possible) to find why throughput drops about 20×. It decides the throughput half of D-84 A independently of lag.
+- **Cost:** S–M.
+- **Risks:** none.
+
+### E. Do nothing now
+- **What we do:** keep 64 as the simulation's default group only, with no node default, and go on with step 7a; revisit when a host is available.
+- **Cost:** XS.
+- **Risks:** step 7a ships with whatever `max_uncommitted` its configuration is given.
+
+**Recommendation.** A, then D on the same host. Two of the three effects are unexplained and come from a container; a host settles which is real before a protocol change.
+
+**Answer:** `D-85: A` · `D-85: B` · `D-85: C` · `D-85: D` · `D-85: E` · `D-85: discuss`
+````
+
+````markdown
+## D-86. The cap on takeover patience
+
+**Context.** D-85's fix for takeovers taking turns for ever doubles a node's wait for silence after each takeover it starts that does not end in a commit (`patience`). The cap is 64×, back to 1 once the commit point moves. Two consequences, recorded in ADR-0008's liveness contract:
+- eventual progress is guaranteed only while a takeover's round trips fit within `takeover_ticks × 64` heartbeats;
+- after a run of failed takeovers, a dead sequencer may be passed over only after up to `takeover_ticks × 64` heartbeats per turn. At 50 ms and 3 ticks that is 9.6 s, until a commit resets it.
+
+Neither is measured on a host. The simulation needs the doubling: without it, seed 643 churns through 3520 slots, and 3000 seeds take 2826 s instead of 8.
+**Vision.** unified-stream §1 (time only triggers; predictability before peak speed).
+
+### A. Keep 64, measure on the Linux host with D-85 A — recommended
+- **What we do:** add to the cap benchmark a run of repeated failovers (kill the new sequencer each time), and record the worst failover time with patience grown. Revisit 64 if it exceeds the target.
+- **Cost:** S, with D-85 A's host hour.
+- **Risks:** none now.
+
+### B. Derive the cap from a measured worst round trip
+- **What we do:** cap = the measured worst takeover time on the host ÷ (`takeover_ticks` × heartbeat), with margin; make it a setting.
+- **Cost:** S–M after the host run.
+- **Risks:** one more setting to choose.
+
+### C. Grow by a fixed step instead of doubling
+- **What we do:** add one `takeover_ticks` per failed takeover, up to a cap.
+- **Cost:** S plus sweeps.
+- **Risks:** slower to outgrow a long round trip; how many failed takeovers that costs is unmeasured.
+
+**Recommendation.** A.
+
+**Answer:** `D-86: A` · `D-86: B` · `D-86: C` · `D-86: discuss`
+````
+
+````markdown
+## D-87. Fault cycles that need a state copy (2.8% of cycles)
+
+**Context.** The cluster simulation classifies 504 of 18 438 fault cycles (10 000 seeds) as "needs a state copy". A replica was lost past the byte bound, which is 1000 bytes in this simulation, and no majority able to catch up remained. These cycles are outside the liveness guarantee until step 7b (state copy) exists. They are reported, not counted as recovered. The guard against hiding a stall behind a loss (`LOSS_GRACE`) is described in ADR-0008.
+**Vision.** D-57 A; ADR-0008 step 7b (D-60 A); D-85.
+
+### A. Rerun the liveness sweep with a realistic retention bound — recommended
+- **What we do:** a seed group with `RETAIN_BYTES` at a production-like multiple of the uncommitted tail, to show how many cycles need a state copy once the bound is not tiny.
+- **Cost:** S.
+- **Risks:** fewer losses means less coverage of the loss paths in that group; the 1000-byte groups stay as they are.
+
+### B. Bring step 7b forward
+- **What we do:** build state copy before 7a/7c, so these cycles become recoverable and are gated too.
+- **Cost:** M–L.
+- **Risks:** it reorders ADR-0008 (D-78 A).
+
+### C. Leave it classified
+- **What we do:** nothing until 7b comes in its turn.
+- **Cost:** XS.
+- **Risks:** 2.8% of fault cycles stay outside the claim.
+
+**Recommendation.** A. It tells whether the 2.8% is the simulation's tiny bound or a real share.
+
+**Answer:** `D-87: A` · `D-87: B` · `D-87: C` · `D-87: discuss`
+````
+
+````markdown
+## D-88. Patience grown during a partition slows recovery after it
+
+**Context.** D-86 A asked whether the 64× patience turns repeated failed takeovers into long unavailability once the network recovers. In the cluster simulation over 3000 seeds it does, in the tail. Rounds (heartbeats) from healing to the first commit, by the highest patience among the nodes at that moment:
+
+| Patience | Runs | p50 | max |
+|---|---|---|---|
+| 1–8× | 2 926 | 2–8 | 66–188 |
+| 16× | 39 | 17 | 300 |
+| 32× | 3 | 383 | 389 |
+| 64× | 32 | 2 | 1 790 |
+
+1790 heartbeats is about 90 s at 50 ms. Patience doubles after every takeover a node starts by silence that does not commit, including takeovers that fail because no majority is reachable at all (a partition). The doubling was meant for takeovers that reach a majority but are too slow to finish.
+**Why now.** D-86 A treats the 64× wait as a known risk; this shows it applies after every long partition.
+**Vision.** unified-stream §1 (time only triggers; predictability before peak speed); D-85, D-86.
+
+### A. Grow patience only for a takeover that got a majority's promises — recommended
+- **What we do:** the doubling happens when a takeover reaches the catch-up stage (`decide`, a majority promised), not when it starts. A takeover that never hears from a majority leaves patience as it was.
+- **Cost:** S plus all sweeps and the regression seeds (4 and 643 must still recover).
+- **Risks:** a takeover that loses its majority right after `decide` still doubles; partitions that flap at that point are untested.
+- **Check:** the healing table above, with the 16–64× tail gone; every regression seed passes; the cluster sweep (10 000 seeds), the takeover sweep (20 000), and the apply and MQTT sweeps (10 000).
+- **Fact / hypothesis:** It is a hypothesis that the livelock seeds all reach `decide`.
+
+### B. Reset patience when the node hears from the slot's owner or a majority
+- **What we do:** any append, or promises from a majority, resets patience to 1, as a commit does.
+- **Cost:** S.
+- **Risks:** a livelock between nodes that do hear each other could reset patience before it outgrows the round trip.
+
+### C. Keep it, measure on the Linux host (D-86 A as is)
+- **Cost:** XS now.
+- **Risks:** up to about 90 s to recover after a long partition, in the tail.
+
+### D. Lower the cap (D-86 B or C, with this data)
+- **What we do:** for example 8×: the tail above is all at 16× and higher, where at most 188 rounds were seen.
+- **Cost:** S plus sweeps.
+- **Risks:** a cap too low brings back takers-in-turn livelocks whose round trips need more (seeds 4 and 643 are the check).
+
+**Recommendation.** A; D if A's hypothesis fails.
+
+**Answer:** `D-88: A` · `D-88: B` · `D-88: C` · `D-88: D` · `D-88: discuss`
+````
+
+````markdown
+## D-89. The replica-lag invariants for D-85 B
+
+**Context.** D-85 B is the direction, to be implemented only once what it bounds is defined and it is shown that flow control cannot block majority progress. ADR-0008 now has a draft ("D-85 B: bounding replica lag"):
+- the bounded measure is the **lag** `C − D_r`, the commit point minus a replica's durable position;
+- **L1:** safety is untouched;
+- **L2:** commit of records already appended is never held; only new batches may wait, and only for *attached* replicas. A replica whose lag stays above `L` for `T` heartbeats detaches, so new appends wait at most `T` heartbeats;
+- **L3:** an attached replica's catch-up is bounded by `L` records;
+- **L4:** with one survivor detached and the other failing, failover is bounded only by retention and 7b;
+- proof obligations (a)–(c).
+
+Your condition was "never block commit for an available majority". L2 reads it as: commit is never held, and new appends may wait up to `T` heartbeats. That reading is yours to confirm.
+**Vision.** D-85 (conditions); unified-stream §1, §2.3; D-57 A.
+
+### A1. Accept L1–L4 and write proof (a) as an argument — recommended first
+- **What we do:** confirm L2's reading; write in ADR-0008 the argument that the hold rule names only attached replicas, and that detachment is a pure function of lag and heartbeats, so no available majority waits more than `T` for an append. No code.
+- **Cost:** S.
+
+### A2. Implement, with simulation proof (b) — only after A1
+- **What we do:** attach/detach and the hold rule, then two properties in the cluster simulation: no stall, and no available majority waiting more than `T` heartbeats for a batch. Then (c) on Linux sets `L` and `T`.
+- **Cost:** M, plus the host.
+- **Risks:** throughput limited by the slowest attached replica; L2's bound is the guard.
+
+### B. Revise the draft first
+- **What we do:** for example bound `E − D_r`, or detach on catch-up room `D_r − F` rather than on time.
+- **Cost:** S.
+
+### C. Wait for the Linux measurement before any design
+- **Cost:** XS now.
+- **Risks:** the design stays open.
+
+**Recommendation.** A1, then A2.
+
+**Answer:** `D-89: A1` · `D-89: A1+A2` · `D-89: B` · `D-89: C` · `D-89: discuss`
+````
+
+````markdown
+## D-90. Cycles still progressing at the cap ("slow")
+
+**Context.** The cluster simulation's eventual-liveness check stops a cycle at 500 000 events. One cycle in the 10 000-seed sweep (seed 8956) is still getting further there. It is in the group with no uncommitted bound: its sequencer appends faster than the only replica it can commit with catches up. It commits at about 1 300 000 events (an ignored test reruns it with `STRAUM_SIM_STALL_CAP=5000000`, about two minutes). The test treats such a cycle as "slow", allowed only in that group and only for the known seed: any other fails the sweep. That allowance was decided inside the test; it is yours to confirm.
+**Vision.** D-85 (eventual liveness); D-82 A (`max_uncommitted` bounds failover).
+
+### A. Allow slow cycles only without an uncommitted bound, listed by seed — as now, recommended
+- **What we do:** keep the allowance; every new slow seed fails the sweep until it is shown to commit with the cap raised and added to the list.
+- **Cost:** none.
+
+### B. No allowance: a raised cap in the sweep
+- **What we do:** the 10 000-seed sweep runs with a 5 000 000-event cap, so seed 8956 must commit within it.
+- **Cost:** S. The sweep takes a few minutes longer.
+
+### C. Drop the uncapped group's appends during cycles
+- **What we do:** the simulation stops proposing to a sequencer that cannot commit.
+- **Risks:** it tests less of what an uncapped tail does.
+
+**Recommendation.** A. Choose B if a slow cycle should never pass a gate.
+
+**Answer:** `D-90: A` · `D-90: B` · `D-90: C` · `D-90: discuss`
+````
+
+````markdown
+## D-91. What retention bound is realistic for the new path
+
+**Context.** D-87 A's rerun used 100 000 bytes, which I chose: about 1400 of this simulation's records. It found no state-copy cycles. The old path's documented default is 64 MiB (`STRAUM_WAL_RETAIN_BYTES`); `node` has no default for `retain_bytes`. The figure matters for how many failovers end in a state copy, and it comes to the server with step 7a's configuration.
+**Vision.** D-57 A; D-87 A; configuration.md.
+
+### A. Default 64 MiB, like the old path, in 7a — recommended
+- **What we do:** set the node default to 64 MiB, and keep the simulation's 100 000 bytes as "realistic" there (records are tiny).
+- **Cost:** XS now, S in 7a.
+
+### B. Derive it from `max_uncommitted` × a record size × a factor
+- **Cost:** S.
+- **Risks:** a derived default nobody can read off.
+
+**Recommendation.** A.
+
+**Answer:** `D-91: A` · `D-91: B` · `D-91: discuss`
+````
+
+````markdown
+## D-92. The promise round no longer gets a longer wait (a consequence of D-88 A)
+
+**Context.** Under D-88 A patience doubles only after a takeover a majority promised. A takeover whose promise round itself is slower than the wait is passed over and the wait does not grow, so the liveness contract in ADR-0008 now asks that the promise round fit `takeover_ticks` heartbeats once in a while (the remaining round trips still get up to 64×). In 10 000 seeds nothing stalls and seeds 4 and 643 recover, but the group with the default bound (64) is at 90.4% within 2 000 events against the 90% gate (91.0% before D-88 A): a 0.4-point margin.
+**Why now.** The contract is narrower than before; that is yours to accept.
+**Vision.** unified-stream §1 (time only triggers); D-85 (liveness contract); D-88 A.
+
+### A. Accept the narrower contract as written — recommended
+- **What we do:** nothing; the contract states it, the sweeps check it.
+- **Cost:** none.
+- **Risks:** a network whose promise round always exceeds `takeover_ticks` never takes over; the 0.4-point margin on group 64 may go under the gate with other changes.
+- **Check:** every sweep keeps "no stall" and the 90% gate.
+
+### B. Also double after a takeover that heard a promise besides its own that was not enough for a majority
+- **What we do:** evidence of slow round trips, not of a partition, also grows patience.
+- **Cost:** S.
+- **Risks:** with three voters it never applies — one other promise already is a majority — so it changes nothing in the simulation or a three-node cluster; it only matters at five voters or more.
+
+### C. Reset patience on hearing a majority (D-88 B)
+- **What we do:** revive D-88 B: grow at every takeover, reset when a majority is heard.
+- **Cost:** S.
+- **Risks:** only with new evidence that A stalls or falls under the gate; D-88 B was not chosen.
+
+**Recommendation.** A. C if a sweep shows A stalling or under 90%.
+
+**Answer:** `D-92: A` · `D-92: B` · `D-92: C` · `D-92: discuss`
+````
+
+````markdown
+## D-93. Flow control is rarely exercised in the simulation
+
+**Context.** With flow control on in half of each bounded seed group, 10 000 seeds produce 64 held heartbeats in 21 stretches between batches. The rules are covered by unit tests, each failing without its rule, and the simulation's check catches a broken R2 (seed 57), but holds and detachments under faults are rare.
+**Vision.** D-89 A2; unified-stream §7 (correctness by deterministic simulation).
+
+### A. Add a "slow replica" fault to the cluster simulation — recommended
+- **What we do:** a replica whose writes and syncs lag for a while, so attached replicas fall behind by more than `L` often; the same checks (no stall, held fewer than `T` heartbeats per batch, every safety invariant).
+- **Cost:** S–M, plus a sweep.
+- **Risks:** it shifts the seed schedules; the gates are rechecked.
+
+### B. Leave it
+- **Cost:** none.
+- **Risks:** interactions between detachment and takeovers stay rare in the simulation.
+
+**Recommendation.** A, before `lag_bound` is turned on anywhere.
+
+**Answer:** `D-93: A` · `D-93: B` · `D-93: discuss`
+````
+
+````markdown
+## D-94. A Linux host for step 6 (D-84 A; D-89: `L`, `T`, the cap)
+
+**Context.** Step 6 of your order — Linux benchmarks and production settings — needs a quiet Linux host; none is available here. The cap bench (`node/benches/cap.rs`) is ready; flow control can be measured off and on once `node` sets `lag_bound`.
+**Vision.** CLAUDE.md §11, §13 (accepted numbers come from a quiet Linux host); D-84 A.
+
+### A. You provide a quiet Linux host (ssh); I run the cap bench with flow control off and on — recommended
+- **Cost:** M, your host time.
+
+### B. A cloud VM
+- **Risks:** noisier; its numbers are preliminary and cannot set `L`, `T` or the cap.
+
+### C. Defer
+- **Risks:** no production settings, no bounded-failover claim.
+
+**Recommendation.** A.
+
+**Answer:** `D-94: A` · `D-94: B` · `D-94: C` · `D-94: discuss`
+````
+
+````markdown
+## D-95. A short test of the takeover-during-catch-up race
+
+**Context.** D-90 B asked for a short regression test of the mechanism behind the long cycles. `without_an_uncommitted_bound_a_new_slot_must_first_cover_the_whole_tail` shows one half: a new slot commits only once a replica holds everything to its first record. The other half — a takeover during the catch-up moves that first record further on, while the sequencer keeps appending — is shown only by the sweeps and the ignored test.
+**Vision.** D-90 B (conditions).
+
+### A. A `Voter`-level test of the race — recommended
+- **What we do:** a sequencer with a long uncommitted tail, a replica catching up, a takeover by the next owner before it finishes; assert the new slot's `SlotStart` lies past the old target and commit waits for it.
+- **Cost:** S–M.
+
+### B. Pin the shortest simulation seed that shows it
+- **What we do:** seed 2212 (about 210 000 events), release only, ignored.
+- **Cost:** XS.
+- **Risks:** not short; schedules shift with any change.
+
+**Recommendation.** A.
+
+**Answer:** `D-95: A` · `D-95: B` · `D-95: discuss`
+````
+
+````markdown
+## D-96. Step 7a while there is no Linux host
+
+**Context.** Flow control is built and off by default (`lag_bound: None`); `max_uncommitted` and `retain_bytes` have starting defaults (64, 64 MiB) that are not measured optima. Step 7a (configuration from the environment) can proceed with them or wait.
+**Vision.** ADR-0008 step plan; D-84 A, D-91 A.
+
+### A. Proceed to 7a with flow control off; `L`, `T` and the cap chosen once measured — recommended
+- **Cost:** none now.
+- **Risks:** 7a's defaults are provisional, as documented.
+
+### B. Wait for the Linux host before 7a
+- **Risks:** the rewrite stalls on hardware.
+
+**Recommendation.** A.
+
+**Answer:** `D-96: A` · `D-96: B` · `D-96: discuss`
+````
+
+````markdown
+## D-97. One sweep that did not finish within an hour
+
+**Context.** One 10 000-seed run of the cluster simulation with flow control on did not finish within an hour and was stopped by its time limit. A 50 000 000-cap sweep was running beside it. Every later run of the same and later code finished in 197–219 s, and per-seed progress showed no seed hanging. The cause is not identified. Under D-90 B an unexplained non-termination should not be left open.
+**Vision.** D-90 B; D-85.
+
+### A. Reproduce or exclude it — recommended
+- **What we do:** rerun the configuration of that run (flow control on, `records: seed % 8`, before the R4 count fix) alone and beside a 50M sweep, with per-seed wall-clock and event counts, until it reproduces or contention is shown.
+- **Cost:** S, about an hour of machine time.
+
+### B. Record it as contention
+- **Risks:** a real hang in that code version would go unexamined (that version's R4 counted per hold, since fixed).
+
+**Recommendation.** A.
+
+**Answer:** `D-97: A` · `D-97: B` · `D-97: discuss`
+````
+
+````markdown
+## D-98. A replica with a slow disk starts takeovers it cannot finish
+
+**Context.** Found by D-93's scenario (ADR-0008, "A takeover finding"). The trigger is a replica whose promise of the newer slot is not durable yet:
+- it treats that slot's appends as a reason to promise, not as a heartbeat (`Voter::on_append` resets silence only when following);
+- on a slow disk it therefore counts silence while the sequencer is talking to it;
+- it starts takeovers of its own that it cannot finish, and its patience stays at 1, because no majority ever answers them (D-88 A);
+- when one of its promises finally lands, it can depose a healthy sequencer.
+
+With 95 of 100 writes deferred, takeovers roughly tripled (145–200 a run against 35–53 with no slow disk). The count was the same with flow control off and under the old patience rule, so neither caused it. Safety holds throughout; availability and throughput suffer.
+**Why now.** A slow disk on one replica is an ordinary production fault, and this happens with flow control off — so also in 7a as D-96 configures it. Whether 7a waits for it is D-101.
+**Vision.** unified-stream §1 (time only triggers; predictability before peak speed); D-85 liveness contract; D-88 A.
+
+### A. Count an append from the owner of a newer slot as being heard — recommended
+- **What we do:** in `on_append`, an append from the owner of a slot above the one promised resets silence while the promise of that slot is being made durable. The node is then neither silent nor ignoring the sequencer it is about to follow.
+- **Cost:** S. A unit test, the slow-replica scenario at `takeover_ticks` 3, and every sweep.
+- **Risks:** silence is reset by a sequencer this node has not promised yet; safety does not depend on silence (time only triggers).
+- **Check:** the slow-replica scenario at the base timing (3 heartbeats, rotation on), compared with the same runs without a slow disk: takeovers per run within that baseline (35–53 in the measurement, against 145–200 now), the commit point moving after each detach, and no takeover started by the slow replica itself. Not zero takeovers: at this timing the simulation takes over about every 300 events with no fault (D-99).
+- **Fact / hypothesis:** It is a hypothesis that this alone removes the churn.
+
+### B. A pre-vote: a takeover asks first whether a majority still hears the sequencer
+- **What we do:** a takeover starts only if a majority reports silence too. Silence still only triggers; the promises still decide (§1).
+- **Cost:** M; a new message and round trip.
+- **Risks:** a longer failover; a new liveness argument to write.
+
+### C. Leave it; document that a slow disk can depose a healthy sequencer
+- **Cost:** none.
+- **Risks:** churn in production on one slow disk; 7a then ships with a known availability fault, which D-96 asks to state rather than present as ready.
+
+**Recommendation.** A. B if A's check does not bring takeovers back to the baseline.
+
+**Answer:** `D-98: A` · `D-98: B` · `D-98: C` · `D-98: discuss`
+````
+
+````markdown
+## D-99. The simulation's base timing takes over every ~300 events with no fault
+
+**Context.** With `takeover_ticks` 3 and the simulation's random delivery, a slot is taken over about every 300 events even in calm periods: several times in a 3 000-event window (D-93's scenario, ADR-0008). Every new slot starts with all replicas detached (R1), so flow control rarely runs long enough to act. The slow-replica test therefore uses 30 heartbeats and no rotation. The main sweep keeps 3: that churn is part of what it checks.
+**Vision.** unified-stream §7 (correctness by deterministic simulation); D-89 A2.
+
+### A. Keep 3 in the main sweep; give D-93's scenario its own steady setting (as now) — recommended
+- **Cost:** none.
+- **Risks:** flow control under heavy churn is covered only by the main sweep, where it rarely acts.
+
+### B. Add a seed group with a longer `takeover_ticks`
+- **What we do:** for example 10 heartbeats, so flow control and long slots meet faults more often.
+- **Cost:** S. The group shifts the seed schedules; the gates are re-checked.
+
+**Recommendation.** A; B if D-98 A lands and the sweep should cover it at a realistic timing.
+
+**Answer:** `D-99: A` · `D-99: B` · `D-99: discuss`
+````
+
+````markdown
+## D-100. A detached replica may never re-attach under sustained load
+
+**Context.** In D-93's scenario, after the slow disk recovers and under the same load, the detached replica is caught up from the log at about the rate the sequencer appends:
+- it closed the gap in only 74 of 800 windows;
+- its lag held at up to 550 records (p50 295);
+- R2 attaches only at lag 0, so it stays detached until the load drops, and keeps no bounded failover meanwhile (condition 5);
+- with a slower catch-up it would fall behind until retention passes it and it needs a state copy, the D-85 concern.
+
+L2 forbids holding appends for a detached replica, so flow control cannot close the gap.
+**Vision.** D-85 (bounded lag: backpressure or an explicit move to a state copy, never at the majority's cost); D-89 A1 (R2, Lemma 2); D-57 A.
+
+### A. Attach at lag ≤ `L − U` instead of 0 (`U` = `max_uncommitted + max_batch`, the floor `L` is already raised to) — recommended once flow control is to be turned on
+- **What we do:** generalise Lemma 2. A replica attached at lag ≤ `L − U` cannot pass `L` before the next batch, since within a hold its lag grows by less than `E − C < U`. A larger `L` widens the re-attach window. R4 then detaches those above `L − U`. A replica trailing within `L − U` is counted again, and its failover bound restored.
+- **Cost:** S, plus the proof's update in ADR-0008 and the slow-replica scenario with a re-attach under load.
+- **Risks:** a larger attached lag bound, `L + U`, which is what condition 5's bound already says.
+- **Note:** it changes R2, part of D-89 A1's accepted proof, so it re-opens D-89 A1 (Lemma 2 and conditions 2 and 6), gated by the cluster and takeover sweeps. Irrelevant while `lag_bound` is `None` (D-96).
+- **Check:** the scenario's "gap closed under load" turns into "re-attached under load" in most windows.
+
+### B. Catch a detached replica up faster
+- **What we do:** a larger read for a replica that is detached, so its catch-up outruns the appends.
+- **Cost:** S–M; read sizes are D-81 A and D-83 A's.
+- **Risks:** more I/O on the sequencer while it serves; the size comes from Linux.
+
+### C. Defer until flow control is to be turned on — recommended now
+- **What we do:** nothing now. Under D-96 flow control is off in 7a, so attachment does not run there; decide when `lag_bound` is first set.
+- **Cost:** none.
+
+### D. Accept it: a detached replica rejoins when the load allows, or moves to a state copy past retention
+- **Cost:** none.
+- **Risks:** under sustained load, bounded failover is held by the other replica alone.
+
+**Recommendation.** C now; A when flow control is to be turned on, then B measured on Linux if the gap still does not close.
+
+**Answer:** `D-100: A` · `D-100: B` · `D-100: C` · `D-100: D` · `D-100: discuss`
+````
+
+````markdown
+## D-101. Does 7a wait for D-98?
+
+**Context.** D-96 lets 7a continue once D-92, D-93, D-95 and D-97 are closed. D-93 is closed with the slow-replica test at 30 heartbeats and no rotation:
+- every window: the slow replica detached at `T` by the settled sequencer, the commit point moving after that detach, the replica never lost, rejoining when the load pauses.
+
+At the base timing (3 heartbeats) majority progress is not shown, because a slow disk deposes healthy sequencers (D-98). That happens with flow control on or off, so it applies to 7a as configured (`lag_bound: None`). `node` has no default `takeover_ticks` yet; 3 is the simulation's.
+**Vision.** D-96 (conditions); unified-stream §1 (predictability before peak speed).
+
+### A. 7a waits for D-98 A, gated by its check — recommended
+- **What we do:** D-98 first; 7a once D-98 A's check holds at the base timing: takeovers per run within the no-slow-disk baseline, the commit point moving after each detach, no takeover started by the slow replica.
+- **Cost:** S before 7a.
+- **Risks:** 7a later by that much.
+
+### B. 7a waits for D-98 A only; the base-timing measurement lands with it
+- **What we do:** the fix gates 7a; the slow-replica scenario at the base timing is added as a reported comparison against the baseline, not as a pass condition, since the simulation's own churn (D-99) may keep any strict condition out of reach.
+- **Risks:** the fix's effect is reported, not enforced.
+
+### C. 7a in parallel; D-98 tracked as a known availability fault
+- **What we do:** 7a with `lag_bound: None`; the server documents that one slow disk can cause takeover churn until D-98 lands.
+- **Risks:** an experimental server with a known liveness fault under an ordinary disk problem.
+
+**Recommendation.** A.
+
+**Answer:** `D-101: A` · `D-101: B` · `D-101: C` · `D-101: discuss`
+````
+
+````markdown
+## D-102. D-101 reassessed: start 7a now?
+
+**Context.** D-101 A held 7a until D-98's check passes at the standard timing. It now does (ADR-0008, "D-98 A"):
+- **Takeovers:** those started by silence with a slow disk are back at the fast-disk level (−6% over 100 seeds, +3% over 20; +47% before).
+- **The slowed replica:** wins fewer takeovers than on a fast disk.
+- **Commit:** it moved after every detach.
+- **Durability:** nothing is appended, acknowledged or committed on the strength of a sign of life.
+- **A dead sequencer:** is still taken over.
+- **Every sweep:** passes.
+
+One residue: the slowed replica still *starts* more takeovers than on a fast disk (2 492 against 1 520). A takeover it began legitimately in the base churn stays pending on its slow promise, and it moves on to later slots without finishing any; it wins none of them. An append from the current slot's owner does not reset silence while this node is itself taking over.
+One reading to confirm: condition 2 ("the number of takeovers returns to the level") is met for the cluster total; the takeovers the slowed replica itself starts are still +64%. The ADR reads it as the total.
+**Vision.** D-101 A; D-96 (7a with `lag_bound: None`, flow control off, unverified settings not presented as production-ready).
+
+### A. Start 7a with flow control off — recommended
+- **What we do:** step 7a as D-96 configures it, still labelled not production-ready. The D-98 gate (`a_slow_disk_adds_no_takeovers_at_the_standard_timing`) stays ignored in the debug run and is run explicitly in release with the sweeps.
+- **Cost:** the step itself.
+- **Risks:** the residue above, measured as harmless in the simulation only.
+
+### B. First also reset silence when the current slot's owner is heard during a takeover of this node's own
+- **What we do:** stop the futile moves on to later slots; the pending takeover itself still completes when its promise is durable.
+- **Accepted when:** the D-98 gate still passes; the slowed replica's own starts fall towards the fast-disk level; a dead sequencer is still taken over while this node's own takeover is pending (a unit test like the D-98 ones).
+- **Cost:** S.
+- **Risks:** it changes when silence counts during this node's own takeover, the liveness-critical path (D-85, D-88 patience).
+
+### C. Wait for the Linux host (D-94)
+- **Risks:** 7a stalls on hardware; nothing here depends on it.
+
+**Recommendation.** A; B only if a host measurement shows the residue costing anything.
+
+**Answer:** `D-102: A` · `D-102: B` · `D-102: C` · `D-102: discuss`
+````
+
+````markdown
+## D-103. How the server reaches the new path (7a)
+
+**Context.** 7a lets `server` start a node on the new path behind an experimental switch (D-78 A, D-102 A).
+- **Where the new path lives:** in `node` (links, sequencer or replica, the log on disk, the gateway over TCP; `publish = false`). It depends on `apply`, `cluster`, `gateway`, `journal`, `storage` and `transport`.
+- **What the boundaries allow:** `server` may depend on `runtime` only (CLAUDE.md §2, enforced by `scripts/check-boundaries.sh`). `runtime` is the old path's driver.
+
+Wiring the switch therefore changes the dependency table, which is a decision, not a detail (CLAUDE.md §17: no silent changes). D-78 A's precondition holds: D-72 was settled by D-80 B (liveness per fault cycle, not a rate), made concrete by D-81 A and D-82 A.
+**Vision.** CLAUDE.md §2 (enforced boundaries); D-49 A (the new crates beside the old path until step 8); D-75 (old path frozen).
+
+### A. `server` depends on `node` directly — recommended
+- **What we do:**
+  - the table gains `server → node`, and `check-boundaries.sh` follows;
+  - `server`'s config parses the switch and builds a `node::NodeConfig`;
+  - `runtime` and the frozen old path stay untouched.
+- **Cost:** S for the dependency and the table; the configuration is D-104.
+- **Risks:**
+  - `server` links two drivers until step 8;
+  - `node` stays `publish = false`, which is fine for a binary.
+- **Check:** `check-boundaries.sh`; a server test that starts in each mode.
+
+### B. A new binary for the new path
+- **What we do:** a separate `straum-node` binary beside `straum-server` until step 8, then folded into the server; no dependency change for `server`.
+- **Benefit:** the experimental path is not reachable from the production binary at all, which fits D-102 A's "not production-ready".
+- **Cost:** M (a second binary: its config, signals, packaging).
+- **Risks:**
+  - two binaries to operate;
+  - step 8 must merge them again.
+
+**Recommendation.** A. B if the experimental path should not be reachable from the production binary at all.
+
+**Rejected.** `runtime` depends on `node` and offers the switch: it adds a feature to the frozen old path's crate (D-75 allows bug fixes only).
+
+**Answer:** `D-103: A` · `D-103: B` · `D-103: discuss`
+````
+
+````markdown
+## D-104. The new path's configuration surface and defaults (7a)
+
+**Context.** `node::NodeConfig` is built by tests today. 7a reads it from the environment with startup checks (ADR-0006, D-68 A). Decided already:
+- `read_bytes` 64 KiB, checked against `max_frame` and the largest batch (D-83 A);
+- `retain_bytes` 64 MiB (D-91 A);
+- `max_uncommitted` 64 (D-82 A, D-84);
+- `lag_bound` off and not configurable in 7a (D-102 A).
+
+Undecided:
+- **The switch and membership:** how a node learns its id, its peers' link addresses and the first slot's owner.
+- **The timing:**
+  - `heartbeat` and `takeover_ticks` have no measured defaults;
+  - the tests and the simulation use 50 ms and 3, and the simulation shows 3 heartbeats churns under random delivery (D-99);
+  - none of it is measured on a real network (D-94 C).
+**Vision.** ADR-0006 (startup checks); CLAUDE.md §8 (every limit with a default and an owner in configuration.md); D-102 A (5: no unmeasured production claims).
+
+### A. Explicit env, timing defaults marked experimental — recommended
+- **What we do:**
+  - the switch is `STRAUM_EXPERIMENTAL_CLUSTER=1`, plus names of its own, so none takes on an old-path meaning (`STRAUM_WAL_RETAIN_BYTES` and `STRAUM_WAL_PATH` keep theirs):
+    - `STRAUM_CLUSTER_NODE_ID`;
+    - `STRAUM_CLUSTER_PEERS` (`id=host:port,…`, own id included);
+    - `STRAUM_CLUSTER_LISTEN`;
+    - `STRAUM_CLUSTER_DATA_DIR`;
+    - `STRAUM_CLUSTER_RETAIN_BYTES` (64 MiB) and D-83 A's `STRAUM_READ_BYTES` (64 KiB);
+  - timing: `STRAUM_CLUSTER_HEARTBEAT_MS` default 50 and `STRAUM_CLUSTER_TAKEOVER_TICKS` default 3. These are placeholders — the values the tests use — not recommendations; no cap and no failover claim before Linux (D-102 A, condition 5);
+  - startup refuses an id not in the peers, `read_bytes` over the frame, and a data directory holding another cluster's promise;
+  - part of this choice, not decided before: refuse fewer than three voters, and an even count (a majority of an even count tolerates no more failures than one fewer node);
+  - the switch refuses wills, persistent sessions and expiry at CONNECT, rather than handling them locally (D-78 A).
+- **Cost:** M (parsing, checks, their tests, configuration.md).
+- **Risks:** the 3-heartbeat default churns in the simulation; on a real network that is unmeasured.
+
+### B. No timing defaults: both required
+- **What we do:** as A, but `STRAUM_HEARTBEAT_MS` and `STRAUM_TAKEOVER_TICKS` must be set, or the node refuses to start.
+- **Cost:** as A.
+- **Risks:** none new. Every operator picks a value with no measurement to guide it.
+
+### C. A more conservative timing default
+- **What we do:** as A, with `takeover_ticks` 10 (about 500 ms of silence at 50 ms).
+- **Cost:** as A.
+- **Risks:** a slower failover; still unmeasured, and the simulation's main sweep keeps 3 (D-99 A).
+
+**Recommendation.** A. B if no number should look like a recommendation before Linux.
+
+**Answer:** `D-104: A` · `D-104: B` · `D-104: C` · `D-104: discuss`
+````
+
+````markdown
+## D-105. How an operator hands the slot over (7a)
+
+**Context.**
+- **What exists:** `cluster::Voter::hand_off` (step 6, `SlotEnd` and the successor schedule) is reachable only from tests. `node::Node` has no command for it.
+- **What D-78 A asks:** an operator `hand_off` in 7a.
+- **Precedent:** the server already handles SIGTERM and Ctrl-C (`#[cfg(unix)]` in `main.rs`), and has a hand-written HTTP listener for metrics (`STRAUM_METRICS_ADDR`).
+**Vision.** unified-stream §2.4 (planned handoff); CLAUDE.md §13 (platform code); ADR-0008 step 6.
+
+### A. A signal: SIGUSR1 asks the node to hand its slot over — recommended
+- **What we do:**
+  - `node::Node::hand_off()`, called on SIGUSR1;
+  - on a node that is not sequencing it is logged and ignored;
+  - unix only, as SIGTERM is.
+- **Cost:** S.
+- **Risks:**
+  - no reply to the operator except the log and the status;
+  - Windows is not a target.
+
+### B. An HTTP request on the metrics listener
+- **What we do:** `POST /hand-off` on `STRAUM_METRICS_ADDR`, answered with the outcome.
+- **Cost:** S–M.
+- **Risks:** the metrics listener becomes able to change state. It has no authentication today, so it needs a separate switch or address.
+
+### C. Not in 7a: rotation (`rotate_every`) only
+- **What we do:** leave the operator command for later; `STRAUM_CLUSTER_ROTATE_EVERY` exposes step 6's optional rotation. This amends D-78 A, which lists the command as part of 7a, and is recorded as an amendment.
+- **Cost:** XS.
+- **Risks:** D-78 A asked for the command; no way to move the sequencer off a host on demand.
+
+**Recommendation.** A.
+
+**Answer:** `D-105: A` · `D-105: B` · `D-105: C` · `D-105: discuss`
+````
+
+````markdown
+## D-106. An automated end-to-end test of the server in cluster mode
+
+**Context.** 7a is wired and checked piece by piece:
+- `node` tests drive `Node` directly;
+- the server's configuration is unit-tested;
+- a manual smoke run on loopback passed: three server processes, a QoS 1 publish across nodes, an operator handoff, refused CONNECTs, clean shutdown (ADR-0008, "Step 7a").
+
+Nothing automated starts the server binary in this mode. D-102 A says 7a is not complete until the new server path passes its correctness checks. The rules allow the MQTT client `rumqttc` only in the e2e and node tests (CLAUDE.md §2).
+**Vision.** D-102 A (transition criterion); CLAUDE.md §2 (dev-dependencies), §17.
+
+### A. A server integration test with a hand-written MQTT client — recommended
+- **What we do:**
+  - a test in `crates/server/tests/` starts three `straum-server` processes (`CARGO_BIN_EXE_straum-server`) in cluster mode on loopback;
+  - it speaks MQTT 3.1.1 with a few hand-encoded packets (CONNECT, SUBSCRIBE, PUBLISH QoS 1), as the smoke run did;
+  - it checks: delivery across nodes; a handoff by SIGUSR1 while delivery goes on; a will and a CleanSession=0 refused; a restart over the same data; SIGTERM.
+- **Cost:** M.
+- **Risks:** a hand-written client covers only what it encodes; process and port handling in tests.
+- **Check:** in every `cargo test`, unix only, as SIGUSR1 is.
+
+### B. The same, with `rumqttc` as a dev-dependency of `server`
+- **What we do:** as A, with the full client already used by `node`'s tests.
+- **Cost:** M; a change to §2's list of allowed dev-dependencies.
+- **Risks:** a second crate pulls the client in.
+
+### C. Defer to after 7c
+- **What we do:** keep the manual smoke run until sessions and wills are in the log, then test once.
+- **Cost:** none now.
+- **Risks:** 7a's wiring stays unguarded against regressions until then. Under D-102 A, 7a stays incomplete until such a test exists: C defers the step's completion too.
+
+**Recommendation.** A.
+
+**Answer:** `D-106: A` · `D-106: B` · `D-106: C` · `D-106: discuss`
+````
+
+````markdown
+## D-107. Credentials and TLS on the new path
+
+**Context.** In the experimental cluster mode:
+- MQTT clients connect without credentials or TLS: `node` has no `auth`, and the server refuses `STRAUM_TLS_*` and `STRAUM_AUTH_*` there rather than ignore them;
+- the links between nodes are plain TCP, protected only by the frame version and the configuration digest, which are not authentication.
+
+Anyone who can reach the ports can publish, subscribe, or join the link protocol with a guessed digest.
+**Vision.** CLAUDE.md scope (TLS optional); D-102 A (experimental, not production-ready); ADR-0008 "Not yet in step 4" (credentials not checked).
+
+### A. Client credentials and TLS before 7a counts as complete — recommended
+- **Amends D-102 A:** it adds a completion criterion D-78 A and D-102 A do not contain.
+- **What we do:**
+  - `node` checks CONNECT credentials with the `auth` crate (password file, ACL) as the broker does;
+  - TLS for clients over `transport`, which already has it;
+  - links between nodes stay plain, documented as trusted-network only.
+- **Cost:** M.
+- **Risks:** `node` gains `auth`. An ACL refusal at the gateway decides nothing in shared state: it filters input before it reaches the log (§1).
+
+### B. A and authenticated links (mutual TLS between nodes)
+- **Cost:** L.
+- **Risks:** certificate handling for every node.
+
+### C. Loopback by default until credentials exist
+- **What we do:** `STRAUM_CLUSTER_MQTT_LISTEN` defaults to `127.0.0.1:1883` instead of every interface; reaching it from elsewhere needs an explicit address. A change of default, so a decision.
+- **Cost:** XS.
+- **Risks:** a multi-host trial must set the address, knowingly unauthenticated.
+
+### D. Keep it experimental and trusted-network only until step 8
+- **What we do:** document it, and log a warning at startup (as now).
+- **Cost:** XS.
+- **Risks:** an unauthenticated `0.0.0.0:1883` stays the default.
+
+**Recommendation.** C now (XS), then A; B before any production claim.
+
+**Answer:** `D-107: A` · `D-107: B` · `D-107: C` · `D-107: D` · `D-107: discuss`
+````
+
+````markdown
+## D-108. Node tests that pick ports by binding and releasing them
+
+**Context.** One validation run in the Linux container failed two node tests that pass everywhere else: `a_node_with_other_limits_is_refused_and_the_others_go_on` and `a_restarted_sequencer_resumes_where_its_log_ends`, both at a node's start. Three reruns in the container and every host run passed.
+- **The suspected cause, not proven:** the tests' `free_port()` binds port 0, reads the number and releases it before the node binds it, so a test running in parallel can take the port first. Two more cluster tests in that file make it likelier.
+- **The cause is not confirmed:** the failing run kept no error text.
+**Vision.** CLAUDE.md §17 (failure paths tested; no flaky gate).
+
+### A. Bind first, then tell the peers
+- **What we do:** each node binds port 0 itself (`Node::start` already reports `listen`); the test starts the nodes, then gives each its peers' real addresses.
+- **Cost:** S–M; `NodeConfig.peers` must then be set after binding, so a small change to how tests start a cluster.
+- **Risks:** none for production; the server takes fixed ports.
+
+### B. Keep the error, then decide — recommended
+- **What we do:** make the tests print `Node::start`'s error instead of `unwrap`, run the node test binary in the container in a loop (for example 20 times) to try to reproduce it, and look at the error.
+- **Cost:** XS.
+- **Risks:** waiting for a rare failure.
+
+**Recommendation.** B now (XS), A if the error shows a port in use.
+
+**Answer:** `D-108: A` · `D-108: B` · `D-108: discuss`
+````

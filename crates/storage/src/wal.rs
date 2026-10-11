@@ -498,6 +498,11 @@ fn scan(
     if !ready(header.sequence.saturating_add(1)) {
         return Ok(Recovery::default());
     }
+    // No further than the file ended when the walk began. A reader of a log
+    // that is being appended to — catch-up — read on until `read` came back
+    // empty, and under load chased the writer's tail without ever finishing
+    // (D-76: the Linux container, `replication_matrix` test 41).
+    let mut file = Read::by_ref(file).take(length.saturating_sub(header_len()));
 
     let mut buf: Vec<u8> = Vec::with_capacity(
         SCAN_WINDOW.saturating_add(limits.max_record_bytes.saturating_add(record::HEADER_BYTES)),
@@ -545,7 +550,7 @@ fn scan(
                 start = 0;
                 let before = buf.len();
                 buf.resize(before.saturating_add(SCAN_WINDOW), 0);
-                let filled = read_some(file, &mut buf, before)?;
+                let filled = read_some(&mut file, &mut buf, before)?;
                 buf.truncate(before.saturating_add(filled));
                 if filled == 0 {
                     exhausted = true;

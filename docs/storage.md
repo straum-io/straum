@@ -1,5 +1,7 @@
 # Durable Storage
 
+> **Partly current.** The log described here (`storage::Wal`: records, group commit, recovery, compaction) is what each segment of the new path's log is (`storage::Segments`, ADR-0008). The durability levels (`memory`, `written`, `fsynced`, `quorum`) and the `STRAUM_WAL_*` settings belonged to the old broker, removed at step 8 (D-111): the new path acknowledges once a majority holds a record durably.
+
 > **Target: docs/architecture/unified-stream.md §3** — a segmented WAL, compaction
 > that never truncates a segment somebody reads (refcount), versioned records
 > with a properties section (§2.7, ADR-0003), and `(slot, lsn, prev_hash)` on
@@ -29,6 +31,7 @@ updated in the same change.
 | §4 makes the broker a single synchronous task that must never block. `sync_data()` blocks for milliseconds. | The WAL never runs inside `Broker::handle`. It owns a dedicated thread, and its completions enter the broker loop as events. This is why the durable acknowledgement is a second entry point rather than a return value. |
 | §2 gives every crate a layer. A WAL is neither transport (TCP only) nor broker (no I/O). | A new crate, `storage`. It does blocking file I/O and reads the clock to measure storage latency, both through its `Disk` boundary (§95); it owns no threads. |
 | §7 bounds memory globally. Recovery of a large log would read it whole. | Recovery scans in a window: memory is the window plus one record, never the log. |
+| A walk of a log someone appends to (catch-up) chased the tail and never finished (D-76). | Every walk ends where the file ended when it began (`Read::take` of the length at open); recovery and compaction walk files nobody appends to, so for them nothing changes. |
 | `DeliveryGuarantee` (`AtMostOnce`/`AtLeastOnce`) and `Durability` (`memory`/`written`/`fsynced`) both sound like "how safe is this message". | They are orthogonal axes and must never be conflated. Delivery guarantee is about redelivery to a subscriber; durability is about surviving a crash. MQTT 3.1.1 has no wire representation for the second, so it is configuration, not a protocol field. |
 
 ---

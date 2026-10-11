@@ -1,5 +1,7 @@
 # Straum: the current implementation
 
+> **History.** This document describes the old leader/follower broker, removed at step 8 on 2026-10-11 (D-111): the crates `broker`, `protocol`, `mqtt`, `replication`, `runtime` and `e2e` are gone, and its code is in git history (commit ffeda02 and earlier). What runs now is the cluster path of ADR-0008, documented in the ADR, `docs/configuration.md` and `docs/testing.md`. Kept as a record of what was built, measured and decided.
+
 What the code does today, as of 2026-10-04. The target is
 `docs/architecture/unified-stream.md`, which takes precedence wherever the
 two differ; ADR-0001 records the move. These sections were in `CLAUDE.md`

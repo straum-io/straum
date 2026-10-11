@@ -1,5 +1,7 @@
 # Replication
 
+> **History.** This document describes the old leader/follower broker, removed at step 8 on 2026-10-11 (D-111): the crates `broker`, `protocol`, `mqtt`, `replication`, `runtime` and `e2e` are gone, and its code is in git history (commit ffeda02 and earlier). What runs now is the cluster path of ADR-0008, documented in the ADR, `docs/configuration.md` and `docs/testing.md`. Kept as a record of what was built, measured and decided.
+
 > **Superseded as a target by docs/architecture/unified-stream.md §2.2–§2.6**
 > (slots and fencing with `(slot, lsn, prev_hash)`, commit by majority,
 > graceful and ungraceful handoff, membership, topology) and ADR-0001. This
@@ -712,6 +714,12 @@ smaller of the two, and with no later report the watermark never moved
 again (D-22, matrix row 39). Stopping at `local` keeps §112's order — durable
 here, then shipped — on the catch-up path as well as the live one, and
 `local` is a commit boundary, so no batch is split.
+
+The walk ends where the file ended when the walk began. It used to read until
+`read` came back empty, and catch-up reads the file the writer is appending
+to: under load it chased the tail and never finished, so the batch it held
+never went out, no write ever stalled, and a follower that stopped reading was
+never cut off (D-76, matrix row 41, in the Linux container).
 
 **What advances what.** On the follower, only the completed durability
 operation: the writer thread reports `commit.durable_sequence` after

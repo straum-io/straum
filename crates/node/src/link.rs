@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cluster::wire::{Frame, decode, encode};
+use cluster::wire::{Frame, WIRE_VERSION, decode, encode};
 use tokio::sync::mpsc;
 use transport::{BufferBudget, Listener, TransportConfig};
 
@@ -69,14 +69,14 @@ pub async fn dial(
     }
 }
 
-/// Accepts links from peers. A link opens with the sender's HELLO: an
-/// unknown node, another slot, or other `apply` limits is refused (their
-/// limits are part of what the log means).
+/// Accepts links from peers. A link opens with the sender's HELLO: another
+/// frame version, an unknown node, another slot, or another configuration
+/// digest — cluster parameters or `apply` limits — is refused.
 pub async fn listen(
     listener: Listener,
     nodes: Vec<u8>,
     slot: u64,
-    limits: u64,
+    config: u64,
     max_frame: usize,
     inbound: mpsc::Sender<Inbound>,
 ) {
@@ -90,7 +90,7 @@ pub async fn listen(
             let Ok(connection) = accepted.establish().await else {
                 return;
             };
-            read(connection.reader, nodes, slot, limits, max_frame, inbound).await;
+            read(connection.reader, nodes, slot, config, max_frame, inbound).await;
         });
     }
 }
@@ -99,7 +99,7 @@ async fn read(
     mut reader: transport::Reader,
     nodes: Vec<u8>,
     slot: u64,
-    limits: u64,
+    config: u64,
     max_frame: usize,
     inbound: mpsc::Sender<Inbound>,
 ) {
@@ -120,15 +120,25 @@ async fn read(
                 (
                     None,
                     Frame::Hello {
+                        version,
                         node,
                         slot: s,
-                        limits: l,
+                        config: c,
                     },
                 ) => {
-                    if !nodes.contains(&node) || s != slot || l != limits {
+                    if version != WIRE_VERSION {
                         tracing::error!(
                             node,
-                            "link refused: unknown node, another slot, or other apply limits"
+                            version,
+                            expected = WIRE_VERSION,
+                            "link refused: another frame version"
+                        );
+                        return;
+                    }
+                    if !nodes.contains(&node) || s != slot || c != config {
+                        tracing::error!(
+                            node,
+                            "link refused: unknown node, another slot, or another configuration (cluster parameters or apply limits)"
                         );
                         return;
                     }

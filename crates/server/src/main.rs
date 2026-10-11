@@ -1,20 +1,19 @@
-//! Composition root: read the environment, look at the kernel, wire it up,
-//! run until a signal says otherwise.
+//! Composition root: read the environment, start the node, run until a
+//! signal says otherwise. One path since step 8 (D-111): a node of the
+//! cluster path, experimental and not production-ready (D-102 A).
 
 mod config;
 
 use std::process::ExitCode;
 
 use config::{Settings, Source};
-use runtime::{Durability, KernelLimits, Runtime};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> ExitCode {
-    let kernel = KernelLimits::probe();
-    let settings = match Settings::parse(std::env::vars(), kernel) {
+    let settings = match Settings::parse(std::env::vars()) {
         Ok(settings) => settings,
         Err(error) => {
-            // Before tracing exists, and a misconfigured broker must not start.
+            // Before tracing exists, and a misconfigured node must not start.
             eprintln!("configuration error: {error}");
             return ExitCode::FAILURE;
         }
@@ -26,38 +25,79 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|_| EnvFilter::new(settings.log_level.clone())),
         )
         .init();
-
-    report(&settings, &kernel);
-
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder.enable_all();
-    if let Some(threads) = settings.worker_threads {
-        builder.worker_threads(threads);
+    tracing::warn!(
+        "EXPERIMENTAL cluster path (ADR-0008): not production-ready; flow control off; \
+         no credentials or TLS; wills, persistent sessions and session expiry are refused; \
+         timing defaults are placeholders, nothing is measured on Linux"
+    );
+    for (name, value, source) in &settings.effective {
+        let source = match source {
+            Source::Env => "env",
+            Source::Default => "default",
+        };
+        tracing::info!(%name, %value, %source, "setting");
     }
-    let tokio = match builder.build() {
+
+    let tokio = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(settings.worker_threads)
+        .build()
+    {
         Ok(tokio) => tokio,
         Err(error) => {
             tracing::error!(%error, "could not start the async runtime");
             return ExitCode::FAILURE;
         }
     };
-
-    tokio.block_on(run(settings))
+    tokio.block_on(run(settings.node))
 }
 
-async fn run(settings: Settings) -> ExitCode {
-    let broker = match Runtime::start(settings.runtime) {
-        Ok(broker) => broker,
+async fn run(config: node::NodeConfig) -> ExitCode {
+    let node = match node::Node::start(config).await {
+        Ok(node) => node,
         Err(error) => {
-            tracing::error!(%error, "could not start");
+            tracing::error!(%error, "could not start the node");
             return ExitCode::FAILURE;
         }
     };
-
-    signal().await;
+    tracing::info!(listen = %node.listen, mqtt = ?node.mqtt, "node started");
+    serve_hand_offs(&node).await;
     tracing::info!("stopping");
-    broker.shutdown().await;
+    node.shutdown().await;
     ExitCode::SUCCESS
+}
+
+/// Until Ctrl-C or TERM: each SIGUSR1 asks the node to hand its slot over —
+/// a protocol handoff, never an exit or a forced change of leader (D-105 A).
+async fn serve_hand_offs(node: &node::Node) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut user1 = match signal(SignalKind::user_defined1()) {
+            Ok(user1) => user1,
+            Err(error) => {
+                tracing::warn!(%error, "no SIGUSR1 handler; no operator handoff");
+                crate::signal().await;
+                return;
+            }
+        };
+        let stop = crate::signal();
+        tokio::pin!(stop);
+        loop {
+            tokio::select! {
+                () = &mut stop => return,
+                _ = user1.recv() => match node.hand_off().await {
+                    Ok(()) => tracing::info!("SIGUSR1: handing the slot over to the next owner"),
+                    Err(error) => tracing::warn!(%error, "SIGUSR1: no handoff"),
+                },
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = node;
+        crate::signal().await;
+    }
 }
 
 /// Ctrl-C, or the TERM a supervisor sends.
@@ -81,98 +121,5 @@ async fn signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
-/// One startup report: what the kernel says, what we resolved, and where the
-/// two disagree (docs/linux-tuning.md).
-fn report(settings: &Settings, kernel: &KernelLimits) {
-    match kernel.somaxconn {
-        Some(_) => tracing::info!(
-            somaxconn = ?kernel.somaxconn,
-            tcp_max_syn_backlog = ?kernel.max_syn_backlog,
-            rmem_max = ?kernel.rmem_max,
-            wmem_max = ?kernel.wmem_max,
-            open_files = ?kernel.open_files,
-            "kernel parameters"
-        ),
-        None => {
-            tracing::info!("kernel parameters unavailable on this platform; `auto` uses defaults")
-        }
-    }
-
-    for (name, value, source) in &settings.effective {
-        let source = match source {
-            Source::Env => "env",
-            Source::Default => "default",
-            Source::Kernel => "kernel",
-        };
-        tracing::info!(%name, %value, %source, "setting");
-    }
-
-    let transport = &settings.runtime.transport;
-    if let Some(somaxconn) = kernel.somaxconn {
-        if transport.backlog > somaxconn {
-            tracing::warn!(
-                backlog = transport.backlog,
-                somaxconn,
-                "the kernel will clamp the accept backlog"
-            );
-        }
-    }
-    if let Some(syn) = kernel.max_syn_backlog {
-        if transport.backlog > syn {
-            tracing::info!(
-                backlog = transport.backlog,
-                tcp_max_syn_backlog = syn,
-                "the SYN queue may overflow before the accept queue does"
-            );
-        }
-    }
-    if let Some(open_files) = kernel.open_files {
-        let needed = (transport.max_connections as u64).saturating_add(64);
-        if needed > open_files {
-            tracing::warn!(
-                max_connections = transport.max_connections,
-                open_files,
-                "accepts will fail with EMFILE before reaching the configured maximum"
-            );
-        }
-    }
-
-    // Accepted, documented, and not acted on yet: saying so is cheaper than
-    // letting somebody discover it in production.
-    for name in &settings.ignored {
-        tracing::warn!(
-            %name,
-            "set but not applicable on this platform; ignored so one env file works on both"
-        );
-    }
-    if settings.runtime.auth.passwords.is_empty() && settings.runtime.auth.allow_anonymous {
-        tracing::warn!(
-            "no credentials configured and anonymous access allowed: anybody who can \
-             reach this port may publish and subscribe to anything"
-        );
-    }
-    if settings.runtime.tls.is_none() {
-        tracing::warn!("no TLS: credentials and messages travel in the clear");
-    }
-    if settings.runtime.transport.listeners > 1 {
-        tracing::info!(
-            listeners = settings.runtime.transport.listeners,
-            "listening on several sockets; the kernel balances accepts across them"
-        );
-    }
-    match settings.runtime.durability {
-        Durability::Memory => tracing::warn!(
-            "durability is memory: an acknowledged message is lost if this process dies"
-        ),
-        durability => tracing::info!(
-            ?durability,
-            path = %settings.runtime.wal.path.display(),
-            queue = settings.runtime.wal.queue,
-            max_batch_bytes = settings.runtime.wal.limits.max_batch_bytes,
-            "writing to the log; nothing is acknowledged before its record is durable"
-        ),
     }
 }

@@ -1,5 +1,7 @@
 # Baselines
 
+> **History.** The baselines recorded here are of the old broker (removed at step 8, D-111) unless a section says otherwise; the new path has no Linux baseline yet.
+
 One file per benchmark machine: `docs/baselines/<machine-id>.md`.
 
 Each entry records a commit hash, the environment block from

@@ -9,9 +9,10 @@ use journal::Kind;
 fn frames() -> Vec<Frame> {
     vec![
         Frame::Hello {
+            version: cluster::wire::WIRE_VERSION,
             node: 2,
             slot: 1,
-            limits: 0xdead_beef,
+            config: 0xdead_beef,
         },
         Frame::Message(Message::Append {
             slot: 1,
@@ -33,6 +34,7 @@ fn frames() -> Vec<Frame> {
             end: 10,
             durable: 8,
             cut: false,
+            report: 0,
         }),
         Frame::Forward(Proposal {
             kind: Kind::Publish,
@@ -52,6 +54,7 @@ fn frames() -> Vec<Frame> {
         }),
         Frame::Message(Message::Fetched {
             slot: 7,
+            asked_slot: 4,
             asked: 60,
             after: 60,
             after_slot: 4,
@@ -119,7 +122,7 @@ fn malformed_frames_are_refused() {
     assert_eq!(decode(&frame(&append), 1 << 20), Err(WireError::Truncated));
     // An ACK with a byte too many.
     let mut ack = vec![3];
-    ack.extend_from_slice(&[0; 34]);
+    ack.extend_from_slice(&[0; 42]);
     assert_eq!(decode(&frame(&ack), 1 << 20), Err(WireError::Trailing));
     // A FORWARD of a kind no version knows.
     assert_eq!(

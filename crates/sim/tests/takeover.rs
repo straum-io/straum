@@ -1,5 +1,8 @@
-//! Ungraceful takeover (ADR-0008 step 5; unified-stream §2.4, §5): three
-//! `cluster::Voter`s on in-memory logs, with crashes, power losses, a
+//! Ungraceful takeover and planned handoff (ADR-0008 steps 5 and 6;
+//! unified-stream §2.4, §5): three `cluster::Voter`s on in-memory logs, with
+//! sequencers handing their slots over at random — a crash can fall before,
+//! during and after `SlotEnd`, and a `SlotEnd` can be written and never
+//! committed — crashes, power losses, a
 //! promise made durable by a node that dies before it answers, partitions
 //! that leave a sequencer writing alone, lost and reordered messages, and
 //! log cuts and reads that a crash can fall between.
@@ -15,6 +18,9 @@
 //! 6. no sequencer of slot k raises the commit point once a majority has
 //!    durably promised a slot above k.
 //!
+//! And 2a, a `SlotEnd` closes its slot: nothing of slot k follows slot k's
+//! `SlotEnd` in the committed log.
+//!
 //! Each run ends healed: every node up, nothing lost, and a sequencer must
 //! emerge, commit new records, and every node must reach the same log.
 //!
@@ -25,10 +31,13 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use cluster::{Config, Effect, Message, Proposal, Voter};
-use journal::{BatchHeader, Chain, Kind, Verifier, decode};
+use journal::{Chain, Kind, Verifier, decode};
 
 const NODES: u8 = 3;
 const STEPS: u64 = 3000;
+/// Bytes one read of the log hands back at most, or one batch if that
+/// alone is larger (D-81 A).
+const READ_BYTES: usize = 4096;
 
 fn seeds() -> std::ops::Range<u64> {
     match std::env::var("STRAUM_SIM_SEED")
@@ -73,6 +82,7 @@ fn config(id: u8) -> Config {
         recent_batches: 4,
         max_uncommitted: 64,
         takeover_ticks: 3,
+        lag_bound: None,
     }
 }
 
@@ -90,7 +100,7 @@ struct Node {
     report_durable: bool,
     report_promise: Option<u64>,
     truncate: Option<u64>,
-    reads: VecDeque<(u8, u64)>,
+    reads: VecDeque<(u8, u64, u64)>,
     /// The commit point up to which this node's log was checked.
     checked: u64,
 }
@@ -104,6 +114,15 @@ struct Stats {
     power_losses: u64,
     promises_unanswered: u64,
     cut_below_commit: u64,
+    /// `hand_off` accepted, and slots led without anyone asking for a
+    /// promise of them: taken over by a committed `SlotEnd`.
+    handoffs: u64,
+    slot_ends: u64,
+    /// Unified-stream §5: a `SlotEnd` written and never committed, and a
+    /// node crashing with one in its log not yet committed.
+    slot_ends_lost: u64,
+    crashes_with_slot_end: u64,
+    handed_over: u64,
 }
 
 struct World {
@@ -124,6 +143,11 @@ struct World {
     /// commit (invariant 6).
     fences: BTreeMap<u64, u64>,
     next_body: u64,
+    /// Slots someone asked promises of, and slots whose `SlotEnd` committed.
+    asked: std::collections::BTreeSet<u64>,
+    ended: std::collections::BTreeSet<u64>,
+    /// Slots whose `SlotEnd` some node appended.
+    written: std::collections::BTreeSet<u64>,
     stats: Stats,
 }
 
@@ -163,6 +187,9 @@ impl World {
             leaders: BTreeMap::new(),
             fences: BTreeMap::new(),
             next_body: 0,
+            asked: Default::default(),
+            ended: Default::default(),
+            written: Default::default(),
             stats: Stats::default(),
         };
         for id in 0..NODES {
@@ -210,7 +237,9 @@ impl World {
         node.truncate = None;
         node.reads.clear();
         node.checked = 0;
-        node.voter = Some(Voter::new(config(id), tail.chain, slots, node.promised));
+        node.voter = Some(
+            Voter::new(config(id), tail.chain, slots, node.promised).incarnation(node.incarnation),
+        );
     }
 
     fn crash(&mut self, id: u8, power: bool) {
@@ -219,6 +248,14 @@ impl World {
         if node.report_promise.is_some() {
             self.stats.promises_unanswered += 1;
         }
+        let pending_end = node.records.iter().any(|record| {
+            let r = decode(record).unwrap();
+            r.kind == Kind::SlotEnd && !self.ended.contains(&r.slot)
+        });
+        if pending_end {
+            self.stats.crashes_with_slot_end += 1;
+        }
+        let node = &mut self.nodes[usize::from(id)];
         node.voter = None;
         if power {
             node.records.truncate(node.durable);
@@ -252,6 +289,9 @@ impl World {
                 None => {
                     self.leaders.insert(slot, me);
                     self.stats.takeovers += 1;
+                    if !self.asked.contains(&slot) {
+                        self.stats.handed_over += 1;
+                    }
                 }
             }
         }
@@ -284,10 +324,26 @@ impl World {
                         "node {id}: append at {first}, its log ends at {have}"
                     ));
                 }
+                for record in &records {
+                    let r = decode(record).unwrap();
+                    if r.kind == Kind::SlotEnd {
+                        self.written.insert(r.slot);
+                    }
+                }
+                let node = &mut self.nodes[usize::from(id)];
                 node.records.extend(records);
             }
-            Effect::Send { to, message } => self.network.push((id, to, message)),
-            Effect::Read { to, from } => self.nodes[usize::from(id)].reads.push_back((to, from)),
+            Effect::Send { to, message } => {
+                if let Message::Promise { slot } = message {
+                    self.asked.insert(slot);
+                }
+                self.network.push((id, to, message));
+            }
+            Effect::Read { to, from, upto } => {
+                self.nodes[usize::from(id)]
+                    .reads
+                    .push_back((to, from, upto));
+            }
             Effect::Committed(lsn) => self.committed(id, lsn),
             Effect::Promise { slot } => {
                 let node = &mut self.nodes[usize::from(id)];
@@ -365,6 +421,21 @@ impl World {
             }
             for at in self.commit + 1..=lsn {
                 let record = node.records[usize::try_from(at - 1).unwrap()].clone();
+                // Invariant 2a: a `SlotEnd` closes its slot.
+                let r = decode(&record).unwrap();
+                if self.ended.contains(&r.slot) {
+                    self.fail(&format!(
+                        "committed lsn {at} is in slot {}, after that slot's SlotEnd",
+                        r.slot
+                    ));
+                }
+                if r.kind == Kind::SlotEnd {
+                    self.ended.insert(r.slot);
+                    self.stats.slot_ends += 1;
+                    if std::env::var_os("STRAUM_SIM_TRACE").is_some() {
+                        eprintln!("{} SlotEnd of slot {} committed at {at}", self.step, r.slot);
+                    }
+                }
                 self.oracle.insert(at, record);
             }
             self.commit = lsn;
@@ -464,7 +535,28 @@ impl World {
         let Some(after) = node.truncate.take() else {
             return;
         };
+        // To the last batch boundary at or below `after`, as the node's
+        // WAL thread cuts.
+        let mut after = after;
+        while after > 0
+            && decode(&node.records[usize::try_from(after).unwrap()])
+                .unwrap()
+                .kind
+                != Kind::BatchHeader
+        {
+            after -= 1;
+        }
         let after_index = usize::try_from(after).unwrap();
+        // Invariant 1, on the cut as made.
+        if let Some(index) = (after_index..node.records.len())
+            .find(|&index| self.oracle.get(&(index as u64 + 1)) == Some(&node.records[index]))
+        {
+            self.fail(&format!(
+                "node {id}: cut to {after}, removing its copy of committed lsn {}",
+                index + 1
+            ));
+        }
+        let node = &mut self.nodes[usize::from(id)];
         let chain = if after == 0 {
             Chain::genesis()
         } else {
@@ -481,18 +573,18 @@ impl World {
 
     fn read(&mut self, id: u8) {
         let node = &mut self.nodes[usize::from(id)];
-        let Some((to, from)) = node.reads.pop_front() else {
+        let Some((to, from, upto)) = node.reads.pop_front() else {
             return;
         };
         let start = usize::try_from(from - 1).unwrap();
-        let batch = node.records.get(start).and_then(|header| {
-            let header = decode(header).ok()?;
-            if header.kind != Kind::BatchHeader {
-                return None;
+        let mut batches = cluster::ReadBatches::new(from, upto, READ_BYTES);
+        for record in node.records.iter().skip(start) {
+            if batches.done() {
+                break;
             }
-            let count = usize::try_from(BatchHeader::decode(header.body).ok()?.records).ok()?;
-            node.records.get(start..=start + count).map(<[_]>::to_vec)
-        });
+            batches.feed(record);
+        }
+        let batch = batches.finish();
         let voter = node.voter.as_mut().unwrap();
         match batch {
             Some(batch) => voter.on_read(to, batch),
@@ -507,6 +599,16 @@ impl World {
                 continue;
             };
             if !voter.leading() {
+                continue;
+            }
+            if self.rng.chance(5) {
+                if voter.hand_off().is_ok() {
+                    if std::env::var_os("STRAUM_SIM_TRACE").is_some() {
+                        eprintln!("{} n{id} hands slot {} over", self.step, voter.slot());
+                    }
+                    self.stats.handoffs += 1;
+                }
+                self.drain(id);
                 continue;
             }
             self.next_body += 1;
@@ -594,7 +696,8 @@ impl World {
     }
 
     /// Every node up, nothing lost or reordered: a sequencer must emerge and
-    /// commit, and every node must reach the same log.
+    /// commit, and every node must reach the same log. Then a planned
+    /// handoff must pass the next slot to its owner without a promise round.
     fn heal(&mut self) {
         self.isolated = None;
         for id in 0..NODES {
@@ -602,7 +705,55 @@ impl World {
                 self.start(id);
             }
         }
-        let goal = self.commit + 1;
+        self.converge(self.commit + 1);
+        // A handoff from before the healing can have just committed its
+        // `SlotEnd`: its sequencer stepped down and the successor has not
+        // started yet (seed 6055). Wait for one.
+        for _ in 0..40 {
+            if (0..NODES).any(|id| {
+                self.nodes[usize::from(id)]
+                    .voter
+                    .as_ref()
+                    .unwrap()
+                    .leading()
+            }) {
+                break;
+            }
+            self.converge(self.commit + 1);
+        }
+        let (id, slot) = (0..NODES)
+            .find_map(|id| {
+                let v = self.nodes[usize::from(id)].voter.as_ref().unwrap();
+                v.leading().then(|| (id, v.slot()))
+            })
+            .unwrap_or_else(|| self.fail("healed cluster has no sequencer"));
+        let voter = self.nodes[usize::from(id)].voter.as_mut().unwrap();
+        if let Err(e) = voter.hand_off() {
+            self.fail(&format!(
+                "healed sequencer of slot {slot} refused to hand off: {e}"
+            ));
+        }
+        self.stats.handoffs += 1;
+        self.drain(id);
+        // What was queued before the seal commits first, then `SlotEnd`,
+        // then the next slot's records.
+        let next = slot + 1;
+        for _ in 0..40 {
+            if self.leaders.contains_key(&next) {
+                break;
+            }
+            self.converge(self.commit + 1);
+        }
+        if !self.leaders.contains_key(&next) || self.asked.contains(&next) {
+            self.fail(&format!(
+                "slot {slot} handed off in a healed cluster, and slot {next} was not taken over by its SlotEnd (led: {:?}, promises asked: {})",
+                self.leaders.get(&next),
+                self.asked.contains(&next)
+            ));
+        }
+    }
+
+    fn converge(&mut self, goal: u64) {
         for round in 0..400 {
             if round % 4 == 0 {
                 self.propose();
@@ -695,6 +846,7 @@ fn run(seed: u64) -> Stats {
     }
     world.step = STEPS;
     world.heal();
+    world.stats.slot_ends_lost = world.written.difference(&world.ended).count() as u64;
     world.stats
 }
 
@@ -710,16 +862,26 @@ fn takeovers_keep_one_committed_log() {
         total.power_losses += s.power_losses;
         total.promises_unanswered += s.promises_unanswered;
         total.cut_below_commit += s.cut_below_commit;
+        total.handoffs += s.handoffs;
+        total.slot_ends += s.slot_ends;
+        total.slot_ends_lost += s.slot_ends_lost;
+        total.crashes_with_slot_end += s.crashes_with_slot_end;
+        total.handed_over += s.handed_over;
     }
     println!(
-        "committed {} takeovers {} truncations {} restarts {} power losses {} durable promises never answered {} divergent tails cut below the commit point {}",
+        "committed {} takeovers {} truncations {} restarts {} power losses {} durable promises never answered {} divergent tails cut below the commit point {} handoffs {} committed {} never committed {} crashes with one pending {} slots handed over without a promise round {}",
         total.committed,
         total.takeovers,
         total.truncations,
         total.restarts,
         total.power_losses,
         total.promises_unanswered,
-        total.cut_below_commit
+        total.cut_below_commit,
+        total.handoffs,
+        total.slot_ends,
+        total.slot_ends_lost,
+        total.crashes_with_slot_end,
+        total.handed_over
     );
     if std::env::var("STRAUM_SIM_SEED").is_err() {
         assert!(total.committed > 0 && total.takeovers > 0 && total.truncations > 0);
@@ -728,5 +890,18 @@ fn takeovers_keep_one_committed_log() {
             "no divergent tail reached below a commit point"
         );
         assert!(total.power_losses > 0 && total.promises_unanswered > 0);
+        assert!(total.handed_over > 0, "no slot was handed over by SlotEnd");
+        assert!(
+            total.slot_ends_lost > 0 && total.crashes_with_slot_end > 0,
+            "no SlotEnd was lost, or no crash fell on a pending one"
+        );
     }
+}
+
+/// A planned handoff whose successor had just cut its log: the slot is
+/// handed over once the successor holds `SlotEnd`, not taken by silence
+/// (D-85, seed 4905).
+#[test]
+fn a_handoff_waits_for_a_successor_catching_up() {
+    run(4905);
 }

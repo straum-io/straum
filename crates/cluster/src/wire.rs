@@ -2,22 +2,25 @@
 //!
 //! ```text
 //! frame    [ length u32 ][ type u8 ][ payload ]     length = 1 + payload
-//! HELLO    1  [ node u8 ][ slot u64 ][ limits u64 ]
+//! HELLO    1  [ version u16 ][ node u8 ][ slot u64 ][ config u64 ]
 //! APPEND   2  [ slot u64 ][ prev u64 ][ prev_slot u64 ][ commit u64 ][ records ]
-//! ACK      3  [ slot u64 ][ last_slot u64 ][ end u64 ][ durable u64 ][ cut u8 ]
+//! ACK      3  [ slot u64 ][ last_slot u64 ][ end u64 ][ durable u64 ][ cut u8 ][ report u64 ]
 //! FORWARD  4  [ kind u8 ][ properties_len u32 ][ properties ][ body ]
 //! PROMISE  5  [ slot u64 ]
 //! PROMISED 6  [ slot u64 ][ last_slot u64 ][ end u64 ]
 //! FETCH    7  [ slot u64 ][ last_slot u64 ][ end u64 ]
-//! FETCHED  8  [ slot u64 ][ asked u64 ][ after u64 ][ after_slot u64 ][ records ]
+//! FETCHED  8  [ slot u64 ][ asked_slot u64 ][ asked u64 ][ after u64 ][ after_slot u64 ][ records ]
 //!
 //! records  [ count u32 ]( [ len u32 ][ record ] ){count}
 //! ```
 //!
 //! A link carries one direction: the dialling node sends, the accepting
-//! node reads. It opens with the sender's `HELLO`, which names it and
-//! carries a digest of its `apply` limits; a receiver whose limits differ
-//! refuses the link (they are part of what the log means). Nothing sent to
+//! node reads. It opens with the sender's `HELLO`, which carries the frame
+//! layout's version (`WIRE_VERSION`), names the sender and carries a digest
+//! of its configuration — the cluster parameters every node must share and
+//! its `apply` limits; a receiver whose version or digest differs refuses
+//! the link (the layouts change between versions; the parameters decide
+//! the schedule and what the log means). Nothing sent to
 //! one process reaches its successor: a link does not outlive either end,
 //! and a sender drops what it queued for a link that broke.
 //!
@@ -34,6 +37,11 @@ use journal::Kind;
 
 use crate::{Message, NodeId, Proposal};
 
+/// The layout of every frame below. A link from another version is refused
+/// at its HELLO (ADR-0008 step 7a, D-78 A): ACK and FETCHED changed shape
+/// in steps 5 and 6, and a node of another build would misread them.
+pub const WIRE_VERSION: u16 = 1;
+
 const HELLO: u8 = 1;
 const APPEND: u8 = 2;
 const ACK: u8 = 3;
@@ -46,9 +54,11 @@ const FETCHED: u8 = 8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     Hello {
+        version: u16,
         node: NodeId,
         slot: u64,
-        limits: u64,
+        /// A digest of what every node must share (`node::cluster_digest`).
+        config: u64,
     },
     Message(Message),
     /// A gateway's proposal on its way to the sequencer.
@@ -97,11 +107,17 @@ pub fn encode(frame: &Frame, out: &mut Vec<u8>) -> Result<(), WireError> {
     let start = out.len();
     out.extend_from_slice(&[0; 4]);
     match frame {
-        Frame::Hello { node, slot, limits } => {
+        Frame::Hello {
+            version,
+            node,
+            slot,
+            config,
+        } => {
             out.push(HELLO);
+            out.extend_from_slice(&version.to_be_bytes());
             out.push(*node);
             out.extend_from_slice(&slot.to_be_bytes());
-            out.extend_from_slice(&limits.to_be_bytes());
+            out.extend_from_slice(&config.to_be_bytes());
         }
         Frame::Message(Message::Append {
             slot,
@@ -120,10 +136,12 @@ pub fn encode(frame: &Frame, out: &mut Vec<u8>) -> Result<(), WireError> {
             end,
             durable,
             cut,
+            report,
         }) => {
             out.push(ACK);
             put_u64s(&[*slot, *last_slot, *end, *durable], out);
             out.push(u8::from(*cut));
+            put_u64s(&[*report], out);
         }
         Frame::Message(Message::Promise { slot }) => {
             out.push(PROMISE);
@@ -147,13 +165,14 @@ pub fn encode(frame: &Frame, out: &mut Vec<u8>) -> Result<(), WireError> {
         }
         Frame::Message(Message::Fetched {
             slot,
+            asked_slot,
             asked,
             after,
             after_slot,
             records,
         }) => {
             out.push(FETCHED);
-            put_u64s(&[*slot, *asked, *after, *after_slot], out);
+            put_u64s(&[*slot, *asked_slot, *asked, *after, *after_slot], out);
             put_records(records, out)?;
         }
         Frame::Forward(proposal) => {
@@ -189,6 +208,10 @@ impl<'a> Reader<'a> {
     }
     fn u8(&mut self) -> Result<u8, WireError> {
         self.take(1)?.first().copied().ok_or(WireError::Truncated)
+    }
+    fn u16(&mut self) -> Result<u16, WireError> {
+        let bytes: [u8; 2] = self.take(2)?.try_into().map_err(|_| WireError::Truncated)?;
+        Ok(u16::from_be_bytes(bytes))
     }
     fn u32(&mut self) -> Result<usize, WireError> {
         let bytes: [u8; 4] = self.take(4)?.try_into().map_err(|_| WireError::Truncated)?;
@@ -241,9 +264,10 @@ pub fn decode(buf: &[u8], max_frame: usize) -> Result<Option<(Frame, usize)>, Wi
     let mut r = Reader(frame);
     let frame = match r.u8()? {
         HELLO => Frame::Hello {
+            version: r.u16()?,
             node: r.u8()?,
             slot: r.u64()?,
-            limits: r.u64()?,
+            config: r.u64()?,
         },
         APPEND => Frame::Message(Message::Append {
             slot: r.u64()?,
@@ -262,6 +286,7 @@ pub fn decode(buf: &[u8], max_frame: usize) -> Result<Option<(Frame, usize)>, Wi
                 1 => true,
                 _ => return Err(WireError::Malformed),
             },
+            report: r.u64()?,
         }),
         PROMISE => Frame::Message(Message::Promise { slot: r.u64()? }),
         PROMISED => Frame::Message(Message::Promised {
@@ -276,6 +301,7 @@ pub fn decode(buf: &[u8], max_frame: usize) -> Result<Option<(Frame, usize)>, Wi
         }),
         FETCHED => Frame::Message(Message::Fetched {
             slot: r.u64()?,
+            asked_slot: r.u64()?,
             asked: r.u64()?,
             after: r.u64()?,
             after_slot: r.u64()?,

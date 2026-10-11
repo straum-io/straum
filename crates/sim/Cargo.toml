@@ -3,7 +3,7 @@ name = "sim"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Deterministic simulation: the leader/follower replication (ADR-0007) and the three-node sequencer/replica (ADR-0008 step 2)"
+description = "Deterministic simulation of the cluster path: sequencer, replicas, takeover, apply and gateway (ADR-0007, ADR-0008)"
 
 [lints]
 workspace = true
@@ -16,5 +16,4 @@ bytes = "1"
 domain = { path = "../domain" }
 cluster = { path = "../cluster" }
 journal = { path = "../journal" }
-replication = { path = "../replication" }
 storage = { path = "../storage" }

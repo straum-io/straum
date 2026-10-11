@@ -397,3 +397,28 @@ fn retaining_nothing_is_the_old_rewrite() {
     assert!(addressable(&path).is_empty());
     assert_eq!(present(&path).len(), 3);
 }
+
+/// A read stops where the file ended when the read began. Catch-up reads
+/// the log a writer is appending to; a scan that read until `read` came
+/// back empty chased the tail under load and never finished, so nothing
+/// was shipped and a follower that stopped reading was never cut off
+/// (D-76, `replication_matrix` test 41 in the Linux container).
+#[test]
+fn a_read_ends_where_the_file_ended_when_it_began() {
+    let path = scratch("growing");
+    let mut wal = open(&path);
+    assert_eq!(append(&mut wal, 0, 4), 4);
+    let mut seen = 0;
+    replay_addressable(&path, WalLimits::default(), &mut |_| true, &mut |_, _| {
+        seen += 1;
+        // Every record read makes another, as a busy leader does; bounded
+        // so a scan that chases them fails instead of running for ever.
+        if seen < 1000 {
+            append(&mut wal, 100 + seen, 1);
+        }
+    })
+    .unwrap();
+    assert_eq!(seen, 4, "the read took records appended after it began");
+    drop(wal);
+    let _ = fs::remove_file(&path);
+}

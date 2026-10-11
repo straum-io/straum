@@ -12,6 +12,7 @@ workspace = true
 apply = { path = "../apply" }
 bytes = "1"
 cluster = { path = "../cluster" }
+codec = { path = "../codec" }
 crc32fast = "1"
 gateway = { path = "../gateway" }
 journal = { path = "../journal" }
@@ -22,6 +23,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "
 tracing = "0.1"
 
 [dev-dependencies]
-codec = { path = "../codec" }
 domain = { path = "../domain" }
 rumqttc = { version = "0.24", default-features = false }
+
+[[bench]]
+name = "cap"
+harness = false

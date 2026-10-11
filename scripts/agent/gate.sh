@@ -24,6 +24,9 @@ fi
 
 changed="$(git status --porcelain | awk '{print $NF}')"
 crates="$(printf '%s\n' "$changed" | sed -n 's|^crates/\([^/]*\)/.*|\1|p' | sort -u)"
+# A deleted crate shows up as changed too; there is nothing left to check
+# in it (step 8 removed six at once, D-111).
+crates="$(for c in $crates; do [ -f "crates/$c/Cargo.toml" ] && echo "$c"; done)"
 
 [ -n "$crates" ] || exit 0
 

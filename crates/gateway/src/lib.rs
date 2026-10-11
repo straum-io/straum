@@ -32,10 +32,13 @@
 //! `retry_interval` until their effect is seen; applying one twice changes
 //! nothing.
 //!
-//! Not yet (ADR-0008 step 7): sessions that outlive their connection,
-//! wills, session expiry, takeover across gateways — every session is
-//! clean, and a 3.1.1 CleanSession=0 is answered with SessionPresent=0;
-//! enhanced authentication; message properties through the log (D-65).
+//! Not yet (ADR-0008 step 7c): sessions that outlive their connection,
+//! wills, session expiry, takeover across gateways. A CONNECT asking for
+//! any of the first three — a will, a 3.1.1 CleanSession=0, an MQTT 5
+//! session expiry above zero — is refused (`ImplementationSpecificError`,
+//! 3.1.1 "server unavailable"), so no client believes this server keeps
+//! them (D-78 A, step 7a). Also not yet: enhanced authentication; message
+//! properties through the log (D-65).
 
 mod properties;
 
@@ -536,6 +539,18 @@ impl Gateway {
             // (3.1.1 §3.1.3.1).
             return self.refuse_connect(conn, version, ReasonCode::ClientIdentifierNotValid);
         }
+        // Refused, not handled here: a will, a session that outlives its
+        // connection, a session expiry. They go through the log at step 7c;
+        // until then a client must not believe this server keeps them
+        // (D-78 A, ADR-0008 step 7a). 3.1.1 has no closer code than
+        // "server unavailable".
+        let persistent = match version {
+            Version::V311 => !connect.clean_start,
+            _ => connect.properties.session_expiry_secs != 0,
+        };
+        if connect.will.is_some() || persistent {
+            return self.refuse_connect(conn, version, ReasonCode::ImplementationSpecificError);
+        }
         let client_id = if assigned {
             Bytes::from(format!("straum-{}-{session}", self.config.node))
         } else {
@@ -576,9 +591,6 @@ impl Gateway {
             .ok()
             .and_then(NonZeroU32::new);
         let properties = ConnAckProperties {
-            // Sessions end with their connection until step 7: a client
-            // that asked for more is told so (MQTT 5 §3.2.2.3.2).
-            session_expiry_secs: (connect.properties.session_expiry_secs != 0).then_some(0),
             receive_maximum: Some(self.config.receive_maximum),
             maximum_qos: Some(Qos::AtLeastOnce),
             retain_available: Some(true),
