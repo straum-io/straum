@@ -327,7 +327,9 @@ maintenance cost. State the reason in the change report.
   globally — the gateway's pending proposals and waiting deliveries in total
   (`max_total_pending_bytes`, `max_total_waiting_bytes`), `apply`'s queued
   bytes in total, and the transport's connection-buffer budget for read and
-  write buffers together. Each global budget exists because a per-session
+  write buffers together. Each node also holds its own proposals awaiting
+  commit, at most its share `max_queue / voters` (D-109 B, D-120 A), a
+  count without a byte budget of its own. Each global budget exists because a per-session
   limit times the session count is a product, not a bound.
 * **Malformed input never panics**, never reads out of bounds, never allocates
   from an unchecked remote length, never loops without progress — MQTT
@@ -354,11 +356,13 @@ Overflow policy **(initial)**, the new path:
 |---|---|
 | A publisher's proposals awaiting commit at `max_pending`/`max_pending_bytes`, or all at `max_total_pending_bytes` | the gateway stops reading that connection (`Gateway::wants_read`); nothing dropped |
 | A proposal not committed within `commit_timeout` | the publisher's connection is closed; the client resends (at-least-once); nothing uncommitted is acknowledged |
-| The sequencer's queue full (`max_queue`), or a proposal while the slot changes hands | the proposal is dropped, never acknowledged; `commit_timeout` closes its publisher (ADR-0008, "Not yet in step 4"; D-109) |
+| A proposal while the slot changes hands | held by the node that made it, in order, and sent to the next sequencer once the old slot is closed in the committed log; never sent twice into one slot (D-109 B) |
+| A node's own proposals at its share of the queue (`max_queue / voters`, never 0) | the node reads none of its MQTT clients until one commits (backpressure, D-120 A; keep-alives are not read either, D-123); a proposal made meanwhile without a read (a lifecycle retry) is refused and counted (`Status::refused`), never acknowledged |
+| The sequencer's queue full (`max_queue`) | the forward is dropped and counted (`Voter::forwards_refused`); once a later one of its node commits it is given up, handed back and counted (`Status::given_up`), never reordered; with nothing later it waits for the slot to change (stranded, D-120); `commit_timeout` closes its publisher |
 | Uncommitted tail at `max_uncommitted` | the sequencer makes no new batch; proposals wait in its queue |
 | At-most-once deliveries behind a QoS 1 delivery at `max_waiting`/`max_waiting_bytes`, or all at `max_total_waiting_bytes` | dropped and counted (`Load::dropped`) |
 | A client's write queue full (`write_queue`) | the connection is closed (a writer that makes no progress) |
-| A peer's link queue full (`link_queue`) | the frame is dropped; the protocol resends at the next heartbeat |
+| A peer's link queue full (`link_queue`) | the frame is dropped; the protocol resends at the next heartbeat — except a forward, which is lost as in the row above |
 | Connection-buffer budget exceeded | the growth is refused before it is allocated; the connection is closed |
 | A replica further behind than `retain_bytes` | the log is compacted past it; it is lost and needs a state copy (D-57 A, step 7b) |
 

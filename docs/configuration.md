@@ -47,8 +47,15 @@ any other `STRAUM_*` variable is refused at startup (D-104 A).
 
 Fixed in 7a, not settings: `max_uncommitted` 64 (D-82 A), batches of 16
 records, MQTT packets up to 256 KiB, link frames up to 8 MiB, window 256,
-snapshots every 4 096 applied records, segments of 64 MiB, the gateway's and
-`apply`'s limits at the values in `node::experimental`. Every node of one
+snapshots every 4 096 applied records, segments of 64 MiB, a queue of
+1 024 proposals (`max_queue`) at the sequencer; each node's outbox of its own
+proposals awaiting commit holds its share, `max_queue / voters` rounded
+down and never 0 — 341 with three voters (D-109 B, D-120 A): up to 341
+times a packet of 256 KiB, about 85 MiB, per node at worst, a count without
+a byte budget of its own (D-119 A); while it is full the node reads none
+of its MQTT clients. A queue below one proposal per voter is refused at startup
+(`ConfigError::Queue`), so the shares always fit it. A link to a down peer is redialled at least once per
+heartbeat (D-122 A). And the gateway's and `apply`'s limits at the values in `node::experimental`. Every node of one
 cluster must agree on the voters, the first slot, the timing and these
 bounds: they go into the configuration digest each link's HELLO carries, and
 a link from a node that differs is refused. Wills, persistent sessions and

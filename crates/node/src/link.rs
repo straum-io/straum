@@ -13,7 +13,6 @@ use transport::{BufferBudget, Listener, TransportConfig};
 pub type Inbound = (u8, Frame);
 
 const BACKOFF_FIRST: Duration = Duration::from_millis(50);
-const BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// Sends to one peer for as long as the node runs: dials, introduces
 /// itself, and writes what the node loop queues. A link that breaks drops
@@ -25,8 +24,15 @@ pub async fn dial(
     mut outbox: mpsc::Receiver<Frame>,
     transport: TransportConfig,
     budget: Arc<BufferBudget>,
+    heartbeat: Duration,
 ) {
-    let mut backoff = BACKOFF_FIRST;
+    // Never longer than a heartbeat (D-122): a peer that restarts hears
+    // this node within one, inside the `takeover_ticks` of silence after
+    // which it would take a live sequencer's slot over. A 1 s cap let it
+    // (6 runs of 6 in `a_restarted_replica_leaves_the_slot_with_its_live_owner`).
+    // The cost: one failed connect per heartbeat to a peer that is down.
+    let first = BACKOFF_FIRST.min(heartbeat);
+    let mut backoff = first;
     loop {
         let connected = transport::connect(
             peer,
@@ -37,10 +43,10 @@ pub async fn dial(
         .await;
         let Ok(mut connection) = connected else {
             tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(BACKOFF_MAX);
+            backoff = (backoff * 2).min(heartbeat);
             continue;
         };
-        backoff = BACKOFF_FIRST;
+        backoff = first;
         // Queued for the last connection: addressed to a process that may
         // be gone.
         while outbox.try_recv().is_ok() {}

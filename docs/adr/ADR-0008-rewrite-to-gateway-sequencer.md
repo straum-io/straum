@@ -489,8 +489,8 @@ Not yet in step 4:
 - Configuration and its startup checks moved to step 7 (D-68 A):
   `NodeConfig` is built by tests; the one startup check done is the limits
   digest at every link.
-- A proposal the sequencer's full queue refuses is dropped, not held. No
-  acknowledgement is lost: the gateway closes a publisher whose publish does
+- A proposal the sequencer's full queue refuses is dropped, not held (a
+  slot change no longer drops one, D-109 B). No acknowledgement is lost: the gateway closes a publisher whose publish does
   not commit within `commit_timeout` and resends its lifecycle proposals.
   `cluster::Sequencer::propose` no longer promises that the caller waits.
 - Credentials are not checked (`auth` is not wired); metrics are not
@@ -1328,15 +1328,15 @@ Checked:
   publish is neither acknowledged nor delivered, and once one replica
   restarts over its data the same publish, on the same connection, is
   acknowledged and delivered (a gateway that acknowledged on receipt fails
-  it); the SIGUSR1 handoff and publishing after it, at most one resend; a node refused over another cluster's
+  it); the SIGUSR1 handoff and publishing after it; a node refused over another cluster's
   data, and its links refused from fresh data; a clean rejoin and clean
-  stops. About 11 s.
+  stops. About 11 s at first; about 7 s since D-109 B removed the resend.
 - **Found by it:** the first publish after a handoff is dropped, not held,
   every time — a proposal made while the slot changes hands goes nowhere
   (ADR-0008, "Not yet in step 4"). No PUBACK comes for it; the gateway
   closes the connection after `commit_timeout` (30 s), and an
-  at-least-once client resends. The test resends as such a client does and
-  asserts it takes no more than one resend (D-109).
+  at-least-once client resends. Fixed by D-109 B: the test now requires
+  the first sending to be acknowledged.
 - **D-108, the unstable start:** not reproduced. The failure was one run of
   the container's node tests, two tests failing at a node's start with no
   error text kept. Since then:
@@ -1396,6 +1396,185 @@ Lost with the old path, until rebuilt on the new one:
 
 The docs that described only the old path carry a "History" banner. The
 code is in git history (commit ffeda02 and earlier).
+
+**D-109 B (2026-10-11): a node holds its proposals across a slot change.**
+Before, a proposal made while the slot changed hands — at a node with no
+sequencer known, or forwarded to one that had just sealed or died — was
+dropped; its publisher waited `commit_timeout` (30 s). Now each node keeps
+its own proposals in an outbox (`cluster/src/outbox.rs` since D-117 B) until it applies
+their records from the committed log:
+- **Confirmation:** an entry leaves when the identical record (kind,
+  properties, body) is applied. Every gateway proposal names its node and
+  session, and a publish or a filter its request, so another node's record
+  never matches one.
+- **Deduplication:** an entry is sent again only once a record of a later
+  slot has committed. The committed log is a prefix that never changes, so
+  the slot it went to can no longer gain a record: a resend never commits a
+  second copy. A client's own resend is a new proposal, as at-least-once
+  allows.
+- **Order and fencing:** entries go strictly in order, and none while an
+  earlier one waits for its slot to be decided. Forwarding waits until the
+  owner's slot has a committed record — before that the owner may not
+  sequence yet. A sequencer takes its own entries only into a slot the
+  committed log has not passed. The protocol's fencing is unchanged: the
+  outbox only decides what to send, and when.
+- **Losses it still has:** a proposal a full queue refused, or a link lost
+  in its tail, while a later one of the same node committed in the same
+  slot. Sending it again would put it behind the later one, so it is given
+  up and logged; its publisher is closed by `commit_timeout`, as before.
+- **Bound:** `cluster::Config::max_queue` entries per node, the sequencer's
+  own queue bound; a proposal beyond it is refused. One copy of each
+  proposal per send, not measured (D-112).
+- **What it does not drop:** an entry stays when `commit_timeout` closes
+  its publisher, so it may still commit after the client has resent it as
+  a new proposal — a duplicate at-least-once allows. If the client reconnected
+  elsewhere, that old copy may commit after the client's newer messages;
+  per-session order holds, since the resend comes from a new session. The gateway's
+  lifecycle retries (`NodeReset`, session gone, delivery acks, every
+  `retry_interval`) each add an entry too; they are idempotent in `apply`,
+  and the bound caps how many wait.
+- **Deviation (unified-stream §1, §7), closed by D-117 B:** the outbox
+  first lived in the tokio driver (`node`), which no deterministic
+  simulation runs.
+- **Closed narrowly (D-119 A):** resolved for the reported handoff stall.
+  Closing it does not show fencing, proposal loss, memory bounds or every
+  takeover case correct; D-117 B below is what the simulation shows.
+
+Checked:
+- unit tests of the outbox: confirmation, resend only after the slot
+  closed and in order, a later commit showing earlier ones lost, the bound;
+- `a_handoff_loses_no_proposal_and_commits_each_once`: 200 proposals on
+  each of three nodes, the handoff between the halves; each commits once,
+  in its node's order, and no record of an older slot commits after a newer
+  one's;
+- `a_sequencer_failure_loses_no_proposal_the_others_hold`: the sequencer
+  stopped between the halves — in five runs it had 144–172 records
+  appended past its commit as it stopped;
+  the same checks, and the old sequencer restarted converges on that log;
+- both fail with the resend replaced by the old drop (checked by mutation:
+  proposals 34–140 of one node were lost);
+- the server end-to-end test now requires the first publish after the
+  handoff to be acknowledged without a resend.
+
+**D-117 B (2026-10-12): the outbox in `cluster`, driven by the takeover
+simulation.** The outbox moved from `node` into `cluster`
+(`cluster/src/outbox.rs`, owned by `Voter`), so the simulation runs the
+code a node runs. A node's own proposals go through `Voter::submit`; a
+forward is a protocol message, `Message::Forward { slot, proposal }`,
+sent as any other; each applied record goes back through
+`Voter::applied`, which hands back the proposals it shows lost (D-115 A:
+never dropped unseen; `node::Status` counts them, `given_up`, and the
+outbox's refusals, `refused`). The node only carries the effects out.
+
+- **Found in the move:** a forward carried no slot. One still in flight
+  after its node gave it up, or sent it again, could reach the same owner
+  leading a later slot and be taken there — committing after it was given
+  up, or twice. A sequencer now takes a forward only into the slot it was
+  sent for; the frame carries it (`WIRE_VERSION` 2). The simulation
+  catches the old rule at seed 14165
+  (`a_forward_for_an_older_slot_is_not_taken_into_a_later_one`).
+- **Invariant 7 in `sim/tests/takeover.rs`:** every node proposes through
+  its outbox; forwards cross the same network as the protocol — dropped,
+  cut off by partitions, sent to a fenced owner still running, lost with
+  a crash — in order per link, as TCP delivers. Checked at every commit:
+  a proposal commits at most once; one node incarnation's proposals
+  commit in order; a proposal given up never commits. At the end, with no
+  new proposals, each is committed, given up, refused or orphaned by its
+  node's crash — or stranded, below.
+- **Swept:** 20 000 seeds pass. In 2 000 seeds: 1 187 814 own proposals,
+  124 549 committed in a later slot than their node had promised when it
+  made them, 1 948 given up, 16 741 stranded.
+- **Mutations it catches:** sending again before the old slot is closed
+  (a duplicate commit, seed 11); taking a forward into another slot (seed
+  14165). The loopback tests of D-109 B still catch the old drop.
+- **Found by the simulation, not fixed (D-120):** a proposal is stranded
+  when its forward is lost — the link, or a sequencer's queue full or
+  sealed — and nothing after it commits in that slot while the slot stays
+  open. Nothing then shows it lost, and nothing may send it again; it
+  waits until a later proposal of its node commits (then it is given up)
+  or the slot changes (then it is sent again). Its publisher is closed by
+  `commit_timeout`, and the client's resend is what unblocks it. Every
+  stranded proposal in the sweep had a forward lost; any other wait fails
+  the run.
+- **Found by the simulation, not fixed (D-120):** after a slot change
+  every node sends its whole outbox again at once; the sequencer's queue
+  (`max_queue`) is as large as one outbox, so the burst overflows it and
+  the overflow is lost as above.
+
+**D-116 A, D-118 A (2026-10-12): failing tests keep what explains them.**
+The node tests' `Cluster` lets its nodes go and removes their data on
+drop; the server test kills its processes on drop and, on a failure,
+prints every node's log from every life and keeps the directory. The
+first failure they caught: the server test's SIGTERM reached the node
+started from another cluster's data before its handler was installed
+(fixed: the test waits for "node started"). The second: the D-118 failure
+again — a restarted node 1 took the slot over 0.66 s after it started,
+while node 0 was alive and sequencing. The server test at a6986ea fails
+the same assertion in D-113's loop (its own logs show only the symptom:
+it predates D-118 A), so it predates D-109; the likely mechanism
+is the link redial backoff (up to 1 s) outlasting the takeover window
+(150 ms), not yet measured (D-122).
+
+**D-113 A (2026-10-12): D-108 closes as not reproduced.** 100 container
+runs of the node and server tests on the current tree, and 100 runs of the
+server test at a6986ea (before D-109) beside them, every run's output kept
+(in `/private/tmp/claude-501/-Users-stan-Projects-straum/d3e8fb69-0454-4e47-a8c2-0ac86e2dda88/scratchpad/d113/{current,base}/run-*.log`, temporary, not in the repository), nothing retried:
+- current tree: 94 passed; the 6 failures are all the server test at its
+  handoff — node 0 no longer the sequencer when SIGUSR1 comes (D-122);
+- a6986ea: 95 passed; the 5 failures are the same assertion;
+- the node tests failed in none of the 100 runs, and no node failed to
+  start in any of the 200: D-108's failure did not recur after the port
+  helper's fix.
+The handoff failure comes at about the same rate on both trees, so it is
+not a D-109 regression: D-118's question is answered, and its likely
+cause is D-122.
+
+**D-122 A, D-120 A, D-121 A (2026-10-12).**
+- **D-122 A, the redial backoff:** a link to a down peer is redialled
+  with a backoff that never exceeds one heartbeat (it was 1 s). A peer
+  that restarts now hears the sequencer within a heartbeat, inside the
+  `takeover_ticks` of silence after which it would take a live owner's
+  slot. `a_restarted_replica_leaves_the_slot_with_its_live_owner` (a
+  replica down 3 s, then restarted; the slot must stay with its owner)
+  failed 6 runs of 6 before the change and passes 8 of 8 after it. The
+  protocol is unchanged — fencing, promises and the committed prefix
+  are not touched; a takeover of an owner that is really gone is still
+  checked by `another_node_takes_the_slot_over_when_the_sequencer_stops`
+  and by invariant 6 in every simulation. The cost: one failed connect
+  per heartbeat toward a peer that is down.
+  Two more tests put a delaying proxy on the sequencer's link to the
+  restarted node. A connection a heartbeat late leaves the slot with its
+  owner. A connection a second late lets the restarted node take the
+  next slot (or node 2, if the turn passes), and the old owner, still
+  running, is fenced: nothing of its slot commits after the new slot
+  began, it stops sequencing, and a publish proposed at it commits once,
+  through the new owner. The proxy accepts at once, so these test
+  tolerance of a late connection, not the backoff; the restart test is
+  the backoff's regression test (it fails 3 of 3 with the 1 s cap).
+- **D-120 A, each node's share of the queue:** a node's outbox holds at
+  most `max_queue / voters`, rounded down and never 0 (341 of 1 024 with
+  three voters), so every outbox resent at once after a slot change fits
+  the sequencer's queue. A full outbox is backpressure: the node gives no
+  read credit to any MQTT client until it has room; a proposal made with
+  no read behind it (a lifecycle retry) is refused and counted. In 2 000
+  seeds of the takeover simulation: 16 741 stranded and 1 948 given up
+  with the whole `max_queue` per node; 0 stranded and 7 given up with the
+  share (the simulation offers proposals faster than any outbox drains, so
+  its refusals at a full outbox — 829 715 — have no read backpressure in
+  front of them as a node does). A seed with give-ups is pinned
+  (`a_proposal_shown_lost_is_given_up_and_never_commits`).
+  A queue below one proposal per voter is refused at startup, so the
+  shares always fit. While the outbox is full the node reads none of its
+  clients, keep-alives included: a client idle through a long full spell
+  can be closed for silence it did not cause (D-123).
+- **D-121 A:** the storage and transport tests remove the files and
+  directories they write when they end, passing or failing; a run used
+  to leave about 20 of them.
+- **Under load, after D-122 A:** the D-113 setup again — 100 container
+  runs of the node and server tests beside 100 of the server test as load
+  — passed 200 of 200. The same setup failed the handoff 6 times in 100
+  before the fix. As in D-113, the load loop is the faster one and ended
+  first, so the last runs of the other had no load beside them.
 
 **D-84 A (2026-10-09): the production cap comes from a Linux host.**
 `node/benches/cap.rs` measures throughput and failover (the sequencer

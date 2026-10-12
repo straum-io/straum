@@ -5,7 +5,7 @@
 //! HELLO    1  [ version u16 ][ node u8 ][ slot u64 ][ config u64 ]
 //! APPEND   2  [ slot u64 ][ prev u64 ][ prev_slot u64 ][ commit u64 ][ records ]
 //! ACK      3  [ slot u64 ][ last_slot u64 ][ end u64 ][ durable u64 ][ cut u8 ][ report u64 ]
-//! FORWARD  4  [ kind u8 ][ properties_len u32 ][ properties ][ body ]
+//! FORWARD  4  [ slot u64 ][ kind u8 ][ properties_len u32 ][ properties ][ body ]
 //! PROMISE  5  [ slot u64 ]
 //! PROMISED 6  [ slot u64 ][ last_slot u64 ][ end u64 ]
 //! FETCH    7  [ slot u64 ][ last_slot u64 ][ end u64 ]
@@ -40,7 +40,8 @@ use crate::{Message, NodeId, Proposal};
 /// The layout of every frame below. A link from another version is refused
 /// at its HELLO (ADR-0008 step 7a, D-78 A): ACK and FETCHED changed shape
 /// in steps 5 and 6, and a node of another build would misread them.
-pub const WIRE_VERSION: u16 = 1;
+/// Version 2: FORWARD carries the slot it is sent for (D-117 B).
+pub const WIRE_VERSION: u16 = 2;
 
 const HELLO: u8 = 1;
 const APPEND: u8 = 2;
@@ -61,8 +62,6 @@ pub enum Frame {
         config: u64,
     },
     Message(Message),
-    /// A gateway's proposal on its way to the sequencer.
-    Forward(Proposal),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -175,8 +174,9 @@ pub fn encode(frame: &Frame, out: &mut Vec<u8>) -> Result<(), WireError> {
             put_u64s(&[*slot, *asked_slot, *asked, *after, *after_slot], out);
             put_records(records, out)?;
         }
-        Frame::Forward(proposal) => {
+        Frame::Message(Message::Forward { slot, proposal }) => {
             out.push(FORWARD);
+            put_u64s(&[*slot], out);
             out.push(proposal.kind as u8);
             put_u32(proposal.properties.len(), out)?;
             out.extend_from_slice(&proposal.properties);
@@ -308,15 +308,19 @@ pub fn decode(buf: &[u8], max_frame: usize) -> Result<Option<(Frame, usize)>, Wi
             records: r.records()?,
         }),
         FORWARD => {
+            let slot = r.u64()?;
             let kind = r.u8()?;
             let kind = Kind::from_u8(kind).ok_or(WireError::UnknownKind(kind))?;
             let len = r.u32()?;
             let properties = r.take(len)?.to_vec();
             let body = std::mem::take(&mut r.0).to_vec();
-            Frame::Forward(Proposal {
-                kind,
-                properties,
-                body,
+            Frame::Message(Message::Forward {
+                slot,
+                proposal: Proposal {
+                    kind,
+                    properties,
+                    body,
+                },
             })
         }
         other => return Err(WireError::UnknownType(other)),

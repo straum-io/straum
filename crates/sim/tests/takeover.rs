@@ -21,6 +21,15 @@
 //! And 2a, a `SlotEnd` closes its slot: nothing of slot k follows slot k's
 //! `SlotEnd` in the committed log.
 //!
+//! And 7, every node's own proposals (D-109 B, D-117 B): each node submits
+//! them to its `Voter`, whose outbox forwards them over the same faulty
+//! network — lost, cut off by a partition, sent to an owner that is fenced
+//! and still running, or crashed with — in order per link, as TCP delivers.
+//! A proposal commits at most once; one node incarnation's proposals commit
+//! in the order it made them; one handed back as given up never commits
+//! later. At the end, with no new proposals, each is committed, given up,
+//! refused at a full outbox, or orphaned by its node's crash — none waits.
+//!
 //! Each run ends healed: every node up, nothing lost, and a sequencer must
 //! emerge, commit new records, and every node must reach the same log.
 //!
@@ -123,6 +132,40 @@ struct Stats {
     slot_ends_lost: u64,
     crashes_with_slot_end: u64,
     handed_over: u64,
+    /// Invariant 7: proposals submitted; committed in a later slot than
+    /// the one their node had promised when it submitted them (carried
+    /// across a slot change); given up; refused; orphaned by a crash.
+    submitted: u64,
+    carried: u64,
+    given_up: u64,
+    refused: u64,
+    orphaned: u64,
+    /// Sent to a slot that stayed open, the forward lost (D-120).
+    stranded: u64,
+    /// Forwards a sequencer's full or sealed queue refused (D-120 A).
+    refused_at_sequencer: u64,
+}
+
+/// What became of one node's own proposal (invariant 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    /// Submitted while its node had promised this slot.
+    Pending(u64),
+    Committed,
+    GivenUp,
+    Refused,
+    /// Its node crashed with it uncommitted: it may still commit once.
+    Orphaned,
+}
+
+/// A proposal's identity, from its body: (node, incarnation, number).
+fn ident(body: &[u8]) -> Option<(u8, u64, u64)> {
+    if body.len() != 17 {
+        return None;
+    }
+    let incarnation = u64::from_be_bytes(body[1..9].try_into().ok()?);
+    let number = u64::from_be_bytes(body[9..17].try_into().ok()?);
+    Some((body[0], incarnation, number))
 }
 
 struct World {
@@ -142,12 +185,18 @@ struct World {
     /// a majority's promises past k became durable: what slot k may still
     /// commit (invariant 6).
     fences: BTreeMap<u64, u64>,
-    next_body: u64,
     /// Slots someone asked promises of, and slots whose `SlotEnd` committed.
     asked: std::collections::BTreeSet<u64>,
     ended: std::collections::BTreeSet<u64>,
     /// Slots whose `SlotEnd` some node appended.
     written: std::collections::BTreeSet<u64>,
+    /// Invariant 7: every own proposal's fate, and the last number each
+    /// (node, incarnation) committed.
+    proposals: BTreeMap<(u8, u64, u64), Fate>,
+    next_proposal: u64,
+    last_committed: BTreeMap<(u8, u64), u64>,
+    /// Proposals one of whose forwards was lost on the way (invariant 7).
+    lost_forwards: std::collections::BTreeSet<(u8, u64, u64)>,
     stats: Stats,
 }
 
@@ -186,10 +235,13 @@ impl World {
             commit: 0,
             leaders: BTreeMap::new(),
             fences: BTreeMap::new(),
-            next_body: 0,
             asked: Default::default(),
             ended: Default::default(),
             written: Default::default(),
+            proposals: BTreeMap::new(),
+            next_proposal: 0,
+            last_committed: BTreeMap::new(),
+            lost_forwards: Default::default(),
             stats: Stats::default(),
         };
         for id in 0..NODES {
@@ -205,7 +257,7 @@ impl World {
     /// Recovery: the log verified as one chain (invariant 5), a torn batch
     /// cut, the slot table rebuilt, the durable promise read back.
     fn start(&mut self, id: u8) {
-        self.network.retain(|(_, to, _)| *to != id);
+        self.drop_to(id);
         let node = &mut self.nodes[usize::from(id)];
         node.records.truncate(node.durable);
         let mut verifier = Verifier::new(Chain::genesis());
@@ -243,7 +295,7 @@ impl World {
     }
 
     fn crash(&mut self, id: u8, power: bool) {
-        self.network.retain(|(_, to, _)| *to != id);
+        self.drop_to(id);
         let node = &mut self.nodes[usize::from(id)];
         if node.report_promise.is_some() {
             self.stats.promises_unanswered += 1;
@@ -254,6 +306,14 @@ impl World {
         });
         if pending_end {
             self.stats.crashes_with_slot_end += 1;
+        }
+        // Its outbox goes with it: what it held may still commit, once.
+        let incarnation = self.nodes[usize::from(id)].incarnation;
+        for (&(node, life, _), fate) in &mut self.proposals {
+            if node == id && life == incarnation && matches!(fate, Fate::Pending(_)) {
+                *fate = Fate::Orphaned;
+                self.stats.orphaned += 1;
+            }
         }
         let node = &mut self.nodes[usize::from(id)];
         node.voter = None;
@@ -429,6 +489,29 @@ impl World {
                         r.slot
                     ));
                 }
+                // Invariant 7: once, in its node's order, never after it
+                // was given up.
+                if let Some(key @ (node, life, number)) = ident(r.body) {
+                    let fate = self.proposals.get(&key).copied();
+                    match fate {
+                        Some(Fate::Pending(submitted)) => {
+                            if r.slot > submitted {
+                                self.stats.carried += 1;
+                            }
+                        }
+                        Some(Fate::Orphaned) => {}
+                        other => self.fail(&format!(
+                            "committed lsn {at}: proposal {key:?} commits, its fate was {other:?}"
+                        )),
+                    }
+                    self.proposals.insert(key, Fate::Committed);
+                    let last = self.last_committed.insert((node, life), number);
+                    if let Some(last) = last.filter(|&last| number <= last) {
+                        self.fail(&format!(
+                            "committed lsn {at}: proposal {number} of node {node} (life {life}) after its {last}"
+                        ));
+                    }
+                }
                 if r.kind == Kind::SlotEnd {
                     self.ended.insert(r.slot);
                     self.stats.slot_ends += 1;
@@ -449,18 +532,99 @@ impl World {
                 ));
             }
         }
+        // The node applies what it learned is committed, in order: its
+        // outbox confirms its proposals and hands back the ones it shows
+        // lost.
+        let from = node.checked + 1;
         let node = &mut self.nodes[usize::from(id)];
         node.checked = node.checked.max(lsn);
+        let mut lost = Vec::new();
+        for at in from..=lsn {
+            let record = &node.records[usize::try_from(at - 1).unwrap()];
+            let voter = node.voter.as_mut().unwrap();
+            lost.extend(voter.applied(&decode(record).unwrap()));
+        }
+        for proposal in lost {
+            let key = ident(&proposal.body).unwrap();
+            match self.proposals.get(&key) {
+                Some(Fate::Pending(_)) => {
+                    self.proposals.insert(key, Fate::GivenUp);
+                    self.stats.given_up += 1;
+                }
+                other => self.fail(&format!(
+                    "node {id}: gave up proposal {key:?}, its fate was {other:?}"
+                )),
+            }
+        }
     }
 
     fn deliver(&mut self, index: usize) {
+        // Forwards keep their order on a link, as TCP does: the earliest of
+        // that link goes first. They are lost only whole (the drop event, a
+        // partition, a crash), never reordered.
+        let index = match &self.network[index] {
+            (from, to, Message::Forward { .. }) => {
+                let (from, to) = (*from, *to);
+                self.network
+                    .iter()
+                    .position(|(f, t, m)| {
+                        *f == from && *t == to && matches!(m, Message::Forward { .. })
+                    })
+                    .unwrap_or(index)
+            }
+            _ => index,
+        };
         let (from, to, message) = self.network.remove(index);
-        if self.isolated.is_some_and(|i| i == from || i == to) {
+        let cut_off = self.isolated.is_some_and(|i| i == from || i == to);
+        // A forward its receiver will not take — cut off, down, or not
+        // sequencing the slot it was sent for — is lost here (invariant 7).
+        if let Message::Forward { slot, proposal } = &message {
+            let taken = !cut_off
+                && self.nodes[usize::from(to)]
+                    .voter
+                    .as_ref()
+                    .is_some_and(|v| v.leading() && v.slot() == *slot);
+            if !taken {
+                self.forward_lost(proposal);
+            }
+        }
+        if cut_off {
             return;
         }
         if let Some(voter) = self.nodes[usize::from(to)].voter.as_mut() {
+            // A forward the sequencer's full or sealed queue refuses is lost
+            // too.
+            let forward = match &message {
+                Message::Forward { proposal, .. } => Some(proposal.clone()),
+                _ => None,
+            };
+            let refused = voter.forwards_refused();
             voter.on_message(from, message);
+            if let Some(proposal) = forward.filter(|_| voter.forwards_refused() > refused) {
+                self.stats.refused_at_sequencer += 1;
+                self.forward_lost(&proposal);
+            }
             self.drain(to);
+        }
+    }
+
+    /// Invariant 7: a forward that never reached a sequencer of its slot.
+    fn forward_lost(&mut self, proposal: &Proposal) {
+        if let Some(key) = ident(&proposal.body) {
+            self.lost_forwards.insert(key);
+        }
+    }
+
+    /// Messages to `id` go with it; its forwards among them are lost.
+    fn drop_to(&mut self, id: u8) {
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.network)
+            .into_iter()
+            .partition(|(_, to, _)| *to == id);
+        self.network = kept;
+        for (_, _, message) in gone {
+            if let Message::Forward { proposal, .. } = message {
+                self.forward_lost(&proposal);
+            }
         }
     }
 
@@ -593,15 +757,16 @@ impl World {
         self.drain(id);
     }
 
+    /// Every node makes one of its own proposals, through its outbox as a
+    /// node does (invariant 7); a sequencer sometimes hands its slot over
+    /// instead. A sequencer then makes a batch.
     fn propose(&mut self) {
         for id in 0..NODES {
+            let incarnation = self.nodes[usize::from(id)].incarnation;
             let Some(voter) = self.nodes[usize::from(id)].voter.as_mut() else {
                 continue;
             };
-            if !voter.leading() {
-                continue;
-            }
-            if self.rng.chance(5) {
+            if voter.leading() && self.rng.chance(5) {
                 if voter.hand_off().is_ok() {
                     if std::env::var_os("STRAUM_SIM_TRACE").is_some() {
                         eprintln!("{} n{id} hands slot {} over", self.step, voter.slot());
@@ -611,14 +776,26 @@ impl World {
                 self.drain(id);
                 continue;
             }
-            self.next_body += 1;
-            let proposal = Proposal {
+            self.next_proposal += 1;
+            let key = (id, incarnation, self.next_proposal);
+            let mut body = vec![id];
+            body.extend_from_slice(&incarnation.to_be_bytes());
+            body.extend_from_slice(&self.next_proposal.to_be_bytes());
+            let slot = voter.slot();
+            let fate = match voter.submit(Proposal {
                 kind: Kind::Publish,
                 properties: Vec::new(),
-                body: self.next_body.to_be_bytes().to_vec(),
+                body,
+            }) {
+                Ok(()) => Fate::Pending(slot),
+                Err(_) => {
+                    self.stats.refused += 1;
+                    Fate::Refused
+                }
             };
-            let _ = voter.propose(proposal);
             let _ = voter.flush();
+            self.stats.submitted += 1;
+            self.proposals.insert(key, fate);
             self.drain(id);
         }
     }
@@ -655,7 +832,12 @@ impl World {
             60..=64 => {
                 if !self.network.is_empty() {
                     let index = self.rng.below(self.network.len() as u64) as usize;
-                    self.network.swap_remove(index);
+                    // `remove`, not `swap_remove`: forwards keep their order on
+                    // a link, and the position in this list is that order.
+                    let (_, _, message) = self.network.remove(index);
+                    if let Message::Forward { proposal, .. } = &message {
+                        self.forward_lost(proposal);
+                    }
                 }
             }
             65..=69 => {
@@ -753,6 +935,65 @@ impl World {
         }
     }
 
+    /// Invariant 7 at the end: with no new proposals, every node's own
+    /// proposal is committed, given up, refused or orphaned — or stranded:
+    /// sent to the sequencer of a slot that stays open, with its forward
+    /// lost on the way. Nothing then shows it lost or lets it be sent again
+    /// (D-120); only that is allowed to wait. A proposal held unsent, or
+    /// waiting with every forward of it delivered, fails.
+    fn settle(&mut self) {
+        for _ in 0..200 {
+            if !self
+                .proposals
+                .values()
+                .any(|f| matches!(f, Fate::Pending(_)))
+            {
+                return;
+            }
+            self.tick();
+            for id in 0..NODES {
+                if let Some(voter) = self.nodes[usize::from(id)].voter.as_mut() {
+                    let _ = voter.flush();
+                }
+                self.drain(id);
+            }
+            let mut budget = 2000;
+            while !self.network.is_empty() && budget > 0 {
+                self.deliver(0);
+                budget -= 1;
+            }
+            for id in 0..NODES {
+                self.sync(id);
+                self.report(id);
+                self.truncate(id);
+                while !self.nodes[usize::from(id)].reads.is_empty() {
+                    self.read(id);
+                }
+            }
+        }
+        for id in 0..NODES {
+            let (held, sent) = self.nodes[usize::from(id)].voter.as_ref().unwrap().held();
+            if held != sent {
+                self.fail(&format!(
+                    "node {id}: {} of its {held} proposals still unsent after the cluster settled",
+                    held - sent
+                ));
+            }
+        }
+        let waiting: Vec<(u8, u64, u64)> = self
+            .proposals
+            .iter()
+            .filter(|(_, f)| matches!(f, Fate::Pending(_)))
+            .map(|(&key, _)| key)
+            .collect();
+        if let Some(key) = waiting.iter().find(|k| !self.lost_forwards.contains(k)) {
+            self.fail(&format!(
+                "proposal {key:?} still waits after the cluster settled, and no forward of it was lost"
+            ));
+        }
+        self.stats.stranded += waiting.len() as u64;
+    }
+
     fn converge(&mut self, goal: u64) {
         for round in 0..400 {
             if round % 4 == 0 {
@@ -846,6 +1087,7 @@ fn run(seed: u64) -> Stats {
     }
     world.step = STEPS;
     world.heal();
+    world.settle();
     world.stats.slot_ends_lost = world.written.difference(&world.ended).count() as u64;
     world.stats
 }
@@ -867,6 +1109,13 @@ fn takeovers_keep_one_committed_log() {
         total.slot_ends_lost += s.slot_ends_lost;
         total.crashes_with_slot_end += s.crashes_with_slot_end;
         total.handed_over += s.handed_over;
+        total.submitted += s.submitted;
+        total.carried += s.carried;
+        total.given_up += s.given_up;
+        total.refused += s.refused;
+        total.orphaned += s.orphaned;
+        total.stranded += s.stranded;
+        total.refused_at_sequencer += s.refused_at_sequencer;
     }
     println!(
         "committed {} takeovers {} truncations {} restarts {} power losses {} durable promises never answered {} divergent tails cut below the commit point {} handoffs {} committed {} never committed {} crashes with one pending {} slots handed over without a promise round {}",
@@ -883,6 +1132,16 @@ fn takeovers_keep_one_committed_log() {
         total.crashes_with_slot_end,
         total.handed_over
     );
+    println!(
+        "own proposals {} carried across a slot change {} given up {} refused {} orphaned by a crash {} stranded {} forwards refused by a sequencer {}",
+        total.submitted,
+        total.carried,
+        total.given_up,
+        total.refused,
+        total.orphaned,
+        total.stranded,
+        total.refused_at_sequencer
+    );
     if std::env::var("STRAUM_SIM_SEED").is_err() {
         assert!(total.committed > 0 && total.takeovers > 0 && total.truncations > 0);
         assert!(
@@ -891,6 +1150,10 @@ fn takeovers_keep_one_committed_log() {
         );
         assert!(total.power_losses > 0 && total.promises_unanswered > 0);
         assert!(total.handed_over > 0, "no slot was handed over by SlotEnd");
+        assert!(
+            total.carried > 0 && total.orphaned > 0,
+            "no proposal was carried across a slot change, or orphaned"
+        );
         assert!(
             total.slot_ends_lost > 0 && total.crashes_with_slot_end > 0,
             "no SlotEnd was lost, or no crash fell on a pending one"
@@ -904,4 +1167,23 @@ fn takeovers_keep_one_committed_log() {
 #[test]
 fn a_handoff_waits_for_a_successor_catching_up() {
     run(4905);
+}
+
+/// A forward still in flight when its sender gave it up reaches its old
+/// owner leading a later slot: taken there, it would commit after its node
+/// gave it up. A sequencer takes a forward only into the slot it was sent
+/// for (D-117 B; caught by mutation at seed 14165, rare in the sweep).
+#[test]
+fn a_forward_for_an_older_slot_is_not_taken_into_a_later_one() {
+    run(14165);
+}
+
+/// A proposal shown lost — its forward refused or dropped, a later one of
+/// its node committed in the same slot — is given up and handed back, and
+/// never commits afterwards (D-115 A). Rare since each node holds only its
+/// share of the sequencer's queue (D-120 A): 7 in 2 000 seeds; this seed
+/// has 3.
+#[test]
+fn a_proposal_shown_lost_is_given_up_and_never_commits() {
+    assert!(run(1676).given_up > 0);
 }

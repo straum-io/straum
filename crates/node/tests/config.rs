@@ -82,6 +82,18 @@ fn every_broken_rule_is_refused() {
     ));
 }
 
+/// Each node's outbox is its share of the sequencer's queue (D-120 A): a
+/// queue below one proposal per voter is refused, since the shares, never
+/// 0, would no longer fit it.
+#[test]
+fn a_queue_below_one_proposal_per_voter_is_refused() {
+    let mut config = experimental().node_config().unwrap();
+    config.core.max_queue = config.core.nodes.len() - 1;
+    assert!(matches!(config.check(), Err(ConfigError::Queue { .. })));
+    config.core.max_queue = config.core.nodes.len();
+    assert_eq!(config.check(), Ok(()));
+}
+
 #[tokio::test]
 async fn a_node_refuses_to_start_on_a_broken_configuration() {
     let mut config = experimental().node_config().unwrap();

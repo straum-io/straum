@@ -19,7 +19,30 @@ use std::path::{Path, PathBuf};
 
 use storage::{Retain, Wal, WalLimits, allocated, replay, replay_addressable};
 
-fn scratch(name: &str) -> PathBuf {
+/// A test's log file, removed when the test ends, passing or failing
+/// (D-121): the assertion's message is the diagnostic, not the file.
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn scratch(name: &str) -> Scratch {
     let mut path = std::env::temp_dir();
     path.push(format!(
         "straum-retention-{name}-{}-{:?}.wal",
@@ -27,7 +50,7 @@ fn scratch(name: &str) -> PathBuf {
         std::thread::current().id()
     ));
     let _ = fs::remove_file(&path);
-    path
+    Scratch(path)
 }
 
 fn open(path: &Path) -> Wal {
@@ -238,7 +261,7 @@ fn a_rewrite_during_a_read_cannot_change_what_the_read_is_answering() {
     let (reached, floor_seen) = mpsc::channel();
     let (rewritten, proceed) = mpsc::channel();
 
-    let reading = path.clone();
+    let reading = path.to_path_buf();
     let reader = std::thread::spawn(move || {
         let mut seen = Vec::new();
         let mut floor = 0;

@@ -138,14 +138,21 @@ pub struct Status {
     /// The highest slot this node has promised, and whether it sequences it.
     pub slot: u64,
     pub leading: bool,
+    /// This node's proposals refused at a full outbox, and given up as
+    /// lost before a later one of its committed (D-109 B, D-115 A).
+    pub refused: u64,
+    pub given_up: u64,
 }
 
-/// A running node. Dropping it does not stop it; `shutdown` does.
+/// A running node. `shutdown` stops it and waits for every part. Dropping
+/// it only ends the node loop (its stop channel closes); its link and MQTT
+/// tasks run until the runtime ends, and the log thread until its queue
+/// closes — nothing waits for them.
 pub struct Node {
     pub listen: SocketAddr,
     pub mqtt: Option<SocketAddr>,
     proposals: mpsc::Sender<Proposal>,
-    effects: broadcast::Sender<(u64, Vec<Effect>)>,
+    effects: broadcast::Sender<(u64, u64, Vec<Effect>)>,
     /// Operator handoffs, each with where its answer goes.
     hand_offs: mpsc::Sender<oneshot::Sender<Result<(), cluster::ClusterError>>>,
     status: watch::Receiver<Status>,
@@ -350,6 +357,10 @@ struct Loop {
     /// Connections whose reader waits for the gateway to want more.
     paused: BTreeSet<u64>,
     started: tokio::time::Instant,
+    /// This node's proposals refused at a full outbox, and given up as lost
+    /// before a later one committed (D-115 A: counted, never silent).
+    refused: u64,
+    given_up: u64,
 }
 
 impl Loop {
@@ -357,29 +368,14 @@ impl Loop {
         self.started.elapsed()
     }
 
+    /// This node's own proposal: the core holds it until its record
+    /// commits and sends it when a sequencer can take it (D-109 B).
     fn propose(&mut self, proposal: Proposal) {
-        if self.core.leading() {
-            // ponytail: dropped, not held. Nothing is acknowledged that
-            // was not committed: the gateway closes a publisher whose
-            // proposal does not commit within `commit_timeout`, and
-            // resends its lifecycle proposals. Holding them back is open
-            // (ADR-0008, "Not yet in step 4").
-            if self.core.propose(proposal).is_err() {
-                tracing::warn!("proposal refused: the sequencer's queue is full");
-            }
-            return;
-        }
-        // Forwarded to the owner of the promised slot, over a link that
-        // keeps order (gateway::Action::Propose). While no one sequences —
-        // a takeover in progress, or this node about to — it is dropped,
-        // as above.
-        match self.core.owner() {
-            Some(owner) if owner != self.core.id() => {
-                if let Some(link) = self.links.get(&owner) {
-                    let _ = link.try_send(Frame::Forward(proposal));
-                }
-            }
-            _ => {}
+        if self.core.submit(proposal).is_err() {
+            self.refused = self.refused.saturating_add(1);
+            tracing::warn!(
+                "proposal refused: this node holds a full queue of uncommitted proposals"
+            );
         }
     }
 
@@ -435,7 +431,10 @@ impl Loop {
     }
 
     fn credit(&mut self, conn: u64) {
-        let wants = self.gateway.as_ref().is_some_and(|g| g.wants_read(conn));
+        // Backpressure from the outbox too (D-120 A): while it is full, no
+        // client is read, so a publish waits in TCP instead of being refused.
+        let room = !self.core.outbox_full();
+        let wants = room && self.gateway.as_ref().is_some_and(|g| g.wants_read(conn));
         match self.conns.get(&conn) {
             Some(c) if wants => {
                 let _ = c.credit.try_send(());
@@ -449,6 +448,9 @@ impl Loop {
 
     /// Gives a credit to every paused connection the gateway would now read.
     fn resume(&mut self) {
+        if self.core.outbox_full() {
+            return;
+        }
         let Some(gateway) = self.gateway.as_ref() else {
             return;
         };
@@ -565,6 +567,7 @@ impl Node {
                 rx,
                 config.transport,
                 Arc::clone(&budget),
+                config.heartbeat,
             )));
         }
 
@@ -615,6 +618,9 @@ impl Node {
             recovered.promised,
         )
         .knowing_commit(state.applied())
+        // What forwarding waits for after a restart: the slot of the last
+        // committed record, from the snapshot until the replay passes it.
+        .knowing_applied_slot(snapshot_slots.last().map(|&(slot, _)| slot))
         .incarnation(life);
         let core = match config.rotate_every {
             Some(ticks) => core.rotate_every(ticks),
@@ -627,6 +633,8 @@ impl Node {
             conns: HashMap::new(),
             paused: BTreeSet::new(),
             started,
+            refused: 0,
+            given_up: 0,
         };
         // The gateway's NodeReset goes to the log before anything else.
         node.gateway_actions();
@@ -663,14 +671,12 @@ impl Node {
                         node.gateway_actions();
                     }
                     Some(event) = mqtt_rx.recv() => node.mqtt(event),
-                    Some((from, frame)) = inbound_rx.recv() => match frame {
-                        Frame::Message(message) => node.core.on_message(from, message),
-                        // One hop only: a node that no longer sequences
-                        // drops it rather than pass it on to a view of the
-                        // owner that may point back.
-                        Frame::Forward(proposal) if node.core.leading() => node.propose(proposal),
-                        _ => {}
-                    },
+                    // A HELLO after the first is ignored; forwards are messages.
+                    Some((from, frame)) = inbound_rx.recv() => {
+                        if let Frame::Message(message) = frame {
+                            node.core.on_message(from, message);
+                        }
+                    }
                     Some(proposal) = proposals_rx.recv() => node.propose(proposal),
                     Some(reply) = hand_offs_rx.recv() => {
                         let _ = reply.send(node.core.hand_off());
@@ -782,6 +788,11 @@ impl Node {
                     if committed_slots.last().is_none_or(|&(slot, _)| slot < decoded.slot) {
                         committed_slots.push((decoded.slot, decoded.lsn));
                     }
+                    let lost = node.core.applied(&decoded).len();
+                    if lost > 0 {
+                        node.given_up = node.given_up.saturating_add(lost as u64);
+                        tracing::warn!(lost, "proposals lost before a later one of this node committed; their publishers time out");
+                    }
                     let mut out = Vec::new();
                     if let Err(error) = state.apply(&decoded, &mut out) {
                         tracing::error!(%error, "a committed record does not apply; the node stops");
@@ -794,7 +805,7 @@ impl Node {
                     // can then check a PUBACK came after its commit.
                     // Cloned only for a test that listens.
                     if effects_tx.receiver_count() > 0 {
-                        let _ = effects_tx.send((next, out.clone()));
+                        let _ = effects_tx.send((next, decoded.slot, out.clone()));
                     }
                     let now = node.now();
                     if let Some(g) = node.gateway.as_mut() {
@@ -831,6 +842,8 @@ impl Node {
                     digest,
                     slot: node.core.slot(),
                     leading: node.core.leading(),
+                    refused: node.refused,
+                    given_up: node.given_up,
                 };
                 status_tx.send_if_modified(|current| {
                     let changed = *current != last;
@@ -891,8 +904,9 @@ impl Node {
         self.status.clone()
     }
 
-    /// Every committed record's effects, as this node applies them.
-    pub fn effects(&self) -> broadcast::Receiver<(u64, Vec<Effect>)> {
+    /// Every committed record's effects, as this node applies them, with
+    /// its lsn and slot: `(lsn, slot, effects)`.
+    pub fn effects(&self) -> broadcast::Receiver<(u64, u64, Vec<Effect>)> {
         self.effects.subscribe()
     }
 

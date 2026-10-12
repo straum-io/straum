@@ -193,7 +193,9 @@ fn load(
                 return committed;
             }
             let received = tokio::time::timeout(Duration::from_millis(50), effects.recv()).await;
-            let Ok(Ok((_, out))) = received else { continue };
+            let Ok(Ok((_, _, out))) = received else {
+                continue;
+            };
             for effect in out {
                 if let Effect::Accepted { to, .. } = effect {
                     if to.node == at {

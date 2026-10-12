@@ -319,7 +319,25 @@ mod tests {
     use crate::wal::Wal;
     use std::sync::mpsc::{Receiver, Sender, channel};
 
-    fn scratch(name: &str) -> std::path::PathBuf {
+    /// A test's log file, removed when it is dropped (D-121) — at the test's
+    /// end, or once the `Wal` holds it open: the file stays readable through
+    /// that descriptor until it closes.
+    struct Scratch(std::path::PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> Scratch {
         let mut path = std::env::temp_dir();
         path.push(format!(
             "straum-commit-{name}-{}-{:?}.wal",
@@ -327,7 +345,7 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_file(&path);
-        path
+        Scratch(path)
     }
 
     fn committer(name: &str) -> (Committer, Sender<WalRecord>, Receiver<WalRecord>) {

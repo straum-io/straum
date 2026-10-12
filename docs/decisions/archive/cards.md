@@ -2214,3 +2214,453 @@ Anyone who can reach the ports can publish, subscribe, or join the link protocol
 
 **Answer:** `D-108: A` · `D-108: B` · `D-108: discuss`
 ````
+
+````markdown
+## D-109. A publish made while the slot changes hands is dropped
+
+**Context.** The end-to-end test (D-106) finds it every run: the first QoS 1 publish after the operator's handoff gets no PUBACK.
+- **What the node does:** a proposal reaching a node while no one sequences, or forwarded to a sequencer that has just stepped down, is dropped, not held (ADR-0008, "Not yet in step 4"). Nothing uncommitted is ever acknowledged.
+- **What the client sees:** a silence of up to `commit_timeout` (30 s), after which the gateway closes the connection; an at-least-once client then reconnects and resends.
+- **In the test:** the resend is acknowledged on the second attempt.
+
+It is safe, but every handoff — planned, as an operator's command — costs publishers up to 30 s.
+**Vision.** unified-stream §2.4 (planned handoff); CLAUDE.md §8 (today: "the proposal is dropped, never acknowledged; `commit_timeout` closes its publisher"); §7 (bounded memory); D-102 A.
+
+### A. Pass the queue on at the handoff — recommended
+- **What we do:** the outgoing sequencer forwards the proposals it still holds, in order, to the successor with the handoff — the successor is known then, from the schedule. A proposal reaching a node while no successor is known yet is dropped as today. The drop at a planned handoff is fixed at its source, in the handoff protocol.
+- **Requirement:** held proposals stay within the gateway's existing budgets (`max_pending`, `max_total_pending_bytes`, §7); one older than `commit_timeout` is dropped as today.
+- **Duplicates:** a proposal forwarded once and re-forwarded may commit twice. For a QoS 1 publish that is a legitimate duplicate — at-least-once allows it, and the client's own resend already can — so no dedup key is added; lifecycle proposals are already idempotent.
+- **Cost:** M. The handoff path and the node loop; the end-to-end test then asserts the first publish after a handoff is acknowledged without a resend.
+- **Check:** that test; the takeover, MQTT and apply simulations.
+
+### B. Hold proposals at the node across a slot change, bounded
+- **What we do:** each node keeps what it could not hand to a sequencer, in order, within the same budgets, and re-forwards it once a later slot's sequencer is known. Covers takeovers by silence too, not only planned handoffs.
+- **Duplicates:** as in A.
+- **Cost:** M.
+- **Risks:** a buffer per node, bounded by the gateway's budgets.
+
+### C. Close the publisher's connection at once when its proposal is dropped
+- **What we do:** the gateway learns of the drop and closes the connection with a reason, so the client reconnects and resends immediately, not after 30 s.
+- **Cost:** S.
+- **Risks:** a burst of reconnects at each handoff.
+
+### D. Keep it; document it
+- **Cost:** none.
+- **Risks:** up to 30 s of silence per publisher at every handoff.
+
+**Recommendation.** A; C as a cheap first step if A waits.
+
+**Answer:** `D-109: A` · `D-109: B` · `D-109: C` · `D-109: D` · `D-109: discuss`
+
+````
+
+````markdown
+## D-110. A design for credentials and TLS on the new path
+
+**Context.** D-107 asks for the bounds of acceptable use and a design.
+- **The bounds, now in place:** loopback by default; any address beyond it refused at startup unless `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1`; an isolated, trusted network only.
+- **What already exists:**
+  - the old path has client credentials (`auth`: password file, ACL) and client TLS (`transport`, rustls);
+  - the new path has neither;
+  - its links are plain TCP whose HELLO carries a version and a configuration digest — integrity of intent, not authentication.
+**Vision.** CLAUDE.md scope (TLS optional), §2 (`auth`, `transport`); D-102 A; unified-stream §1.
+
+### A. Clients first, then mutual TLS between nodes — recommended
+- **What we do:**
+  1. **Clients:** `node` checks CONNECT credentials with the `auth` crate (its password file and ACL format) and serves TLS through `transport`. The ACL is checked only at the gateway's ingress — CONNECT, PUBLISH, SUBSCRIBE — never at apply or delivery, so nodes with different ACL files still apply the same log the same way; a refusal filters input before it reaches the log and decides nothing in shared state (§1: a node is a function of the committed log and its input).
+  2. **Links:** mutual TLS with a cluster CA; each node's certificate names its id, checked against the HELLO.
+  3. The unauthenticated-network flag then applies only to what still lacks either.
+- **Cost:** M for 1, M–L for 2.
+- **Risks:**
+  - certificate handling for every node;
+  - TLS on links costs throughput, unmeasured until Linux.
+
+### B. Clients as A; links authenticated by a cluster secret
+- **What we do:** HELLO becomes a challenge and response under a shared key (HMAC), with no encryption on links.
+- **Cost:** M; a new dependency for HMAC (§2 asks for a reason).
+- **Risks:** link traffic stays readable; one secret for the whole cluster.
+
+### C. Clients as A; links left to the network (WireGuard, IPsec, a private VLAN)
+- **What we do:** document that links require a protected network, and keep the flag for them.
+- **Cost:** S beyond A.
+- **Risks:** the broker depends on an operator getting the network right.
+
+**Recommendation.** A, in that order: clients first, since that is what an untrusted network reaches first.
+
+**Answer:** `D-110: A` · `D-110: B` · `D-110: C` · `D-110: discuss`
+
+````
+
+````markdown
+## D-112. What to rebuild on the new path after step 8
+
+**Context.** Step 8 (D-111) removed, with the old broker:
+- a single-node mode — the new path needs three voters;
+- metrics;
+- kernel probes at startup;
+- client TLS and credentials (D-110);
+- ADR-0006's durability levels.
+
+Your order after D-106–D-108 is the rest of 7a, then measurements on a Linux host.
+**Vision.** unified-stream §1 (one mechanism; the log decides), §6 phases; D-102 A; D-111.
+
+### A. Metrics before Linux measurements, the rest after — recommended
+- **What we do:**
+  - export `node::Status` and `gateway::Load` (commit, applied, slot, leading, pending, dropped, takeovers) in the Prometheus text format, written by hand as before;
+  - opt-in address, loopback by default (D-107).
+  - Linux measurements need them to say what happened.
+- **Cost:** S–M.
+
+### B. A cluster of one first
+- **What we do:** allow one voter (commit = the local sync), as step 8 planned; a single host can run Straum again.
+- **Cost:** M; the startup rule "at least three voters" becomes "one, or an odd number ≥ 3", with the simulation covering one.
+- **Risks:** it reopens D-104 A.
+
+### C. Neither before 7a's remaining parts (7b state copy, 7c sessions)
+- **Cost:** none now.
+- **Risks:** Linux measurements without metrics see only what the benchmarks print.
+
+**Recommendation.** A.
+
+**Answer:** `D-112: A` · `D-112: B` · `D-112: C` · `D-112: discuss`
+
+````
+
+````markdown
+## D-113. Closing D-108: the unstable node start
+
+**Context.** One run in the Linux container failed two node tests at a node's start; the run kept no error text.
+- **Since then:** 24 container runs and every host run passed. The tests now report `Node::start`'s error.
+- **One candidate removed:** the bind-and-release port race in the test helper. Each test binary now takes ports from a block of its own, numbered by a counter.
+- **The cause is not established.**
+**Vision.** D-108 (diagnose; never mask by retries); CLAUDE.md §17.
+
+### A. Keep it open with a long container loop that keeps the logs — recommended
+- **What we do:** 100 runs of the node tests in the container, keeping the full output of any failure.
+- **Outcome:** a failure with its error decides the fix; none, and D-108 closes as not reproduced after the helper fix.
+- **Cost:** S, about 90 minutes of machine time.
+
+### B. Close it now as not reproduced after the helper fix
+- **Cost:** none.
+- **Risks:** a cause in node startup, if there is one, waits for the next failure. Its error text will now be kept.
+
+**Recommendation.** A.
+
+**Answer:** `D-113: A` · `D-113: B` · `D-113: discuss`
+
+````
+
+````markdown
+## D-114. The architecture document after step 8
+
+**Context.** `docs/architecture/unified-stream.md` (level 1, yours) still describes the old path as existing:
+- line 5: durable leader/follower replication "is implemented";
+- §6, phase 0: a harness "for the existing leader/follower replication".
+
+Both the replication and the harness were deleted at step 8 (D-111). ADR-0008 records the deviation, but the level-1 text now contradicts the tree.
+**Vision.** CLAUDE.md "Sources, in order of precedence" (level 1 decides; the lower is corrected); D-111.
+
+### A. Amend unified-stream.md to say what was removed and when — recommended
+- **What we do:** you edit it, or approve the edit: the intro and §6 phase 0 say the old path existed until step 8 (D-111), and point to ADR-0008.
+- **Cost:** XS.
+
+### B. Leave it; ADR-0008's record suffices
+- **Risks:** the highest-ranked document disagrees with the code.
+
+**Recommendation.** A.
+
+**Answer:** `D-114: A` · `D-114: B` · `D-114: discuss`
+````
+
+
+````markdown
+## D-115. The losses the outbox still has, inside one slot
+
+**Context.** D-109 B closed the loss at a slot change. One loss remains, inside a slot:
+- **When:** a proposal is refused by a full sequencer queue (`max_queue`), or lost in the tail of a broken link, and a later proposal of the same node then commits in the same slot.
+- **What the node does:** sending it again would put it behind the later one, so it is given up and logged ("proposals lost before a later one of this node committed"). Its publisher is closed by `commit_timeout` (30 s), as before D-109.
+- **What never happens:** a duplicate or a reorder. Only a loss, which at-least-once covers through the client's resend.
+- **Unknown:** how often this happens under load. Nothing counts it yet (D-112).
+**Vision.** CLAUDE.md §7 (ordering), §8; D-109 B's condition ("no republishing without well-defined deduplication"); D-112 A.
+
+### A. Count it first, decide on the number — recommended
+- **What we do:** the metrics of D-112 count these losses (`proposals_given_up`) next to the queue and link drops. If the Linux runs show them under a realistic load, this card comes back with the number.
+- **Cost:** XS within D-112.
+- **Risks:** until then — D-112 comes after D-113 and D-114 — a publisher can wait 30 s after such a loss.
+
+### B. Acknowledged forwarding: the sequencer confirms what it queued
+- **What we do:** every forwarded proposal carries a per-node sequence number. The sequencer acknowledges receipt, or reports a refusal, over the link. The origin then resends a refused one at once, within the slot, before anything after it. That needs a dedup window at the sequencer per origin, and a wire change (`WIRE_VERSION` 2).
+- **Cost:** M–L. The protocol, the wire, the simulation, and a new invariant to prove: no reorder across a refusal.
+- **Limits:** the sequencer's dedup window is volatile and lives per slot (a fresh `Sequencer` at every takeover or handoff), so the outbox's slot-closure rule stays the only dedup across slots.
+- **Check:** a takeover-simulation scenario with refusals (`max_queue` small) and link loss, asserting each node's proposals commit in order, with no gap followed by a reordered resend.
+- **Risks:** new protocol state beside the log; it decides nothing durable, but it is a second place where order is kept.
+
+### C. Close the publisher at once on a give-up
+- **What we do:** when the outbox gives an entry up, the node tells the gateway, which closes that publisher's connection with a reason; the client reconnects and resends at once instead of after 30 s. No protocol change. You weighed the same mechanism as D-109 C, for slot changes.
+- **Cost:** S. A gateway call keyed by the proposal's origin and request.
+- **Risks:** a reconnect burst when a queue overflows under load — exactly when load is highest.
+
+### D. Leave it as it is
+- **Cost:** none.
+- **Risks:** as in A, without the number.
+
+**Recommendation.** A. C if the number shows these losses and a 30 s wait is unacceptable; B only if reconnects are unacceptable too.
+
+**Answer:** `D-115: A` · `D-115: B` · `D-115: C` · `D-115: D` · `D-115: discuss`
+
+````
+
+````markdown
+## D-116. A failing node test leaves its nodes running
+
+**Context.** Seen once while checking D-109 by mutation. Two node tests failed after 31 s, but the test process took about 7 more minutes to exit.
+- **Why:** `Node` does not stop when dropped (its documented contract). A test that panics never reaches `Cluster::shutdown`, and its nodes keep running until the runtime is torn down.
+- **Scope:** a passing run is unaffected. A failing one is slow to report, and in the container loop of D-113 it would stretch each failing run.
+**Vision.** CLAUDE.md §17 (failure paths tested); D-113 (diagnostics kept, nothing retried).
+
+### A. Stop the nodes when the test `Cluster` is dropped — recommended
+- **What we do:** a `Drop` on the test helper `Cluster` sends each node its stop, without awaiting. Test code only; `Node`'s contract stays as it is.
+- **Cost:** XS.
+- **Risks:** none in production code.
+
+### B. Leave it
+- **Cost:** none.
+- **Risks:** a failing run in D-113's loop takes minutes longer; no information is lost.
+
+**Recommendation.** A, before D-113's 100 runs.
+
+**Answer:** `D-116: A` · `D-116: B` · `D-116: discuss`
+
+````
+
+````markdown
+## D-117. The outbox is not in any deterministic simulation
+
+**Context.** D-109 B's ordering, dedup and fencing rules live in the tokio driver (`node::Loop::pump`, `node/src/outbox.rs`).
+- **What checks it now:** unit tests, two loopback tests (a handoff, and a sequencer stopped), and a mutation check.
+- **What does not:** no simulation runs it. Partitions, message loss and a fenced owner that is still alive with forwards in its queue (unified-stream §5, {A}|{B,C}) are untested for it.
+- **Rule broken:** unified-stream §1 and §7 ask that correctness be shown by deterministic simulation, with scenarios in every step. This is recorded as a deviation in ADR-0008.
+**Vision.** unified-stream §1, §5, §7; ADR-0007; D-109 B.
+
+### A. Move the outbox into `gateway`, drive it in the gateway and takeover simulations
+- **What we do:** the gateway already owns its proposals' identity (origin, request) and sees every committed effect. It would hold the outbox and decide what to send, given the slot and owner the node tells it, and whether that slot has a committed record. `node` would only carry out the sends. `sim/tests/gateway.rs` and the takeover simulation then add these scenarios:
+  - a handoff, and a takeover by silence;
+  - a fenced owner still alive with forwards queued;
+  - link loss and refusals.
+  
+  Each scenario asserts commit-once, per-session order, and no older-slot commit after a newer one.
+- **Cost:** M. The gateway's interface gains the slot/owner input; the node's pump moves over.
+- **Risks:** the gateway's tests change shape; the simulation needs a per-node forwarding model it does not have yet.
+
+### B. Move the outbox into `cluster`, beside `Sequencer`, driven by the takeover simulation — recommended
+- **What we do:** `cluster` already knows the slot, the owner and the committed slot table. The outbox would live there and decide what to send. The existing takeover simulation already has partitions, loss and a live fenced owner ({A}|{B,C}), so it drives the outbox with no new forwarding model. Each scenario asserts commit-once, per-origin order, and no older-slot commit after a newer one.
+- **Cost:** M. `cluster` learns which records a node proposed (opaque bytes; identity by equality, as now).
+- **Risks:** `cluster` grows a client-facing concern; per-session order then rests on per-origin order, as it does now.
+
+### C. Keep it in `node`; model it in the takeover simulation as a copy
+- **What we do:** the takeover simulation gets its own outbox model with the same rules.
+- **Cost:** S–M.
+- **Risks:** two implementations that can drift; the simulation then checks the model, not the code.
+
+### D. Keep the deviation as recorded
+- **Cost:** none.
+- **Risks:** the rules that keep order and prevent duplicates across slot changes are shown only on loopback, under no partition. D-109 then stays open against its own condition (fencing of a live owner unverified).
+
+**Recommendation.** B: it reuses the simulation that already has the faults, without a new model. A if the outbox should stay with the proposals' owner. Before D-112's measurements, which will exercise it under load.
+
+**Answer:** `D-117: A` · `D-117: B` · `D-117: C` · `D-117: D` · `D-117: discuss`
+
+````
+
+````markdown
+## D-118. A takeover by silence seen in the end-to-end test under load
+
+**Context.** One gate run of the D-106 test failed: when SIGUSR1 came, node 0 was no longer the sequencer ("this node is not the slot's sequencer").
+- **When it happened:** the run shared the machine with the full workspace validation and the Linux container.
+- **Likely cause, unconfirmed:** node 1, just restarted over its data, took the slot over by silence, which the protocol allows when heartbeats are late.
+- **What the test assumes:** node 0 still sequences at that point.
+- **The other runs:** five passed before it, and three after.
+- **Diagnostics:** only node 0's log was kept (in the hook's report): node 0 started at 16:08:38.5 and refused the handoff at 16:08:43.5. Node 1's log was not kept.
+- **What I did:** I briefly relaxed the test to accept either node, then reverted it: you made this test a regression barrier, and a relaxation needs your decision.
+**Vision.** D-106 (mandatory regression barrier); D-113 (diagnose; no retries); unified-stream §1 (time triggers, never decides).
+
+### A. Treat it as a D-113 lead: keep every node's log on failure, then decide — recommended
+- **What we do:** the server test copies all three nodes' logs aside when it fails. D-113's 100 container runs include the server test, under the same parallel load, and the same loop runs the test at a6986ea, before D-109 B, to tell a regression from a takeover that was already there. A recurrence with node 1's log shows whether it was a takeover by silence, and why.
+- **Cost:** XS, plus machine time inside D-113.
+- **Outcome:** a confirmed takeover by silence comes back to you as a card (widening the barrier is your decision); anything else is a defect to fix.
+
+### B. Accept that either running node may sequence there
+- **What we do:** the test asks both nodes for the handoff and checks that one hands over and the other refuses, as I had briefly done.
+- **Cost:** XS.
+- **Risks:** it widens what the barrier accepts before the cause is known.
+
+### C. Leave the test as it is
+- **Risks:** a flaky barrier under load, with nothing kept to explain it.
+
+**Recommendation.** A.
+
+**Answer:** `D-118: A` · `D-118: B` · `D-118: C` · `D-118: discuss`
+
+````
+
+````markdown
+## D-119. Is D-109 closed?
+
+**Context.** D-112 A is ordered "after D-109 is closed". D-109 B's conditions, and where they stand:
+- **No proposal republished without dedup and confirmation of the result:** met. Confirmation is the identical committed record; a resend happens only after the slot it went to is closed.
+- **Order, fencing and commit rules unchanged:** met on loopback. The fencing check is structural: committed slots never go backwards. A fenced owner that is still alive is not tested (D-117).
+- **No loss of an accepted proposal:**
+  - met for proposals in flight at a handoff or a failure;
+  - not met for in-slot give-ups after a full queue or a lost link tail (D-115). The publisher is never acknowledged; it is closed at `commit_timeout`.
+- **Within the existing limits:** a count bound, `max_queue` = 1 024 entries per node. That is the sequencer's own bound, without a byte budget of its own: up to 256 MiB at worst.
+
+**Vision.** D-109 B; D-112 A; unified-stream §1, §7; CLAUDE.md §7.
+
+### A. Closed, with D-115 and D-117 open — recommended
+- **What we do:** D-109 counts as closed. "Accepted" means acknowledged to a client: none is lost, and none was acknowledged before its commit. The next steps are D-113, then D-114, with D-117 before D-112's measurements.
+- **Risks:** the live-fenced-owner case stays unverified until D-117.
+
+### B. Open until D-117 is done
+- **What we do:** D-117 next, before D-113.
+- **Cost:** M first.
+- **Risks:** the order you set (D-113, D-114 next) shifts.
+
+### C. Open until D-115 and D-117 are done, and the outbox has a byte bound
+- **What we do:** D-117 next; then an outbox byte budget (the gateway's `max_total_pending_bytes` plus a fixed share for lifecycle proposals); then D-115 once counted.
+- **Cost:** M–L before D-113.
+
+**Recommendation.** A.
+
+**Answer:** `D-119: A` · `D-119: B` · `D-119: C` · `D-119: discuss`
+````
+
+
+````markdown
+## D-120. Proposals stranded in an open slot, and the resend burst after a slot change
+
+**Context.** The takeover simulation now runs the real outbox (D-117 B) and found two gaps. Neither is a safety failure: no duplicate, no reorder, nothing committed after fencing. Both are liveness gaps.
+- **Stranded:** a node's forward is lost — on the link, refused by the sequencer's full or sealed queue, or dropped by a node that does not lead its slot — and nothing of that node commits after it while the slot stays open. Nothing shows it lost, and resending it into the same slot could commit it twice. So it waits: until a later proposal of the same node commits (then it is given up and counted), or the slot changes (then it is sent again). Its publisher is closed after `commit_timeout` (30 s); the client's resend unblocks it.
+  - In 2 000 seeds: 16 741 stranded of 1 187 814 proposals. Every one had a lost forward; any other wait fails the run.
+- **Resend burst:** after a slot change every node sends its whole outbox again at once. The sequencer's queue (`max_queue`, 1 024, fixed in 7a) is as large as one node's outbox (also 1 024), so three full outboxes overflow it, and the overflow is lost as above.
+- **What is counted now, and what is not:**
+  - counted: refusals at a full outbox (`Status::refused`), give-ups (`Status::given_up`), forwards a full or sealed sequencer queue refused (`Voter::forwards_refused`, not yet in `Status`);
+  - not counted: forwards lost on a link, or dropped by a node not leading their slot. D-112's metrics must cover these paths (D-115 A).
+**Vision.** D-109 B, D-115 A (measure first; a forwarding acknowledgement is not a durable commit), D-119 A (the outbox bound becomes a real resource bound; explicit backpressure or fail-fast, never silent loss); CLAUDE.md §7, §8.
+
+### A. Cap each node's outbox at `max_queue / voters` — recommended
+- **What we do:** each node holds at most 341 proposals with three voters, so every outbox together fits the sequencer's queue and a resend burst cannot overflow it. The sequencer's bound and memory stay as they are. A node at its cap refuses new proposals, counted (`Status::refused`), and its publisher waits as at any refusal: explicit backpressure.
+- **Strandings:** counted in D-112 (the oldest sent entry's age in heartbeats). The stranding itself is decided on that number.
+- **Check:** the takeover simulation, with its assertions unchanged; refused forwards at the sequencer should fall to those from a sealed queue.
+- **Cost:** S. A fixed 7a limit changes (`docs/configuration.md`); a behaviour change by CLAUDE.md §8.
+- **Risks:** a third of today's per-node admission, at a byte cost still unbounded per entry (up to 341 × 256 KiB per node).
+
+### B. Grow the sequencer's queue to voters × `max_queue`
+- **What we do:** the sequencer's queue takes every outbox at once.
+- **Cost:** S. A fixed 7a limit and the configuration digest change.
+- **Risks:** a count-only bound tripled: a worst case of 3 072 × 256 KiB = 768 MiB at the sequencer, against D-119 A's priority on bounding memory.
+
+### C. Reopen D-115: the sequencer acknowledges receipt of each forward
+- **What we do:** you deferred this in D-115 A until D-112 measures the losses. The new evidence is the 16 741 strandings in the simulation; the decision should still wait for D-112's numbers from a real workload. Each forward would carry a per-node number, and the sequencer would report it queued or refused. A refused one is sent again at once, in order. A receipt is not a commit: confirmation stays the committed record.
+- **Cost:** M–L; a wire change, new protocol state, simulation scenarios.
+
+### D. Leave both as recorded
+- **Risks:** the 30 s wait on loss stays, and every slot change under load overflows the sequencer's queue.
+
+**Rejected.**
+- *Give up a sent entry after K heartbeats and close its publisher at once:* this revives D-109 C and D-115 C, which you rejected, without new evidence. Without the immediate close it only frees outbox room. It would also redefine "given up" as "may still commit".
+
+**Recommendation.** A. C once D-112's numbers show strandings matter on a real workload.
+
+**Answer:** `D-120: A` · `D-120: B` · `D-120: C` · `D-120: D` · `D-120: discuss`
+````
+
+````markdown
+## D-121. Storage and transport tests leave their directories behind
+
+**Context.** Found while checking D-116. `$TMPDIR` holds about 5 400 `straum-*` directories, about 32 MB:
+- **`storage` tests:** about 4 800 of them (`straum-retention-*` and `straum-commit-*`), one or more per test case, left on passing runs too. Some come from proptest cases, which multiplies them.
+- **`transport` tests:** 379 empty `straum-tls-*`.
+- **The node and server tests:** they now clean up after themselves (D-116).
+
+Nothing breaks: names carry the process and thread ids. But the directories grow with every validation run, and in D-113's loops with every run.
+**Vision.** CLAUDE.md §17 (failure paths tested); D-116 A (cleanup on success and failure).
+
+### A. Each test removes its directory in a guard dropped at its end — recommended
+- **What we do:** the storage and transport test helpers return a guard that removes the directory on drop, success or failure. Same shape as D-116. Test code only.
+- **Cost:** S.
+- **Risks:** none in production code; a failing storage test no longer leaves its files to inspect. Its assertion message is the diagnostic, as today in the node tests.
+
+### B. Leave it
+- **Risks:** about 30 MB more per few hundred runs, in a directory macOS clears only on reboot.
+
+**Recommendation.** A.
+
+**Answer:** `D-121: A` · `D-121: B` · `D-121: discuss`
+
+````
+
+````markdown
+## D-122. A restarted node takes a live sequencer's slot over, because the sequencer redials slowly
+
+**Context.** D-118's failure recurred during a gate run while D-113's loops loaded the machine. This time every node's log was kept (D-118 A).
+- **What the logs show:** node 1 restarted at 21:21:21.644 and was the sequencer 0.66 s later. Node 0 had been sequencing and was alive throughout. So node 1 took the slot over by silence. The end-to-end test, which requires node 0 to sequence there, failed.
+- **Likely mechanism, from the code, not yet measured:**
+  - While a peer is down, a node redials it with a backoff doubling from 50 ms to 1 s (`node/src/link.rs`, `BACKOFF_MAX`).
+  - Node 1 was down for about 4 s, so node 0's next dial could be up to 1 s away when node 1 came back.
+  - A restarted node that hears nothing from the slot's owner for `takeover_ticks` heartbeats (3 × 50 ms) starts a takeover.
+  - The sequencer's silence toward a restarted peer can therefore outlast the takeover window. Under load the window is crossed more often.
+- **Not a D-109 regression:** the link code predates D-109, and D-113's loop of the server test at a6986ea fails the same way — node 0 no longer the sequencer when SIGUSR1 comes (5 of 100 at a6986ea, 6 of 100 on the current tree, D-113 A).
+- **Is it unsafe?** No. The takeover follows the protocol, with fencing and the committed prefix intact. But a needless takeover after every restart costs a slot change and its stall, and it breaks the barrier test.
+**Vision.** unified-stream §1 (time only triggers a transition); D-118 A (keep the assertion, find the cause); D-85 liveness contract.
+
+### A. Cap the redial backoff below the takeover window — recommended
+- **What we do:** a link's redial backoff never exceeds one heartbeat. A peer that comes back hears the sequencer within one heartbeat, inside the window of `takeover_ticks`. A redial costs one failed `connect` per heartbeat per down peer, to loopback or the LAN.
+- **Check:**
+  - a node test that stops a replica for longer than the old 1 s cap and restarts it, asserting the slot stays with its owner;
+  - the D-106 test under the D-113 loop.
+- **Cost:** S.
+- **Risks:** more connect attempts toward a dead peer, one per heartbeat.
+
+### B. A restarted node waits before counting silence
+- **What we do:** after a start, a node counts silence only after it has heard the owner once, or after `takeover_ticks × MAX_PATIENCE`.
+- **Cost:** S–M; touches `cluster::Voter`, with a simulation scenario.
+- **Risks:** a cluster restarting with its sequencer dead waits longer for a takeover.
+
+**Rejected.**
+- *Accept it and relax the barrier:* you rejected that in D-118 A.
+
+**Recommendation.** A; B as well if the loop still shows takeovers after A.
+
+**Answer:** `D-122: A` · `D-122: B` · `D-122: discuss`
+````
+
+
+````markdown
+## D-123. Keep-alives under outbox backpressure
+
+**Context.** D-120 A made a full outbox backpressure: while a node's outbox holds its share, the node reads none of its MQTT clients.
+- **What that includes:** subscribers' PINGREQs and PUBACKs, from clients that publish nothing.
+- **What can follow:** the gateway closes a client after 1.5 × its keep-alive with no packet received. A client idle through a long full spell can be closed for silence the node caused.
+- **How long a full spell lasts:** as long as commits stall — for example, no majority. In that case `commit_timeout` (30 s) closes the publishers anyway.
+- **Unmeasured:** how often a spell outlasts a keep-alive. D-112 can count reads withheld and how long.
+**Vision.** D-120 A ("failure or backpressure, never silent loss"); CLAUDE.md §8; MQTT 3.1.1 §3.1.2.10 and MQTT 5 §3.1.2.10 (keep-alive).
+
+### A. Measure first, in D-112 — recommended
+- **What we do:** D-112 counts spells of withheld reads and their length. This card comes back with the number if spells approach a keep-alive.
+- **Cost:** XS within D-112.
+- **Risks:** until then, an idle client can be closed during a long stall. It reconnects; nothing it was promised is lost.
+
+### B. Pause only reads that would propose
+- **What we do:** keep reading every client, and hold every packet that would propose — PUBLISH, SUBSCRIBE, UNSUBSCRIBE and PUBACK, since a PUBACK is itself a log record (`Proposal::Ack`) — until the outbox has room. Only PINGREQ and DISCONNECT pass.
+- **Cost:** M. The gateway holds at most one decoded packet per connection while it waits, counted in the connection-buffer budget.
+- **Risks:** a subscriber that acknowledges deliveries is held as a publisher is; only idle clients are helped.
+
+### C. Suspend keep-alive expiry while reads are withheld
+- **What we do:** the gateway does not count a client's silence while the node is not reading it. MQTT 3.1.1 and 5 §3.1.2.10 require a disconnect after 1.5 × keep-alive with no packet *received*; this reads "received" as "read by the gateway". A clock only triggers the close, it decides nothing in shared state (§1).
+- **Cost:** S.
+- **Risks:** a client that really died is noticed later, after the spell.
+
+**Recommendation.** A. C if D-112 shows spells near a keep-alive.
+
+**Answer:** `D-123: A` · `D-123: B` · `D-123: C` · `D-123: discuss`
+````

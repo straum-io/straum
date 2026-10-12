@@ -140,6 +140,14 @@ pub struct Voter {
     serving: Vec<(NodeId, u64, (u64, u64))>,
     refused: u64,
     effects: Vec<Effect>,
+    /// This node's own proposals until they commit (D-109 B).
+    outbox: crate::outbox::Outbox,
+    /// The slot of the last committed record applied: every older slot is
+    /// closed.
+    decided: Option<u64>,
+    /// Other nodes' forwards this sequencer's full or sealed queue refused:
+    /// lost (D-115 A counts them).
+    forwards_refused: u64,
 }
 
 impl Voter {
@@ -147,6 +155,8 @@ impl Voter {
     /// table is `slots`, having promised `promised` durably. It starts as a
     /// follower, whatever it was before.
     pub fn new(config: Config, chain: Chain, slots: Vec<(u64, u64)>, promised: u64) -> Self {
+        let max_queue = config.max_queue;
+        let voters = config.nodes.len();
         let end = chain.next_lsn().saturating_sub(1);
         Self {
             slot: promised.max(chain.slot()),
@@ -167,6 +177,9 @@ impl Voter {
             serving: Vec::new(),
             refused: 0,
             effects: Vec::new(),
+            outbox: crate::outbox::Outbox::new(crate::outbox::capacity(max_queue, voters)),
+            decided: None,
+            forwards_refused: 0,
         }
     }
 
@@ -330,7 +343,96 @@ impl Voter {
         }
     }
 
+    /// Takes one of this node's own proposals (a gateway's): held until its
+    /// record is applied from the committed log, sent to the sequencer of
+    /// the promised slot, and sent again only once that slot is closed in
+    /// the committed log (`outbox`, D-109 B). `Full` at `max_queue` held:
+    /// refused, never acknowledged.
+    pub fn submit(&mut self, proposal: Proposal) -> Result<(), ClusterError> {
+        if !self.outbox.push(proposal) {
+            return Err(ClusterError::Full);
+        }
+        self.pump();
+        Ok(())
+    }
+
+    /// The driver applied this committed record, in log order. Returns this
+    /// node's proposals it shows lost — sent before it to the same slot and
+    /// never committed; sending them again would reorder them, so they are
+    /// given up and handed back for the driver to account for (D-115 A).
+    pub fn applied(&mut self, record: &journal::Record<'_>) -> Vec<Proposal> {
+        self.decided = Some(record.slot);
+        let lost = self.outbox.committed(record);
+        self.pump();
+        lost
+    }
+
+    /// This node's own proposals held uncommitted, and how many of them are
+    /// sent and wait for their slot to be decided (D-109 B).
+    pub fn held(&self) -> (usize, usize) {
+        self.outbox.held()
+    }
+
+    /// The outbox is at its share of the sequencer's queue (D-120 A): a
+    /// driver stops reading its clients until it is not, and `submit`
+    /// refuses meanwhile.
+    pub fn outbox_full(&self) -> bool {
+        self.outbox.full()
+    }
+
+    /// Forwards from other nodes this node, sequencing, refused at a full or
+    /// sealed queue: lost; their nodes give them up once a later one
+    /// commits, or send them again once the slot closes.
+    pub fn forwards_refused(&self) -> u64 {
+        self.forwards_refused
+    }
+
+    /// After a restart: the slot of the last committed record the driver
+    /// has applied — from its snapshot when nothing after it is replayed.
+    /// Nothing is forwarded before the promised slot has a committed record.
+    pub fn knowing_applied_slot(mut self, slot: Option<u64>) -> Self {
+        self.decided = slot;
+        self
+    }
+
+    /// Sends what the outbox holds to the sequencer of the promised slot:
+    /// this node's own, or a forward to an owner whose slot has a committed
+    /// record — before that, the owner may not sequence yet and would drop
+    /// it. Stops at the first its own sequencer refuses.
+    fn pump(&mut self) {
+        let slot = self.slot;
+        let leading = matches!(self.role, Role::Lead(_));
+        let to = if leading {
+            // Not into a slot the committed log has already passed.
+            if self.decided > Some(slot) {
+                return;
+            }
+            None
+        } else {
+            match self.owner() {
+                Some(owner) if owner != self.config.id && self.decided == Some(slot) => Some(owner),
+                _ => return,
+            }
+        };
+        while let Some(proposal) = self.outbox.next(slot) {
+            // ponytail: a copy per send, the outbox keeps the original until
+            // it commits; unmeasured (D-112).
+            let proposal = proposal.clone();
+            match (to, &mut self.role) {
+                (None, Role::Lead(s)) => {
+                    if s.propose(proposal).is_err() {
+                        return;
+                    }
+                }
+                (Some(owner), _) => self.send(owner, Message::Forward { slot, proposal }),
+                _ => return,
+            }
+            self.outbox.sent(slot);
+        }
+    }
+
     pub fn flush(&mut self) -> Result<(), ClusterError> {
+        self.pump();
         match &mut self.role {
             Role::Lead(s) => s.flush(),
             _ => Ok(()),
@@ -355,6 +457,9 @@ impl Voter {
     /// The heartbeat. A sequencer sends its own; anyone else counts the
     /// silence and, at its turn in the schedule, takes the next slot over.
     pub fn tick(&mut self) {
+        // What waited for a slot to be decided or a sequencer to start goes
+        // out at the latest with the heartbeat.
+        self.pump();
         if let Role::Lead(s) = &mut self.role {
             s.tick();
             // This heartbeat carried the commit point past `SlotEnd`. The
@@ -460,6 +565,15 @@ impl Voter {
             }
             Message::Promise { slot } => {
                 self.promise(slot, Some(from));
+            }
+            Message::Forward { slot, proposal } => {
+                // Only into the very slot it was sent for; dropped otherwise,
+                // and its node sends it again once that slot is closed.
+                if let Role::Lead(s) = &mut self.role {
+                    if s.slot() == slot && s.propose(proposal).is_err() {
+                        self.forwards_refused = self.forwards_refused.saturating_add(1);
+                    }
+                }
             }
             Message::Promised {
                 slot,

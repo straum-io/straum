@@ -166,9 +166,19 @@ mod tls {
     use tokio_rustls::rustls::{ClientConfig, RootCertStore};
     use transport::Tls;
 
+    /// The directory a test writes, removed when the test ends, passing or
+    /// failing (D-121).
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// Writes a throwaway certificate and key; nothing secret is ever
     /// committed to the repository.
-    fn certificate() -> (std::path::PathBuf, std::path::PathBuf, Vec<u8>) {
+    fn certificate() -> (Scratch, std::path::PathBuf, std::path::PathBuf, Vec<u8>) {
         let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
         let mut directory = std::env::temp_dir();
         directory.push(format!(
@@ -189,12 +199,17 @@ mod tls {
             .write_all(issued.signing_key.serialize_pem().as_bytes())
             .unwrap();
 
-        (certificate, key, issued.cert.der().to_vec())
+        (
+            Scratch(directory),
+            certificate,
+            key,
+            issued.cert.der().to_vec(),
+        )
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_tls_client_is_served() {
-        let (certificate, key, der) = certificate();
+        let (_scratch, certificate, key, der) = certificate();
         let tls = Tls::from_pem_files(&certificate, &key).unwrap();
         let listener = Listener::bind(config(), budget(), Some(tls)).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -225,13 +240,11 @@ mod tls {
         connection.writer.write_all(b"pong").await.unwrap();
 
         assert_eq!(&client.await.unwrap(), b"pong");
-        let _ = std::fs::remove_file(&certificate);
-        let _ = std::fs::remove_file(&key);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_plaintext_client_gets_nowhere_on_a_tls_port() {
-        let (certificate, key, _) = certificate();
+        let (_scratch, certificate, key, _) = certificate();
         let tls = Tls::from_pem_files(&certificate, &key).unwrap();
         let listener = Listener::bind(config(), budget(), Some(tls)).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -254,9 +267,6 @@ mod tls {
         if let Ok(first) = answer {
             assert_eq!(first, 0x15, "a plaintext client was answered in MQTT");
         }
-
-        let _ = std::fs::remove_file(&certificate);
-        let _ = std::fs::remove_file(&key);
     }
 
     #[test]

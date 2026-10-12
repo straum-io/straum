@@ -70,6 +70,8 @@ pub enum ConfigError {
     BatchOverFrame { batch: usize, max_frame: usize },
     #[error("max_uncommitted must be at least 1")]
     Uncommitted,
+    #[error("max_queue {max_queue} is below one proposal per voter ({voters})")]
+    Queue { max_queue: usize, voters: usize },
 }
 
 impl NodeConfig {
@@ -135,6 +137,15 @@ impl NodeConfig {
         }
         if self.core.max_uncommitted == 0 {
             return Err(ConfigError::Uncommitted);
+        }
+        // Each node's outbox holds `max_queue / voters` (D-120 A); below one
+        // per voter the shares, never 0, would add up past the queue and a
+        // resend burst after a slot change could overflow it.
+        if self.core.max_queue < voters.len() {
+            return Err(ConfigError::Queue {
+                max_queue: self.core.max_queue,
+                voters: voters.len(),
+            });
         }
         Ok(())
     }

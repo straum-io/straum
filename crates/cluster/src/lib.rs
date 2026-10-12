@@ -35,6 +35,7 @@
 //! have been sent beyond what it has made durable (`window`). A replica
 //! further behind is caught up from the log, one batch at a time.
 
+mod outbox;
 mod voter;
 pub mod wire;
 
@@ -333,6 +334,13 @@ pub enum Message {
         after_slot: u64,
         records: Vec<Vec<u8>>,
     },
+    /// A node's own proposal, to the sequencer of `slot` (D-109 B). Taken
+    /// only by a node leading that very slot: one sent for an older slot
+    /// may already be sent again by its node, which counts it lost once a
+    /// later slot commits — taking it into another slot could commit it
+    /// twice. Over a link that keeps order, so one node's proposals reach
+    /// the log in the order it made them.
+    Forward { slot: u64, proposal: Proposal },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -19,10 +19,12 @@ const NODES: u8 = 3;
 /// counter. Nothing retries a port that turns out taken.
 fn free_port() -> u16 {
     static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    let block = u16::try_from(std::process::id() % 120).unwrap();
+    // The node tests' blocks (40 of 300 from 20 000, below Linux's ephemeral
+    // range): the same for every test binary, so two never overlap.
+    let block = u16::try_from(std::process::id() % 40).unwrap();
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    assert!(n < 100, "this test binary used up its block of ports");
-    20_000 + block * 100 + n
+    assert!(n < 300, "this test binary used up its block of ports");
+    20_000 + block * 300 + n
 }
 
 /// One node's process and where it logs.
@@ -141,12 +143,37 @@ impl Cluster {
     }
 }
 
+/// The processes are killed whether the test passed or not (D-116). On a
+/// failure every node's logs, from every life, go to the test's output and
+/// the directory is kept, so a failure shows what all three nodes did, not
+/// only the one an assertion names (D-118); on success it is removed.
+/// Nothing in here panics: a cleanup that fails cannot hide the failure.
 impl Drop for Cluster {
     fn drop(&mut self) {
         for server in self.servers.iter_mut().flatten() {
             let _ = server.child.kill();
             let _ = server.child.wait();
         }
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            return;
+        }
+        let mut logs: Vec<PathBuf> = std::fs::read_dir(&self.dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| {
+                        p.file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with("log-"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        logs.sort();
+        for path in &logs {
+            eprintln!("===== {} =====\n{}", path.display(), log(path));
+        }
+        eprintln!("===== kept: {} =====", self.dir.display());
     }
 }
 
@@ -326,21 +353,6 @@ fn delivered(stream: &mut TcpStream, payload: &str, within: Duration) -> bool {
     false
 }
 
-/// As an at-least-once client does: publish, and if no PUBACK comes, connect
-/// again and resend. A proposal made while the slot changes hands is dropped,
-/// not held (ADR-0008, "Not yet in step 4"); the client's resend is what
-/// delivers it. Returns the attempt that was acknowledged.
-fn publish_until_acknowledged(address: SocketAddr, client: &str, payload: &str, id: u16) -> u32 {
-    for attempt in 1..=10 {
-        let mut stream = connect(address, client);
-        publish(&mut stream, "t/x", payload, id);
-        if acknowledged(&mut stream, id, Duration::from_secs(3)) {
-            return attempt;
-        }
-    }
-    panic!("{payload}: never acknowledged in ten attempts");
-}
-
 #[test]
 fn three_server_processes_acknowledge_only_committed_publishes_and_hand_over() {
     let mut cluster = Cluster::new();
@@ -405,17 +417,18 @@ fn three_server_processes_acknowledge_only_committed_publishes_and_hand_over() {
     );
 
     // The operator's handoff: the first slot's owner, node 0, hands it
-    // over; node 1 says it does not sequence. Publishing goes on. The first
-    // publish after a handoff is dropped, not held (D-109): one resend, as
-    // an at-least-once client does, and no more.
+    // over; node 1 says it does not sequence. Publishing goes on: the first
+    // publish after the handoff is held by its node while the slot changes
+    // hands and acknowledged on its first sending, with no resend (D-109 B).
     cluster.signal(0, "-USR1");
     cluster.signal(1, "-USR1");
     wait_for_log(&cluster, 0, "handing the slot over");
     wait_for_log(&cluster, 1, "no handoff");
-    let tries = publish_until_acknowledged(cluster.mqtt(1), "pub-1", "four", 4);
+    let mut pub1 = connect(cluster.mqtt(1), "pub-1");
+    publish(&mut pub1, "t/x", "four", 4);
     assert!(
-        tries <= 2,
-        "acknowledged only on attempt {tries} after the handoff"
+        acknowledged(&mut pub1, 4, long),
+        "the first publish after the handoff was not acknowledged without a resend"
     );
     assert!(
         delivered(&mut on0, "four", long),
@@ -446,6 +459,10 @@ fn three_server_processes_acknowledge_only_committed_publishes_and_hand_over() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    // Its links can be refused before it finishes starting; a SIGTERM
+    // before its handler is installed kills it, which is not a clean stop
+    // (seen under the full validation's load, logs kept by D-118 A).
+    wait_for_log(&cluster, 2, "node started");
     cluster.stop(2);
 
     // Node 2 as it was configured rejoins, and everyone stops cleanly.

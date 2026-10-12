@@ -826,3 +826,98 @@ Card: docs/decisions/archive/cards.md
 Date: 2026-10-11
 Choice: the user's request, confirmed against its consequences — remove the old leader/follower broker path completely now, to end conflicts in decision-making. Removed: the crates `broker`, `protocol`, `mqtt`, `replication`, `runtime` and `e2e`; the old leader/follower simulation (`sim`'s library and `tests/seeds.rs`) and the D-28 chain check (`sim/tests/chain.rs`); the fuzz targets on `mqtt`; the broker half of `server`. Kept: `storage` (its `Wal` is what each segment of the new log is), `transport`, `domain`, `auth` (planned for the new path's credentials, D-110). Overrides D-51 A's and D-75's conditions for step 8 — a witness for the two-node `quorum` pair, D-28 C1–C4 carried into new-path invariants, a durability benchmark comparable with the old path's — none of which holds. Consequences accepted: the server runs only the experimental cluster path (not production-ready, D-102 A); no single-node mode (the new path requires three voters, D-104 A); no TLS or credentials until D-110; the old durability levels (`memory`, `written`, `fsynced`, `quorum`) and the old benchmarks and baselines go with it. Reversible through git: the old crates are in commit ffeda02 and earlier.
 Rejected options: "stop deciding for it only" (keep the code, closed for decisions) and "remove after a cluster of one" not chosen.
+
+## D-109. A publish made while the slot changes hands is dropped
+Date: 2026-10-11
+Choice: B, with conditions — each node retains, in order, the proposals it could not hand to a sequencer, within the existing limits, and re-forwards them once a later slot's sequencer is known. A proposal must not be republished into the log without well-defined deduplication semantics and confirmation of the result: QoS 1 permits redelivery, but that does not authorize violating order, fencing or commit rules. Before the implementation is accepted, tests for two cases: a regular handoff, and an emergency failure of the sequencer before the queue is transferred — each showing that no accepted proposal is lost and that nothing commits after the old owner is fenced.
+Rejected options: A (forward the queue at the handoff only), C (close the publisher at once), D (keep and document) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-110. Credentials and TLS on the new path
+Date: 2026-10-11
+Choice: A — MQTT client security first (authentication at CONNECT, authorization of PUBLISH and SUBSCRIBE), then mutual TLS between nodes. `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1` is not a substitute for authentication. Sixth in order; the network restrictions are not lifted.
+Rejected options: B (cluster secret on links), C (links left to the network) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-112. What to rebuild on the new path after step 8
+Date: 2026-10-11
+Choice: A, after D-109 is closed — metrics before Linux benchmarks: commit, queues, catch-up, handoff, replica state. The old durability levels and benchmarks are not restored mechanically: first determine what guarantees the new architecture gives and which measurements are actually needed. No broker features added now.
+Rejected options: B (a cluster of one first), C (neither before 7b/7c) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-113. Closing D-108: the unstable node start
+Date: 2026-10-11
+Choice: A — 100 container runs with logs preserved, no automatic retries. If the failure does not recur, D-108 closes as not reproduced, with the diagnostics kept.
+Rejected options: B (close now) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-114. The architecture document after step 8
+Date: 2026-10-11
+Choice: A, widened — update `unified-stream.md` to the current architecture: experimental status explicit, existing mechanisms separated from planned ones.
+Rejected options: B (leave it) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-115. The losses the outbox still has, inside one slot
+Date: 2026-10-11
+Choice: A — measure first: outbox overflow, proposals lost on a broken link and dropped proposals are counted in D-112's metrics. No sequencer acknowledgements yet: a forwarding acknowledgement must not be confused with a durable commit. Temporary, not acceptance of silent loss: when the outbox finds an earlier proposal lost, the behaviour is explicit and tested; a later proposal committing must not silently erase the unresolved earlier one.
+Rejected options: B (acknowledged forwarding), C (close the publisher at once), D (leave it) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-116. A failing node test leaves its nodes running
+Date: 2026-10-11
+Choice: A — the test `Cluster` stops its nodes when dropped, on success and on failure; the original test failure stays visible if cleanup also fails.
+Rejected options: B (leave it) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-117. The outbox is not in any deterministic simulation
+Date: 2026-10-11
+Choice: B — the outbox moves into `cluster`, driven by the takeover simulation (partitions, loss, a fenced owner still alive). Production and simulation share the same deterministic state machine, I/O as events; no imitation model. Tests establish that proposals survive a partition and a takeover, an old owner cannot commit after fencing, and retries create no duplicate committed record; deterministic, no timing sleeps.
+Rejected options: A (into `gateway`), C (a model copy in the simulation), D (keep the deviation) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-118. A takeover by silence seen in the end-to-end test under load
+Date: 2026-10-11
+Choice: A — keep the requirement that node 0 sequences there; on failure keep every node's log, to tell a regression from an older takeover issue. The assertion is not relaxed to accept either sequencer.
+Rejected options: B (accept either node), C (leave as is) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-119. Is D-109 closed?
+Date: 2026-10-11
+Choice: A, narrowly — D-109 is resolved for the reported handoff stall, with its known limitations attached. Closing it does not imply that fencing, proposal loss, memory bounds or all takeover cases are proven. D-117 runs before the outbox's behaviour is used as evidence for D-112. Priorities stated with it: the outbox's bound becomes a real resource bound (byte accounting in the metrics; a bounded-memory policy — explicit backpressure or fail-fast, never silent loss — before any production-readiness claim); the simulation covers the actual outbox logic. Order: D-116 → D-117 → D-118 → D-113 → D-112 (with D-115's loss accounting); D-114 independent.
+Rejected options: B (open until D-117), C (open until D-115, D-117 and a byte bound) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-108. Closed as not reproduced (D-113 A)
+Date: 2026-10-12
+Outcome: 100 container runs of the node and server tests, plus 100 of the server test at a6986ea, logs kept, no retries: no node failed to start in any run. The only failures (6 of 100, and 5 of 100 at a6986ea) are the end-to-end test's handoff assertion, a takeover that predates D-109 (D-122).
+
+## D-120. Proposals stranded in an open slot, and the resend burst after a slot change
+Date: 2026-10-12
+Choice: A — cap each node's outbox at `max_queue / voters`, rather than grow the sequencer's queue. Check the rounding and the minimum, so a small `max_queue` never gives zero capacity. A full outbox is explicit — a refusal (backpressure or failure), never a silent loss of a proposal.
+Rejected options: B (grow the sequencer's queue), C (reopen D-115 with acknowledgements), D (leave it) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-121. Storage and transport tests leave their directories behind
+Date: 2026-10-12
+Choice: A — storage and transport tests release the directories and resources they create, on error too. Diagnostic logs are not deleted with temporary files when a test fails: keeping them is separate, explicit behaviour.
+Rejected options: B (leave it) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-122. A restarted node takes a live sequencer's slot over
+Date: 2026-10-12
+Choice: A — the link's redial backoff is capped at one heartbeat. It must not weaken fencing or the durable-promise requirements. Tests after the fix: a live sequencer, a restarted node and a delayed connection; and that an old owner cannot commit after it is fenced. Order: D-122 → D-120 → D-121 → D-112; before D-112, the automated handoff test green and checked under load. D-112's metrics, in priority: commit and durability (commit point, proposal-to-commit delay, proposals awaiting confirmation); outbox and memory (size and bytes per node, overflow refusals, resends); replication (each replica's durable position, lag to the commit point, catch-up speed); takeover (attempts, reasons, transfer duration, failures, fencing); MQTT (publishes accepted, PUBACKs, deliveries, queue overflows, closed connections) — cheap counters and histograms first, fit for the Linux benchmark.
+Rejected options: B (a restarted node waits before counting silence) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-123. Keep-alives under outbox backpressure
+Date: 2026-10-12
+Choice: A — measure first. D-112 measures the duration of withheld reads, the longest spell without a read, and the clients closed for keep-alive; and records each node's outbox memory in bytes — with about 85 MiB per node at worst, a count limit is not yet a memory guarantee. A refusal counter does not replace a guarantee of preservation: the metrics distinguish a proposal not yet accepted by the broker from one accepted and awaiting commit. Criterion for D-112: the load handoff test green, fencing verified, and no unexplained proposal loss; D-112 does not start while the 100 load runs are unfinished, and any failure there becomes a go/no-go card, not an automatic move to metrics. Protocol correctness and its performance are not mixed.
+Rejected options: B (pause only proposing reads: needs precise packet separation and a bounded hold; PUBACK never before its commit), C (ignore the silence: changes observability, solves nothing) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-112. Metrics on the new path — go-ahead and requirements
+Date: 2026-10-12
+Go-ahead: D-112 starts. The corrected fencing test (`a_link_slower_than_the_takeover_window_fences_the_live_owner`, whose assertion now forbids the fenced node sequencing its old slot, not ever sequencing again) runs separately under load; the 200-run cycle is not repeated, the handoff it verified is unchanged.
+Stages, in order: (1) commit and durability — proposal acceptance to commit, durable write delays, proposals awaiting commit: where PUBACK delay arises; (2) outbox — entries and bytes per node, fill, backpressure, resends and refusals; (3) replication — each replica's durable position, lag to the commit point, catch-up rate; (4) takeover — reason, duration and result of a role transfer, fencing; (5) MQTT — publishes, PUBACKs, deliveries, connection closes; and D-123's — read blocking time, longest spell without a read, keep-alive closes.
+Requirements: proposal states are never mixed — not yet accepted by the broker; accepted and awaiting commit; committed; refused or lost for a named reason. Measurement does not distort the result — cheap counters and histograms first, no allocation per event and no string formatting on the hot path, monotonic clocks, and no metric feeds a commit or takeover decision.
+Done means: tests that the metrics update correctly, the outbox overflow observed, and an observed delay attributable to a stage of the message path; then Linux measurements, with the safety and liveness checks kept as mandatory gates.

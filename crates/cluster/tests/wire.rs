@@ -36,10 +36,13 @@ fn frames() -> Vec<Frame> {
             cut: false,
             report: 0,
         }),
-        Frame::Forward(Proposal {
-            kind: Kind::Publish,
-            properties: vec![1, 0, 1, 1],
-            body: b"body".to_vec(),
+        Frame::Message(Message::Forward {
+            slot: 9,
+            proposal: Proposal {
+                kind: Kind::Publish,
+                properties: vec![1, 0, 1, 1],
+                body: b"body".to_vec(),
+            },
         }),
         Frame::Message(Message::Promise { slot: 7 }),
         Frame::Message(Message::Promised {
@@ -126,7 +129,10 @@ fn malformed_frames_are_refused() {
     assert_eq!(decode(&frame(&ack), 1 << 20), Err(WireError::Trailing));
     // A FORWARD of a kind no version knows.
     assert_eq!(
-        decode(&frame(&[4, 200, 0, 0, 0, 0]), 1 << 20),
+        decode(
+            &frame(&[4, 0, 0, 0, 0, 0, 0, 0, 9, 200, 0, 0, 0, 0]),
+            1 << 20
+        ),
         Err(WireError::UnknownKind(200))
     );
 }
