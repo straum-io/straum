@@ -17,3 +17,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Built, not run, by `cargo test --all-targets` (D-4): it refuses a debug
+# build. `cargo bench -p server --bench puback` (D-124).
+[[bench]]
+name = "puback"
+harness = false

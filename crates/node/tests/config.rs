@@ -24,6 +24,7 @@ fn experimental() -> Experimental {
         takeover_ticks: node::experimental::DEFAULT_TAKEOVER_TICKS,
         read_bytes: node::experimental::DEFAULT_READ_BYTES,
         retain_bytes: node::DEFAULT_RETAIN_BYTES,
+        metrics: None,
     }
 }
 

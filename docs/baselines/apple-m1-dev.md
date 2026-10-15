@@ -789,3 +789,187 @@ What it shows, as a hypothesis until a Linux host repeats it:
   300 k), the same in four runs; cause not found.
 - A single run on macOS (one round, 3 failovers) gave 4 216 publishes/s at
   cap 64 and 2 237 at 4096, every failover ≈ 200 ms.
+
+## D-124, the cost of measuring — preliminary (2026-10-12)
+
+`scripts/overhead.sh .bench/base . 5` in the Linux container
+(`rust:1.85-bookworm`, podman on this Mac): base 071db00 (no metrics),
+head with D-112's metrics; five alternating rounds, the order flipped each
+round; medians. `cap` at cap 64 (3 throughput rounds of 3 s, 5 failovers);
+`puback` with 6 publishers (window 16, 64 B), 3 QoS 0 subscribers, 3 s
+warm-up, 10 s measured.
+
+| | base | head | |
+|---|---|---|---|
+| cap publishes/s | 241 971 | 239 667 | −1.0 % |
+| cap failover p50 | 309 ms | 305 ms | −1.3 % |
+| PUBACKs/s | 91 293 | 91 847 | +0.6 % |
+| publish→PUBACK p50 | 0.980 ms | 1.012 ms | +3.3 % |
+| publish→PUBACK p99 | 1.945 ms | 1.985 ms | +2.1 % |
+| server CPU per 1 000 PUBACKs | 20.43 ms | 20.63 ms | +1.0 % |
+
+Every difference is inside this machine's 10 % noise floor (CLAUDE.md
+§11): a result, not proof of zero overhead. Read by D-129 A's rule
+(`scripts/noise.awk`), the run could not have detected a 3 % effect at all:
+each copy's spread between rounds was 2–29 % per quantity, and failover
+p50's over 500 % (it is bimodal: about 300 ms, or about 1 975 ms). The
+medians being within 3.3 % says nothing about the cost of measuring. Outliers: head round 3
+(80 053 PUBACKs/s, p50 1.142 ms); one failover round near 1 980 ms in each
+build. Not accepted until a quiet Linux host repeats it (D-124 A).
+
+The same `puback` run on macOS directly (not in the container) gave 2 344
+PUBACKs/s and a p50 of 40 ms, about 40 times slower than the container run
+on the same machine: an effect of the environment, not diagnosed — not
+attributed to any one macOS component (D-127). A lead, not a conclusion: the metrics
+put a batch's append→durable p50 at about 16 ms on macOS directly (one run
+of `STRAUM_BENCH_SECONDS=4 STRAUM_BENCH_WARMUP=2 STRAUM_BENCH_SCRAPE_MS=1000
+cargo bench -p server --bench puback`, its bucket bound 16.384 ms) and
+0.128 ms in the container (D-127's dry run, one round). One run each; no
+diagnosis of the gap follows from them.
+
+## D-133 A, catch-up by read size — preliminary (2026-10-15)
+
+`puback` with `STRAUM_BENCH_EVENTS=kill`, 60 s, scraping every 1 s, in the
+Linux container; three rounds per size, the order turned each round. Per
+round, for the killed and restarted node: the lag's rate under load,
+positions a second (negative: shrinking), and its recovery rate in the 10 s
+after the load.
+
+| read_bytes | lag rate under load (rounds) | recovery (rounds) |
+|---|---|---|
+| 64 KiB | −3 369, −3 577, −3 555 | 9 453, 14 498, 6 781 |
+| 512 KiB | −4 668, −4 494, −3 837 | 0, 9 800, 6 910 |
+| 4 MiB | −4 225, −3 341, −3 467 | 10 024, 6 582, 6 850 |
+
+CPU over the 27.9 s from the restart, every run: the sequencer about
+28.2 s (one full core), the catching-up replica about 0.3 s, the third node
+about 0.5 s. The 512 KiB round 1 outlier: node 0 used 5.9 s and wrote
+335 MB, and its recovery read 0. Not accepted; direction only.
+
+## D-133 B, catch-up by replication window — preliminary (2026-10-15)
+
+`STRAUM_BENCH_MODE=catchup cargo bench -p node --bench cap` in the Linux
+container: three nodes in-process, closed-loop load of 512 at the
+sequencer, a replica stopped 2 s and started again, its own lag read every
+second for 20 s under load, then 10 s after; three rounds, the order turned.
+
+| window | lag rate under load (rounds) | lag at the load's stop | recovery after |
+|---|---|---|---|
+| 256 | −2 079, −2 045, −2 035 | 817 765, 702 130, 801 255 | 6 413, 6 394, 6 374 |
+| 1 024 | −25 153, −24 737, −25 290 | 294 515, 309 595, 320 580 | 29 452, 30 960, 32 058 |
+| 4 096 | −30 835, −31 121, −31 205 | 0, 0, 0 | (caught up) |
+
+Sequencer commit latency at every window: p50 1.024 ms, p99 131 ms (bucket
+bounds). Not accepted; direction only.
+
+## D-135 A, catch-up mechanism and cost — preliminary (2026-10-15)
+
+`STRAUM_BENCH_MODE=catchup STRAUM_BENCH_HEARTBEATS=25,50,100 cargo bench -p node --bench cap` in the Linux container; three rounds, combinations turned each round. One line per trial: lag rate under load, lag at the load's stop, recovery, positions per tick, share of still heartbeats, bytes in flight (mean, most), positions in flight (mean), commit latency from raw samples (p50, p99, p99.9, max, ms).
+
+```text
+round=1 w=256 hb=25 rate=-2042 stop=528645 rec=7343 ppt=160 still=0.039 inflB=5763 inflMax=428168 inflPos=45 c50=65.167 c99=165.523 c999=276.280 cmax=318.264
+round=2 w=256 hb=25 rate=-1892 stop=617045 rec=5900 ppt=144 still=0.002 inflB=3293 inflMax=428168 inflPos=26 c50=84.891 c99=103.105 c999=107.074 cmax=108.815
+round=3 w=256 hb=25 rate=-1885 stop=625170 rec=5867 ppt=143 still=0.002 inflB=3705 inflMax=452870 inflPos=29 c50=85.257 c99=103.934 c999=106.615 cmax=107.032
+round=1 w=256 hb=50 rate=-2370 stop=869700 rec=6868 ppt=371 still=0.007 inflB=5763 inflMax=263488 inflPos=45 c50=62.498 c99=79.343 c999=83.616 cmax=86.536
+round=2 w=256 hb=50 rate=-1820 stop=762450 rec=5620 ppt=272 still=0.015 inflB=2470 inflMax=263488 inflPos=19 c50=1.095 c99=107.775 c999=110.853 cmax=113.481
+round=3 w=256 hb=50 rate=-1884 stop=772915 rec=5854 ppt=282 still=0.018 inflB=4117 inflMax=263488 inflPos=32 c50=1.099 c99=103.690 c999=107.938 cmax=114.605
+round=1 w=256 hb=100 rate=-2397 stop=743275 rec=7297 ppt=718 still=0.015 inflB=6175 inflMax=131744 inflPos=48 c50=1.307 c99=83.066 c999=89.852 cmax=94.036
+round=2 w=256 hb=100 rate=-1857 stop=816335 rec=5750 ppt=555 still=0.015 inflB=4940 inflMax=164680 inflPos=39 c50=1.071 c99=105.354 c999=107.415 cmax=113.099
+round=3 w=256 hb=100 rate=-1867 stop=809575 rec=5809 ppt=559 still=0.015 inflB=4940 inflMax=164680 inflPos=39 c50=1.093 c99=104.426 c999=112.718 cmax=119.388
+round=1 w=1024 hb=25 rate=-27682 stop=132340 rec=13234 ppt=814 still=0.011 inflB=28819 inflMax=1770310 inflPos=227 c50=59.849 c99=81.929 c999=84.619 cmax=92.391
+round=2 w=1024 hb=25 rate=-25935 stop=109330 rec=10933 ppt=747 still=0.010 inflB=20173 inflMax=1613864 inflPos=159 c50=55.498 c99=108.784 c999=117.227 cmax=124.780
+round=3 w=1024 hb=25 rate=-25962 stop=119795 rec=11980 ppt=749 still=0.010 inflB=26348 inflMax=1671502 inflPos=208 c50=58.740 c99=105.499 c999=110.880 cmax=115.420
+round=1 w=1024 hb=50 rate=-27015 stop=244270 rec=24427 ppt=1591 still=0.018 inflB=21408 inflMax=1111590 inflPos=169 c50=1.127 c99=79.719 c999=81.541 cmax=84.947
+round=2 w=1024 hb=50 rate=-25365 stop=146900 rec=14690 ppt=1469 still=0.007 inflB=20173 inflMax=1053952 inflPos=159 c50=70.128 c99=106.508 c999=152.151 cmax=155.475
+round=3 w=1024 hb=50 rate=-23101 stop=316030 rec=30522 ppt=1329 still=0.015 inflB=14409 inflMax=996314 inflPos=113 c50=1.108 c99=103.950 c999=134.358 cmax=152.128
+round=1 w=1024 hb=100 rate=-26162 stop=307450 rec=30745 ppt=3088 still=0.015 inflB=15232 inflMax=625784 inflPos=120 c50=1.128 c99=81.238 c999=84.288 cmax=89.440
+round=2 w=1024 hb=100 rate=-23166 stop=322335 rec=31607 ppt=2678 still=0.010 inflB=14409 inflMax=658720 inflPos=113 c50=1.147 c99=103.896 c999=109.861 cmax=115.959
+round=3 w=1024 hb=100 rate=-22708 stop=371085 rec=29833 ppt=2612 still=0.015 inflB=23055 inflMax=625784 inflPos=182 c50=1.086 c99=104.597 c999=105.752 cmax=106.542
+round=1 w=4096 hb=25 rate=-19907 stop=0 rec=caught_up ppt=3889 still=0.014 inflB=172914 inflMax=6908326 inflPos=682 c50=1.038 c99=67.437 c999=81.205 cmax=232.144
+round=2 w=4096 hb=25 rate=-15902 stop=0 rec=caught_up ppt=2377 still=0.070 inflB=95102 inflMax=6751880 inflPos=750 c50=1.027 c99=104.415 c999=199.980 cmax=250.634
+round=3 w=4096 hb=25 rate=-15370 stop=0 rec=caught_up ppt=3177 still=0.006 inflB=25937 inflMax=6595434 inflPos=204 c50=1.063 c99=88.366 c999=106.949 cmax=119.726
+round=1 w=4096 hb=50 rate=-25135 stop=0 rec=caught_up ppt=4039 still=0.005 inflB=12762 inflMax=4199340 inflPos=100 c50=1.060 c99=103.464 c999=105.006 cmax=105.905
+round=2 w=4096 hb=50 rate=-29590 stop=0 rec=caught_up ppt=1844 still=0.020 inflB=20585 inflMax=4273446 inflPos=162 c50=1.127 c99=101.723 c999=103.006 cmax=104.496
+round=3 w=4096 hb=50 rate=-27967 stop=0 rec=caught_up ppt=2346 still=0.018 inflB=20585 inflMax=4215808 inflPos=162 c50=1.066 c99=106.284 c999=114.224 cmax=122.606
+round=1 w=4096 hb=100 rate=-24689 stop=218790 rec=21879 ppt=2823 still=0.015 inflB=25937 inflMax=2692518 inflPos=204 c50=1.090 c99=107.668 c999=114.332 cmax=117.002
+round=2 w=4096 hb=100 rate=-25793 stop=198770 rec=19877 ppt=2948 still=0.015 inflB=25937 inflMax=2659582 inflPos=204 c50=1.085 c99=102.828 c999=105.927 cmax=108.505
+round=3 w=4096 hb=100 rate=-25296 stop=210340 rec=21034 ppt=2894 still=0.015 inflB=25937 inflMax=2659582 inflPos=204 c50=1.095 c99=104.530 c999=109.216 cmax=111.809
+```
+
+Not accepted; direction only.
+
+## D-136 A, catch-up stages and control — preliminary (2026-10-16)
+
+`STRAUM_BENCH_MODE=catchup STRAUM_BENCH_WINDOWS=256,1024,4096 cargo bench -p node --bench cap` in the Linux container, heartbeat 50 ms, three rounds; each trial paired with a control (same timing, no replica restarted), the pair's order turned each round. Per trial: lag, recovery and commit latency (ms, from raw samples). Per stage row (`stages`): each append shipped to a replica followed to the durable report covering it, matched by position over the process's one clock, p50/p90/p99 in ms; `_W` waiting, `_K` work; `path=log` is catch-up (a read before the send), `path=memory` the live path; `read_cycle` is one read asked to the next, `positions_per_read_mean` what each brought.
+
+```text
+round=1 catchup window=256 heartbeat_ms=50 lag_first=456430 lag_rate_under_load=-1369 lag_at_stop=430300 recovery_rate=3891 positions_per_tick=204 still_tick_share=0.005 bytes_in_flight_mean=0 bytes_in_flight_max=263488 positions_in_flight_mean=0 commit_samples=84288 commit_p50_ms=115.928 commit_p99_ms=152.048 commit_p999_ms=163.923 commit_max_ms=165.129
+round=1 stages run=catchup window=256 heartbeat_ms=50 peer=lagging path=log n=841 round_trip=23.66/26.51/33.75 read_queue_W=0.03/0.04/0.13 read_K=23.17/24.61/27.41 read_return_W=0.08/0.10/0.14 ship_K=0.00/0.01/0.01 link_out_W=0.09/0.15/0.25 replica_loop_K=0.02/0.02/0.06 append_queue_W=0.04/0.40/9.24 write_K=0.03/0.07/0.20 sync_K=0.00/0.00/0.01 durable_return_W=0.02/0.41/0.52 report_K=0.00/0.00/0.00 link_back_W=0.05/0.10/0.18 next_ask_K=0.00/0.00/0.01 read_cycle=23.27/24.72/28.39 positions_per_read_mean=97
+round=1 stages run=catchup window=256 heartbeat_ms=50 peer=healthy path=memory n=1316 round_trip=0.18/0.28/0.42 link_out_W=0.07/0.12/0.18 replica_loop_K=0.01/0.01/0.03 append_queue_W=0.03/0.07/0.13 write_K=0.02/0.03/0.08 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.04/0.07 report_K=0.00/0.00/0.00 link_back_W=0.02/0.05/0.10
+round=1 control window=256 heartbeat_ms=50 lag_first=0 lag_rate_under_load=0 lag_at_stop=0 recovery_rate=caught_up positions_per_tick=7652 still_tick_share=0.000 bytes_in_flight_mean=6998 bytes_in_flight_max=16468 positions_in_flight_mean=55 commit_samples=3007992 commit_p50_ms=2.019 commit_p99_ms=6.801 commit_p999_ms=21.330 commit_max_ms=104.934
+round=1 stages run=control window=256 heartbeat_ms=50 peer=lagging path=memory n=46998 round_trip=0.29/0.50/1.08 link_out_W=0.10/0.18/0.34 replica_loop_K=0.01/0.02/0.06 append_queue_W=0.04/0.10/0.35 write_K=0.02/0.06/0.13 sync_K=0.00/0.00/0.01 durable_return_W=0.02/0.07/0.21 report_K=0.00/0.00/0.00 link_back_W=0.06/0.16/0.32
+round=1 stages run=control window=256 heartbeat_ms=50 peer=healthy path=memory n=46999 round_trip=0.29/0.48/1.08 link_out_W=0.10/0.17/0.33 replica_loop_K=0.01/0.03/0.07 append_queue_W=0.04/0.10/0.33 write_K=0.02/0.06/0.13 sync_K=0.00/0.00/0.01 durable_return_W=0.02/0.06/0.19 report_K=0.00/0.00/0.00 link_back_W=0.06/0.16/0.31
+round=1 catchup window=1024 heartbeat_ms=50 lag_first=397995 lag_rate_under_load=-18783 lag_at_stop=39195 recovery_rate=3920 positions_per_tick=1094 still_tick_share=0.013 bytes_in_flight_mean=14821 bytes_in_flight_max=1053952 positions_in_flight_mean=117 commit_samples=133376 commit_p50_ms=73.013 commit_p99_ms=169.722 commit_p999_ms=236.454 commit_max_ms=277.715
+round=1 stages run=catchup window=1024 heartbeat_ms=50 peer=lagging path=log n=1064 round_trip=18.68/43.83/74.39 read_queue_W=0.03/0.06/0.28 read_K=16.36/24.62/36.98 read_return_W=0.08/0.11/0.20 ship_K=0.01/0.01/0.01 link_out_W=0.16/0.28/0.71 replica_loop_K=0.08/0.15/0.29 append_queue_W=0.22/20.87/34.70 write_K=0.14/0.24/0.41 sync_K=0.00/0.00/0.00 durable_return_W=0.17/0.58/0.96 report_K=0.00/0.00/0.00 link_back_W=0.06/0.12/0.32 next_ask_K=0.00/0.00/0.01 read_cycle=16.49/24.83/37.73 positions_per_read_mean=411
+round=1 stages run=catchup window=1024 heartbeat_ms=50 peer=healthy path=memory n=2084 round_trip=0.18/0.34/0.70 link_out_W=0.07/0.11/0.30 replica_loop_K=0.01/0.02/0.04 append_queue_W=0.03/0.07/0.39 write_K=0.02/0.04/0.09 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.04/0.23 report_K=0.00/0.00/0.00 link_back_W=0.02/0.05/0.19
+round=1 control window=1024 heartbeat_ms=50 lag_first=0 lag_rate_under_load=0 lag_at_stop=0 recovery_rate=caught_up positions_per_tick=12037 still_tick_share=0.000 bytes_in_flight_mean=6998 bytes_in_flight_max=16468 positions_in_flight_mean=55 commit_samples=4734562 commit_p50_ms=1.405 commit_p99_ms=2.091 commit_p999_ms=3.229 commit_max_ms=16.007
+round=1 stages run=control window=1024 heartbeat_ms=50 peer=lagging path=log n=1 round_trip=8.63/8.63/8.63 read_queue_W=0.05/0.05/0.05 read_K=8.27/8.27/8.27 read_return_W=0.05/0.05/0.05 ship_K=0.01/0.01/0.01 link_out_W=0.12/0.12/0.12 replica_loop_K=0.01/0.01/0.01 append_queue_W=0.03/0.03/0.03 write_K=0.03/0.03/0.03 sync_K=0.00/0.00/0.00 durable_return_W=0.04/0.04/0.04 report_K=0.00/0.00/0.00 link_back_W=0.02/0.02/0.02
+round=1 stages run=control window=1024 heartbeat_ms=50 peer=lagging path=memory n=47652 round_trip=0.20/0.30/0.46 link_out_W=0.08/0.11/0.14 replica_loop_K=0.01/0.02/0.03 append_queue_W=0.03/0.04/0.19 write_K=0.02/0.03/0.06 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.04/0.14 report_K=0.00/0.00/0.00 link_back_W=0.05/0.10/0.18
+round=1 stages run=control window=1024 heartbeat_ms=50 peer=healthy path=log n=1 round_trip=15.30/15.30/15.30 read_queue_W=8.32/8.32/8.32 read_K=6.71/6.71/6.71 read_return_W=0.08/0.08/0.08 ship_K=0.01/0.01/0.01 link_out_W=0.08/0.08/0.08 replica_loop_K=0.01/0.01/0.01 append_queue_W=0.03/0.03/0.03 write_K=0.02/0.02/0.02 sync_K=0.00/0.00/0.00 durable_return_W=0.00/0.00/0.00 report_K=0.00/0.00/0.00 link_back_W=0.04/0.04/0.04
+round=1 stages run=control window=1024 heartbeat_ms=50 peer=healthy path=memory n=47651 round_trip=0.19/0.27/0.41 link_out_W=0.07/0.11/0.13 replica_loop_K=0.01/0.02/0.03 append_queue_W=0.03/0.04/0.13 write_K=0.02/0.03/0.06 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.04/0.12 report_K=0.00/0.00/0.00 link_back_W=0.04/0.09/0.17
+round=1 stages run=control window=1024 heartbeat_ms=50 stamps_dropped=423043
+round=1 catchup window=4096 heartbeat_ms=50 lag_first=191295 lag_rate_under_load=-10054 lag_at_stop=0 recovery_rate=caught_up positions_per_tick=4988 still_tick_share=0.018 bytes_in_flight_mean=440930 bytes_in_flight_max=3853512 positions_in_flight_mean=2544 commit_samples=1809758 commit_p50_ms=1.435 commit_p99_ms=52.001 commit_p999_ms=203.294 commit_max_ms=480.218
+round=1 stages run=catchup window=4096 heartbeat_ms=50 peer=lagging path=log n=787 round_trip=23.53/33.23/419.72 read_queue_W=0.03/0.04/0.16 read_K=8.73/17.36/25.06 read_return_W=0.07/0.09/0.12 ship_K=0.01/0.07/0.16 link_out_W=0.18/0.35/0.62 replica_loop_K=0.09/0.14/0.54 append_queue_W=12.83/21.27/23.42 write_K=0.21/0.63/0.93 sync_K=0.00/0.00/0.00 durable_return_W=0.33/0.42/0.59 report_K=0.00/0.00/0.00 link_back_W=0.07/0.10/0.20 next_ask_K=0.00/0.00/0.01 read_cycle=8.97/33.28/55.58 positions_per_read_mean=452
+round=1 stages run=catchup window=4096 heartbeat_ms=50 peer=lagging path=memory n=8945 round_trip=13.08/21.98/25.61 link_out_W=0.09/0.50/0.75 replica_loop_K=0.01/0.03/0.04 append_queue_W=12.07/20.85/23.79 write_K=0.69/0.90/1.06 sync_K=0.00/0.00/0.00 durable_return_W=0.02/0.08/0.43 report_K=0.00/0.00/0.00 link_back_W=0.04/0.10/0.24
+round=1 stages run=catchup window=4096 heartbeat_ms=50 peer=healthy path=memory n=12623 round_trip=0.16/0.22/0.50 link_out_W=0.06/0.10/0.17 replica_loop_K=0.01/0.01/0.03 append_queue_W=0.03/0.04/0.14 write_K=0.02/0.03/0.06 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.03/0.07 report_K=0.00/0.00/0.00 link_back_W=0.02/0.05/0.07
+round=1 control window=4096 heartbeat_ms=50 lag_first=0 lag_rate_under_load=0 lag_at_stop=0 recovery_rate=caught_up positions_per_tick=11874 still_tick_share=0.000 bytes_in_flight_mean=8645 bytes_in_flight_max=24702 positions_in_flight_mean=68 commit_samples=4692736 commit_p50_ms=1.412 commit_p99_ms=2.341 commit_p999_ms=3.325 commit_max_ms=9.150
+round=1 stages run=control window=4096 heartbeat_ms=50 peer=lagging path=memory n=47654 round_trip=0.20/0.29/0.46 link_out_W=0.08/0.11/0.15 replica_loop_K=0.01/0.01/0.03 append_queue_W=0.03/0.04/0.19 write_K=0.02/0.03/0.06 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.04/0.14 report_K=0.00/0.00/0.00 link_back_W=0.05/0.09/0.17
+round=1 stages run=control window=4096 heartbeat_ms=50 peer=healthy path=memory n=47654 round_trip=0.20/0.27/0.43 link_out_W=0.07/0.11/0.14 replica_loop_K=0.01/0.02/0.03 append_queue_W=0.03/0.05/0.19 write_K=0.02/0.03/0.06 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.04/0.11 report_K=0.00/0.00/0.00 link_back_W=0.04/0.09/0.16
+round=1 stages run=control window=4096 heartbeat_ms=50 stamps_dropped=404722
+round=2 control window=1024 heartbeat_ms=50 lag_first=0 lag_rate_under_load=0 lag_at_stop=0 recovery_rate=caught_up positions_per_tick=12961 still_tick_share=0.000 bytes_in_flight_mean=8645 bytes_in_flight_max=24702 positions_in_flight_mean=68 commit_samples=5211871 commit_p50_ms=1.301 commit_p99_ms=2.368 commit_p999_ms=5.019 commit_max_ms=27.014
+round=2 stages run=control window=1024 heartbeat_ms=50 peer=lagging path=memory n=47650 round_trip=0.20/0.28/0.45 link_out_W=0.08/0.11/0.14 replica_loop_K=0.01/0.01/0.03 append_queue_W=0.03/0.04/0.17 write_K=0.02/0.03/0.06 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.04/0.14 report_K=0.00/0.00/0.00 link_back_W=0.05/0.09/0.17
+round=2 stages run=control window=1024 heartbeat_ms=50 peer=healthy path=memory n=47650 round_trip=0.20/0.27/0.41 link_out_W=0.07/0.11/0.13 replica_loop_K=0.01/0.02/0.03 append_queue_W=0.03/0.04/0.19 write_K=0.02/0.03/0.06 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.04/0.12 report_K=0.00/0.00/0.00 link_back_W=0.04/0.09/0.16
+round=2 stages run=control window=1024 heartbeat_ms=50 stamps_dropped=623954
+round=2 catchup window=1024 heartbeat_ms=50 lag_first=625950 lag_rate_under_load=-24934 lag_at_stop=151320 recovery_rate=15132 positions_per_tick=1451 still_tick_share=0.013 bytes_in_flight_mean=14409 bytes_in_flight_max=1053952 positions_in_flight_mean=113 commit_samples=110848 commit_p50_ms=82.372 commit_p99_ms=105.184 commit_p999_ms=198.114 commit_max_ms=217.598
+round=2 stages run=catchup window=1024 heartbeat_ms=50 peer=lagging path=log n=1331 round_trip=17.15/32.40/37.24 read_queue_W=0.04/0.05/0.08 read_K=16.64/17.28/18.08 read_return_W=0.08/0.10/0.12 ship_K=0.00/0.01/0.01 link_out_W=0.12/0.16/0.33 replica_loop_K=0.05/0.09/0.14 append_queue_W=0.11/14.25/18.50 write_K=0.08/0.14/0.20 sync_K=0.00/0.00/0.00 durable_return_W=0.05/0.31/0.36 report_K=0.00/0.00/0.00 link_back_W=0.05/0.07/0.10 next_ask_K=0.00/0.00/0.01 read_cycle=16.76/17.42/18.29 positions_per_read_mean=436
+round=2 stages run=catchup window=1024 heartbeat_ms=50 peer=healthy path=memory n=1732 round_trip=0.13/0.24/0.39 link_out_W=0.05/0.08/0.22 replica_loop_K=0.01/0.01/0.03 append_queue_W=0.02/0.05/0.27 write_K=0.01/0.02/0.06 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.04/0.14 report_K=0.00/0.00/0.00 link_back_W=0.01/0.03/0.10
+round=2 control window=4096 heartbeat_ms=50 lag_first=0 lag_rate_under_load=0 lag_at_stop=0 recovery_rate=caught_up positions_per_tick=15801 still_tick_share=0.000 bytes_in_flight_mean=8645 bytes_in_flight_max=16468 positions_in_flight_mean=68 commit_samples=6250816 commit_p50_ms=1.059 commit_p99_ms=1.945 commit_p999_ms=3.945 commit_max_ms=7.905
+round=2 stages run=control window=4096 heartbeat_ms=50 peer=lagging path=memory n=47642 round_trip=0.15/0.21/0.34 link_out_W=0.06/0.07/0.11 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.03/0.05/0.08 write_K=0.01/0.02/0.05 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.03/0.09 report_K=0.00/0.00/0.00 link_back_W=0.02/0.07/0.11
+round=2 stages run=control window=4096 heartbeat_ms=50 peer=healthy path=memory n=47642 round_trip=0.17/0.21/0.36 link_out_W=0.07/0.09/0.12 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.02/0.04/0.09 write_K=0.01/0.02/0.05 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.03/0.08 report_K=0.00/0.00/0.00 link_back_W=0.04/0.07/0.11
+round=2 stages run=control window=4096 heartbeat_ms=50 stamps_dropped=1063754
+round=2 catchup window=4096 heartbeat_ms=50 lag_first=610740 lag_rate_under_load=-32092 lag_at_stop=0 recovery_rate=caught_up positions_per_tick=3292 still_tick_share=0.018 bytes_in_flight_mean=18114 bytes_in_flight_max=4273446 positions_in_flight_mean=143 commit_samples=772288 commit_p50_ms=1.088 commit_p99_ms=79.584 commit_p999_ms=85.811 commit_max_ms=115.657
+round=2 stages run=catchup window=4096 heartbeat_ms=50 peer=lagging path=log n=1618 round_trip=13.12/24.08/28.87 read_queue_W=0.04/0.05/0.10 read_K=12.62/13.41/15.14 read_return_W=0.08/0.10/0.11 ship_K=0.00/0.01/0.01 link_out_W=0.12/0.17/0.38 replica_loop_K=0.05/0.08/0.12 append_queue_W=0.04/9.50/13.70 write_K=0.08/0.13/0.17 sync_K=0.00/0.00/0.00 durable_return_W=0.04/0.31/0.36 report_K=0.00/0.00/0.00 link_back_W=0.05/0.07/0.13 next_ask_K=0.00/0.00/0.00 read_cycle=12.75/13.53/15.34 positions_per_read_mean=454
+round=2 stages run=catchup window=4096 heartbeat_ms=50 peer=lagging path=memory n=9127 round_trip=0.15/0.24/0.46 link_out_W=0.06/0.07/0.16 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.03/0.05/0.10 write_K=0.01/0.02/0.06 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.04/0.10 report_K=0.00/0.00/0.00 link_back_W=0.02/0.07/0.14
+round=2 stages run=catchup window=4096 heartbeat_ms=50 peer=healthy path=memory n=12067 round_trip=0.15/0.22/0.44 link_out_W=0.06/0.09/0.16 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.02/0.05/0.20 write_K=0.01/0.02/0.06 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.03/0.09 report_K=0.00/0.00/0.00 link_back_W=0.02/0.07/0.12
+round=2 control window=256 heartbeat_ms=50 lag_first=0 lag_rate_under_load=0 lag_at_stop=0 recovery_rate=caught_up positions_per_tick=15946 still_tick_share=0.000 bytes_in_flight_mean=8234 bytes_in_flight_max=24702 positions_in_flight_mean=65 commit_samples=6334935 commit_p50_ms=1.051 commit_p99_ms=1.655 commit_p999_ms=3.120 commit_max_ms=7.060
+round=2 stages run=control window=256 heartbeat_ms=50 peer=lagging path=memory n=47649 round_trip=0.15/0.21/0.32 link_out_W=0.06/0.07/0.11 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.03/0.05/0.07 write_K=0.01/0.02/0.04 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.03/0.09 report_K=0.00/0.00/0.00 link_back_W=0.02/0.07/0.10
+round=2 stages run=control window=256 heartbeat_ms=50 peer=healthy path=memory n=47649 round_trip=0.17/0.21/0.33 link_out_W=0.07/0.09/0.11 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.02/0.04/0.10 write_K=0.01/0.02/0.04 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.03/0.08 report_K=0.00/0.00/0.00 link_back_W=0.04/0.07/0.11
+round=2 stages run=control window=256 heartbeat_ms=50 stamps_dropped=1098389
+round=2 catchup window=256 heartbeat_ms=50 lag_first=786110 lag_rate_under_load=-2103 lag_at_stop=746005 recovery_rate=6563 positions_per_tick=320 still_tick_share=0.018 bytes_in_flight_mean=4940 bytes_in_flight_max=205850 positions_in_flight_mean=39 commit_samples=196980 commit_p50_ms=1.140 commit_p99_ms=92.184 commit_p999_ms=97.798 commit_max_ms=108.164
+round=2 stages run=catchup window=256 heartbeat_ms=50 peer=lagging path=log n=1335 round_trip=15.12/28.85/32.36 read_queue_W=0.04/0.05/0.09 read_K=14.58/15.14/16.66 read_return_W=0.09/0.10/0.12 ship_K=0.00/0.00/0.01 link_out_W=0.08/0.12/0.24 replica_loop_K=0.01/0.02/0.03 append_queue_W=0.05/13.13/16.95 write_K=0.03/0.05/0.08 sync_K=0.00/0.00/0.01 durable_return_W=0.04/0.33/0.38 report_K=0.00/0.00/0.00 link_back_W=0.05/0.07/0.11 next_ask_K=0.00/0.00/0.00 read_cycle=14.70/15.26/16.91 positions_per_read_mean=96
+round=2 stages run=catchup window=256 heartbeat_ms=50 peer=healthy path=memory n=3077 round_trip=0.12/0.18/0.32 link_out_W=0.05/0.08/0.14 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.02/0.04/0.08 write_K=0.01/0.02/0.05 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.02/0.05 report_K=0.00/0.00/0.00 link_back_W=0.01/0.03/0.05
+round=3 catchup window=4096 heartbeat_ms=50 lag_first=609375 lag_rate_under_load=-32009 lag_at_stop=0 recovery_rate=caught_up positions_per_tick=2468 still_tick_share=0.018 bytes_in_flight_mean=20585 bytes_in_flight_max=4273446 positions_in_flight_mean=162 commit_samples=456007 commit_p50_ms=1.093 commit_p99_ms=87.039 commit_p999_ms=120.236 commit_max_ms=138.991
+round=3 stages run=catchup window=4096 heartbeat_ms=50 peer=lagging path=log n=1614 round_trip=13.06/27.06/40.19 read_queue_W=0.04/0.05/0.10 read_K=12.09/14.42/18.29 read_return_W=0.09/0.10/0.12 ship_K=0.00/0.01/0.01 link_out_W=0.13/0.17/0.39 replica_loop_K=0.05/0.09/0.19 append_queue_W=0.05/11.66/16.20 write_K=0.08/0.13/0.19 sync_K=0.00/0.00/0.00 durable_return_W=0.05/0.31/0.37 report_K=0.00/0.00/0.00 link_back_W=0.05/0.07/0.16 next_ask_K=0.00/0.00/0.00 read_cycle=13.51/14.54/18.52 positions_per_read_mean=454
+round=3 stages run=catchup window=4096 heartbeat_ms=50 peer=lagging path=memory n=4127 round_trip=0.15/0.20/0.30 link_out_W=0.06/0.07/0.11 replica_loop_K=0.01/0.01/0.01 append_queue_W=0.04/0.04/0.06 write_K=0.01/0.02/0.03 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.03/0.09 report_K=0.00/0.00/0.00 link_back_W=0.02/0.07/0.10
+round=3 stages run=catchup window=4096 heartbeat_ms=50 peer=healthy path=memory n=7126 round_trip=0.14/0.21/0.39 link_out_W=0.06/0.09/0.15 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.02/0.04/0.24 write_K=0.01/0.02/0.06 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.03/0.09 report_K=0.00/0.00/0.00 link_back_W=0.02/0.07/0.11
+round=3 control window=4096 heartbeat_ms=50 lag_first=0 lag_rate_under_load=0 lag_at_stop=0 recovery_rate=caught_up positions_per_tick=15882 still_tick_share=0.000 bytes_in_flight_mean=7410 bytes_in_flight_max=24702 positions_in_flight_mean=58 commit_samples=6253632 commit_p50_ms=1.063 commit_p99_ms=1.670 commit_p999_ms=3.554 commit_max_ms=28.945
+round=3 stages run=control window=4096 heartbeat_ms=50 peer=lagging path=memory n=47642 round_trip=0.15/0.21/0.29 link_out_W=0.06/0.07/0.10 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.04/0.05/0.07 write_K=0.01/0.02/0.04 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.03/0.09 report_K=0.00/0.00/0.00 link_back_W=0.02/0.07/0.10
+round=3 stages run=control window=4096 heartbeat_ms=50 peer=healthy path=memory n=47642 round_trip=0.16/0.20/0.29 link_out_W=0.06/0.09/0.10 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.02/0.04/0.07 write_K=0.01/0.02/0.04 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.03/0.07 report_K=0.00/0.00/0.00 link_back_W=0.04/0.07/0.10
+round=3 stages run=control window=4096 heartbeat_ms=50 stamps_dropped=1065007
+round=3 catchup window=256 heartbeat_ms=50 lag_first=794560 lag_rate_under_load=-2076 lag_at_stop=755040 recovery_rate=6446 positions_per_tick=314 still_tick_share=0.015 bytes_in_flight_mean=2058 bytes_in_flight_max=263488 positions_in_flight_mean=16 commit_samples=202886 commit_p50_ms=1.115 commit_p99_ms=98.572 commit_p999_ms=121.204 commit_max_ms=125.006
+round=3 stages run=catchup window=256 heartbeat_ms=50 peer=lagging path=log n=1302 round_trip=15.88/28.52/32.35 read_queue_W=0.04/0.05/0.10 read_K=14.74/15.62/20.56 read_return_W=0.09/0.10/0.13 ship_K=0.00/0.00/0.01 link_out_W=0.09/0.13/0.30 replica_loop_K=0.01/0.02/0.04 append_queue_W=0.05/12.71/16.70 write_K=0.03/0.05/0.13 sync_K=0.00/0.00/0.00 durable_return_W=0.04/0.33/0.38 report_K=0.00/0.00/0.00 link_back_W=0.05/0.07/0.13 next_ask_K=0.00/0.00/0.00 read_cycle=14.86/15.74/20.71 positions_per_read_mean=96
+round=3 stages run=catchup window=256 heartbeat_ms=50 peer=healthy path=memory n=3170 round_trip=0.12/0.18/0.32 link_out_W=0.05/0.09/0.14 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.02/0.04/0.08 write_K=0.01/0.02/0.05 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.02/0.04 report_K=0.00/0.00/0.00 link_back_W=0.01/0.03/0.06
+round=3 control window=256 heartbeat_ms=50 lag_first=0 lag_rate_under_load=0 lag_at_stop=0 recovery_rate=caught_up positions_per_tick=15984 still_tick_share=0.000 bytes_in_flight_mean=7822 bytes_in_flight_max=16468 positions_in_flight_mean=61 commit_samples=6344150 commit_p50_ms=1.055 commit_p99_ms=1.582 commit_p999_ms=3.303 commit_max_ms=6.479
+round=3 stages run=control window=256 heartbeat_ms=50 peer=lagging path=memory n=47640 round_trip=0.15/0.21/0.30 link_out_W=0.06/0.07/0.10 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.04/0.04/0.06 write_K=0.01/0.02/0.03 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.03/0.09 report_K=0.00/0.00/0.00 link_back_W=0.02/0.07/0.11
+round=3 stages run=control window=256 heartbeat_ms=50 peer=healthy path=memory n=47640 round_trip=0.17/0.21/0.30 link_out_W=0.07/0.09/0.11 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.02/0.04/0.07 write_K=0.01/0.02/0.04 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.02/0.08 report_K=0.00/0.00/0.00 link_back_W=0.04/0.07/0.11
+round=3 stages run=control window=256 heartbeat_ms=50 stamps_dropped=1103041
+round=3 catchup window=1024 heartbeat_ms=50 lag_first=755430 lag_rate_under_load=-25432 lag_at_stop=270400 recovery_rate=27040 positions_per_tick=1479 still_tick_share=0.020 bytes_in_flight_mean=41170 bytes_in_flight_max=1053952 positions_in_flight_mean=325 commit_samples=218496 commit_p50_ms=1.030 commit_p99_ms=97.156 commit_p999_ms=146.754 commit_max_ms=160.496
+round=3 stages run=catchup window=1024 heartbeat_ms=50 peer=lagging path=log n=1387 round_trip=14.72/29.89/36.89 read_queue_W=0.04/0.05/0.09 read_K=14.20/15.38/18.11 read_return_W=0.08/0.10/0.12 ship_K=0.00/0.01/0.01 link_out_W=0.13/0.17/0.43 replica_loop_K=0.05/0.09/0.15 append_queue_W=0.11/13.77/17.85 write_K=0.10/0.14/0.20 sync_K=0.00/0.00/0.00 durable_return_W=0.06/0.31/0.38 report_K=0.00/0.00/0.00 link_back_W=0.05/0.07/0.13 next_ask_K=0.00/0.00/0.00 read_cycle=14.35/15.49/18.96 positions_per_read_mean=427
+round=3 stages run=catchup window=1024 heartbeat_ms=50 peer=healthy path=memory n=3414 round_trip=0.11/0.18/0.39 link_out_W=0.05/0.07/0.18 replica_loop_K=0.01/0.01/0.03 append_queue_W=0.01/0.04/0.22 write_K=0.01/0.02/0.05 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.03/0.10 report_K=0.00/0.00/0.00 link_back_W=0.02/0.03/0.07
+round=3 control window=1024 heartbeat_ms=50 lag_first=0 lag_rate_under_load=0 lag_at_stop=0 recovery_rate=caught_up positions_per_tick=15806 still_tick_share=0.000 bytes_in_flight_mean=9057 bytes_in_flight_max=24702 positions_in_flight_mean=71 commit_samples=6270848 commit_p50_ms=1.066 commit_p99_ms=1.514 commit_p999_ms=2.889 commit_max_ms=5.844
+round=3 stages run=control window=1024 heartbeat_ms=50 peer=lagging path=memory n=47649 round_trip=0.15/0.20/0.30 link_out_W=0.06/0.07/0.10 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.04/0.04/0.06 write_K=0.01/0.02/0.03 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.03/0.09 report_K=0.00/0.00/0.00 link_back_W=0.02/0.07/0.10
+round=3 stages run=control window=1024 heartbeat_ms=50 peer=healthy path=memory n=47648 round_trip=0.17/0.20/0.30 link_out_W=0.07/0.09/0.10 replica_loop_K=0.01/0.01/0.02 append_queue_W=0.02/0.04/0.07 write_K=0.01/0.02/0.04 sync_K=0.00/0.00/0.00 durable_return_W=0.01/0.02/0.08 report_K=0.00/0.00/0.00 link_back_W=0.04/0.07/0.11
+round=3 stages run=control window=1024 heartbeat_ms=50 stamps_dropped=1071739
+```
+
+Not accepted; direction only. fsync costs about 0 in this container (`sync_K`), so the replica's sync stage is not represented. Rows marked `stamps_dropped` filled the trace (2^19 stamps a node) early in the window; their samples come from its first part.

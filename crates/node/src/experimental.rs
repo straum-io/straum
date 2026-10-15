@@ -44,6 +44,8 @@ pub struct Experimental {
     pub takeover_ticks: u32,
     pub read_bytes: usize,
     pub retain_bytes: u64,
+    /// Where the metrics are served (D-112); `None` serves none.
+    pub metrics: Option<SocketAddr>,
 }
 
 /// A configuration refused at startup: nothing is corrected silently
@@ -225,6 +227,7 @@ impl Experimental {
             snapshot_every: 4096,
             rotate_every: None,
             read_bytes: self.read_bytes,
+            metrics: self.metrics,
         };
         config.check()?;
         Ok(config)

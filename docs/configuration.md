@@ -38,12 +38,13 @@ any other `STRAUM_*` variable is refused at startup (D-104 A).
 | `STRAUM_CLUSTER_PEERS` | required | Every voter, this node included: `id=address,…` (socket addresses). Odd, at least three; no id twice. |
 | `STRAUM_CLUSTER_LISTEN` | this node's address in the peers | Where its links listen. |
 | `STRAUM_CLUSTER_MQTT_LISTEN` | `127.0.0.1:1883` | Where MQTT clients connect. Loopback by default: the path has no credentials and no TLS (D-107). |
-| `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK` | `0` | `1` lets the MQTT listener, the link listener and the peers use addresses beyond loopback — unauthenticated and unencrypted, for an isolated, trusted network only. Without it any such address is refused at startup. The experimental switch is no security mechanism (D-107). |
+| `STRAUM_CLUSTER_METRICS_LISTEN` | off | Where the node serves its metrics over plain HTTP, in the Prometheus text format (D-112): every request gets the current snapshot. No credentials; loopback unless the next setting is `1`. A diagnostic interface, not a monitoring system (D-126 A): at most 4 scrapes at once — more wait unaccepted — and each read and write bounded by 2 s. |
+| `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK` | `0` | `1` lets the MQTT listener, the link listener, the peers and the metrics listener use addresses beyond loopback — unauthenticated and unencrypted, for an isolated, trusted network only. Without it any such address is refused at startup. The experimental switch is no security mechanism (D-107). |
 | `STRAUM_CLUSTER_DATA_DIR` | required | The log, the promise, snapshots, and the `cluster` file that pins the directory to its cluster's configuration digest: a node started over another cluster's data is refused. |
 | `STRAUM_CLUSTER_HEARTBEAT_MS` | `50` | 1–10 000. A placeholder, not a recommendation (D-104 A). |
 | `STRAUM_CLUSTER_TAKEOVER_TICKS` | `3` | Heartbeats of silence before a takeover, 1–1 000. A placeholder; the simulation shows 3 churns under random delivery (D-99). |
 | `STRAUM_CLUSTER_RETAIN_BYTES` | `67108864` | The log kept behind a slow replica (D-57 A, D-91 A); a starting value, not a measured optimum. |
-| `STRAUM_READ_BYTES` | `65536` | One catch-up or fetch read (D-83 A); at most half the frame (8 MiB), refused above. |
+| `STRAUM_READ_BYTES` | `65536` | One catch-up or fetch read (D-83 A); at most half the 8 MiB frame — 4 MiB — refused above. |
 
 Fixed in 7a, not settings: `max_uncommitted` 64 (D-82 A), batches of 16
 records, MQTT packets up to 256 KiB, link frames up to 8 MiB, window 256,

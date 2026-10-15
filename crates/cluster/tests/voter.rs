@@ -326,6 +326,15 @@ fn a_handoff_ends_the_slot_and_the_successor_starts_the_next_without_a_promise_r
     }
     assert_eq!(voters[1].commit(), 8);
     assert!(voters.iter().all(|v| v.slot() == 2 && v.end() == 8));
+    // What metrics read (D-112): node 0 led slot 1 and stepped down; node 1
+    // succeeded by `SlotEnd`, with no takeover; node 1 sees both replicas
+    // durable through the commit point.
+    let (old, new) = (voters[0].stats(), voters[1].stats());
+    assert_eq!((old.slots_led, old.stepped_down), (1, 1));
+    assert_eq!((new.successions, new.takeovers, new.slots_led), (1, 0, 1));
+    let mut replicas = voters[1].replicas();
+    replicas.sort_unstable();
+    assert_eq!(replicas, vec![(0, Some(8)), (2, Some(8))]);
 }
 
 #[test]
@@ -445,6 +454,11 @@ fn a_takeover_that_does_not_commit_doubles_the_wait_for_the_next() {
     let mut v = Voter::new(config(1), Chain::genesis(), Vec::new(), 1);
     // Its turn is slot 2, after `takeover_ticks` (3) of silence.
     assert_eq!(ticks_to_takeover(&mut v), (3, 2));
+    assert_eq!(
+        v.stats().takeovers,
+        1,
+        "a takeover after silence is counted"
+    );
     v.on_promised(2);
     // Node 2 promises too: a majority answered, and the takeover goes on to
     // fetch, but never commits. Its next turn is slot 5, three turns on: 9
@@ -902,4 +916,28 @@ fn a_newer_slots_owner_dying_while_the_promise_is_pending_is_taken_over() {
     v.take_effects();
     let (_, taken) = ticks_to_takeover(&mut v);
     assert!(taken > newer, "took slot {taken}, not past {newer}");
+}
+
+/// D-132: a replica behind reports the commit point it heard, not the one
+/// capped at its log's end — so how far behind it is can be seen. It acts
+/// on nothing past its own log.
+#[test]
+fn a_replica_behind_reports_the_commit_point_it_heard() {
+    let mut v = Voter::new(config(1), Chain::genesis(), Vec::new(), 1);
+    v.on_message(
+        0,
+        Message::Append {
+            slot: 1,
+            prev: 0,
+            prev_slot: 0,
+            records: Vec::new(),
+            commit: 100,
+        },
+    );
+    assert_eq!(v.heard_commit(), 100);
+    assert_eq!(
+        (v.end(), v.commit()),
+        (0, 0),
+        "nothing past its log is taken"
+    );
 }

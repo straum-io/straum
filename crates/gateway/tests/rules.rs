@@ -225,10 +225,14 @@ fn a_puback_waits_for_the_commit() {
     rig.take_sent();
     rig.client(1, publish("t", Qos::AtLeastOnce, 9), Version::V311);
     assert!(rig.take_sent().is_empty(), "acknowledged before commit");
+    // Counted (D-112): proposed, not yet acknowledged.
+    let counted = rig.gateway.load().counted;
+    assert_eq!((counted.publishes, counted.pubacks), (1, 0));
     rig.commit();
     assert!(
         matches!(&rig.take_sent()[..], [(1, Packet::PubAck(PubAck { id, .. }))] if id.get() == 9)
     );
+    assert_eq!(rig.gateway.load().counted.pubacks, 1);
 }
 
 #[test]
@@ -331,6 +335,30 @@ fn a_silent_client_is_closed_after_one_and_a_half_keep_alives() {
     assert!(rig.take_sent().iter().any(
         |(_, p)| matches!(p, Packet::Disconnect(d) if d.reason == ReasonCode::KeepAliveTimeout)
     ));
+    let counted = rig.gateway.load().counted;
+    assert_eq!((counted.closed, counted.closed_keep_alive), (1, 1));
+}
+
+/// A publish not committed within `commit_timeout` closes its publisher,
+/// counted apart from other closes (D-112): a stall in commit shows as
+/// such, not as clients leaving.
+#[test]
+fn a_publish_that_never_commits_closes_its_publisher_and_is_counted() {
+    let mut rig = Rig::ready();
+    rig.connect_as(1, "p", Version::V311, 0);
+    rig.client(1, publish("t", Qos::AtLeastOnce, 9), Version::V311);
+    rig.gateway.tick(Duration::from_secs(31));
+    rig.drain();
+    assert_eq!(rig.closed, vec![1]);
+    let counted = rig.gateway.load().counted;
+    assert_eq!(
+        (
+            counted.closed,
+            counted.closed_commit_timeout,
+            counted.pubacks
+        ),
+        (1, 1, 0)
+    );
 }
 
 #[test]

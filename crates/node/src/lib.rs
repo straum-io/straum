@@ -20,6 +20,7 @@
 //! (ADR-0008): this crate is reached from tests.
 
 mod link;
+pub mod metrics;
 mod mqtt;
 mod wal;
 
@@ -38,6 +39,7 @@ use apply::{Effect, Limits, State};
 use cluster::wire::Frame;
 use cluster::{Config as CoreConfig, Effect as Step, Proposal, Voter};
 use gateway::{Action, Gateway};
+use metrics::Stage;
 use storage::SegmentLimits;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use transport::{BufferBudget, Listener, TransportConfig};
@@ -117,6 +119,10 @@ pub struct NodeConfig {
     /// per round trip (D-81 A). At most half of `max_frame`, which carries it;
     /// more is refused at startup (D-83 A).
     pub read_bytes: usize,
+    /// Where the Prometheus text of `Node::metrics` is served (D-112):
+    /// `None`, the default, serves none. Plain HTTP, no credentials:
+    /// loopback unless the operator says otherwise (D-107).
+    pub metrics: Option<SocketAddr>,
 }
 
 /// The starting `retain_bytes` (D-91 A): 64 MiB, the old path's
@@ -151,10 +157,14 @@ pub struct Status {
 pub struct Node {
     pub listen: SocketAddr,
     pub mqtt: Option<SocketAddr>,
+    /// Where the metrics are served, if they are (`NodeConfig::metrics`).
+    pub metrics_listen: Option<SocketAddr>,
     proposals: mpsc::Sender<Proposal>,
     effects: broadcast::Sender<(u64, u64, Vec<Effect>)>,
     /// Operator handoffs, each with where its answer goes.
     hand_offs: mpsc::Sender<oneshot::Sender<Result<(), cluster::ClusterError>>>,
+    metrics: mpsc::Sender<oneshot::Sender<metrics::Snapshot>>,
+    trace: mpsc::Sender<TraceRequest>,
     status: watch::Receiver<Status>,
     stop: Option<oneshot::Sender<()>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -357,10 +367,18 @@ struct Loop {
     /// Connections whose reader waits for the gateway to want more.
     paused: BTreeSet<u64>,
     started: tokio::time::Instant,
-    /// This node's proposals refused at a full outbox, and given up as lost
-    /// before a later one committed (D-115 A: counted, never silent).
-    refused: u64,
-    given_up: u64,
+    /// What this node measures about itself (D-112); refusals and give-ups
+    /// among it (D-115 A: counted, never silent).
+    measured: metrics::Measured,
+    /// The stages' stamps, while a run asks for them (D-136 A).
+    trace: metrics::Trace,
+}
+
+/// A run's request for the stages' stamps (`Node::trace_start`,
+/// `Node::trace_take`).
+enum TraceRequest {
+    Start(usize),
+    Take(oneshot::Sender<metrics::Trace>),
 }
 
 impl Loop {
@@ -368,11 +386,54 @@ impl Loop {
         self.started.elapsed()
     }
 
+    /// What `Node::metrics` hands out: the measurements, the cores' counts
+    /// and the status, read together in one pass of the loop.
+    fn snapshot(&self, id: u8, applied: u64) -> metrics::Snapshot {
+        let m = &self.measured;
+        metrics::Snapshot {
+            node: id,
+            status: Status {
+                end: self.core.end(),
+                commit: self.core.commit(),
+                applied,
+                digest: 0,
+                slot: self.core.slot(),
+                leading: self.core.leading(),
+                refused: m.refused,
+                given_up: m.given_up,
+            },
+            durable: self.core.durable(),
+            voter: self.core.stats(),
+            replicas: self.core.replicas(),
+            gateway: self.gateway.as_ref().map(Gateway::load),
+            accepted: m.accepted,
+            refused: m.refused,
+            committed: m.committed,
+            given_up: m.given_up,
+            link_drops: m.link_drops,
+            forwards_dropped: m.forwards_dropped,
+            proposal_commit: m.proposal_commit,
+            append_durable: m.append_durable,
+            append_commit: m.append_commit,
+            takeovers_completed: m.takeovers_completed,
+            takeovers_abandoned: m.takeovers_abandoned,
+            takeover: m.takeover,
+            spells: m.spells(tokio::time::Instant::now()),
+            heard_commit: self.core.heard_commit(),
+            own: m.own,
+            replica_progress: m.replicas.clone(),
+            flights: m.flights.clone(),
+            serving: self.gateway.as_ref().is_some_and(Gateway::ready),
+        }
+    }
+
     /// This node's own proposal: the core holds it until its record
     /// commits and sends it when a sequencer can take it (D-109 B).
     fn propose(&mut self, proposal: Proposal) {
-        if self.core.submit(proposal).is_err() {
-            self.refused = self.refused.saturating_add(1);
+        if self.core.submit(proposal).is_ok() {
+            self.measured.accepted(tokio::time::Instant::now());
+        } else {
+            self.measured.refused();
             tracing::warn!(
                 "proposal refused: this node holds a full queue of uncommitted proposals"
             );
@@ -577,6 +638,7 @@ impl Node {
         let started = tokio::time::Instant::now();
         let (mqtt_tx, mut mqtt_rx) = mpsc::channel::<mqtt::Event>(1024);
         let mut mqtt_listen = None;
+        let mut metrics_listen = None;
         let gateway = match &config.mqtt {
             Some(m) => {
                 let first_session = life << 32;
@@ -608,6 +670,14 @@ impl Node {
         let (stop, mut stop_rx) = oneshot::channel::<()>();
         let (hand_offs, mut hand_offs_rx) =
             mpsc::channel::<oneshot::Sender<Result<(), cluster::ClusterError>>>(4);
+        // Snapshots on demand (D-112): nothing is built while nobody asks.
+        let (metrics, mut metrics_rx) = mpsc::channel::<oneshot::Sender<metrics::Snapshot>>(4);
+        let (trace, mut trace_rx) = mpsc::channel::<TraceRequest>(4);
+        if let Some(address) = config.metrics {
+            let listener = tokio::net::TcpListener::bind(address).await?;
+            metrics_listen = Some(listener.local_addr()?);
+            tasks.push(tokio::spawn(metrics::serve(listener, metrics.clone())));
+        }
 
         // A follower, whatever it was before: a sequencer that restarts
         // does not lead its old slot again; the schedule moves on (step 5).
@@ -633,8 +703,8 @@ impl Node {
             conns: HashMap::new(),
             paused: BTreeSet::new(),
             started,
-            refused: 0,
-            given_up: 0,
+            measured: metrics::Measured::default(),
+            trace: metrics::Trace::default(),
         };
         // The gateway's NodeReset goes to the log before anything else.
         node.gateway_actions();
@@ -664,6 +734,18 @@ impl Node {
                     _ = &mut stop_rx => break,
                     _ = tick.tick() => {
                         node.core.tick();
+                        // D-132: progress, once a heartbeat — not per event.
+                        let replicas = node.core.replicas();
+                        for (&peer, link) in &node.links {
+                            node.measured.queued(peer, link.max_capacity() - link.capacity());
+                        }
+                        node.measured.progress(
+                            node.core.end(),
+                            node.core.heard_commit(),
+                            &replicas,
+                            node.core.commit(),
+                            tokio::time::Instant::now(),
+                        );
                         let now = node.now();
                         if let Some(g) = node.gateway.as_mut() {
                             g.tick(now);
@@ -674,6 +756,18 @@ impl Node {
                     // A HELLO after the first is ignored; forwards are messages.
                     Some((from, frame)) = inbound_rx.recv() => {
                         if let Frame::Message(message) = frame {
+                            if node.trace.on() {
+                                match &message {
+                                    cluster::Message::Append { prev, records, .. } if !records.is_empty() => {
+                                        let last = prev.saturating_add(records.len() as u64);
+                                        node.trace.stamp_now(Stage::Received, from, prev.saturating_add(1), last);
+                                    }
+                                    cluster::Message::Ack { durable, .. } => {
+                                        node.trace.stamp_now(Stage::ReportReceived, from, *durable, *durable);
+                                    }
+                                    _ => {}
+                                }
+                            }
                             node.core.on_message(from, message);
                         }
                     }
@@ -681,15 +775,32 @@ impl Node {
                     Some(reply) = hand_offs_rx.recv() => {
                         let _ = reply.send(node.core.hand_off());
                     }
+                    Some(reply) = metrics_rx.recv() => {
+                        let _ = reply.send(node.snapshot(id, state.applied()));
+                    }
+                    Some(request) = trace_rx.recv() => match request {
+                        TraceRequest::Start(capacity) => node.trace.start(capacity),
+                        TraceRequest::Take(reply) => {
+                            let _ = reply.send(node.trace.take());
+                        }
+                    },
                     Some(event) = wal_rx.recv() => match event {
-                        wal::Event::Durable { lsn, bytes_floor } => {
+                        wal::Event::Durable { lsn, bytes_floor, started, written, synced } => {
+                            if node.trace.on() {
+                                node.trace.stamp(Stage::WalStarted, id, lsn, lsn, started);
+                                node.trace.stamp(Stage::WalWritten, id, lsn, lsn, written);
+                                node.trace.stamp(Stage::Synced, id, lsn, lsn, synced);
+                                node.trace.stamp_now(Stage::DurableHandled, id, lsn, lsn);
+                            }
                             retained_floor = bytes_floor;
+                            node.measured.durable(lsn, tokio::time::Instant::now());
                             node.core.on_durable(lsn);
                         }
                         wal::Event::Promised(slot) => node.core.on_promised(slot),
                         wal::Event::Truncated(chain) => {
                             // What was appended past the cut is not the log.
                             drop(recent.split_off(&chain.next_lsn()));
+                            node.measured.truncated(chain.next_lsn().saturating_sub(1));
                             node.core.on_truncated(chain);
                         }
                         wal::Event::Snapshot(lsn) => {
@@ -708,10 +819,20 @@ impl Node {
                             cluster::prune_slots(&mut committed_slots, floor);
                             node.core.on_compacted(floor);
                         }
-                        wal::Event::Read { to, from, batch } => match batch {
-                            Some(batch) => node.core.on_read(to, batch),
-                            None => node.core.on_read_missing(to, from),
-                        },
+                        wal::Event::Read { to, from, batch, started, done } => {
+                            if node.trace.on() {
+                                let last = batch
+                                    .as_ref()
+                                    .map_or(0, |b| from.saturating_add(b.len() as u64).saturating_sub(1));
+                                node.trace.stamp(Stage::ReadStarted, to, from, last, started);
+                                node.trace.stamp(Stage::ReadDone, to, from, last, done);
+                                node.trace.stamp_now(Stage::ReadHandled, to, from, last);
+                            }
+                            match batch {
+                                Some(batch) => node.core.on_read(to, batch),
+                                None => node.core.on_read_missing(to, from),
+                            }
+                        }
                         wal::Event::Range(records) => {
                             reading = false;
                             for record in records {
@@ -739,15 +860,50 @@ impl Node {
                                 for (offset, record) in records.iter().enumerate() {
                                     recent.insert(first.saturating_add(offset as u64), record.clone());
                                 }
+                                let last = first.saturating_add(records.len() as u64).saturating_sub(1);
+                                node.measured.appended(last, tokio::time::Instant::now());
+                                node.trace.stamp_now(Stage::Appended, id, first, last);
                                 let _ = wal.send(wal::Command::Append { first, records });
                             }
                             Step::Send { to, message } => {
                                 if let Some(link) = node.links.get(&to) {
-                                    // Full: dropped; the heartbeat resends.
-                                    let _ = link.try_send(Frame::Message(message));
+                                    // Full: dropped; the heartbeat resends — except
+                                    // a forward, lost: counted by name (D-115 A).
+                                    let forward =
+                                        matches!(message, cluster::Message::Forward { .. });
+                                    // D-135 A: an append's records, for the bytes
+                                    // in flight to this peer.
+                                    let shipped = match &message {
+                                        cluster::Message::Append { prev, records, .. }
+                                            if !records.is_empty() =>
+                                        {
+                                            Some((
+                                                prev.saturating_add(1),
+                                                prev.saturating_add(records.len() as u64),
+                                                records.iter().map(|r| r.len() as u64).sum::<u64>(),
+                                            ))
+                                        }
+                                        _ => None,
+                                    };
+                                    let report = match &message {
+                                        cluster::Message::Ack { durable, .. } => Some(*durable),
+                                        _ => None,
+                                    };
+                                    if link.try_send(Frame::Message(message)).is_err() {
+                                        node.measured.link_dropped(forward);
+                                    } else {
+                                        if let Some((first, last, bytes)) = shipped {
+                                            node.measured.shipped(to, last, bytes);
+                                            node.trace.stamp_now(Stage::Shipped, to, first, last);
+                                        }
+                                        if let Some(durable) = report {
+                                            node.trace.stamp_now(Stage::ReportSent, to, durable, durable);
+                                        }
+                                    }
                                 }
                             }
                             Step::Read { to, from, upto } => {
+                                node.trace.stamp_now(Stage::ReadAsked, to, from, upto);
                                 let _ = wal.send(wal::Command::Read {
                                     to,
                                     from,
@@ -788,9 +944,14 @@ impl Node {
                     if committed_slots.last().is_none_or(|&(slot, _)| slot < decoded.slot) {
                         committed_slots.push((decoded.slot, decoded.lsn));
                     }
+                    // The outbox removes only from its front: the given-up
+                    // entries, then the one this record confirms, if any.
+                    let held = node.core.held().0;
                     let lost = node.core.applied(&decoded).len();
+                    let confirmed = held.saturating_sub(node.core.held().0) > lost;
+                    node.measured
+                        .left_outbox(lost, confirmed, tokio::time::Instant::now());
                     if lost > 0 {
-                        node.given_up = node.given_up.saturating_add(lost as u64);
                         tracing::warn!(lost, "proposals lost before a later one of this node committed; their publishers time out");
                     }
                     let mut out = Vec::new();
@@ -815,6 +976,11 @@ impl Node {
                     }
                     node.gateway_actions();
                 }
+                let now = tokio::time::Instant::now();
+                node.measured.committed_through(commit, now);
+                node.measured
+                    .roles(node.core.taking(), node.core.leading(), node.core.slot(), now);
+                node.measured.blocked(node.core.outbox_full(), now);
                 node.resume();
                 // Only what is durable here: a restart must find the log up
                 // to the snapshot, or it could not check the two meet.
@@ -842,8 +1008,8 @@ impl Node {
                     digest,
                     slot: node.core.slot(),
                     leading: node.core.leading(),
-                    refused: node.refused,
-                    given_up: node.given_up,
+                    refused: node.measured.refused,
+                    given_up: node.measured.given_up,
                 };
                 status_tx.send_if_modified(|current| {
                     let changed = *current != last;
@@ -858,6 +1024,9 @@ impl Node {
             mqtt: mqtt_listen,
             proposals,
             hand_offs,
+            metrics,
+            metrics_listen,
+            trace,
             effects,
             status,
             stop: Some(stop),
@@ -892,6 +1061,29 @@ impl Node {
         answer
             .await
             .unwrap_or(Err(cluster::ClusterError::NotLeader))
+    }
+
+    /// A snapshot of what this node measures (D-112), as it is now; `None`
+    /// once the node stopped.
+    pub async fn metrics(&self) -> Option<metrics::Snapshot> {
+        let (reply, answer) = oneshot::channel();
+        self.metrics.send(reply).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// Starts recording the stages' stamps (D-136 A), at most `capacity`,
+    /// discarding any recorded before. Diagnostic: the cap benchmark's
+    /// catch-up mode; nothing reads them back into a decision.
+    pub async fn trace_start(&self, capacity: usize) {
+        let _ = self.trace.send(TraceRequest::Start(capacity)).await;
+    }
+
+    /// The stamps recorded since `trace_start`; recording stops. `None`
+    /// once the node stopped.
+    pub async fn trace_take(&self) -> Option<metrics::Trace> {
+        let (reply, answer) = oneshot::channel();
+        self.trace.send(TraceRequest::Take(reply)).await.ok()?;
+        answer.await.ok()
     }
 
     /// Where proposals go, as [`Node::propose`], for a task that outlives

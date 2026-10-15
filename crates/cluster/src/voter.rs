@@ -94,6 +94,28 @@ enum Role {
     Lead(Box<Sequencer>),
 }
 
+/// A voter's counts and its outbox, for metrics (D-112).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VoterStats {
+    /// Takeovers started after silence, and slots taken over by a
+    /// committed `SlotEnd` (a handoff's successor).
+    pub takeovers: u64,
+    pub successions: u64,
+    /// Slots this node began sequencing, and times it stopped (handed
+    /// over, or fenced by a newer slot).
+    pub slots_led: u64,
+    pub stepped_down: u64,
+    /// Other nodes' forwards its full or sealed queue refused.
+    pub forwards_refused: u64,
+    /// This node's own proposals accepted and awaiting commit, of them sent,
+    /// their bytes, the bound, and entries sent again after a slot closed.
+    pub outbox_entries: usize,
+    pub outbox_sent: usize,
+    pub outbox_bytes: usize,
+    pub outbox_capacity: usize,
+    pub outbox_resent: u64,
+}
+
 #[derive(Debug)]
 pub struct Voter {
     config: Config,
@@ -148,6 +170,13 @@ pub struct Voter {
     /// Other nodes' forwards this sequencer's full or sealed queue refused:
     /// lost (D-115 A counts them).
     forwards_refused: u64,
+    /// Role changes, counted for metrics (D-112); the outbox fields are
+    /// filled in by `stats`.
+    roles: VoterStats,
+    /// The highest commit point heard from a slot's owner, not capped at
+    /// this log's end: how far behind this replica is (D-132). Reported,
+    /// never acted on.
+    heard_commit: u64,
 }
 
 impl Voter {
@@ -180,6 +209,8 @@ impl Voter {
             outbox: crate::outbox::Outbox::new(crate::outbox::capacity(max_queue, voters)),
             decided: None,
             forwards_refused: 0,
+            roles: VoterStats::default(),
+            heard_commit: 0,
         }
     }
 
@@ -387,6 +418,42 @@ impl Voter {
         self.forwards_refused
     }
 
+    /// What this voter has done and holds, for metrics (D-112): counts since
+    /// it was built, and its outbox now. Read on demand, never on a path
+    /// that decides anything.
+    pub fn stats(&self) -> VoterStats {
+        let (entries, sent) = self.outbox.held();
+        let (bytes, resent) = self.outbox.bytes_resent();
+        VoterStats {
+            forwards_refused: self.forwards_refused,
+            outbox_entries: entries,
+            outbox_sent: sent,
+            outbox_bytes: bytes,
+            outbox_capacity: self.outbox.capacity(),
+            outbox_resent: resent,
+            ..self.roles
+        }
+    }
+
+    /// The commit point this node has heard of — its own when sequencing;
+    /// as a replica, the highest an owner sent, not capped at this log's
+    /// end (D-132). With `end`, how far behind it is: a report only.
+    pub fn heard_commit(&self) -> u64 {
+        match &self.role {
+            Role::Lead(s) => s.commit(),
+            _ => self.heard_commit.max(self.log.commit),
+        }
+    }
+
+    /// Sequencing: each replica's durable position as last reported, for
+    /// metrics (D-112); `None` for one not heard from in this slot.
+    pub fn replicas(&self) -> Vec<(NodeId, Option<u64>)> {
+        match &self.role {
+            Role::Lead(s) => s.replicas(),
+            _ => Vec::new(),
+        }
+    }
+
     /// After a restart: the slot of the last committed record the driver
     /// has applied — from its snapshot when nothing after it is replayed.
     /// Nothing is forwarded before the promised slot has a committed record.
@@ -539,6 +606,7 @@ impl Voter {
             && !self.truncating
             && self.config.owner_of(target) == Some(self.config.id)
         {
+            self.roles.takeovers = self.roles.takeovers.saturating_add(1);
             self.role = Role::Take(Take {
                 slot: target,
                 promised: Vec::new(),
@@ -774,6 +842,7 @@ impl Voter {
         self.effects.extend(pending);
         self.log = Log::new(s.chain(), s.durable(), s.commit());
         self.role = Role::Follow;
+        self.roles.stepped_down = self.roles.stepped_down.saturating_add(1);
         self.silent = 0;
     }
 
@@ -791,6 +860,7 @@ impl Voter {
             && self.promising.is_none()
             && self.config.owner_of(next) == Some(self.config.id)
         {
+            self.roles.successions = self.roles.successions.saturating_add(1);
             self.role = Role::Take(Take {
                 slot: next,
                 promised: Vec::new(),
@@ -947,6 +1017,8 @@ impl Voter {
                 return;
             }
         }
+        // From the owner of the promised slot: its commit point, as heard.
+        self.heard_commit = self.heard_commit.max(commit);
         if !records.is_empty() && !self.truncating && prev.0 == self.log.end {
             self.append(records);
         }
@@ -1175,6 +1247,7 @@ impl Voter {
         }
         self.silent = 0;
         self.role = Role::Lead(Box::new(sequencer));
+        self.roles.slots_led = self.roles.slots_led.saturating_add(1);
     }
 }
 

@@ -60,7 +60,7 @@ async fn run(config: node::NodeConfig) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    tracing::info!(listen = %node.listen, mqtt = ?node.mqtt, "node started");
+    tracing::info!(listen = %node.listen, mqtt = ?node.mqtt, metrics = ?node.metrics_listen, "node started");
     serve_hand_offs(&node).await;
     tracing::info!("stopping");
     node.shutdown().await;

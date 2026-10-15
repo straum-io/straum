@@ -2664,3 +2664,492 @@ Nothing breaks: names carry the process and thread ids. But the directories grow
 
 **Answer:** `D-123: A` · `D-123: B` · `D-123: C` · `D-123: discuss`
 ````
+
+
+````markdown
+## D-124. The Linux run: the cost of measuring first, then the measurements
+
+**Context.** D-112 ends with Linux measurements, with the safety and liveness checks as gates. The metrics added cost to the hot path, and it is unmeasured:
+- an `Instant::now()` per own proposal, per batch append, per durable report and per pass of the node loop;
+- two outbox reads per applied record;
+- three counter increments in the gateway, per publish, PUBACK and delivery.
+
+`Measured` always runs, even with no metrics listener, so the same build cannot be compared with metrics off. No Linux host has been available so far (D-84); container numbers are preliminary.
+**Vision.** CLAUDE.md §11 (baseline, one variable, ≥ 5 alternating rounds, medians; macOS and containers show direction only), §17 (hot-path changes carry a performance report); D-112 ("no measurement overhead that distorts the result"); D-84 A.
+
+### A. Overhead against 071db00 first, then the gated measurements — recommended
+- **What we do:**
+  1. On a quiet Linux host, run `node/benches/cap.rs` at 071db00 and at this change, alternating, at least 5 rounds each. Compare medians of throughput and failover time, which is what it measures; the noise floor is 3 %. `cap.rs` proposes through a node handle, not over MQTT, so the gateway's counters are not on its path: an MQTT workload (publishers and subscribers through the server, PUBACK latency at the client) goes into the same comparison.
+  2. If the overhead is under the floor, take the D-112 measurements with the metrics on. Gates before each run: the takeover simulation, the node tests, the e2e test, and your D-123 criterion — the load handoff test green, fencing verified, and no unexplained proposal loss. A failure there becomes a go/no-go card, not a number.
+  3. If it is above, the cost is found by profile before anything else is measured.
+- **Cost:** M, plus an MQTT load generator for step 1 and access to a Linux host.
+- **Risks:** without a host, only container numbers, marked preliminary.
+
+### B. Make measuring switchable first, then compare on one build
+- **What we do:** `Measured` is skipped when the node serves no metrics and nobody asks for them. The same binary is then run with metrics on and off.
+- **Cost:** S, plus A's runs.
+- **Risks:** a branch per event to switch it, and a node that measures nothing unless asked: a stall seen only after the fact cannot be explained.
+
+**Rejected.**
+- *Measure with the metrics on, without the overhead check:* D-112 forbids measurement overhead that distorts the result, and CLAUDE.md §11 asks for a baseline first.
+
+**Recommendation.** A. B only if A shows an overhead above the floor that cannot be removed.
+
+**Answer:** `D-124: A` · `D-124: B` · `D-124: discuss`
+
+````
+
+````markdown
+## D-125. Stage 4 incomplete: handoffs are not timed, and fencing is not told from handover
+
+**Context.** D-112's stage 4 asks for the reason, duration and result of a role transfer, and for fencing. Covered:
+- takeovers by silence: started, completed (timed), abandoned;
+- successions by `SlotEnd`: counted;
+- slots led;
+- times stepped down.
+
+Missing:
+- a handoff's duration, from the old sequencer sealing its slot until the successor leads;
+- `stepped_down` does not separate a handover from fencing by a newer slot.
+**Vision.** D-112 stage 4; unified-stream §2.4.
+
+### A. Complete it now
+- **What we do:**
+  - the old sequencer times from `hand_off` until it steps down after `SlotEnd` commits;
+  - the successor times from its succession until it leads;
+  - `stepped_down` splits into `handed_over` and `fenced`, decided by whether the slot's `SlotEnd` was committed;
+  - a voter test for each.
+- **Cost:** S–M; small changes in `cluster::Voter` and the node.
+
+### B. After D-124's first Linux run — recommended
+- **What we do:** as A, scheduled after the overhead check. That run needs commit, outbox and replication; a handoff's duration matters once failover is measured.
+- **Cost:** as A, later.
+- **Risks:** the first Linux run cannot attribute a handoff's cost to the handoff.
+
+### C. Leave it as recorded
+- **Risks:** stage 4 stays partial.
+
+**Recommendation.** B. A if the first Linux run includes failover.
+
+**Answer:** `D-125: A` · `D-125: B` · `D-125: C` · `D-125: discuss`
+
+````
+
+````markdown
+## D-126. A metrics listener over the network, or in-process only
+
+**Context.** D-112 asked for metrics fit for the Linux benchmark. I also added an HTTP listener (`STRAUM_CLUSTER_METRICS_LISTEN`):
+- off by default;
+- loopback unless an unauthenticated network is acknowledged (D-107);
+- at most 4 scrapes at once, with 2 s timeouts, and a test.
+
+It is a new public surface you did not ask for. The benchmark harness can read `Node::metrics` in-process instead.
+**Vision.** D-112; D-107 (exposure); CLAUDE.md §15 (metrics nobody can read are metrics nobody acts on); "do not do work the task did not ask for".
+
+### A. Keep the listener as built — recommended
+- **What we do:** keep it. A three-process run (the server, the e2e test, a Linux host) has no other way to read the metrics.
+- **Cost:** none now.
+- **Risks:** one more listener to secure when D-110 brings credentials and TLS.
+
+### B. Remove it; in-process only
+- **What we do:** drop the listener and the setting; the benchmark reads `Node::metrics`.
+- **Cost:** S.
+- **Risks:** a running server cannot be observed until D-110.
+
+**Recommendation.** A.
+
+**Answer:** `D-126: A` · `D-126: B` · `D-126: discuss`
+````
+
+
+````markdown
+## D-127. A quiet Linux host for D-124
+
+**Context.** D-124 A needs its numbers from a quiet Linux host. The harness is ready:
+- `scripts/overhead.sh` alternates a baseline and a candidate tree;
+- it runs `cap` (throughput, failover) and the new `server/benches/puback.rs` (MQTT throughput, publish→PUBACK p50 and p99, server CPU per PUBACK).
+
+Its first run, in the container on the development Mac, put every median within 3.3 %, inside that machine's 10 % noise floor. That result is preliminary (`docs/baselines/apple-m1-dev.md`). No Linux host has been available (D-84). The accepted result and the gated D-112 measurements wait for one.
+- **Not covered yet:** the container run compared metric collection only. The benches run with no metrics listener, so nothing was scraped during the rounds. The cost of scraping — the listener on, polled every few seconds — is part of D-124's step 4 on the same host.
+**Vision.** CLAUDE.md §11 (accepted numbers from a quiet Linux host, never a container on macOS); D-124 A; D-84 A.
+
+### A. A bare-metal Linux machine: one you have, or rented for a few hours — recommended
+- **What we do:**
+  - first, a machine you already own or can borrow (a spare box or a home server) costs nothing; otherwise rent one;
+  - a dedicated machine with no VM neighbours (Hetzner AX, OVH, Equinix Metal or similar), with the CPU and frequency recorded and cores pinned as `docs/benchmarks.md` §6 describes;
+  - first measure the host's own noise: the same build run against itself, its spread below the 3 % floor, with the governor and pinning recorded;
+  - then `scripts/overhead.sh` (it exists; 5 rounds), then the D-112 measurements under the D-123 gates, with a scraper polling the metrics listener;
+  - record the results in `docs/baselines/<machine>.md`.
+- **Cost:** nothing on your own machine, or a few hours of rental in your account. The script exists; you run it, or give me access.
+- **Risks:** none to the code; the host must be quiet, which a rented bare-metal machine usually is.
+
+### B. A cloud VM (a dedicated-CPU instance)
+- **What we do:** as A, on a VM with dedicated vCPUs.
+- **Cost:** lower and quicker to get.
+- **What it settles:** CLAUDE.md §11 asks for a quiet Linux host, and a VM is not one. Its numbers would stay preliminary — better than the Mac's, and they do not close D-124.
+- **Risks:** virtualised time and noisy neighbours on the host.
+
+### C. Keep the container result as the only one for now
+- **Risks:** D-124 stays open; no claim about the cost of measuring or about throughput can be made.
+
+**Recommendation.** A.
+
+**Answer:** `D-127: A` · `D-127: B` · `D-127: C` · `D-127: discuss`
+````
+
+
+````markdown
+## D-128. Handoff and takeover in the Linux run's diagnostics
+
+**Context.** D-127 step 4 asks for handoff and takeover to be measured separately, not mixed with fencing.
+- **What the runbook does now:** its diagnostic run is 60 s of steady load. It injects no handoff and no takeover, so its counters show only the startup quirk: the first owner starting slot 1 counts as a takeover.
+- **Where failover appears at all:** only in `cap`'s failover p50 — a stopped sequencer, measured inside one process.
+- **Planned handoffs:** never exercised.
+- **Server-side timing of handoffs:** D-125, after the first Linux run (D-125 B).
+**Vision.** D-127 A step 4; D-125 B (handoff, takeover and fencing are different events); D-112 stage 4.
+
+### A. Inject both into the diagnostic run now; time them from the client — recommended
+- **What we do:** `puback` gains `STRAUM_BENCH_EVENTS=handoff,kill`. Midway through the run it sends SIGUSR1 to the sequencer (a planned handoff). Later it kills the sequencer with SIGKILL (a takeover) and restarts that node. For each event it reports, apart:
+  - the longest gap between PUBACKs around the event;
+  - the PUBACKs lost to it: always 0 for a handoff, and for a kill only those of connections to the killed node;
+  - the takeover and succession counters before and after.
+  
+  No server change; the server-side split is still D-125.
+- **Cost:** S–M.
+- **Risks:** client-side timing only, which includes the clients' own reconnects.
+
+### B. Leave it with D-125 B, after the first Linux run
+- **What we do:** the first Linux run is steady load only; handoff and takeover come with D-125's server-side timing.
+- **Risks:** the first run cannot say what a handoff or a takeover costs a client.
+
+**Recommendation.** A. It is client-side, needs no server change, and gives step 4 what it asks for in the first run.
+
+**Answer:** `D-128: A` · `D-128: B` · `D-128: discuss`
+
+````
+
+````markdown
+## D-129. When is a Linux host's noise low enough?
+
+**Context.** You close D-124 only when the host's noise is low enough to read the result. The runbook measures that noise: this tree against itself, every median with its spread. But no number says what "low enough" is.
+- CLAUDE.md §11 treats differences below 3 % on a pinned, quiet Linux host as noise.
+- The noise run is what shows whether a given host is that quiet.
+**Vision.** CLAUDE.md §11 (noise floor, initial; "if variance is larger than the effect, fix the environment"); D-127 A; D-124.
+
+### A. 3 % for both — recommended
+- **The rule:** a host is accepted when, in the noise run, the two copies' medians differ by less than 3 % on every quantity, and each copy's spread (max − min over min) is below 3 %. Otherwise the run stops after step 1, and steadier conditions or more rounds come first.
+- **What it settles:** an overhead within 3 % is "within this host's noise". It is never "zero".
+
+### B. The noise run itself sets the floor
+- **The rule:** whatever spread the noise run shows becomes the floor for that host. Overhead below it is noise.
+- **Risks:** a noisy host passes with a wide floor that hides a real cost.
+
+**Recommendation.** A. It is §11's floor, and B lets a noisy host pass.
+
+**Answer:** `D-129: A` · `D-129: B` · `D-129: discuss`
+````
+
+
+````markdown
+## D-130. Failover time cannot pass D-129's 3 % gate as measured
+
+**Context.** D-129 A gates a host on every quantity: its two copies' medians within 3 %, each copy's spread across rounds below 3 %.
+- **Why failover cannot pass:** `cap` measures its failover p50 from 5 failovers per round, and the distribution is bimodal. Most failovers take about 300 ms, some about 1 975 ms. In the container run the spread was over 500 %.
+- **Why this is not just the Mac's noise:** a failover that misses its first takeover waits a further round of `takeover_ticks × patience`, by design (D-85, D-88). A quiet Linux host will likely still show two modes, and the median of 5 can land in either.
+- **Consequence:** as decided, every host fails the noise gate on this quantity alone, and the accepted run never starts.
+**Vision.** D-129 A; D-124 A (failover time among the quantities); CLAUDE.md §11 ("a latency is a gauge of the latest value… the average of a bimodal latency is a number that never happened").
+
+### A. Report failover as a distribution, and gate on the others — recommended
+- **What we do:**
+  - this amends D-129 A's "on every quantity": the gate drops failover time, and `log.md` records the change;
+  - `cap` runs more failovers per round (50 instead of 5) and reports the share within 1 s (D-84 A's own criterion) and p50 and p90 apart;
+  - the D-129 gate applies to throughput, PUBACK latency and CPU per PUBACK;
+  - failover is compared baseline against candidate by its share within 1 s and its two modes, with their spread reported, not gated.
+- **Cost:** S; the run takes longer, about 50 × 0.3–2 s per round.
+- **Risks:** failover is not held to 3 %. A real regression in it shows as a shift in the share or the modes, not in a median.
+
+### B. Keep it gated, with many more failovers
+- **What we do:** enough failovers per round (200 or more) that the p50 settles within 3 %.
+- **Cost:** M in time: hours per run.
+- **Risks:** a bimodal median may never settle within 3 %, however many failovers.
+
+### C. Drop failover from D-124's overhead comparison
+- **What we do:** metrics add no work to the takeover path that differs from the steady path, so failover is left to D-125's measurements.
+- **Risks:** it narrows what you set in D-124 ("throughput, publication-to-PUBACK latency, and failover time").
+
+**Recommendation.** A.
+
+**Answer:** `D-130: A` · `D-130: B` · `D-130: C` · `D-130: discuss`
+
+````
+
+````markdown
+## D-131. A restarted node cannot catch up under load
+
+**Context.** Found by D-128's event run, in the container, preliminary. A sequencer is killed under about 80 000 publishes/s and started again 2 s later.
+- **What happens:**
+  - The node rejoins as a replica and must catch up before its gateway serves clients: it refuses them until its own reset record is applied.
+  - In 5 runs of 6 its clients gave up after 30 s. Nothing was lost or duplicated; their in-flight publishes stayed unacknowledged.
+  - With the load stopped, its commit moved 62 143, 156 865 and 68 499 positions in 10 s. That is a catch-up of about 6 000–16 000 positions a second, far below the write rate.
+- **Likely mechanism, from the code, not measured:**
+  - catch-up moves at most `read_bytes` (64 KiB) per round (D-81 A);
+  - if a round is paced by the heartbeat (50 ms) rather than by the replica's reply, that is about 1.3 MB/s, roughly 13 000 records a second — which matches.
+- **Already known in part:** D-85 noted that a replica outside the committing majority falls behind under load, and flow control on replica lag (D-89) is off by default.
+- **Not a safety issue:** the committed log and fencing hold. A node that falls further behind than `retain_bytes` is lost and needs a state copy (step 7b).
+**Vision.** unified-stream §1 (predictability before peak speed); D-81 A, D-83 A (`read_bytes`), D-85, D-89 (flow control), step 7b; D-127 A step 4.
+
+### A. Measure first: confirm the mechanism by `read_bytes` — recommended
+- **What we do:** run the event scenario at `STRAUM_READ_BYTES` = 64 KiB, 512 KiB and 8 MiB (half a frame, the most allowed), and read the catch-up rate from the replica's commit over time. It runs inside the Linux diagnostics step (D-127 A step 4). Run in the container first, the numbers are preliminary, as everything there is. `puback` needs one passthrough setting for the server's `STRAUM_READ_BYTES`.
+  - If the rate scales with `read_bytes`, the round is paced by the heartbeat. The fix is then B.
+  - If it does not, the cost is elsewhere (applying, the disk), and a profile on Linux comes first.
+- **Cost:** S; settings already exist, no code change.
+
+### B. Pipeline the catch-up: the next read on the replica's reply, not on the heartbeat
+- **What we do:** in `cluster::Sequencer`, a replica's progress report triggers the next read at once, up to the replication window. The heartbeat stays the resend timer only. This is a sans-IO change, with takeover-simulation scenarios for a replica far behind.
+- **Cost:** M.
+- **Risks:** more reads at once on the sequencer's disk; bounded by the window.
+- **Order:** after the accepted D-124 run. It changes the code that run compares (071db00 against this tree), and CLAUDE.md §11 allows one variable at a time.
+
+### C. Turn flow control on (D-89)
+- **What we do:** the sequencer holds new batches while an attached replica is more than `L` behind, for at most `T` heartbeats.
+- **Risks:** it slows every client to let one replica catch up; values not measured. It does not help a node that was down and is not attached.
+
+### D. Defer: record it and change nothing until D-124's accepted run
+- **What we do:** keep the finding in ADR-0008. The mechanism comes from a container only, and step 7b's state copy is the planned path for a replica too far behind (unified-stream §6 order).
+- **Risks:** a node restarted under sustained load stays unavailable to its clients until the load drops.
+- **Needs your view first:** may a node behind refuse its clients indefinitely under load before 7b, or does "predictability before peak speed" (unified-stream §1) require a bound on catch-up time? If the latter, D is not enough.
+
+**Recommendation.** A, inside the Linux diagnostics. B if A shows the heartbeat paces it, after the accepted D-124 run.
+
+**Answer:** `D-131: A` · `D-131: B` · `D-131: C` · `D-131: D` · `D-131: discuss`
+````
+
+
+````markdown
+## D-132. The catch-up contract: making "no progress" diagnosable
+
+**Context.** D-131 set a contract for a lagging replica before the state copy (step 7b). Checked against the code:
+- **Holds — no early service:** a restarted node refuses every CONNECT at once with `ServerUnavailable` until its own reset record is applied. A client gets an explicit refusal, never an unbounded wait at the broker; any wait is the client's own retry loop.
+- **Holds — bounded waits for clients of a node that is behind:** a node that is serving but behind acknowledges nothing before its record is applied locally, and `commit_timeout` (30 s) closes a publisher whose publish does not commit. The wait is bounded and the close explicit.
+- **Holds — TCP reachability is not the right to serve:** serving requires the node's own committed reset to be applied.
+- **Missing — a diagnosable state when there is no progress:** a replica that is behind cannot tell how far, because the commit point it learns is capped at its own log's end. Nothing reports a catch-up that has stalled. The D-128 runs showed a restarted node behind by 48 000–146 000 positions, visible only from outside, by comparing nodes.
+**Vision.** D-131 (the contract); unified-stream §1 (predictability before peak speed; time triggers, never decides); D-112 (metrics); D-89 (lag is measured at the sequencer).
+
+### A. Report it from both sides, decide nothing — recommended
+- **What we do:**
+  - **The sequencer**, which knows each replica's durable position, exports per replica how far it is behind and how long since that position last moved (`straum_replica_lag`, and a new `straum_replica_stalled_seconds`).
+  - **The replica** exports the sequencer's commit point as heard, uncapped, and how long since its own log's end last moved.
+  
+  A stall is then a state an operator, and the Linux run, can see, with a threshold for alerting. Nothing in the protocol acts on it.
+- **Cost:** S–M; `cluster` exposes the heard commit and the last-progress times; `node::metrics` exports them, with tests.
+- **Risks:** none to safety; two more gauges.
+
+### B. As A, and close the stalled replica's clients after a bound
+- **What we do:** after N seconds with no progress, the stalled node closes its client connections with a reason, so they reconnect elsewhere.
+- **Risks:** you asked for no hard timeout yet: a temporary overload could become a cycle of closes and reconnects. The bound is unmeasured.
+- **Needs from you first:** the "established period" without progress, N seconds. A needs it as an alert threshold, B as its bound.
+
+### C. Do nothing until the accepted D-124 and Linux run
+- **Risks:** until then a stalled catch-up is visible only by comparing nodes from outside — what D-128's runs had to do — and the alert threshold, the "established period" without progress, stays undefined.
+
+**Recommendation.** A. It makes the contract's missing point observable without a timeout that decides anything.
+
+**Answer:** `D-132: A` · `D-132: B` · `D-132: C` · `D-132: discuss`
+
+````
+
+````markdown
+## D-133. What limits catch-up — and D-131 B
+
+**Context.** D-131 A's first measurement, in the container, one run per size, preliminary:
+- **Under load:** a restarted node's lag shrank at every read size, by about 2 400–4 300 positions a second net.
+- **After the load:** it caught up at 7 400, 4 500 and 7 100 positions a second, for 64 KiB, 512 KiB and 4 MiB.
+- **The running nodes' PUBACK:** p50 1.15, 1.03 and 0.96 ms; p99 25.7, 27.6 and 17.0 ms. Commit latency per size was not read.
+- **So:** the node catches up, slowly — about a minute under this load, longer than its clients' 30 s.
+
+Read size did not show as the limiter in that one run per size. But 512 KiB was 40 % slower than both ends, so one run cannot establish a non-effect. Your step 4 asks for a decision on D-131 B, the next read on the replica's reply. Another suspect, from the code and not measured: the replication window of 256 positions in flight beyond the replica's durable report. At about 28 round trips a second, that is about 7 000 a second.
+**Vision.** D-131 A (measure one variable at a time; no flow control at the same time); CLAUDE.md §11 (repeated measurement over one good number); D-124 (code under its comparison unchanged until its run).
+
+### A. Repeat D-131 A, 3 rounds per size, before anything else — recommended
+- **What we do:** the same kill scenario at 64 KiB, 512 KiB and 4 MiB, alternating, 3 rounds each, with the medians and spreads of the lag's rate and the recovery rate, and the running nodes' commit latency and PUBACK. Container first, preliminary.
+- **Outcome:**
+  - if the rates stay within each other's spread, read size is out and B comes next;
+  - if they differ, read size matters and D-131 B is back in question.
+- **Cost:** S; about 15 minutes in the container.
+
+### B. Measure the replication window
+- **What we do:** a different harness from `puback.rs`: in-process, as `node/benches/cap.rs` runs, where `window` is a `NodeConfig` field, so no server setting is added. A sequencer is stopped with `shutdown`, not killed, under load from node handles (no MQTT), then restarted. At a window of 256, 1 024 and 4 096, it gives the restarted node's lag under load, its recovery after, and the running nodes' commit latency. It gives no PUBACK. Flow control stays off.
+- **Cost:** S; a bench beside `cap.rs`, no change to the server or to the code under D-124's comparison.
+
+### C. Profile a catching-up replica on Linux
+- **What we do:** `perf` on the restarted node during catch-up, to see where its time goes.
+- **Cost:** M; needs the Linux host (D-127).
+
+### D. D-131 B, the next read on the replica's reply: not now
+- **What we do:** decide B only once A and B above have shown what limits catch-up. Even then, only after the accepted D-124 run, since it changes code under that comparison.
+- **Risks:** none; restarted nodes stay about a minute behind under load meanwhile.
+
+**Recommendation.** A, then B. D for D-131 B.
+
+**Answer:** `D-133: A` · `D-133: B` · `D-133: C` · `D-133: D` · `D-133: discuss`
+
+````
+
+````markdown
+## D-134. When does failover's p90 call for more failovers?
+
+**Context.** You set D-130 so that if p90 changes substantially between rounds, the count of 50 failovers per round goes up. The runbook prints p90's spread between rounds, `(max − min) / median`, in `scripts/noise.awk`, marked "not gated". But nothing says what "substantially" is, so the trigger cannot be checked mechanically.
+**Vision.** D-130 A; D-129 A (spreads defined the same way); CLAUDE.md §11.
+
+### A. A p90 spread above 10 % doubles the count — recommended
+- **What we do:** `noise.awk` flags failover p90 when its spread between rounds is above 10 %, and the runbook reruns step 2 with 100 failovers, then 200, until the flag clears or 200 is reached. Each count is reported.
+- **Why 10 %:** a tail estimate from 50 events moves more than a median does; 3 % would rarely clear, and 10 % is the Mac's noise floor in CLAUDE.md §11.
+- **Cost:** S; the run grows to about 200 × 1–2 s per round at worst.
+
+### B. 3 %, as the other quantities
+- **Risks:** with two modes, p90 may sit on either side of the mode boundary; it may never clear, and the run grows to its cap each time.
+
+### C. No automatic trigger; the operator reads the spread
+- **Risks:** a judgement call in every run, against D-129's mechanical rule.
+
+**Recommendation.** A.
+
+**Answer:** `D-134: A` · `D-134: B` · `D-134: C` · `D-134: discuss`
+````
+
+
+````markdown
+## D-135. The replication window limits catch-up
+
+**Context.** D-133's measurements, all preliminary (container):
+- **Read size** (A, through the server, 3 rounds per size): no effect on catch-up. During catch-up the sequencer used a full core, while the replica was nearly idle.
+- **Replication window** (B, in-process, 3 rounds per window):
+  - 256, 7a's fixed value: a restarted replica recovers at about 6 400 positions a second and loses about 2 050 a second of its lag under load;
+  - 1 024: about 30 000 a second after the load, 25 000 under it;
+  - 4 096: it caught up under load within 20 s.
+  
+  The rounds agree within a few percent. The sequencer's commit latency showed no change, at coarse bucket bounds.
+- **What the window is:** `cluster::Config::window`, the positions a sequencer sends a replica beyond what that replica has reported durable. It is part of the configuration digest. In 7a it is fixed at 256 (`node::experimental`).
+- **Its memory cost, against what already bounds it:**
+  - in positions, the window has no byte budget of its own;
+  - what a link holds is already bounded per peer by `link_queue`, 1 024 frames of at most 8 MiB, whatever the window;
+  - a larger window fills that bound sooner under catch-up, rather than adding a new unbounded amount.
+- **Not explained:**
+  - 4× the window gave about 12× the rate.
+  - D-133 also deferred D-131 B "until the heartbeat and window hypotheses are tested". The heartbeat hypothesis is still untested: whether the sequencer sends the next window only at a heartbeat rather than on the replica's reply. That alone could explain the superlinear rate.
+**Vision.** D-133 A→B, D-131 (one variable at a time; D-131 B deferred until the heartbeat and window hypotheses are tested; code under D-124's comparison unchanged before its run); CLAUDE.md §7, §8 (changing a default is a behaviour change), §11.
+
+### A. Explain the mechanism and measure the cost, before any change — recommended
+- **What we do:** in the same in-process mode, at windows 256, 1 024 and 4 096:
+  - **Heartbeat pacing:** the replica's position against heartbeat ticks, and against heartbeat lengths of 25, 50 and 100 ms. If the rate scales with heartbeats per second, the window is sent once per heartbeat; that explains the 12×, and it is what D-131 B would fix.
+  - **Cost:** bytes in flight per link (frames queued and sent but not acknowledged), and the sequencer's commit latency from raw samples, not buckets.
+  
+  Then a card with the mechanism and its numbers.
+- **Cost:** S; benches only, no change to `cluster` or to the code under D-124.
+
+### B. A separate, larger window for catch-up only
+- **What we do:** a replica behind by more than the window is sent at a catch-up window, up to a byte budget — for example 64 MiB per peer, owned by `cluster`, as a new `NodeConfig` field. It is fixed in 7a beside the other values and added to CLAUDE.md §7's bounded-memory list and to `docs/configuration.md`. The steady-state window stays at 256, so a healthy replica's in-flight amount does not change. A sans-IO change with takeover-simulation scenarios.
+- **Preconditions:**
+  - A's finding: if heartbeat pacing explains the rate, D-131 B may make B unnecessary;
+  - the accepted D-124 run, since B changes `cluster` code under that comparison.
+- **Open for you:** whether a catch-up window is local policy on the sequencer, or part of the configuration digest like `window`. The digest decides whether nodes with different values may join one cluster.
+- **Cost:** M.
+
+### C. Raise the fixed window to 4 096
+- **What we do:** one constant in `node::experimental`; the configuration digest changes.
+- **Risks:**
+  - a healthy replica's in-flight amount grows too, within the existing `link_queue` bound;
+  - it changes code and the digest under D-124's comparison, so it also waits for that run;
+  - it is chosen without the mechanism known.
+
+### D. Nothing until the D-124 Linux run
+- **What we do:** every option that changes code waits for that run anyway, and these numbers come from a container. Keep the findings as recorded.
+- **Risks:** restarted replicas recover at about 6 400 positions a second under 7a's window meanwhile.
+
+**Recommendation.** A. Then B or D-131 B, whichever A's mechanism points to, after the accepted D-124 run.
+
+**Answer:** `D-135: A` · `D-135: B` · `D-135: C` · `D-135: D` · `D-135: discuss`
+````
+
+````markdown
+## D-136. What sets the ~40 ms round trip that bounds catch-up
+
+**Context.** D-135 A, preliminary (container, 27 in-process trials):
+- **Supported:**
+  - At windows 256 and 1 024 the heartbeat does not pace catch-up. Positions per heartbeat scale with its length; the rate per second does not. Still heartbeats are 0.2–7 %, so D-131 B would not change it there.
+  - Catch-up fits window ÷ an effective round trip of about 40 ms. At 256: about 6 400/s, observed 5 600–7 300. At 1 024: about 25 600/s, observed about 30 000 in the runs that had not drained; the others' figure is a lower bound.
+  - The "12×" of D-133 B is these rates less the write rate (about 4 500/s), not a superlinear window.
+  - Bytes in flight at most: 0.13–0.45 MB at 256, 0.6–1.8 MB at 1 024, 2.7–6.9 MB at 4 096.
+- **Not established:**
+  - where the 40 ms comes from. It sets the rate at every window, so it decides between a larger window (D-135 B or C) and removing the delay itself;
+  - the window's cost in commit latency: p99 is about 100 ms at every window, with no control trial without a lagging replica;
+  - heartbeat pacing at 4 096: the 100 ms runs did not catch up, the 25 and 50 ms runs did.
+- **Open:** the sequencer's commit p50 is bimodal. It is about 1 ms in 19 trials and 55–85 ms in 8: every trial at 25 ms with windows 256 and 1 024, and two at 50 ms.
+
+**Vision.** D-135 A (close it only once the mechanism is investigated and the cost measured; the window stays at 256 until then); D-124 open; D-137 (whether D-124's candidate includes the measuring); CLAUDE.md §11 (find the stage; do not infer the bottleneck from the final number).
+
+### A. Split the round trip into its stages, with a control, in the same mode — recommended
+- **What we do:** in `cap`'s catch-up mode, time each boundary per Append to the lagging replica. The samples are matched by the batch's last position over one in-process monotonic clock, with no change to `cluster::wire`:
+  1. sequencer send → frame read by the replica;
+  2. read → appended;
+  3. appended → durable (the replica's group commit and fsync);
+  4. durable report sent → read by the sequencer → next window shipped.
+
+  Raw samples, quantiles per window. Plus a control row at each window and heartbeat with no replica restarted, so the commit tail and the bimodal p50 can be attributed or not.
+
+  Then D-135 closes with the stage named, and a card for its fix:
+  - the replica's fsync → a catch-up window with a byte budget (D-135 B);
+  - the report's path or the sequencer loop → that path;
+  - the sequencer's CPU at 4 096 → a profile on Linux.
+- **Where it lives:** the timing adds per-Append work to the `node` loop that D-124 compares; that waits on D-137's answer. Under D-137 B it goes behind the same off-by-default feature.
+- **Cost:** S. No change to `cluster`.
+- **Risk:** container fsync timing may differ from Linux, so the dominant stage could move on a real disk.
+
+### B. Amend D-135 A's closing condition: close it now, decide D-135 B after D-124
+- **What we do:** record the mechanism as "bounded by window ÷ round trip, the round trip's source unknown". This changes D-135 A, which closes only once the mechanism is investigated. After the accepted D-124 run, build the catch-up window with a byte budget (D-135 B).
+- **Risk:** if the 40 ms is a removable delay (for example, the report waiting for the next group commit), a larger window treats the symptom and adds memory in flight — up to about 7 MB per replica measured at 4 096.
+- **Cost:** none now; M later.
+
+### C. Measure the round trip only on the Linux host, after D-124's overhead comparison
+- **What we do:** add A's stage timing and the control to `scripts/linux-run.sh`, as a step after the overhead comparison (D-127's order). Nothing is measured in the container.
+- **Risk:** blocked for as long as D-124 is; D-135 stays open meanwhile.
+- **Cost:** S, plus the host.
+
+**Discarded.** Raise the window now (D-135 C): D-135 A keeps the window unchanged until the evidence exists.
+
+**Recommendation.** A. It names the stage at S cost, and the container numbers mark which stage to recheck on Linux. B becomes right if A shows the replica's fsync dominates; C, if container fsync timing proves unrepresentative.
+
+**Answer:** `D-136: A` · `D-136: B` · `D-136: C` · `D-136: discuss`
+````
+
+````markdown
+## D-137. Does D-124's candidate include the D-132 and D-135 instrumentation?
+
+**Context.**
+- D-124 compares a build with metrics against one without; D-131 says code under that comparison does not change before the run.
+- D-132 and D-135 A asked for diagnostics, and they now sit in the `node` loop that comparison covers:
+  - per heartbeat: `Progress`, `Voter::heard_commit`, the replica table, link queue depth;
+  - per Append sent: a sum of the records' lengths and a push onto `Flight`, a queue bounded at 4 096 entries per peer.
+- Their cost is not measured. The run that would measure it is D-124's own, still waiting for a quiet Linux host.
+
+**Vision.** D-124 A, D-131 (no change to the compared code before the run), D-127 (no rewriting of metrics); CLAUDE.md §10 (every addition to the hot path needs a reason), §11.
+
+### A. The candidate is the tree as it is, all instrumentation included — recommended
+- **What we do:** D-124 measures the cost of the measuring that will ship, D-132 and D-135 included. Record this in ADR-0008 as an amendment to D-131's freeze. No code change. It also decides that D-124's result is no longer comparable to the D-112-only candidate named in D-127 step (2).
+- **Risk:** if the overhead exceeds the noise, the run does not say which part costs it. Then a split run (B's feature) is the follow-up.
+- **Cost:** none.
+
+### B. The per-send part behind an off-by-default cargo feature of `node`
+- **What we do:** `Flight` and the per-send byte count compile only with a feature (`catchup-trace`), which `cap` enables. D-124's candidate is the per-heartbeat metrics only, and the per-send cost is a separate later comparison.
+- **Risk:** a second build configuration — a separate benchmark variable (§11) — and the series `straum_replica_bytes_in_flight` would be missing from production builds.
+- **Cost:** S.
+
+### C. Revert the per-send instrumentation before the run
+- **What we do:** keep the per-heartbeat series; remove `Flight` and the per-send count from the node loop. D-135 A's in-flight numbers stay recorded, but cannot be reproduced from this tree.
+- **Risk:** loses what D-136 A builds on.
+- **Cost:** S.
+
+**Recommendation.** A. D-124 asks what measuring costs, and its candidate should be what is measured in production. B if the D-124 run shows an overhead above the noise.
+
+**Answer:** `D-137: A` · `D-137: B` · `D-137: C` · `D-137: discuss`
+````

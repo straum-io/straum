@@ -19,7 +19,7 @@ journal = { path = "../journal" }
 storage = { path = "../storage" }
 transport = { path = "../transport" }
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
 tracing = "0.1"
 
 [dev-dependencies]

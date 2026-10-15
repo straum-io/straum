@@ -236,7 +236,25 @@ pub struct Gateway {
     total_pending_bytes: usize,
     total_waiting_bytes: usize,
     dropped: u64,
+    /// Counted for metrics (D-112): see `Load`.
+    counted: Counted,
     actions: Vec<Action>,
+}
+
+/// What the gateway has done, since it started (D-112).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counted {
+    /// PUBLISH packets proposed to the log.
+    pub publishes: u64,
+    /// PUBACKs sent: each after its publish committed.
+    pub pubacks: u64,
+    /// PUBLISH packets sent to subscribers.
+    pub deliveries: u64,
+    /// Connections closed, and of them for keep-alive silence and for a
+    /// proposal not committed within `commit_timeout`.
+    pub closed: u64,
+    pub closed_keep_alive: u64,
+    pub closed_commit_timeout: u64,
 }
 
 /// What the gateway holds, for assertions and metrics.
@@ -249,6 +267,7 @@ pub struct Load {
     pub waiting_bytes: usize,
     /// At-most-once deliveries dropped at the waiting bounds.
     pub dropped: u64,
+    pub counted: Counted,
 }
 
 fn room(config: &Config, total_pending_bytes: usize, open: &Open) -> bool {
@@ -291,6 +310,7 @@ impl Gateway {
             total_pending_bytes: 0,
             total_waiting_bytes: 0,
             dropped: 0,
+            counted: Counted::default(),
             actions: Vec::new(),
         };
         gateway.retry(
@@ -319,6 +339,7 @@ impl Gateway {
             retries: self.retries.len(),
             waiting_bytes: self.total_waiting_bytes,
             dropped: self.dropped,
+            counted: self.counted,
         }
     }
 
@@ -454,6 +475,7 @@ impl Gateway {
         let Some(c) = self.conns.remove(&conn) else {
             return;
         };
+        self.counted.closed = self.counted.closed.saturating_add(1);
         self.actions.push(Action::Close { conn });
         let stale: Vec<u64> = self
             .requests
@@ -689,6 +711,7 @@ impl Gateway {
             guarantee: guarantee(publish.qos),
             retain: publish.retain,
         };
+        self.counted.publishes = self.counted.publishes.saturating_add(1);
         self.propose(
             conn,
             proposal,
@@ -912,6 +935,7 @@ impl Gateway {
                     if let Some(open) = self.open(conn) {
                         open.inbound_qos1 = open.inbound_qos1.saturating_sub(1);
                     }
+                    self.counted.pubacks = self.counted.pubacks.saturating_add(1);
                     self.send(
                         conn,
                         &Packet::PubAck(PubAck {
@@ -1054,6 +1078,7 @@ impl Gateway {
                     None
                 },
             });
+            self.counted.deliveries = self.counted.deliveries.saturating_add(1);
             self.send(conn, &publish);
         }
     }
@@ -1085,6 +1110,17 @@ impl Gateway {
             }
         }
         for (conn, reason) in expired {
+            match reason {
+                Some(ReasonCode::KeepAliveTimeout) => {
+                    self.counted.closed_keep_alive =
+                        self.counted.closed_keep_alive.saturating_add(1);
+                }
+                Some(ReasonCode::ServerBusy) if self.conns.contains_key(&conn) => {
+                    self.counted.closed_commit_timeout =
+                        self.counted.closed_commit_timeout.saturating_add(1);
+                }
+                _ => {}
+            }
             self.close(conn, reason);
         }
         let due: Vec<RetryKey> = self

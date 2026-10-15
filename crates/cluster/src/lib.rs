@@ -39,7 +39,7 @@ mod outbox;
 mod voter;
 pub mod wire;
 
-pub use voter::Voter;
+pub use voter::{Voter, VoterStats};
 
 use std::collections::VecDeque;
 
@@ -502,6 +502,15 @@ pub struct Sequencer {
 }
 
 impl Sequencer {
+    /// Each replica's durable position as last reported; `None` if not yet
+    /// heard from in this slot.
+    pub(crate) fn replicas(&self) -> Vec<(NodeId, Option<u64>)> {
+        self.peers
+            .iter()
+            .map(|p| (p.id, p.known.then_some(p.durable)))
+            .collect()
+    }
+
     /// A sequencer over a log that ends with `chain` — recovered, its torn
     /// batch cut and, being reopened, durable (D-43).
     pub fn new(config: Config, chain: Chain) -> Self {

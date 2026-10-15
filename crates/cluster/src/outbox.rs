@@ -36,6 +36,10 @@ pub(crate) struct Outbox {
     /// The sequencer's own queue bound (`cluster::Config::max_queue`): a
     /// node holds no more for a sequencer than a sequencer would.
     max: usize,
+    /// Bytes the entries hold (body and properties), and entries sent again
+    /// after their slot closed: what D-112 reports.
+    bytes: usize,
+    resent: u64,
 }
 
 impl Outbox {
@@ -45,7 +49,13 @@ impl Outbox {
             sent: 0,
             slot: 0,
             max,
+            bytes: 0,
+            resent: 0,
         }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.max
     }
 
     /// Whether a proposal would be refused now: the driver stops reading
@@ -60,6 +70,7 @@ impl Outbox {
         if self.entries.len() >= self.max {
             return false;
         }
+        self.bytes = self.bytes.saturating_add(size(&proposal));
         self.entries.push_back(proposal);
         true
     }
@@ -89,6 +100,7 @@ impl Outbox {
         }
         if record.slot > self.slot {
             // The slot closed without them: to the next sequencer, in order.
+            self.resent = self.resent.saturating_add(self.sent as u64);
             self.sent = 0;
             return Vec::new();
         }
@@ -104,9 +116,20 @@ impl Outbox {
             return Vec::new();
         };
         let lost: Vec<Proposal> = self.entries.drain(..at).collect();
-        self.entries.pop_front();
+        let confirmed = self.entries.pop_front();
+        let gone = lost
+            .iter()
+            .chain(confirmed.as_ref())
+            .map(size)
+            .sum::<usize>();
+        self.bytes = self.bytes.saturating_sub(gone);
         self.sent -= at + 1;
         lost
+    }
+
+    /// Bytes held, and entries sent again after their slot closed.
+    pub(crate) fn bytes_resent(&self) -> (usize, u64) {
+        (self.bytes, self.resent)
     }
 
     /// Entries held, and of them sent and awaiting their slot's decision.
@@ -118,6 +141,13 @@ impl Outbox {
     fn len(&self) -> usize {
         self.entries.len()
     }
+}
+
+fn size(proposal: &Proposal) -> usize {
+    proposal
+        .body
+        .len()
+        .saturating_add(proposal.properties.len())
 }
 
 /// The record this proposal became. Every gateway proposal names its node
@@ -189,6 +219,9 @@ mod tests {
         assert_eq!(outbox.next(4).map(|p| p.body.clone()), Some(vec![2]));
         outbox.sent(4);
         assert_eq!(outbox.next(4).map(|p| p.body.clone()), Some(vec![3]));
+        // One-byte bodies: entry 1 left, entries 2 and 3 held; entry 2 was
+        // sent again once.
+        assert_eq!(outbox.bytes_resent(), (2, 1));
     }
 
     #[test]

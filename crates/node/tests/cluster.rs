@@ -130,6 +130,7 @@ fn config(
         snapshot_every: disk(test).2,
         rotate_every: test.starts_with("rotation").then_some(6),
         read_bytes: 64 * 1024,
+        metrics: None,
     }
 }
 
@@ -1129,5 +1130,188 @@ async fn a_link_slower_than_the_takeover_window_fences_the_live_owner() {
             .count();
     }
     assert_eq!(sevens, 1, "node 0's request 7 committed {sevens} times");
+    cluster.shutdown().await;
+}
+
+/// Waits until `check` holds for node `id`'s metrics.
+async fn metrics_until(
+    cluster: &Cluster,
+    id: u8,
+    what: &str,
+    check: impl Fn(&node::metrics::Snapshot) -> bool,
+) -> node::metrics::Snapshot {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let snapshot = cluster.node(id).metrics().await.expect("the node runs");
+        if check(&snapshot) {
+            return snapshot;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what}: {snapshot:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// D-112, the metrics updated as the path runs: a healthy cluster commits
+/// a node's own proposals, each counted once by state, timed from accepted
+/// to applied, its batches timed to durable and to commit, its replicas
+/// seen caught up; and the text is served over HTTP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_follow_proposals_from_accepted_to_committed() {
+    let mut cluster = Cluster::start("metrics").await;
+    cluster.converged(2).await;
+    // Node 0 again, now serving its metrics.
+    cluster.stop(0).await;
+    let mut config = cluster.config(0, Limits::default());
+    config.metrics = Some(free_port());
+    let served = Node::start(config).await.unwrap();
+    let address = served.metrics_listen.unwrap();
+    cluster.nodes[0] = Some(served);
+    cluster.converged(2).await;
+    // The gateway's own lifecycle proposals go through the outbox too: what
+    // they add is counted against a first snapshot once they settle.
+    let base = metrics_until(&cluster, 0, "settled", |s| {
+        s.accepted == s.committed && s.voter.outbox_entries == 0
+    })
+    .await;
+    for request in 0..20 {
+        cluster.node(0).propose(publish(0, request)).await;
+    }
+    let s = metrics_until(&cluster, 0, "twenty more committed", |s| {
+        s.committed >= base.committed + 20 && s.voter.outbox_entries == 0
+    })
+    .await;
+    assert_eq!(s.accepted, s.committed, "accepted and never committed");
+    assert_eq!((s.refused, s.given_up), (0, 0));
+    assert_eq!(s.proposal_commit.count(), s.committed);
+    assert!(s.append_durable.count() > 0 && s.append_commit.count() > 0);
+    // Whoever sequences sees both replicas durable through its commit.
+    let leader = (0..NODES)
+        .find(|&id| cluster.node(id).status().borrow().leading)
+        .unwrap();
+    metrics_until(&cluster, leader, "replicas caught up", |s| {
+        s.replicas.len() == 2
+            && s.replicas
+                .iter()
+                .all(|&(_, d)| d.is_some_and(|d| d >= s.status.commit))
+    })
+    .await;
+    // The text over HTTP.
+    let text = {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).await.unwrap();
+        text
+    };
+    assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+    let scraped = |name: &str| -> u64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no {name}: {text}"))
+    };
+    // The count moves on with the gateway's own proposals: at least as far
+    // as it was, and the histogram counts every commit.
+    let committed = scraped("straum_proposals_committed_total");
+    assert!(committed >= s.committed, "{committed} < {}", s.committed);
+    assert_eq!(scraped("straum_proposal_commit_seconds_count"), committed);
+    cluster.shutdown().await;
+}
+
+/// D-112 and D-120 A, an outbox that overflows, seen in the metrics: with
+/// both replicas stopped nothing commits, so the sequencer's own proposals
+/// fill its outbox to its share; the rest are refused and counted, the
+/// node withholds reads, and the stall shows at its stage — batches still
+/// become durable locally, none commits. A replica back: all of them
+/// commit, the outbox drains, the spell of withheld reads ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_show_an_outbox_overflow_and_where_the_delay_is() {
+    let mut cluster = Cluster::start("metrics-overflow").await;
+    cluster.converged(2).await;
+    let leader = (0..NODES)
+        .find(|&id| cluster.node(id).status().borrow().leading)
+        .unwrap();
+    let others: Vec<u8> = (0..NODES).filter(|&id| id != leader).collect();
+    for &id in &others {
+        cluster.stop(id).await;
+    }
+    let before = cluster.node(leader).metrics().await.unwrap();
+    let capacity = before.voter.outbox_capacity as u64;
+    let proposer = cluster.node(leader).proposer();
+    for request in 0..capacity + 10 {
+        proposer.send(publish(leader, request)).await.unwrap();
+    }
+    // Durable here is waited for, not assumed: the disk reports it in its
+    // own time (a busy host was slower than the outbox filling).
+    let stalled = metrics_until(&cluster, leader, "a full outbox, durable here", |s| {
+        s.voter.outbox_entries as u64 == capacity
+            && s.refused >= 10
+            && s.spells.longest > Duration::ZERO
+            && s.append_durable.count() > before.append_durable.count()
+    })
+    .await;
+    assert!(stalled.voter.outbox_bytes > 0);
+    assert_eq!(
+        stalled.committed, before.committed,
+        "committed without a majority"
+    );
+    // Where the delay is: durable here (waited for above), not committed.
+    assert_eq!(
+        stalled.append_commit.count(),
+        before.append_commit.count(),
+        "a batch committed without a majority"
+    );
+    cluster.restart(others[0], Limits::default()).await;
+    let drained = metrics_until(&cluster, leader, "the outbox drained", |s| {
+        s.voter.outbox_entries == 0 && s.spells.count >= 1
+    })
+    .await;
+    // Every accepted proposal committed; the refused ones were never
+    // accepted (the gateway's retries can add refusals while it stalls).
+    assert_eq!(drained.accepted, drained.committed);
+    assert!(drained.refused >= 10);
+    assert_eq!(drained.given_up, 0);
+    cluster.shutdown().await;
+}
+
+/// D-132, a stalled and a recovering replica seen from both sides: a
+/// replica stopped while the sequencer commits shows there with a lag above
+/// 0 and a progress age that grows; started again, it reports itself
+/// behind the commit point it heard, then caught up and serving. Nothing
+/// acts on these.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lagging_replica_is_visible_from_both_sides() {
+    let mut cluster = Cluster::start("progress").await;
+    cluster.converged(2).await;
+    let leader = (0..NODES)
+        .find(|&id| cluster.node(id).status().borrow().leading)
+        .unwrap();
+    let replica = (leader + 1) % NODES;
+    cluster.stop(replica).await;
+    for request in 0..50 {
+        cluster.publish(leader, request).await;
+    }
+    let seen = metrics_until(&cluster, leader, "the stopped replica stalled", |s| {
+        s.replica_progress.iter().any(|(id, p)| {
+            *id == replica
+                && p.lag > 0
+                && p.since_moved(tokio::time::Instant::now()) > Duration::from_millis(500)
+        })
+    })
+    .await;
+    assert!(seen.replica_progress.len() <= 2);
+    cluster.restart(replica, Limits::default()).await;
+    let caught_up = metrics_until(&cluster, replica, "the replica caught up and serves", |s| {
+        s.own.lag == 0 && s.heard_commit > 0 && s.serving
+    })
+    .await;
+    assert!(caught_up.heard_commit >= caught_up.status.commit);
     cluster.shutdown().await;
 }

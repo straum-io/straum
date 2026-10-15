@@ -1,6 +1,6 @@
 # Benchmarks
 
-> **Partly history.** The harness and workload matrix below were built for the old broker (`e2e` load generators), removed at step 8 (D-111). The measurement protocol — baseline, alternating rounds, medians, Linux only — still applies; the new path has `node/benches/cap.rs` and `storage/benches/`, and no Linux baseline yet (D-84 A, D-94 C).
+> **Partly history.** The harness and workload matrix below were built for the old broker (`e2e` load generators), removed at step 8 (D-111). The measurement protocol — baseline, alternating rounds, medians, Linux only — still applies; the new path has `node/benches/cap.rs`, `server/benches/puback.rs` (MQTT publish to PUBACK through three server processes, with the servers' CPU time per PUBACK) and `storage/benches/`, and no Linux baseline yet (D-84 A, D-94 C). `scripts/overhead.sh <baseline tree> <candidate tree> [rounds]` alternates the two for D-124's overhead check. `scripts/linux-run.sh [rounds]` is the accepted run of D-127 A on a bare-metal Linux host: the host recorded, its noise (the tree against itself), the overhead (071db00 against the tree), the cost of scraping (`STRAUM_BENCH_SCRAPE_MS`), and a diagnostic run with the metrics read per node.
 
 Target: about 1,000,000 small messages/sec on modern server hardware for the
 in-memory broker benchmark. A target, not a production guarantee.

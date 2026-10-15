@@ -1576,6 +1576,282 @@ cause is D-122.
   before the fix. As in D-113, the load loop is the faster one and ended
   first, so the last runs of the other had no load beside them.
 
+**D-112 A (2026-10-12): metrics on the new path.** The node loop measures
+(`node/src/metrics.rs`), the cores count (`cluster::VoterStats`,
+`gateway::Counted`), and a snapshot is rendered as Prometheus text only
+when asked — `Node::metrics`, or HTTP on `STRAUM_CLUSTER_METRICS_LISTEN`,
+off by default and loopback unless an unauthenticated network is
+acknowledged (D-107). Owned by one task: no atomics, no allocation per
+event, monotonic time, nothing read back into a decision.
+- **Commit and durability:** log end, durable, commit, applied, the
+  uncommitted tail; histograms of a node's own proposal from accepted to
+  applied (`straum_proposal_commit_seconds`), of a batch from appended to
+  durable here (`straum_append_durable_seconds`) and to known committed
+  (`straum_append_commit_seconds`). The three split a PUBACK's delay: a
+  slow commit with a fast local disk is the quorum, not the disk.
+- **Proposal states, never mixed:** refused at a full outbox (never
+  accepted), accepted and awaiting commit (`straum_outbox_entries`),
+  committed, given up — counted separately; the gateway's own lifecycle
+  proposals go through the same outbox and are counted with them.
+- **Outbox:** entries, sent, bytes, capacity, resends after a slot closed;
+  losses by name — forwards a sequencer's full or sealed queue refused,
+  forwards dropped at a full link queue (with every link drop counted),
+  and the give-ups they lead to.
+- **Replication:** each replica's durable lsn and its lag behind the
+  commit point, as the sequencer last heard; a catch-up rate is the
+  scraper's derivative of it.
+- **Takeover:** takeovers by silence started, completed (timed:
+  `straum_takeover_seconds`) and abandoned; successions by `SlotEnd`;
+  slots led; times stepped down (handed over or fenced, not told apart).
+- **MQTT:** connections, pending, waiting bytes; publishes proposed,
+  PUBACKs, deliveries, dropped at-most-once deliveries; closes, and of
+  them for keep-alive and for `commit_timeout`.
+- **D-123:** spells of withheld reads — count, total, the longest (the
+  open one included) — beside the keep-alive closes.
+- **The HTTP listener:** at most 4 scrapes at once, a permit taken before
+  the accept, read and write each bounded by 2 s — a burst of silent
+  connections waits in the kernel's backlog and is closed, never held
+  (tested). An addition: D-112 asked for metrics, not for a listener
+  (D-126).
+- **Not yet:** a handoff by `SlotEnd` is counted but not timed, and
+  stepping down does not tell a handover from fencing (D-125). The
+  overhead of measuring is not yet measured on a quiet Linux host (D-124,
+  D-127): an `Instant::now()` per
+  own proposal, per append, per durable report and per loop pass, and
+  two outbox reads per applied record.
+- **D-124, preliminary:** `scripts/overhead.sh` (071db00 against this
+  change, five alternating rounds, `cap` and the new MQTT benchmark
+  `server/benches/puback.rs`) in the Linux container on the development
+  Mac: every median within 3.3 % — throughput −1.0 % and +0.6 %, PUBACK
+  p50 +3.3 %, server CPU per PUBACK +1.0 % — inside that machine's 10 %
+  noise floor (`docs/baselines/apple-m1-dev.md`). Not accepted until a
+  quiet Linux host repeats it.
+- **The accepted run (D-127 A):** `scripts/linux-run.sh` on a bare-metal
+  Linux host — the host recorded, its noise, the overhead, the cost of
+  scraping, and a diagnostic run. Known quirk in the diagnostics: the first
+  owner starting slot 1 at startup counts as a takeover by silence
+  (D-125 separates the kinds).
+  Medians come with their spread (min and max between rounds). If the
+  noise run's spread is near the effect sought, the run stops there
+  (`STRAUM_STOP_AFTER_NOISE=1`) and steadier conditions are found first;
+  the threshold is D-129. The diagnostic run was steady load only, with no
+  handoff and no takeover to time apart — until D-128, below.
+- **D-128 A, D-129 A (2026-10-13):** the diagnostic run now injects a
+  planned handoff (SIGUSR1 to the sequencer) and a killed sequencer
+  (SIGKILL, started again 2 s later), and reports each apart — the longest
+  wait for a PUBACK, for the event node's clients and for the others' —
+  with every publish accounted: acknowledged (late past 1 s, or not),
+  retransmitted after a reconnect, unacknowledged after a 15 s drain, and
+  duplicate acknowledgements counted apart, never as successes. The noise
+  run gates the host by D-129 (`scripts/noise.awk`): difference
+  `|median_A − median_B| / median_A` at most 3 %, each copy's spread
+  `(max − min) / median` below 3 %, on every quantity; each overhead is
+  then read against the smallest effect that host can detect. Read by that
+  rule, the earlier container comparison was too noisy to say anything
+  (spreads 2–29 %; failover p50 bimodal, D-130).
+- **Found by the event run (D-128), in the container, preliminary:** a
+  handoff paused every client about 150 ms; a killed sequencer paused the
+  surviving nodes' clients 150–260 ms (the takeover). The killed node,
+  started again 2 s later, served its clients only after catching up — and
+  under about 80 000 publishes/s it could not: its clients gave up after
+  30 s in 5 of 6 runs, with nothing duplicated. With the load stopped its
+  commit moved 62 143, 156 865 and 68 499 positions in 10 s — a catch-up
+  of about 6 000–16 000 a second, far below the write rate. Likely, not
+  confirmed: one read of `read_bytes` (64 KiB) per heartbeat (50 ms) —
+  about 13 000 records a second (D-131).
+- **D-130 A:** failover is a distribution, not gated: `cap.rs` reports the
+  share of failovers within 1 s, p50 and p90 (50 failovers a round in
+  `scripts/overhead.sh`), and diagnoses the slow mode apart — slots the
+  cluster moved on (more than one: a candidate's turn passed), takeovers
+  abandoned, the survivors' lag at the stop. `scripts/noise.awk` reports
+  failover and gates the rest; p90's spread between rounds shows when 50
+  is too few. The baseline build prints share and p50, not p90.
+- **D-133 A (container, 3 rounds per size, preliminary):** medians, with
+  per-round ranges in `docs/baselines/apple-m1-dev.md`. Lag rate under
+  load −3 555 / −4 494 / −3 467 positions a second at 64 KiB / 512 KiB /
+  4 MiB, ranges overlapping; recovery 9 453 / 6 910 / 6 850 a second;
+  PUBACK p50 0.72 / 0.68 / 0.74 ms, p99 18.6 / 17.4 / 19.3 ms; commit p99
+  on the running nodes 16–33 ms (bucket bounds); CPU of all three nodes
+  29.0 / 29.1 / 29.0 s over the 27.9 s window. Read size still shows no
+  effect. What the CPU shows, in every run: the sequencer used one full
+  core (about 28.2 s of 27.9 s) while the catching-up replica used about
+  0.3 s and the third node 0.5 s — the replica is nearly idle, the
+  sequencer's one node loop saturated. Likely, not proven: catch-up is
+  limited at the sequencer, by its single loop serving both the load and
+  the catch-up. One outlier: 512 KiB round 1 wrote 335 MB on node 0 and
+  recovered at 0 — reported, not explained.
+- **D-133 B (in-process `cap.rs` catch-up mode, container, 3 rounds,
+  preliminary):** a replica stopped 2 s under load and started again, its
+  own lag read every second. The window is the limiter: at 256 (7a's
+  value) the lag shrank by about 2 050 positions a second under load and
+  recovered at about 6 400 a second after it — near what `puback` saw
+  through the server; at 1 024, about 25 000 under load and 30 000 after;
+  at 4 096, about 31 000 under load, caught up before the load stopped. The
+  three rounds agree within a few percent. Commit latency at the sequencer
+  showed no change at any window (p50 at the 1.024 ms bucket, p99 at the
+  131 ms bucket — coarse bounds). Why 4× the window gave about 12× the rate
+  is not explained. A different harness from `puback.rs` (no MQTT, a stop
+  by `shutdown`). Raising the window is a behaviour change and has a memory
+  cost (D-135); D-131 B does not address it and stays deferred.
+- **D-135 A (in-process, container, 3 rounds × windows 256 / 1 024 /
+  4 096 × heartbeats 25 / 50 / 100 ms, preliminary; D-135 stays open):**
+  - *Supported (preliminary):*
+    - At windows 256 and 1 024 the heartbeat does not pace catch-up:
+      positions per heartbeat scale with its length (256: about 145 /
+      280–370 / 555–720) while the rate per second does not (under load
+      −1 820 to −2 397 a second at 256, −22 708 to −27 682 at 1 024, at
+      every heartbeat); heartbeats with a lag and no movement were
+      0.2–7 %. D-131 B is not what limits it there.
+    - At those windows catch-up fits window ÷ an effective round trip of
+      about 40 ms: 256 → about 6 400 a second, observed 5 600–7 300 after
+      the load; 1 024 → about 25 600, observed about 30 000 in the runs
+      that had not drained (the others' figure is lag at stop ÷ 10, a
+      lower bound). Under load the lag changes by that rate less the
+      cluster's write rate, about 4 500 here; the "12×" of D-133 B is
+      that difference of a difference, not a superlinear window.
+    - Bytes in flight to a replica, the most seen, resends included:
+      0.13–0.45 MB (256), 0.6–1.8 MB (1 024), 2.7–6.9 MB (4 096);
+      positions in flight on average 19–48, 113–227, 100–750 — the window
+      is not used in full on average.
+    - The outlier of D-133 A, from its data: the one run where the
+      restarted node caught up inside the window (lag 0 at about 49 s);
+      its clients came back and the cluster ran at full load — about
+      200 000 positions a second — for the rest, hence 335 MB written and
+      more CPU; its "recovery 0" meant nothing left to recover (now
+      reported as `caught_up`).
+  - *Not established:*
+    - Where the 40 ms round trip comes from.
+    - What the window costs in commit latency: p99 67–109 ms in 26 of 27
+      trials and about 100 ms at every window, with no control trial
+      without a lagging replica, so the window's share cannot be
+      separated; one trial (256, 25 ms, first round) 166 ms, p99.9 276,
+      max 318; p99.9 and max of about 200–250 ms at 4 096 with a 25 ms
+      heartbeat in two of three trials, against about 110 elsewhere.
+    - Heartbeat pacing at 4 096: positions per heartbeat did not scale
+      (about 1 800–4 000 at every heartbeat), the gain flattened (about
+      −25 000 to −30 000 under load; perhaps the sequencer's full core of
+      D-133 A), and the 100 ms runs did not catch up under load (lag at
+      stop about 200 000) while the 25 and 50 ms runs did.
+  - *Open:*
+    - The sequencer's commit p50 is bimodal across trials — about 1 ms in
+      19, 55–85 ms in 8: every trial at 25 ms with windows 256 and 1 024,
+      two at 50 ms, none at 4 096 or at 100 ms.
+    - In D-133 A, catch-up quickened once the lag fell below about
+      90 000.
+  - *The compared tree moved:* the instrumentation behind these numbers
+    (`node::metrics::Progress` and `Flight`, the per-send byte count in
+    the node loop) is in the `node` loop D-124 compares; its cost is not
+    measured. Whether D-124's candidate includes it is D-137.
+- **D-136 A (2026-10-16; in-process, container, 3 rounds × windows 256 /
+  1 024 / 4 096 at 50 ms, each trial with a control and no replica
+  restarted; preliminary):** the stages of catch-up, stamped at each
+  boundary on the three nodes (`node::metrics::Trace`, on only while a
+  run asks — `Node::trace_start` / `trace_take`) and joined by position
+  in `cap`. Off, the node loop reads no clock for it (one branch a stamp
+  site, one match a sent message); the log thread reads the clock three
+  times a group commit and twice a catch-up read, always.
+  - *Supported (preliminary):*
+    - Catch-up is no round trip: it is one read from the log at a time.
+      The sequencer asks the next read as soon as it ships the previous
+      one (`next_ask_K` about 0 ms); a read neither waits behind the log
+      thread (`read_queue_W` about 0.04 ms) nor for the replica's report.
+    - The read is the stage: 14–25 ms each (`read_K`; the read cycle the
+      same plus about 0.1 ms).
+    - What a read brings: whole batches from the replica's next position
+      up to its durable position plus the window — 96 positions at 256,
+      about 410–440 at 1 024, about 454 at 4 096 (there `cap`'s 64 KiB
+      `read_bytes` bounds it). The "40 ms round trip" of D-135 A is not a
+      stage; the window acts through what fits in one read.
+    - The cost of catch-up, against the control: the sequencer's commit
+      p99 1.5–2.4 ms with no replica restarted (6.8 in one trial), 52–170
+      ms during catch-up; commit p50 1.0–2.0 ms in every control, and 73–116
+      ms in three catch-up trials. The window is not what costs:
+      the commit tail goes with catch-up at every window.
+      The control's stage rows filled the trace (2^19 stamps a node; 0.4–1.1
+      million dropped) early in its window, so they are matched to the
+      catch-up rows in setup, not in time; its commit samples cover the
+      whole window.
+  - *Not established:*
+    - Why a read costs 14–25 ms. The code says `Segments::read` replays
+      the segment from its start through `ReadBatches`, whatever the read
+      needs — up to `segment_bytes` (64 MiB, also in 7a) a read; that is
+      read from the code, not measured (`read_K` was not set against the
+      position in the segment).
+    - The rate model, positions per read ÷ read time: it fits window 256
+      (96 ÷ about 15 ms ≈ 6 400 a second; 6 446–6 563 measured after the
+      load) and round 3 at 1 024 (27 040). Rounds 1 and 2 at 1 024 do not
+      test it: their lag drained within the 10 s after the load (lag at
+      stop 39 195 and 151 320), so their 3 920 and 15 132 are lag at stop
+      ÷ 10, lower bounds.
+    - That the commit tail is the catch-up reads holding the log thread,
+      which they share with the live group commits: likely, as nothing
+      else differs from the control, but no commit is stamped against a
+      read.
+    - The replica's appends waiting 10–20 ms at p90 for its log thread
+      (`append_queue_W`) during catch-up and not in the control: what
+      holds that thread is not stamped (a read-back for apply is a
+      candidate).
+    - The sync: about 0 ms in this container, so a real disk's fsync is
+      not represented in any stage.
+  - *Open:* D-135. The stage is measured — the sequencer's serial read
+    from the log, with no queueing and no wait for the report — but the
+    cause inside it is read from the code; D-135 stays open until that is
+    confirmed (D-139).
+- **D-137 A (2026-10-16):** D-124's candidate is the tree as it is, with
+  the D-132, D-135 A and D-136 A instrumentation in the node loop. This
+  amends D-131's freeze; the instrumentation's own cost is not isolated,
+  and D-124's result does not compare with the metrics-only (D-112)
+  candidate D-127 step (2) named. Since 2026-10-16, D-124 gates only
+  accepted performance claims and tuning defaults, not feature work
+  (D-138).
+- **D-132 A (2026-10-15): a lagging replica, observable from both sides.**
+  A replica now keeps the highest commit point an owner sent it, not capped
+  at its own log's end (`Voter::heard_commit`). The node samples progress
+  once a heartbeat — not per event — and exports: its own lag behind that
+  commit point, how fast the lag changes (positions a second, over at least
+  a second), the time since its log end last moved, whether it is catching
+  up, and whether its gateway serves (its own reset applied). As the
+  sequencer it exports the same per replica: lag, rate, the time since its
+  durable position last moved. Nothing acts on them; no client is closed
+  on the age of the last progress. Tests: a voter test (the commit heard,
+  nothing past the log taken); a unit test of the progress tracker; a node
+  test — a replica stopped while the sequencer commits shows there with a
+  lag and a growing age, and once restarted reports itself behind, then
+  caught up and serving. Limits, stated: `straum_catching_up` is
+  `lag > 0`, an indicator only — a healthy replica under load is a few
+  positions behind too; what separates catch-up from normal replication is
+  lag, rate and age together, and no threshold is set yet (D-132: measure
+  first). A replica's availability (`straum_serving`) is visible only on
+  that replica; the sequencer exports each replica's lag, rate and age.
+  D-124's candidate build now includes this sampling — once a heartbeat,
+  one small allocation for the replica list, not per message.
+- **D-131 A, first measurement (container, one run per size,
+  preliminary):** the restarted node's lag shrank under load at every read
+  size — 64 KiB: 263 503 → 190 981 in 17 s; 512 KiB: 271 049 → 230 980;
+  4 MiB: 264 288 → 194 603 — and after the load stopped it caught up at
+  7 400, 4 500 and 7 100 positions a second. So it is slow, not unable:
+  about a minute behind under this load, longer than its clients' 30 s.
+  Read size did not show as the limiter in this one preliminary run per
+  size: a 64× larger read gave a similar rate, while 512 KiB was 40 %
+  slower than both ends, so one run cannot establish a non-effect. The
+  running nodes' PUBACK per size: 64 KiB p50 1.153 ms, p99 25.7 ms,
+  43 485/s; 512 KiB 1.030 ms, 27.6 ms, 48 755/s; 4 MiB 0.955 ms, 17.0 ms,
+  54 045/s; commit latency per size was not read. Next suspect, from the
+  code, not measured: the replication window of 256 positions in flight
+  beyond what the replica reported durable (D-133).
+
+Checked: unit tests of the histogram and every measurement; the voter's
+and gateway's counters in their tests; two node tests —
+`metrics_follow_proposals_from_accepted_to_committed` (accepted equals
+committed, nothing refused or given up, every histogram observed, replicas
+caught up, the text served over HTTP) and
+`metrics_show_an_outbox_overflow_and_where_the_delay_is` (both replicas
+stopped: the outbox fills to its share, the rest is refused and counted,
+reads are withheld; batches still become durable locally and none commits
+— the delay is at the quorum; a replica back, all commit, the spell ends).
+The corrected fencing test passed 100 of 100 under load, beside 23 runs of
+the node tests (D-112's go-ahead).
+
 **D-84 A (2026-10-09): the production cap comes from a Linux host.**
 `node/benches/cap.rs` measures throughput and failover (the sequencer
 stopped in order while the load runs, timed to a commit in a later slot)

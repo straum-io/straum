@@ -113,6 +113,9 @@ impl Settings {
             SocketAddr::from(([127, 0, 0, 1], 1883)),
             "a socket address",
         )?;
+        // Off unless set (D-112): plain HTTP with no credentials, under the
+        // same loopback rule as every other listener.
+        let metrics = parser.optional_value("STRAUM_CLUSTER_METRICS_LISTEN", "a socket address")?;
         let exposed = parser.boolean_flag("STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK")?;
         if !exposed {
             for (name, address) in [
@@ -121,6 +124,7 @@ impl Settings {
             ]
             .into_iter()
             .chain(voters.iter().map(|&(_, a)| ("STRAUM_CLUSTER_PEERS", a)))
+            .chain(metrics.map(|a| ("STRAUM_CLUSTER_METRICS_LISTEN", a)))
             {
                 if !address.ip().is_loopback() {
                     return Err(ConfigError::Exposed { name, address });
@@ -163,6 +167,7 @@ impl Settings {
             takeover_ticks,
             read_bytes,
             retain_bytes,
+            metrics,
         }
         .node_config()?;
         Ok(Self {
@@ -182,6 +187,32 @@ impl Parser {
 
     fn raw(&self, name: &'static str) -> Option<&str> {
         self.vars.get(name).map(String::as_str)
+    }
+
+    /// A setting with no default: `None` when it is not set.
+    fn optional_value<T>(
+        &mut self,
+        name: &'static str,
+        expected: &'static str,
+    ) -> Result<Option<T>, ConfigError>
+    where
+        T: std::str::FromStr + std::fmt::Display,
+    {
+        match self.raw(name) {
+            None => {
+                self.record(name, "off", Source::Default);
+                Ok(None)
+            }
+            Some(raw) => {
+                let parsed = raw.parse::<T>().map_err(|_| ConfigError::Malformed {
+                    name,
+                    value: raw.to_owned(),
+                    expected,
+                })?;
+                self.record(name, &parsed, Source::Env);
+                Ok(Some(parsed))
+            }
+        }
     }
 
     fn parse_value<T>(
@@ -477,6 +508,21 @@ mod tests {
             ("STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK", "1"),
         ];
         assert!(with(&acknowledged, "STRAUM_CLUSTER_PEERS").is_ok());
+        // The metrics listener (D-112) too: off by default, loopback when set,
+        // beyond it only when acknowledged.
+        assert_eq!(with(&[], "").unwrap().node.metrics, None);
+        let metrics = [("STRAUM_CLUSTER_METRICS_LISTEN", "127.0.0.1:9100")];
+        assert!(with(&metrics, "").unwrap().node.metrics.is_some());
+        let open = [("STRAUM_CLUSTER_METRICS_LISTEN", "0.0.0.0:9100")];
+        assert!(matches!(
+            with(&open, ""),
+            Err(ConfigError::Exposed {
+                name: "STRAUM_CLUSTER_METRICS_LISTEN",
+                ..
+            })
+        ));
+        let open_ok = [open[0], ("STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK", "1")];
+        assert!(with(&open_ok, "").is_ok());
         assert!(matches!(
             with(
                 &[hosts[0], ("STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK", "yes")],

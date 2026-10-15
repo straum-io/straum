@@ -921,3 +921,95 @@ Go-ahead: D-112 starts. The corrected fencing test (`a_link_slower_than_the_take
 Stages, in order: (1) commit and durability — proposal acceptance to commit, durable write delays, proposals awaiting commit: where PUBACK delay arises; (2) outbox — entries and bytes per node, fill, backpressure, resends and refusals; (3) replication — each replica's durable position, lag to the commit point, catch-up rate; (4) takeover — reason, duration and result of a role transfer, fencing; (5) MQTT — publishes, PUBACKs, deliveries, connection closes; and D-123's — read blocking time, longest spell without a read, keep-alive closes.
 Requirements: proposal states are never mixed — not yet accepted by the broker; accepted and awaiting commit; committed; refused or lost for a named reason. Measurement does not distort the result — cheap counters and histograms first, no allocation per event and no string formatting on the hot path, monotonic clocks, and no metric feeds a commit or takeover decision.
 Done means: tests that the metrics update correctly, the outbox overflow observed, and an observed delay attributable to a stage of the message path; then Linux measurements, with the safety and liveness checks kept as mandatory gates.
+
+## D-124. The Linux run: the cost of measuring first, then the measurements
+Date: 2026-10-12
+Choice: A — on one Linux host, a build with metrics against one without, under identical load, configuration and startup; at least five alternating rounds, medians; throughput, publish-to-PUBACK latency and failover time. Then full metric collection and diagnostic measurements under the D-123 criterion. A difference within the noise is a result, not proof of zero overhead.
+Rejected options: B (switchable measuring first) not chosen; C (no overhead check) rejected in the card.
+Card: docs/decisions/archive/cards.md
+
+## D-125. Stage 4 incomplete
+Date: 2026-10-12
+Choice: B — after the first Linux run. The distinction is kept between handoff (a planned role transfer), takeover (the role taken after failure detection) and fencing (the old owner barred from its old slot): different events with different causes of delay.
+Rejected options: A (now), C (leave it) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-126. A metrics listener over the network, or in-process only
+Date: 2026-10-12
+Choice: A — keep the HTTP listener as built: off by default, loopback by default, at most four scrapes at once, two-second read and write limits. A diagnostic interface, not a monitoring system; an unsecured network stays a deliberate operator decision. It is kept in the documentation and tests as a separate interface with its own constraints.
+Rejected options: B (in-process only) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-127. A quiet Linux host for D-124
+Date: 2026-10-12
+Choice: A — bare-metal Linux, first on the machine already available; nothing rented until that hardware is checked. Order: (1) the host's noise — no competing load, CPU availability, no hard limits; control runs of the unchanged code; if the noise is comparable to the expected effect, find steadier conditions; (2) `scripts/overhead.sh`, 071db00 against D-112, alternating, five rounds — more rounds rather than reading small differences of medians when the spread is large; (3) the cost of collection with a scraper polling the listener at a fixed frequency, the same load for both; (4) the D-112 diagnostic measurements and the D-123 criteria — where the delay forms (local write and durability, the quorum, outbox fill, read-blocking spells), handoff and takeover apart and not mixed with fencing. D-124 closes only after an accepted Linux run: comparable conditions, host noise low enough, medians and the spread between rounds given, scraping cost checked, and not presented as a universal benchmark of Straum. A Linux VM is acceptable for diagnostics only; its result stays preliminary. The macOS-against-container difference is not attributed to a macOS component without its own diagnosis. No rewriting of metrics or optimising on noisy numbers.
+Rejected options: B (a cloud VM, for accepted numbers), C (the container result only) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-128. Handoff and takeover in the Linux run's diagnostics
+Date: 2026-10-13
+Choice: A — client-side scenarios, no server change: a handoff (the role passed to the next node) and a takeover (the owner's process killed), each measured apart — the longest interval without a PUBACK, and lost PUBACKs. A PUBACK missing within the window is not a loss: a delayed PUBACK, a retransmission and a publish never acknowledged are told apart, and a duplicate acknowledgement is not counted as another successful publish.
+Rejected options: B (leave it with D-125 B) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-129. When is a Linux host's noise low enough?
+Date: 2026-10-13
+Choice: A — a host is accepted only if the two control copies differ by no more than 3 % and each copy's spread across rounds is below 3 %; otherwise the run stops after the noise measurement and nothing is declared accepted. Defined exactly: the difference is |median_A − median_B| / median_A; a copy's spread is (max − min) / median over its rounds. The threshold is also a check that the run can detect the expected effect at all: an overhead is read only against the smallest difference the noise run lets this host detect.
+Rejected options: B (each host sets its own floor) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-130. Failover time and D-129's 3 % gate
+Date: 2026-10-15
+Choice: A — failover is evaluated as a distribution, not held to a spread below 3 %: the share of failovers within 1 s, p50 and p90 over 50 failovers per round, and a separate diagnosis of the slow mode's causes. Amends D-129 A: the 3 % gate stays on the other overhead quantities, where it applies; failover is not excluded from the comparison — it remains the most important indicator of cluster behaviour, evaluated another way. Two modes (about 300 ms and 1 975 ms) look like real behaviour, not imprecision; more runs will not remove them. 50 events is an initial sample, not a guarantee for the tail: if p90 moves substantially between rounds, more events.
+Rejected options: B (gate it with 200+ failovers), C (drop failover from D-124) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-131. A restarted node cannot catch up under load
+Date: 2026-10-15
+Choice: A — measure `read_bytes` at 64 KiB, 512 KiB and 8 MiB without changing the read algorithm, and without flow control on at the same time. The heartbeat pacing is a hypothesis: a larger read helps show whether read size limits the rate, not by itself that the heartbeat does. Per size: the replica's position rate, its lag growing or shrinking under load, its recovery rate after the load stops, CPU and disk where available, and the effect on the running nodes' commit latency and PUBACK. Then decide on B (the next read on the replica's reply). Code under D-124's accepted comparison is not changed before that run, unless a problem makes the run itself incorrect.
+Contract before the state copy (step 7b): a lagging replica does not accept client operations it cannot safely serve; it continues catching up while that is safe and there is progress; a client never waits indefinitely for a replica's recovery — after a bounded wait it gets an explicit refusal or the connection is closed; no progress for an established period leads to a diagnosable state, not indefinite waiting; reachable over TCP is not the right to serve clients — a correct log and an up-to-date applied state are. No hard timeout on the whole catch-up yet: under continued writes it could turn a temporary overload into a cycle of failures and reconnections; measurements first, and an explicit policy for replicas that cannot keep up under load. The client's wait and the replica's recovery are different mechanisms.
+Rejected options: B (pipeline now), C (flow control), D (defer) not chosen.
+Card: docs/decisions/archive/cards.md
+Correction (2026-10-15): the largest `read_bytes` allowed is 4 MiB — half the 8 MiB frame of 7a — not 8 MiB as the card said (a misreading of `docs/configuration.md`, now reworded); a node started with 8 MiB is refused. The measurement uses 64 KiB, 512 KiB and 4 MiB.
+
+## D-132. The catch-up contract: making "no progress" diagnosable
+Date: 2026-10-15
+Choice: A — export, with no automatic action, on both sides (the sequencer and the lagging replica): the replica's lag behind the commit point, the time since its position last advanced, the rate at which the lag changes, and whether it is available to clients and catching up — enough to tell a slow catch-up, a lag growing under load, and a stop. No client is disconnected on the age of the last progress: closing connections on a timer adds production behaviour before normal recovery intervals are known; measure first, then choose a threshold.
+Rejected options: B (close a stalled replica's clients after a bound), C (do nothing until the Linux run) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-133. What limits catch-up — and D-131 B
+Date: 2026-10-15
+Choice: A, then B. (A) the three read sizes (64 KiB, 512 KiB, 4 MiB), three rounds each, keeping PUBACK p50/p99, the lag's rate under load and the recovery rate after it, and adding what the first run lacked: commit latency, CPU and disk. (B) the replication window at 256, 1 024 and 4 096 — a separate diagnostic experiment without PUBACK, not a replacement for the MQTT benchmark. One run per size gives no winner; nothing yet shows a larger read solves it — the replica still recovers in about a minute, longer than the clients' 30 s `commit_timeout`. D-131 B (the next read on the replica's reply) deferred until the heartbeat and window hypotheses are tested, so two factors never change at once.
+Rejected options: C (profile on Linux first), D (as a separate choice: subsumed — D-131 B deferred) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-134. When does failover's p90 call for more failovers?
+Date: 2026-10-15
+Choice: A — a p90 spread above 10 % between rounds raises the count to 200; with 200, p50, p90 and the share within 1 s are still shown. A trigger for more measurement, not proof of statistical significance.
+Rejected options: B (3 %), C (no trigger) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-135. The replication window limits catch-up
+Date: 2026-10-15
+Choice: A — explain the mechanism and measure the cost before changing anything; the window stays at 256 until that evidence exists. Measure: (1) the replica's progress against heartbeat ticks — positions per tick, and how often a tick brings none; (2) bytes actually in flight at each heartbeat, not the configured record window — whether the window is used in full; (3) the sequencer's commit latency from raw samples, fine enough to see the tail; (4) comparable rounds at 256, 1 024 and 4 096 — same workload, restart timing and measurement boundaries; (5) the outlier (335 MB written, recovery 0) explained from the data before results are aggregated — retransmission, catch-up replay, repeated writes or a measurement artefact, not assumed. CPU totals alone cannot tell useful work from waiting or scheduling: heartbeat-level samples should. Kept apart: supported — read size showed no clear effect; larger windows went with much faster catch-up. Not established — why the window matters, whether heartbeat pacing constrains the sequencer, whether larger windows keep an acceptable commit tail. Still open — D-124. `straum_catching_up` stays an indicator, not a health verdict. D-135 closes only after the mechanism is investigated and the cost measured, not because 4 096 did best. 2026-10-16, D-136 A: the stage is measured — the sequencer's serial read from the log, 14–25 ms — its cause inside (a segment replay per read) read from the code only; still open (D-139).
+Rejected options: B (a catch-up window), C (4 096 fixed), D (wait for the Linux run) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-136. What sets the ~40 ms round trip that bounds catch-up
+Date: 2026-10-16
+Choice: A — instrument each stage of the catch-up round trip on the same batch and position boundaries, telling waiting from work, with a matched control run without a restarted replica; results stay preliminary container results, not an accepted Linux run. Not closed by "window ÷ round trip" alone (D-138): that is a throughput model; if investigation stops without the source, the unknown is recorded as an accepted limitation, not as a mechanism. Result (ADR-0008, D-136 A): no round trip — one read from the log at a time, 14–25 ms each, with no queueing and no wait for the report; the window sets what fits in one read. Why a read costs that (a replay of the segment from its start) is read from the code, not measured: D-135 stays open (D-139).
+Rejected options: B (close D-135 now, catch-up window after D-124), C (measure only on the Linux host) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-137. Does D-124's candidate include the D-132 and D-135 instrumentation?
+Date: 2026-10-16
+Choice: A — measure the current tree as it is, per-send instrumentation included; record that its individual cost is not isolated. Amends D-131's freeze; D-124's result no longer compares with D-127 step (2)'s metrics-only candidate.
+Rejected options: B (per-send part behind a feature), C (revert the per-send part) not chosen.
+Card: docs/decisions/archive/cards.md
+
+## D-138. Scope and process, 2026-10-16
+Date: 2026-10-16
+Choice: accepted from a scope-reduction proposal, with boundaries. (1) D-124 no longer gates feature work: container results may support exploratory work and preliminary decisions; a quiet Linux host stays required for accepted performance claims and for tuning defaults — the accepted Linux comparison is a separate gate for those. (4) QoS 2 and shared subscriptions deferred out of the first usable release; existing QoS 1 commit and acknowledgement semantics are not weakened. (5) Persistent sessions first; wills and session expiry stay explicitly refused until implemented. (7) No CLI or web interface; the Prometheus endpoint (and Grafana) is the initial monitoring path. (2) D-136 is not closed by "window ÷ round trip" (see D-136). (6) D-110 order: TLS client authentication first, mutual TLS between nodes later; a trusted network is a deployment assumption, not an authentication mechanism — replication links stay loopback-only by default and any wider bind still needs the explicit experimental opt-in (D-107). Not cut: deterministic simulation, the committed-log boundary for effects, bounded memory, malformed-input handling, security before network exposure. Process: one guardian round only for genuinely low-risk tasks, never for consensus, durability, protocol behaviour, memory bounds or security. The "lower end of 1–3 months" is a guess, not an estimate. Order: record these; finish D-136; then exploratory feature work without waiting for D-124.
+Rejected options: none recorded.
+Card: none (the user's decision in conversation)

@@ -629,11 +629,15 @@ shows contention.
 A latency is a gauge of the latest value, not a counter: the average of a
 bimodal latency is a number that never happened.
 
-The old broker's counters and their export (`STRAUM_METRICS_ADDR`, the
-Prometheus text format) went with it at step 8 (D-111). The new path
-exports no metrics yet: `node::Status` and `gateway::Load` are what it keeps.
-When it does, the rules above hold: Prometheus text written by hand, no
-framework (§2).
+The old broker's counters went with it at step 8 (D-111). The new path
+measures in the node loop (`node::metrics`, D-112): plain integers and
+fixed-bucket histograms owned by one task, no atomics, nothing allocated per
+event, monotonic time, and nothing read back into a decision. A snapshot is
+built only when asked (`Node::metrics`) and served as Prometheus text written
+by hand on `STRAUM_CLUSTER_METRICS_LISTEN`, off by default (§2: no
+framework). A node's own proposals are counted by state, never mixed:
+refused (never accepted), accepted and awaiting commit, committed, given up.
+The series, each with a HELP line, are in `node/src/metrics.rs`.
 
 ---
 
@@ -676,7 +680,7 @@ scripts/linux.sh clippy --workspace --all-targets --all-features -- -D warnings
 # Benchmarks are built but not run. `harness = false` targets are plain
 # programs that `cargo test --all-targets` runs too. divan recognises that
 # and does one short pass; the hand-written load generators
-# (storage/benches/commit.rs, node/benches/cap.rs) refuse to run as a debug
+# (storage/benches/commit.rs, node/benches/cap.rs, server/benches/puback.rs) refuse to run as a debug
 # build, which is what `cargo test` produces (D-4). `--tests` selects every target with `test = true` — library
 # and binary unit tests, integration tests — and benches default to `false`.
 # Setting `test = false` on a bench does not help: `--all-targets` runs it

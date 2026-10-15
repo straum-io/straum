@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use journal::{Chain, ChainError, Kind, Verifier, decode};
 use storage::{OsDisk, SegmentLimits, Segments};
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio::time::Instant;
 
 use crate::NodeError;
 
@@ -46,6 +47,11 @@ pub enum Event {
     Durable {
         lsn: u64,
         bytes_floor: u64,
+        /// The group's start, its writes done, its sync done (D-136 A):
+        /// two clock reads a sync, against the sync itself.
+        started: Instant,
+        written: Instant,
+        synced: Instant,
     },
     Snapshot(u64),
     /// Compacted: the log now holds nothing at or below this lsn — the
@@ -57,6 +63,9 @@ pub enum Event {
         to: u8,
         from: u64,
         batch: Option<Vec<Vec<u8>>>,
+        /// When this thread took the read up and finished it (D-136 A).
+        started: Instant,
+        done: Instant,
     },
     Range(Vec<Vec<u8>>),
     Failed(storage::StorageError),
@@ -285,6 +294,7 @@ fn run(
     events: tokio_mpsc::Sender<Event>,
 ) {
     while let Ok(first) = inbox.recv() {
+        let started = Instant::now();
         // Group commit: every append already waiting goes in this sync.
         let mut pending = vec![first];
         while let Ok(next) = inbox.try_recv() {
@@ -308,6 +318,7 @@ fn run(
             }
         }
         if let Some(last) = durable {
+            let written = Instant::now();
             if let Err(e) = log.commit(true) {
                 // The log can no longer say what is durable (storage §99).
                 let _ = events.blocking_send(Event::Failed(e));
@@ -316,6 +327,9 @@ fn run(
             let durable = Event::Durable {
                 lsn: last,
                 bytes_floor: bytes_floor(&log, retain_bytes),
+                started,
+                written,
+                synced: Instant::now(),
             };
             if events.blocking_send(durable).is_err() {
                 return;
@@ -329,11 +343,17 @@ fn run(
                     from,
                     upto,
                     bytes,
-                } => Event::Read {
-                    to,
-                    from,
-                    batch: read_batches(&log, from, upto, bytes),
-                },
+                } => {
+                    let started = Instant::now();
+                    let batch = read_batches(&log, from, upto, bytes);
+                    Event::Read {
+                        to,
+                        from,
+                        batch,
+                        started,
+                        done: Instant::now(),
+                    }
+                }
                 Command::Range { from, upto } => Event::Range(read_range(&log, from, upto)),
                 Command::Snapshot { lsn, bytes } => match write_snapshot(&directory, &bytes) {
                     Ok(()) => Event::Snapshot(lsn),
