@@ -38,6 +38,7 @@ docs/profiling.md         which tool answers which question, per platform
 docs/storage.md           the write-ahead log: group commit, durability, compaction
 docs/replication.md       the old leader/follower replication (removed at step 8, D-111); history
 docs/linux-tuning.md      kernel parameters and socket options for production hosts
+docs/ecosystem.md         straum-cli and straum-console: the brief and where it starts (D-140)
 docs/baselines/           recorded benchmark baselines, one file per machine
 ```
 

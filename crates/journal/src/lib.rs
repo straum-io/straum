@@ -536,3 +536,46 @@ impl Verifier {
         }
     }
 }
+
+#[cfg(test)]
+mod stable {
+    use super::Kind;
+
+    /// D-141 A: the kinds `docs/configuration.md` declares stable, with
+    /// their names and numbers, and the reserved ones, by number, are
+    /// together exactly the ones a record may carry.
+    #[test]
+    fn the_stable_kinds_are_the_ones_decoded() {
+        let doc = include_str!("../../../docs/configuration.md");
+        let kinds = |marker: &str| -> Vec<(&str, u8)> {
+            doc.split(&format!("<!-- {marker}:begin -->"))
+                .nth(1)
+                .and_then(|rest| rest.split(&format!("<!-- {marker}:end -->")).next())
+                .expect("a kinds block")
+                .lines()
+                .filter_map(|l| l.split_once(" = "))
+                .map(|(name, n)| (name.trim(), n.trim().parse().expect("a kind's number")))
+                .collect()
+        };
+        let declared = kinds("stable-kinds");
+        let reserved = kinds("reserved-kinds");
+        for &(_, n) in &reserved {
+            assert!(
+                Kind::from_u8(n).is_some(),
+                "reserved {n} decodes to no kind"
+            );
+        }
+        for &(name, n) in &declared {
+            let kind = Kind::from_u8(n).unwrap_or_else(|| panic!("{n} decodes to no kind"));
+            assert_eq!(format!("{kind:?}"), name, "kind {n}");
+        }
+        let decoded = (0..=u8::MAX)
+            .filter(|&n| Kind::from_u8(n).is_some())
+            .count();
+        assert_eq!(
+            decoded,
+            declared.len() + reserved.len(),
+            "a kind neither stable nor reserved"
+        );
+    }
+}

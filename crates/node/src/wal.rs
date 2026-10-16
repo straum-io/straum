@@ -66,9 +66,32 @@ pub enum Event {
         /// When this thread took the read up and finished it (D-136 A).
         started: Instant,
         done: Instant,
+        scan: Scan,
     },
-    Range(Vec<Vec<u8>>),
+    /// Committed records read back for apply; when this thread took the
+    /// read up and finished it, and the records and bytes it visited to
+    /// get them (D-139 A).
+    Range {
+        records: Vec<Vec<u8>>,
+        started: Instant,
+        done: Instant,
+        visited: u64,
+        visited_bytes: u64,
+    },
     Failed(storage::StorageError),
+}
+
+/// Where a read's time went (D-139 A): records and bytes scanned before it
+/// reached its start and after it was complete — the replay goes on to the
+/// segment's end — and when it reached and completed it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Scan {
+    pub before: u64,
+    pub before_bytes: u64,
+    pub reached: Option<Instant>,
+    pub finished: Option<Instant>,
+    pub after: u64,
+    pub after_bytes: u64,
 }
 
 /// Records handed back per range read: bounds what one read holds.
@@ -139,7 +162,7 @@ fn truncate(log: &mut Segments<OsDisk>, after: u64) -> Result<Chain, storage::St
     let chain = if boundary == 0 {
         Chain::genesis()
     } else {
-        let at = read_range(log, boundary, boundary);
+        let (at, _, _) = read_range(log, boundary, boundary);
         let slot = at
             .first()
             .and_then(|r| decode(r).ok())
@@ -345,16 +368,27 @@ fn run(
                     bytes,
                 } => {
                     let started = Instant::now();
-                    let batch = read_batches(&log, from, upto, bytes);
+                    let (batch, scan) = read_batches(&log, from, upto, bytes);
                     Event::Read {
                         to,
                         from,
                         batch,
                         started,
                         done: Instant::now(),
+                        scan,
                     }
                 }
-                Command::Range { from, upto } => Event::Range(read_range(&log, from, upto)),
+                Command::Range { from, upto } => {
+                    let started = Instant::now();
+                    let (records, visited, visited_bytes) = read_range(&log, from, upto);
+                    Event::Range {
+                        records,
+                        started,
+                        done: Instant::now(),
+                        visited,
+                        visited_bytes,
+                    }
+                }
                 Command::Snapshot { lsn, bytes } => match write_snapshot(&directory, &bytes) {
                     Ok(()) => Event::Snapshot(lsn),
                     Err(e) => Event::Failed(storage::StorageError::Io(e)),
@@ -390,15 +424,41 @@ fn read_batches(
     from: u64,
     upto: u64,
     bytes: usize,
-) -> Option<Vec<Vec<u8>>> {
-    let segment = log.segment_of(from)?;
+) -> (Option<Vec<Vec<u8>>>, Scan) {
+    let mut scan = Scan::default();
+    let Some(segment) = log.segment_of(from) else {
+        return (None, scan);
+    };
     let mut batches = cluster::ReadBatches::new(from, upto, bytes);
-    log.read(segment, &mut |record| batches.feed(record)).ok()?;
-    batches.finish()
+    // Counted on every read, not only traced ones: two adds and a branch
+    // a record, against the record's checksum.
+    let read = log.read(segment, &mut |record| {
+        let len = record.len() as u64;
+        if batches.done() {
+            scan.after += 1;
+            scan.after_bytes += len;
+            return;
+        }
+        batches.feed(record);
+        if !batches.started() {
+            scan.before += 1;
+            scan.before_bytes += len;
+        } else if scan.reached.is_none() {
+            scan.reached = Some(Instant::now());
+        }
+        if batches.done() {
+            scan.finished = Some(Instant::now());
+        }
+    });
+    if read.is_err() {
+        return (None, scan);
+    }
+    (batches.finish(), scan)
 }
 
-fn read_range(log: &Segments<OsDisk>, from: u64, upto: u64) -> Vec<Vec<u8>> {
+fn read_range(log: &Segments<OsDisk>, from: u64, upto: u64) -> (Vec<Vec<u8>>, u64, u64) {
     let mut out = Vec::new();
+    let (mut visited, mut visited_bytes) = (0u64, 0u64);
     // From the segment that holds `from`: a restart reads the log back in
     // ranges, and starting each at the first segment made it quadratic.
     let start = log.segment_of(from).unwrap_or(0);
@@ -408,6 +468,8 @@ fn read_range(log: &Segments<OsDisk>, from: u64, upto: u64) -> Vec<Vec<u8>> {
             break;
         }
         let _ = log.read(key, &mut |record| {
+            visited += 1;
+            visited_bytes += record.len() as u64;
             if out.len() >= MAX_RANGE {
                 return;
             }
@@ -419,7 +481,7 @@ fn read_range(log: &Segments<OsDisk>, from: u64, upto: u64) -> Vec<Vec<u8>> {
             }
         });
     }
-    out
+    (out, visited, visited_bytes)
 }
 
 #[cfg(test)]

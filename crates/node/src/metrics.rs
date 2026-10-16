@@ -205,6 +205,12 @@ pub enum Stage {
     /// The log thread took the read up; `last` the batch's end, 0 none.
     ReadStarted,
     ReadDone,
+    /// D-139 A: the read reached its start; `first` the records and `last`
+    /// the bytes scanned before it.
+    ReadReached,
+    /// The read was complete; `first` the records and `last` the bytes the
+    /// replay still went through to the segment's end.
+    ReadFinished,
     /// The node loop took the read's answer.
     ReadHandled,
     /// An append handed to the link to `peer`.
@@ -225,6 +231,11 @@ pub enum Stage {
     ReportSent,
     /// Sequencer: a durable report read from the link, from `peer`.
     ReportReceived,
+    /// A read-back of committed records for apply: taken up (`first` the
+    /// records and `last` the bytes it visited), and done (`first` the
+    /// records it brought).
+    RangeStarted,
+    RangeDone,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1226,5 +1237,47 @@ mod flight {
         p.update(0, 10, t0);
         p.update(4, 6, t0);
         assert_eq!((p.ticks, p.still_ticks, p.advanced), (2, 1, 4));
+    }
+}
+
+#[cfg(test)]
+mod stable {
+    use super::*;
+
+    /// D-141 A: the stable set in docs/configuration.md is what clients
+    /// outside the cluster may rely on; each is rendered once, as a gauge
+    /// without labels. The list is read from the document, so the two
+    /// cannot drift apart.
+    #[test]
+    fn the_stable_metrics_are_rendered_as_gauges() {
+        let doc = include_str!("../../../docs/configuration.md");
+        let block = doc
+            .split("<!-- stable-metrics:begin -->")
+            .nth(1)
+            .and_then(|rest| rest.split("<!-- stable-metrics:end -->").next())
+            .expect("the stable-metrics block in docs/configuration.md");
+        let names: Vec<&str> = block
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("straum_"))
+            .collect();
+        assert_eq!(names.len(), 11, "the stable set changed: {names:?}");
+        let text = Snapshot::default().render();
+        for name in names {
+            assert_eq!(
+                text.matches(&format!("# TYPE {name} gauge\n")).count(),
+                1,
+                "{name} is not one gauge"
+            );
+            let samples: Vec<&str> = text
+                .lines()
+                .filter(|l| l.split([' ', '{']).next() == Some(name))
+                .collect();
+            assert_eq!(samples.len(), 1, "{name}: {samples:?}");
+            assert!(
+                samples[0].starts_with(&format!("{name} ")),
+                "{name} has labels"
+            );
+        }
     }
 }

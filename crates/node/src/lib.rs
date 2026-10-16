@@ -819,7 +819,7 @@ impl Node {
                             cluster::prune_slots(&mut committed_slots, floor);
                             node.core.on_compacted(floor);
                         }
-                        wal::Event::Read { to, from, batch, started, done } => {
+                        wal::Event::Read { to, from, batch, started, done, scan } => {
                             if node.trace.on() {
                                 let last = batch
                                     .as_ref()
@@ -827,13 +827,23 @@ impl Node {
                                 node.trace.stamp(Stage::ReadStarted, to, from, last, started);
                                 node.trace.stamp(Stage::ReadDone, to, from, last, done);
                                 node.trace.stamp_now(Stage::ReadHandled, to, from, last);
+                                if let Some(at) = scan.reached {
+                                    node.trace.stamp(Stage::ReadReached, to, scan.before, scan.before_bytes, at);
+                                }
+                                if let Some(at) = scan.finished {
+                                    node.trace.stamp(Stage::ReadFinished, to, scan.after, scan.after_bytes, at);
+                                }
                             }
                             match batch {
                                 Some(batch) => node.core.on_read(to, batch),
                                 None => node.core.on_read_missing(to, from),
                             }
                         }
-                        wal::Event::Range(records) => {
+                        wal::Event::Range { records, started, done, visited, visited_bytes } => {
+                            if node.trace.on() {
+                                node.trace.stamp(Stage::RangeStarted, id, visited, visited_bytes, started);
+                                node.trace.stamp(Stage::RangeDone, id, records.len() as u64, 0, done);
+                            }
                             reading = false;
                             for record in records {
                                 if let Ok(r) = journal::decode(&record) {

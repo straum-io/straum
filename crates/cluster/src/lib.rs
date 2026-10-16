@@ -193,6 +193,12 @@ impl ReadBatches {
         self.done
     }
 
+    /// The read reached its start: a record at `from` was kept. What the
+    /// driver measured before this was scanned to get there (D-139 A).
+    pub fn started(&self) -> bool {
+        !self.records.is_empty()
+    }
+
     pub fn feed(&mut self, record: &[u8]) {
         if self.done {
             return;

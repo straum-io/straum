@@ -1797,6 +1797,36 @@ event, monotonic time, nothing read back into a decision.
     from the log, with no queueing and no wait for the report — but the
     cause inside it is read from the code; D-135 stays open until that is
     confirmed (D-139).
+- **D-139 A (2026-10-16; the D-136 A run again, 3 rounds × 256 / 1 024
+  / 4 096 at 50 ms with paired controls; container, preliminary):** each
+  catch-up read timed where it reached its start and where it was
+  complete, with the records and bytes scanned before and after
+  (`wal::Scan`, counted on every read: two adds and a branch a record);
+  the replica's read-backs for apply (`Range`) timed and counted; the
+  replica's waiting appends attributed by overlap to what its log thread
+  was doing.
+  - *Supported (preliminary):*
+    - A read's time is the segment it replays, not what it returns. The
+      part kept takes 0.01–0.04 ms; reaching the read's start takes 5–17
+      ms over 16–62 MB, and the replay goes on to the segment's end for
+      another 5–15 ms over 20–53 MB — 55–63 MB scanned a read, about the
+      whole 64 MiB segment, at 3.4–4.7 GB/s. Where the bytes scanned
+      vary (1 024, 4 096), read time follows them: r 0.91–0.997, about
+      0.29–0.54 ms a MB. This explains the 14–25 ms of D-136 A: what a
+      read needs is under 0.3 % of it.
+    - The replica's log thread is held by its read-backs for apply: 99 %
+      of its appends' waiting during catch-up (5.1–5.6 s a trial)
+      overlaps them. A read-back brings 1 024 records (`MAX_RANGE`) and
+      visits 55–61 MB doing it — the same replay from the segment's
+      start — 17–21 ms each, 520–620 a trial. In the controls there are
+      none, and an append waits about 0.04 ms.
+  - *Not established:* the cost on a cold disk — the segments were in the
+    page cache — and the sync's, about 0 in this container.
+  - *Closes D-135:* the 14–25 ms read cost is measured — each read
+    replays its segment from the start and on to its end. The catch-up
+    rate is bounded by that serial read together with the replica's wait
+    on its own read-backs (one a read, p90 13–16 ms); which of the two
+    dominates is not separated yet. The optimisation is a card (D-142).
 - **D-137 A (2026-10-16):** D-124's candidate is the tree as it is, with
   the D-132, D-135 A and D-136 A instrumentation in the node loop. This
   amends D-131's freeze; the instrumentation's own cost is not isolated,

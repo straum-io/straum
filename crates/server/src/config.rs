@@ -395,6 +395,33 @@ mod tests {
         parse(&pairs)
     }
 
+    /// D-141 A: the settings `docs/configuration.md` declares stable are
+    /// exactly the ones the server reads — every one recorded in
+    /// `effective` from a valid start, defaults included.
+    #[test]
+    fn the_stable_settings_are_the_ones_read() {
+        let doc = include_str!("../../../docs/configuration.md");
+        let block = doc
+            .split("<!-- stable-settings:begin -->")
+            .nth(1)
+            .and_then(|rest| rest.split("<!-- stable-settings:end -->").next())
+            .expect("the stable-settings block");
+        let mut declared: Vec<&str> = block
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("STRAUM_"))
+            .collect();
+        let mut read: Vec<&str> = parse(&VALID)
+            .unwrap()
+            .effective
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+        declared.sort_unstable();
+        read.sort_unstable();
+        assert_eq!(declared, read);
+    }
+
     #[test]
     fn nothing_starts_without_the_acknowledgement() {
         assert_eq!(parse(&[]).err(), Some(ConfigError::NotAcknowledged));

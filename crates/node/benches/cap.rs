@@ -617,6 +617,191 @@ fn stages(traces: &[(u8, Trace)], sequencer: u8, lagging: u8) -> String {
     out
 }
 
+/// p50/p90/p99 of `v`, sorted in place.
+fn quantiles(v: &mut [f64]) -> String {
+    if v.is_empty() {
+        return "-".to_owned();
+    }
+    v.sort_by(f64::total_cmp);
+    let at = |p: f64| v[((v.len() as f64 * p) as usize).min(v.len() - 1)];
+    format!("{:.2}/{:.2}/{:.2}", at(0.5), at(0.9), at(0.99))
+}
+
+/// Time `a` to `b`, ms; 0 when `b` is earlier.
+fn ms(a: tokio::time::Instant, b: tokio::time::Instant) -> f64 {
+    b.saturating_duration_since(a).as_secs_f64() * 1000.0
+}
+
+/// How much of `[from, to)` the intervals cover; `spans` sorted by start,
+/// one thread's, so they do not overlap one another.
+fn covered(
+    spans: &[(tokio::time::Instant, tokio::time::Instant)],
+    from: tokio::time::Instant,
+    to: tokio::time::Instant,
+) -> f64 {
+    let end = spans.partition_point(|s| s.0 < to);
+    spans[..end]
+        .iter()
+        .rev()
+        .take_while(|s| s.1 > from || s.0 >= from)
+        .map(|s| ms(s.0.max(from), s.1.min(to)))
+        .sum()
+}
+
+/// The intervals of one node's activity on its log thread: each `start`
+/// stamp with the next `end` stamp at or after it.
+fn spans(
+    traces: &[(u8, Trace)],
+    node: u8,
+    start: Stage,
+    end: Stage,
+) -> Vec<(tokio::time::Instant, tokio::time::Instant)> {
+    let (starts, ends) = (
+        Stamps::of(traces, node, start),
+        Stamps::of(traces, node, end),
+    );
+    starts
+        .0
+        .iter()
+        .filter_map(|s| {
+            ends.after(s.at, |e| {
+                e.last == s.last || matches!(start, Stage::RangeStarted | Stage::ReadStarted)
+            })
+            .map(|e| (s.at, e.at))
+        })
+        .collect()
+}
+
+/// D-139 A: where a catch-up read's time goes, and what holds the lagging
+/// replica's log thread while its appends wait.
+///
+/// `scan` row: the sequencer's reads for the lagging replica — read time,
+/// split at the moment it reached its start and the moment it was
+/// complete; the bytes scanned before and after (the replay goes on to the
+/// segment's end); the scan rate over those bytes; and how read time
+/// follows the bytes scanned (Pearson r, and ms a MB by least squares).
+///
+/// `blocking` row: each append the lagging replica handed to its log
+/// thread, and the wait until a group took it up; of all that waiting,
+/// how much overlapped the thread's earlier groups (append and sync),
+/// read-backs for apply (`Range`), reads for others, and none of these.
+fn scans(traces: &[(u8, Trace)], sequencer: u8, lagging: u8) -> String {
+    let mut out = String::new();
+    let s = |stage| Stamps::of(traces, sequencer, stage);
+    let (started, reached, finished, done) = (
+        s(Stage::ReadStarted),
+        s(Stage::ReadReached),
+        s(Stage::ReadFinished),
+        s(Stage::ReadDone),
+    );
+    let (mut read, mut before, mut keep, mut after) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut before_mb, mut after_mb) = (Vec::new(), Vec::new());
+    let mut points: Vec<(f64, f64)> = Vec::new();
+    let (mut scanned_mb, mut scanning_ms) = (0.0, 0.0);
+    for st in started.0.iter().filter(|x| x.peer == lagging) {
+        let Some(dn) = done.after(st.at, |x| x.peer == lagging && x.first == st.first) else {
+            continue;
+        };
+        let inside = |x: &Stamp| x.peer == lagging && x.at <= dn.at;
+        let Some(r) = reached.after(st.at, inside) else {
+            continue;
+        };
+        // Never complete before the end of the segment: nothing after it.
+        let (f_at, f_bytes) = finished
+            .after(st.at, inside)
+            .map_or((dn.at, 0), |f| (f.at, f.last));
+        let (b, a) = (r.last as f64 / 1e6, f_bytes as f64 / 1e6);
+        read.push(ms(st.at, dn.at));
+        before.push(ms(st.at, r.at));
+        keep.push(ms(r.at, f_at));
+        after.push(ms(f_at, dn.at));
+        before_mb.push(b);
+        after_mb.push(a);
+        scanned_mb += b + a;
+        scanning_ms += ms(st.at, r.at) + ms(f_at, dn.at);
+        points.push((b + a, ms(st.at, dn.at)));
+    }
+    if !points.is_empty() {
+        let n = points.len() as f64;
+        let (mx, my) = (
+            points.iter().map(|p| p.0).sum::<f64>() / n,
+            points.iter().map(|p| p.1).sum::<f64>() / n,
+        );
+        let sxy: f64 = points.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+        let sxx: f64 = points.iter().map(|p| (p.0 - mx).powi(2)).sum();
+        let syy: f64 = points.iter().map(|p| (p.1 - my).powi(2)).sum();
+        let r = if sxx > 0.0 && syy > 0.0 {
+            sxy / (sxx * syy).sqrt()
+        } else {
+            0.0
+        };
+        let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+        let _ = writeln!(
+            out,
+            "scan peer=lagging reads={} read_ms={} before_ms={} keep_ms={} after_ms={} before_MB={} after_MB={} scan_MBps={:.0} r={r:.3} ms_per_MB={slope:.3} intercept_ms={:.2}",
+            points.len(),
+            quantiles(&mut read),
+            quantiles(&mut before),
+            quantiles(&mut keep),
+            quantiles(&mut after),
+            quantiles(&mut before_mb),
+            quantiles(&mut after_mb),
+            if scanning_ms > 0.0 {
+                scanned_mb / (scanning_ms / 1000.0)
+            } else {
+                0.0
+            },
+            my - slope * mx,
+        );
+    }
+    // The lagging replica's log thread.
+    let groups = spans(traces, lagging, Stage::WalStarted, Stage::Synced);
+    let ranges = spans(traces, lagging, Stage::RangeStarted, Stage::RangeDone);
+    let reads = spans(traces, lagging, Stage::ReadStarted, Stage::ReadDone);
+    let r = |stage| Stamps::of(traces, lagging, stage);
+    let (appended, wal_started, synced) =
+        (r(Stage::Appended), r(Stage::WalStarted), r(Stage::Synced));
+    let (mut total, mut by_groups, mut by_ranges, mut by_reads, mut waited) =
+        (0.0, 0.0, 0.0, 0.0, 0usize);
+    let mut waits = Vec::new();
+    for a in &appended.0 {
+        let Some(syn) = synced.after(a.at, |x| x.last >= a.last) else {
+            continue;
+        };
+        let Some(ws) = wal_started.before(syn.at, |x| x.last == syn.last) else {
+            continue;
+        };
+        let w = ms(a.at, ws.at);
+        waits.push(w);
+        if w <= 0.0 {
+            continue;
+        }
+        waited += 1;
+        total += w;
+        by_groups += covered(&groups, a.at, ws.at);
+        by_ranges += covered(&ranges, a.at, ws.at);
+        by_reads += covered(&reads, a.at, ws.at);
+    }
+    let range_stamps = r(Stage::RangeStarted);
+    let mut range_ms: Vec<f64> = ranges.iter().map(|s| ms(s.0, s.1)).collect();
+    let range_mb = range_stamps.0.iter().map(|x| x.last as f64).sum::<f64>()
+        / 1e6
+        / (range_stamps.0.len().max(1) as f64);
+    let range_records = r(Stage::RangeDone).0.iter().map(|x| x.first).sum::<u64>()
+        / (range_stamps.0.len().max(1) as u64);
+    let _ = writeln!(
+        out,
+        "blocking peer=lagging appends={} waited={waited} wait_ms={} wait_total_ms={total:.0} by_groups_ms={by_groups:.0} by_range_ms={by_ranges:.0} by_reads_ms={by_reads:.0} unattributed_ms={:.0} ranges={} range_ms={} range_visited_MB_mean={range_mb:.1} range_records_mean={range_records}",
+        waits.len(),
+        quantiles(&mut waits),
+        (total - by_groups - by_ranges - by_reads).max(0.0),
+        ranges.len(),
+        quantiles(&mut range_ms),
+    );
+    out
+}
+
 /// D-133 B, D-135 A: one catch-up trial at a replication window and a
 /// heartbeat. A replica is stopped for 2 s while the sequencer commits,
 /// started again, and read every second for 20 s under load, then 10 s
@@ -717,7 +902,7 @@ async fn catch_up(window: u64, heartbeat_ms: u64, restart: bool) -> Option<(Stri
         format!("{:.0}", (at_stop as f64 - later as f64) / 10.0)
     };
     let run = if restart { "catchup" } else { "control" };
-    let stages = stages(&traces, leader, replica);
+    let stages = stages(&traces, leader, replica) + &scans(&traces, leader, replica);
     // The raw stamps, for a stage the rows do not explain:
     // `STRAUM_BENCH_TRACE_DIR` writes one CSV per trial (node, stage, peer,
     // first, last, µs from the earliest stamp).

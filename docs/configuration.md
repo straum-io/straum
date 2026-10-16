@@ -63,6 +63,136 @@ a link from a node that differs is refused. Wills, persistent sessions and
 session expiry are refused at CONNECT until step 7c. SIGUSR1 asks the node to
 hand its slot over (a protocol handoff, D-105 A); SIGTERM or Ctrl-C stops it.
 
+### Stable metrics (D-141 A)
+
+Clients outside the cluster — `straum-cli` first (D-140) — may rely on
+these series of `STRAUM_CLUSTER_METRICS_LISTEN` and on nothing else there.
+Each is a gauge without labels, one sample per node; its name, type and
+meaning (its HELP text) change only by a decision recorded here, and
+`node`'s test `the_stable_metrics_are_rendered_as_gauges` reads this block
+and fails if the renderer and it disagree. Every other series is unstable:
+diagnostics that may be renamed, re-labelled or removed with any change —
+the catch-up series of D-132–D-139 among them.
+
+<!-- stable-metrics:begin -->
+```text
+straum_node
+straum_slot
+straum_leading
+straum_serving
+straum_commit
+straum_applied
+straum_log_end
+straum_log_durable
+straum_lag
+straum_outbox_entries
+straum_outbox_capacity
+```
+<!-- stable-metrics:end -->
+
+What they mean, as rendered: `straum_node` this node's id; `straum_slot`
+the highest slot it promised; `straum_leading` 1 while it sequences its
+slot; `straum_serving` 1 once its gateway takes clients; `straum_commit`
+the commit point it knows; `straum_applied` the last position applied
+here; `straum_log_end` and `straum_log_durable` its log's last position
+and the position durable through; `straum_lag` positions its log is
+behind the commit point it heard; `straum_outbox_entries` and
+`straum_outbox_capacity` its own proposals awaiting commit and their
+bound. A value is this node's view at the scrape — not the cluster's, and
+not a health verdict.
+
+### Stable names (D-141 A)
+
+Three more lists clients may rely on, by the same rule as the metrics —
+`straum-cli`'s coverage check reads these blocks, not the source. Each is
+pinned by a test in the crate that owns it, which reads the block from
+this file.
+
+The settings the server reads (`server`'s
+`the_stable_settings_are_the_ones_read`), each described in the table
+above:
+
+<!-- stable-settings:begin -->
+```text
+STRAUM_EXPERIMENTAL_CLUSTER
+STRAUM_LOG_LEVEL
+STRAUM_WORKER_THREADS
+STRAUM_CLUSTER_NODE_ID
+STRAUM_CLUSTER_PEERS
+STRAUM_CLUSTER_DATA_DIR
+STRAUM_CLUSTER_LISTEN
+STRAUM_CLUSTER_MQTT_LISTEN
+STRAUM_CLUSTER_METRICS_LISTEN
+STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK
+STRAUM_CLUSTER_HEARTBEAT_MS
+STRAUM_CLUSTER_TAKEOVER_TICKS
+STRAUM_CLUSTER_RETAIN_BYTES
+STRAUM_READ_BYTES
+```
+<!-- stable-settings:end -->
+
+The journal's record kinds that are written, and their numbers
+(`journal`'s `the_stable_kinds_are_the_ones_decoded`):
+
+<!-- stable-kinds:begin -->
+```text
+BatchHeader = 0
+Publish = 1
+Session = 2
+SessionGone = 3
+Subscribe = 4
+Unsubscribe = 5
+Ack = 6
+Connect = 7
+Disconnect = 8
+NodeReset = 9
+SlotStart = 24
+SlotEnd = 25
+```
+<!-- stable-kinds:end -->
+
+Reserved kinds (unified-stream §2.7): their numbers are held — no other
+kind will take them — but nothing writes them yet, and their names and
+meaning stay free until 7c or phase 6 builds them. Not stable.
+
+<!-- reserved-kinds:begin -->
+```text
+SessionExpired = 16
+MessageExpired = 17
+WillPublished = 18
+QosTwoState = 32
+SharedAssignment = 33
+```
+<!-- reserved-kinds:end -->
+
+The MQTT reason codes the gateway sends by name — in CONNACK, SUBACK and
+DISCONNECT, refusals among them (`gateway`'s
+`the_stable_reason_codes_are_the_ones_sent`). That check is textual: the
+`ReasonCode::` names in `gateway/src/lib.rs`, which today is where the
+gateway names every reason it sends. A malformed packet closes the
+connection with the reason `codec` gives it; those are not in this list.
+
+<!-- stable-reasons:begin -->
+```text
+Success
+GrantedQos1
+BadAuthenticationMethod
+ClientIdentifierNotValid
+ImplementationSpecificError
+KeepAliveTimeout
+ProtocolError
+QosNotSupported
+QuotaExceeded
+ReceiveMaximumExceeded
+ServerBusy
+ServerUnavailable
+SessionTakenOver
+SharedSubscriptionsNotSupported
+SubscriptionIdentifiersNotSupported
+TopicAliasInvalid
+```
+<!-- stable-reasons:end -->
+
 ## Internal settings
 
 Not read from the environment: fixed in 7a (`node::experimental`), or set by tests and simulations.

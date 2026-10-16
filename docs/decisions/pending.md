@@ -7,63 +7,66 @@ skill. When the user answers `D-<n>: <choice>`, the card moves to
 ---
 
 
-## D-139. The catch-up read: confirm why it costs 14–25 ms, then remove the cost
+## D-142. Stop replaying whole segments for catch-up reads and read-backs
 
-**Context.** D-136 A, preliminary (container):
-- **Measured:**
-  - Catch-up is one read from the log at a time.
-  - Each read costs 14–25 ms (`read_K`), with no queueing and no wait for the report.
-  - Each read brings 96 positions at window 256, about 430 at 1 024.
-- **Read from the code, not measured:** `Segments::read` replays the segment from its start whatever the read needs, up to `segment_bytes` (64 MiB, also in 7a). D-135 stays open until that is confirmed.
-- **The cost:**
-  - commit p99 52–170 ms during catch-up, against 1.5–2.4 ms in the control;
-  - recovery after the load: 3 891–6 563/s at 256; at 1 024, 27 040/s where it didn't drain (lower bounds elsewhere).
+**Context.** D-139 A, preliminary (container, segments in the page cache):
+- **A catch-up read (sequencer, `wal::read_batches`):**
+  - the part it keeps takes 0.01–0.04 ms;
+  - reaching its start: 5–17 ms over 16–62 MB, which depends on the read's offset in the segment;
+  - going on to the segment's end after it is complete: 5–15 ms over 20–53 MB, pure waste.
 
-  At 256, a lag of several hundred thousand positions outlasts the clients' 30 s `commit_timeout` (D-133).
-- **Not explained:** the replica's own log thread waits 10–20 ms at p90 (`append_queue_W`) during catch-up only.
-- fsync costs about 0 in the container.
+  That is 55–63 MB a read at 3.4–4.7 GB/s, and 14–25 ms in all. Catch-up runs one read at a time; recovery at window 256 was 5 237–7 122 positions/s. The commit p99 was 83–131 ms during catch-up, against 1.4–2.4 ms in the control (D-139 A's rows).
+- **What bounds the rate:** the sequencer's read and the replica's wait on its own read-backs (one per read, p90 13–16 ms) are both serial. The run doesn't separate which dominates; A measures that after step 1.
+- **A read-back for apply (any node, `wal::read_range`):** the same replay, 55–61 MB for 1 024 records, 17–21 ms. During catch-up it holds the replica's log thread for 99 % of its appends' waiting (p90 13–16 ms).
+- **What `storage` offers:**
+  - `Segments::read(key, visit)` replays a segment from its start, and the visitor cannot stop it;
+  - `scan` already has a stop hook (`ready`), but only for the header;
+  - `cluster::ReadBatches::done()` says when a read needs nothing more.
+- **Not measured:** a cold disk, where the scanned bytes are disk reads, not memory, would cost more.
 
-**Vision.** CLAUDE.md §7 (bounded under any input), §10 (append and replicate on the hot path), §11 (baseline, one change, Linux for accepted numbers); D-138 (container results may drive exploratory work; truncation and compaction get a full guardian review); D-57 A (retention).
+**Vision.** CLAUDE.md §7 (bounded under any input), §10 (append and replicate on the hot path), §11 (baseline recorded — D-139 A; one change at a time; Linux for accepted numbers); D-138 (container results drive exploratory work; storage, truncation and compaction get a full guardian review); D-57 A (retention).
 
-**Common first step, for A–C** (S; it closes D-135 or reopens the analysis):
-- stamp `read_K` against the read's offset in its segment;
-- stamp what the replica's log thread does while an append waits (`Range` read-backs for apply).
+### A. Early stop, then a cursor — two changes, measured apart — recommended
+- **Step 1 — early stop (S):** discarded in D-139's card ("a read still scans everything before its start"); it returns on new evidence, since the part after the read is measured at 5–15 ms a read.
+  - `storage`'s replay takes a visitor that can stop the walk;
+  - `read_batches` stops once `ReadBatches::done()`;
+  - `read_range` stops once it has `MAX_RANGE` records or passed `upto`.
 
-If `read_K` grows with the offset, the cause is confirmed and the option below follows; if not, a new card.
+  Expected: the "after" part goes, 5–15 ms a read. `wal::Scan` stays, so the next run shows what is left; it is counted on every read (two adds and a branch a record, two clock reads a read — against a checksum a record and a 14–25 ms read), and is dropped once step 2's measurement is recorded unless it is still needed.
+- **Step 2 — a cursor (S–M):**
+  - `storage::Segments` reads from a file offset and returns where it stopped (`read_from(key, offset)`);
+  - `node::wal` keeps one cursor per replica being caught up and one for the apply read-back, each `(segment, offset, next position)`;
+  - a read continuing at the next position starts there; a truncation, a compaction or another position drops the cursor, which falls back to the scan.
+  - the cursor is a position only and holds no open file; truncation and compaction run on the same log thread and drop it before a segment changes or goes, so it never pins a segment (unified-stream §3, "compaction must not truncate a segment someone is reading").
 
-### A. The common step only; the fix chosen by a new card — recommended
-- **What we do:** the two stamps above, D-136's catch-up mode with control, three rounds. Then D-135 closes with the cause confirmed or not, and a new card offers B, C or another fix on that evidence.
-- **Why first:** D-135 is open on exactly this question; B and C each commit to a fix before the cause is confirmed.
-- **Cost:** S; diagnostics only.
+  Expected: the "before" part goes too, so a sequential read costs about what it brings.
+- **Memory:** O(replicas + 1), bounded under any input.
+- **Tests:**
+  - in `storage`: a read from an offset, or stopped early, equals the full scan's;
+  - in `node`: through a truncation, a compaction and a segment roll;
+  - the cluster simulation unchanged.
+- **Measure after each step:** D-139's mode with controls, against D-139 A as the baseline. That covers `read_K`, the read cycle, the catch-up rate, the commit p99 against the control, and the replica's waits.
+- **Cost:** S + S–M. Full guardian review (storage, truncation).
+- **Why now, against D-138's order (feature work after D-136):** a restarted replica can stay behind longer than the clients' 30 s `commit_timeout` (D-133), and every restart pays it. 7c's persistent sessions would add to that load.
 
-### B. A read cursor per replica
-- **What we do:** `storage::Segments` gets a read from a file offset that returns where it stopped (`read_from(key, offset)`); `node::wal` keeps, per replica being caught up, the segment and file offset where its previous read stopped. The next read from the following position starts there. It is dropped on `Truncated`, `Compacted` or a segment change, which fall back to the scan; a read from any other position scans as now.
-- **Why it fits:** catch-up reads are sequential, one outstanding per replica.
-- **Memory:** O(replicas), no per-batch structure; bounded under any input.
-- **Tests:** in `storage`/`node`, a read through the cursor equals the scan's after appends, a truncation, a compaction and a segment roll; the cluster simulation unchanged.
-- **Measure:** D-136's catch-up mode with control, before and after. `read_K` should follow what a read returns.
-- **Cost:** S–M. Touches the read path near truncation and compaction: a full guardian review (D-138).
+### B. A sparse offset index per segment
+- **What we do:** `storage::Segments` keeps the offset of the first batch at or after every 64 KiB of each retained segment: at most 1 024 entries per 64 MiB segment, rebuilt on open, cut on truncation, dropped with the segment. Reads seek to the entry below their start and stop early.
+- **Serves:** any read, sequential or not — a takeover's catch-up, a restart's read-back.
+- **Cost:** M; a second representation truncation and compaction must keep exact.
 
-### C. A sparse offset index per segment
-- **What we do:** `storage::Segments` keeps the offset of the first batch at or after every 64 KiB of each retained segment: a fixed bound of `segment_bytes / 64 KiB` entries, 1 024 per 64 MiB segment, at most about 16 KiB each, however small the batches. A read seeks to the entry at or below its start and scans from there.
-- **Invalidation:** rebuilt on open; cut on `Truncated`; dropped with a segment on `Compacted`.
-- **Serves:** any read, not only sequential ones (a new replica, a takeover's catch-up), and `Range` read-backs.
-- **Cost:** M. A second representation of each segment that truncation and compaction must keep exact; full guardian review and simulation.
+### C. Early stop only
+- **What we do:** A's step 1 alone.
+- **Expected:** reads and read-backs lose their "after" part, roughly 40–60 % of each. The "before" part, which grows with the offset in the segment, stays — and so, in part, does the replica's wait on read-backs, since `read_range` still scans from the segment's start. Revives the early stop D-139's card discarded, on the measured after-part.
+- **Cost:** S.
 
-### D. Accept it as a known limitation of 7a for now
-- **What we do:** record in ADR-0008 and `docs/configuration.md`, as preliminary container figures:
-  - recovery at window 256 is 3 891–6 563 positions/s;
-  - commit p99 is 52–170 ms during catch-up, against 1.5–2.4 ms without;
-  - a restarted replica can stay behind longer than the clients' 30 s `commit_timeout` (D-133).
-
-  D-135 is recorded as the stage measured, its cause inferred and accepted as a limitation (D-138). Feature work goes first.
-- **Risk:** every restart or long partition pays this, and 7c's persistent sessions add load on the same log.
+### D. Accept it for now
+- **What we do:** record these numbers in `docs/configuration.md` as a known limitation of 7a, and go on with 7c.
+- **Risk:** every restart pays a replica's read-backs and the sequencer's catch-up reads at 14–25 ms each, and the commit tail during catch-up.
 
 **Discarded.**
-- Stopping the scan once the read is complete (S): a read still scans everything before its start; B removes that for the sequential case it would help, fully.
-- Raising the window (D-135 C): the window acts only through what fits in one read.
-- A separate reader thread: it addresses the commit tail only if the reads cause it, which isn't established. It returns as a card if the tail outlives A.
+- A separate reader thread: it would move the scan off the commit path without removing it. It returns only if the tail outlives A.
+- A smaller `segment_bytes`: it shortens every scan but multiplies files and compaction work, and it is a default change that needs Linux numbers (D-138).
 
-**Recommendation.** A. B is the likely fix if A confirms the scan, being the smallest change that matches how catch-up reads (sequentially), bounded by replicas. C if A shows other reads (`Range`, a takeover's catch-up) paying the same scan. D if feature work is to go first.
+**Recommendation.** A. Step 1 is small and removes measured waste on its own; step 2 removes the rest for the sequential reads that catch-up and apply do. B if non-sequential reads (takeover, restart) turn out to matter, measured the same way.
 
-**Answer:** `D-139: A` · `D-139: B` · `D-139: C` · `D-139: D` · `D-139: discuss`
+**Answer:** `D-142: A` · `D-142: B` · `D-142: C` · `D-142: D` · `D-142: discuss`
