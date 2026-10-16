@@ -1038,3 +1038,9 @@ Choice: A — (1) stop segment scans as soon as a read or read-back has what it 
 Amended 2026-10-16 after the guardian review: unified-stream §3 is amended (the user's choice over a recorded deviation or a pin for every reader) — a reader that can be in progress during a truncation or compaction holds a pin; reads serialised with them on the log thread need none. And the measurement is rerun to CLAUDE.md §11 — five alternating rounds, windows 256, 1 024 and 4 096, and cap's failover mode — before the change is accepted.
 Rejected options: B (a sparse index), C (early stop only), D (accept as a limitation) not chosen.
 Card: docs/decisions/archive/cards.md
+
+## D-143. After D-142: what next
+Date: 2026-10-16
+Choice: A + B; C deferred. A — the main next step: 7c (persistent sessions), starting with a design card, not code. The card defines a global limit on persisted sessions and explicit behaviour at the limit — refusal, never unbounded memory or disk — and how the system recovers from an admission failure, a restart and a partial write error. Implementation of 7c does not begin until these conditions are agreed. Changing a reserved record kind is a separate decision, and the straum-cli session is told first. B — in parallel: catch-up measured on a cold page cache if the container can control it; it does not delay the design. C — the D-124 Linux run, after A and B, unless it blocks the next stage. D-142's limits (cold disk, real sync, Linux, pins for future readers on other threads) stay open risks, not mixed with the new work.
+Rejected options: none; C deferred.
+Card: docs/decisions/archive/cards.md

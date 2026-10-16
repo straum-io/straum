@@ -739,6 +739,30 @@ fn scans(traces: &[(u8, Trace)], sequencer: u8, lagging: u8) -> String {
     out
 }
 
+/// D-143 B: every node's files out of the page cache before the restart,
+/// so catch-up reads its log from the disk the kernel sees — GNU `dd`
+/// with `iflag=nocache count=0`, `posix_fadvise(DONTNEED)` on the whole
+/// file, after a `sync` so the pages are clean and can go. Unprivileged,
+/// unlike `drop_caches`. Inside the container that disk is the VM's,
+/// which macOS may still cache: not a cold physical disk.
+fn evict(cluster: &Cluster) {
+    let _ = std::process::Command::new("sync").status();
+    for id in 0..NODES {
+        let Ok(entries) = std::fs::read_dir(data_dir(cluster.cap, id)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let _ = std::process::Command::new("dd")
+                    .arg(format!("if={}", path.display()))
+                    .args(["iflag=nocache", "count=0", "status=none"])
+                    .status();
+            }
+        }
+    }
+}
+
 /// D-133 B, D-135 A: one catch-up trial at a replication window and a
 /// heartbeat. A replica is stopped for 2 s while the sequencer commits,
 /// started again, and read every second for 20 s under load, then 10 s
@@ -766,6 +790,9 @@ async fn catch_up(window: u64, heartbeat_ms: u64, restart: bool) -> Option<(Stri
         cluster.nodes[usize::from(replica)].take()?.shutdown().await;
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
+    if std::env::var("STRAUM_BENCH_COLD").as_deref() == Ok("1") {
+        evict(&cluster);
+    }
     if restart {
         let restarted = Node::start(config(64, replica, &cluster.addresses))
             .await

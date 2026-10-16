@@ -1910,6 +1910,21 @@ event, monotonic time, nothing read back into a decision.
     §3's mmap or a separate reader — must take a pin, and an offset it
     holds across a truncation or compaction is only safe because a stale
     one fails to a scan; a segment removed under such a reader is not.
+- **D-143 B (2026-10-16; in-process, container, preliminary):** catch-up
+  with every node's log evicted from the page cache before the restart
+  (`cap`'s `STRAUM_BENCH_COLD=1`: `sync`, then `dd iflag=nocache count=0`
+  on each file; `drop_caches` is refused in the container). With D-142 A,
+  cold and warm agree in three rotated rounds at 256 and 1 024 — reads
+  0.02–0.03 ms, catch-up commit p99 1.6–3.6 ms, the replica's appends
+  waiting 0.04–0.05 ms, caught up under load every time (at 1 024
+  mostly before the first sample, so window 256 is the comparison). Base
+  cold read no slower than base warm had (10–15 ms against 13.8–16.6), so
+  the run does not show that cold reads cost more here at all. *Not
+  established:* a physical cold disk — the disk here is the VM's, whose
+  image macOS may cache, and the eviction is one pass before the restart.
+  With the cursor each record is read from the disk once, so what remains
+  of the cold-disk risk is one sequential read of the lag, not a rescan per
+  read.
 - **D-137 A (2026-10-16):** D-124's candidate is the tree as it is, with
   the D-132, D-135 A and D-136 A instrumentation in the node loop. This
   amends D-131's freeze; the instrumentation's own cost is not isolated,
