@@ -69,7 +69,7 @@ MQTT 5 is built into the architecture from the start, even if individual feature
 - **QoS2 and shared subscriptions** are not implemented now, but the log model must allow for them: reserve record types for QoS2 state (PUBREC/PUBREL) and for deterministic assignment of messages to members of a shared group based on the committed group membership.
 
 ## 3. Storage (segmented WAL)
-- Keep group commit and compaction. Compaction must not truncate a segment that someone is reading: refcounting is needed.
+- Keep group commit and compaction. Compaction must not truncate a segment that someone is reading: a reader that can be in progress during a truncation or compaction holds a pin (`Segments::pin`, a refcount). Reads serialised with them on the log thread need none; a position they keep to resume from is dropped before the log is cut or a segment removed (D-142 A).
 - The hot path remains allocation-free (current measurement: +24–33 ns, about 0.1% of ~26 µs fsynced publish on M1, possibly in Docker; requires confirmation on Linux, including multi-publisher contention and `STRAUM_MAX_PENDING_DURABLE`).
 - Buffers of known size are created via an exact `with_capacity`.
 - Do not use mmap on the write path. mmap for reading sealed segments is permissible after profiling and under the unsafe policy (section 4.1).

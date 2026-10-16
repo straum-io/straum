@@ -193,10 +193,11 @@ impl ReadBatches {
         self.done
     }
 
-    /// The read reached its start: a record at `from` was kept. What the
-    /// driver measured before this was scanned to get there (D-139 A).
-    pub fn started(&self) -> bool {
-        !self.records.is_empty()
+    /// Records kept so far, from `from` on: 0 until the read reached its
+    /// start (D-139 A). A batch cut short by the end of what was fed is
+    /// still counted here and dropped by `finish`.
+    pub fn kept(&self) -> usize {
+        self.records.len()
     }
 
     pub fn feed(&mut self, record: &[u8]) {

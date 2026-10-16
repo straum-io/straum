@@ -672,14 +672,11 @@ fn spans(
         .collect()
 }
 
-/// D-139 A: where a catch-up read's time goes, and what holds the lagging
-/// replica's log thread while its appends wait.
+/// D-139 A, D-142 A: how long a catch-up read takes, and what holds the
+/// lagging replica's log thread while its appends wait.
 ///
-/// `scan` row: the sequencer's reads for the lagging replica — read time,
-/// split at the moment it reached its start and the moment it was
-/// complete; the bytes scanned before and after (the replay goes on to the
-/// segment's end); the scan rate over those bytes; and how read time
-/// follows the bytes scanned (Pearson r, and ms a MB by least squares).
+/// `scan` row: the sequencer's reads for the lagging replica, from the log
+/// thread taking one up to finishing it.
 ///
 /// `blocking` row: each append the lagging replica handed to its log
 /// thread, and the wait until a group took it up; of all that waiting,
@@ -687,72 +684,16 @@ fn spans(
 /// read-backs for apply (`Range`), reads for others, and none of these.
 fn scans(traces: &[(u8, Trace)], sequencer: u8, lagging: u8) -> String {
     let mut out = String::new();
-    let s = |stage| Stamps::of(traces, sequencer, stage);
-    let (started, reached, finished, done) = (
-        s(Stage::ReadStarted),
-        s(Stage::ReadReached),
-        s(Stage::ReadFinished),
-        s(Stage::ReadDone),
-    );
-    let (mut read, mut before, mut keep, mut after) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let (mut before_mb, mut after_mb) = (Vec::new(), Vec::new());
-    let mut points: Vec<(f64, f64)> = Vec::new();
-    let (mut scanned_mb, mut scanning_ms) = (0.0, 0.0);
-    for st in started.0.iter().filter(|x| x.peer == lagging) {
-        let Some(dn) = done.after(st.at, |x| x.peer == lagging && x.first == st.first) else {
-            continue;
-        };
-        let inside = |x: &Stamp| x.peer == lagging && x.at <= dn.at;
-        let Some(r) = reached.after(st.at, inside) else {
-            continue;
-        };
-        // Never complete before the end of the segment: nothing after it.
-        let (f_at, f_bytes) = finished
-            .after(st.at, inside)
-            .map_or((dn.at, 0), |f| (f.at, f.last));
-        let (b, a) = (r.last as f64 / 1e6, f_bytes as f64 / 1e6);
-        read.push(ms(st.at, dn.at));
-        before.push(ms(st.at, r.at));
-        keep.push(ms(r.at, f_at));
-        after.push(ms(f_at, dn.at));
-        before_mb.push(b);
-        after_mb.push(a);
-        scanned_mb += b + a;
-        scanning_ms += ms(st.at, r.at) + ms(f_at, dn.at);
-        points.push((b + a, ms(st.at, dn.at)));
-    }
-    if !points.is_empty() {
-        let n = points.len() as f64;
-        let (mx, my) = (
-            points.iter().map(|p| p.0).sum::<f64>() / n,
-            points.iter().map(|p| p.1).sum::<f64>() / n,
-        );
-        let sxy: f64 = points.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
-        let sxx: f64 = points.iter().map(|p| (p.0 - mx).powi(2)).sum();
-        let syy: f64 = points.iter().map(|p| (p.1 - my).powi(2)).sum();
-        let r = if sxx > 0.0 && syy > 0.0 {
-            sxy / (sxx * syy).sqrt()
-        } else {
-            0.0
-        };
-        let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+    let mut read: Vec<f64> = spans(traces, sequencer, Stage::ReadStarted, Stage::ReadDone)
+        .iter()
+        .map(|s| ms(s.0, s.1))
+        .collect();
+    if !read.is_empty() {
         let _ = writeln!(
             out,
-            "scan peer=lagging reads={} read_ms={} before_ms={} keep_ms={} after_ms={} before_MB={} after_MB={} scan_MBps={:.0} r={r:.3} ms_per_MB={slope:.3} intercept_ms={:.2}",
-            points.len(),
-            quantiles(&mut read),
-            quantiles(&mut before),
-            quantiles(&mut keep),
-            quantiles(&mut after),
-            quantiles(&mut before_mb),
-            quantiles(&mut after_mb),
-            if scanning_ms > 0.0 {
-                scanned_mb / (scanning_ms / 1000.0)
-            } else {
-                0.0
-            },
-            my - slope * mx,
+            "scan reads={} read_ms={}",
+            read.len(),
+            quantiles(&mut read)
         );
     }
     // The lagging replica's log thread.
@@ -783,16 +724,12 @@ fn scans(traces: &[(u8, Trace)], sequencer: u8, lagging: u8) -> String {
         by_ranges += covered(&ranges, a.at, ws.at);
         by_reads += covered(&reads, a.at, ws.at);
     }
-    let range_stamps = r(Stage::RangeStarted);
     let mut range_ms: Vec<f64> = ranges.iter().map(|s| ms(s.0, s.1)).collect();
-    let range_mb = range_stamps.0.iter().map(|x| x.last as f64).sum::<f64>()
-        / 1e6
-        / (range_stamps.0.len().max(1) as f64);
-    let range_records = r(Stage::RangeDone).0.iter().map(|x| x.first).sum::<u64>()
-        / (range_stamps.0.len().max(1) as u64);
+    let range_records =
+        r(Stage::RangeDone).0.iter().map(|x| x.first).sum::<u64>() / (ranges.len().max(1) as u64);
     let _ = writeln!(
         out,
-        "blocking peer=lagging appends={} waited={waited} wait_ms={} wait_total_ms={total:.0} by_groups_ms={by_groups:.0} by_range_ms={by_ranges:.0} by_reads_ms={by_reads:.0} unattributed_ms={:.0} ranges={} range_ms={} range_visited_MB_mean={range_mb:.1} range_records_mean={range_records}",
+        "blocking peer=lagging appends={} waited={waited} wait_ms={} wait_total_ms={total:.0} by_groups_ms={by_groups:.0} by_range_ms={by_ranges:.0} by_reads_ms={by_reads:.0} unattributed_ms={:.0} ranges={} range_ms={} range_records_mean={range_records}",
         waits.len(),
         quantiles(&mut waits),
         (total - by_groups - by_ranges - by_reads).max(0.0),

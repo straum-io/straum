@@ -5,6 +5,7 @@
 //! atomically, written before any segment below it is removed, so a start
 //! always finds a snapshot and the log after it with no gap between them.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -66,32 +67,15 @@ pub enum Event {
         /// When this thread took the read up and finished it (D-136 A).
         started: Instant,
         done: Instant,
-        scan: Scan,
     },
     /// Committed records read back for apply; when this thread took the
-    /// read up and finished it, and the records and bytes it visited to
-    /// get them (D-139 A).
+    /// read up and finished it (D-139 A).
     Range {
         records: Vec<Vec<u8>>,
         started: Instant,
         done: Instant,
-        visited: u64,
-        visited_bytes: u64,
     },
     Failed(storage::StorageError),
-}
-
-/// Where a read's time went (D-139 A): records and bytes scanned before it
-/// reached its start and after it was complete — the replay goes on to the
-/// segment's end — and when it reached and completed it.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Scan {
-    pub before: u64,
-    pub before_bytes: u64,
-    pub reached: Option<Instant>,
-    pub finished: Option<Instant>,
-    pub after: u64,
-    pub after_bytes: u64,
 }
 
 /// Records handed back per range read: bounds what one read holds.
@@ -162,7 +146,7 @@ fn truncate(log: &mut Segments<OsDisk>, after: u64) -> Result<Chain, storage::St
     let chain = if boundary == 0 {
         Chain::genesis()
     } else {
-        let (at, _, _) = read_range(log, boundary, boundary);
+        let (at, _) = read_range(log, boundary, boundary, None);
         let slot = at
             .first()
             .and_then(|r| decode(r).ok())
@@ -316,6 +300,10 @@ fn run(
     inbox: mpsc::Receiver<Command>,
     events: tokio_mpsc::Sender<Event>,
 ) {
+    // One per replica being caught up, one for apply's read-back: at most
+    // the voters plus one (D-142 A).
+    let mut cursors: BTreeMap<u8, Cursor> = BTreeMap::new();
+    let mut applying: Option<Cursor> = None;
     while let Ok(first) = inbox.recv() {
         let started = Instant::now();
         // Group commit: every append already waiting goes in this sync.
@@ -368,45 +356,58 @@ fn run(
                     bytes,
                 } => {
                     let started = Instant::now();
-                    let (batch, scan) = read_batches(&log, from, upto, bytes);
+                    let (batch, left) =
+                        read_batches(&log, from, upto, bytes, cursors.get(&to).copied());
+                    match left {
+                        Some(c) => drop(cursors.insert(to, c)),
+                        None => drop(cursors.remove(&to)),
+                    }
                     Event::Read {
                         to,
                         from,
                         batch,
                         started,
                         done: Instant::now(),
-                        scan,
                     }
                 }
                 Command::Range { from, upto } => {
                     let started = Instant::now();
-                    let (records, visited, visited_bytes) = read_range(&log, from, upto);
+                    let (records, left) = read_range(&log, from, upto, applying);
+                    applying = left;
                     Event::Range {
                         records,
                         started,
                         done: Instant::now(),
-                        visited,
-                        visited_bytes,
                     }
                 }
                 Command::Snapshot { lsn, bytes } => match write_snapshot(&directory, &bytes) {
                     Ok(()) => Event::Snapshot(lsn),
                     Err(e) => Event::Failed(storage::StorageError::Io(e)),
                 },
-                Command::Compact { floor } => match log.remove_through(floor) {
-                    Ok(_) => Event::Compacted(
-                        log.keys().next().map_or(0, |first| first.saturating_sub(1)),
-                    ),
-                    Err(e) => Event::Failed(e),
-                },
+                Command::Compact { floor } => {
+                    // Before any segment goes (unified-stream §3).
+                    cursors.clear();
+                    applying = None;
+                    match log.remove_through(floor) {
+                        Ok(_) => Event::Compacted(
+                            log.keys().next().map_or(0, |first| first.saturating_sub(1)),
+                        ),
+                        Err(e) => Event::Failed(e),
+                    }
+                }
                 Command::Promise { slot } => match write_promise(&directory, slot) {
                     Ok(()) => Event::Promised(slot),
                     Err(e) => Event::Failed(storage::StorageError::Io(e)),
                 },
-                Command::Truncate { after } => match truncate(&mut log, after) {
-                    Ok(chain) => Event::Truncated(chain),
-                    Err(e) => Event::Failed(e),
-                },
+                Command::Truncate { after } => {
+                    // Before the log is cut (unified-stream §3).
+                    cursors.clear();
+                    applying = None;
+                    match truncate(&mut log, after) {
+                        Ok(chain) => Event::Truncated(chain),
+                        Err(e) => Event::Failed(e),
+                    }
+                }
                 Command::Append { .. } => continue,
             };
             if events.blocking_send(event).is_err() {
@@ -416,72 +417,131 @@ fn run(
     }
 }
 
-/// Whole batches from the one at `from`, none past `upto`, under `bytes`
-/// past the first (`cluster::ReadBatches`, D-81 A); within the segment
-/// that holds `from`.
+/// Where a sequential read left off (D-142 A): a segment, the end offset of
+/// the last record the read handed back, and that record's position plus
+/// one. A position only: it holds no file, so it pins no segment. The
+/// reads, truncation and compaction all run on this thread, one after
+/// another; truncation and compaction drop every cursor before they change
+/// or remove a segment, so no read ever spans either, and a cursor never
+/// names a segment that changed under it (unified-stream §3).
+#[derive(Debug, Clone, Copy)]
+struct Cursor {
+    segment: u64,
+    offset: u64,
+    next: u64,
+}
+
+/// Whole batches from the one at `from`, none past `upto`, under `bytes`;
+/// started at `cursor` when it continues there, and stopped once the read
+/// has what it needs. A read from a cursor that finds nothing is tried
+/// again from the segment's start, so a cursor never makes a read miss.
+/// Measured (D-142 A, container): 13–16 ms a read replaying its segment
+/// before and after it; 0.02–0.03 ms with both the stop and the cursor.
 fn read_batches(
     log: &Segments<OsDisk>,
     from: u64,
     upto: u64,
     bytes: usize,
-) -> (Option<Vec<Vec<u8>>>, Scan) {
-    let mut scan = Scan::default();
+    cursor: Option<Cursor>,
+) -> (Option<Vec<Vec<u8>>>, Option<Cursor>) {
     let Some(segment) = log.segment_of(from) else {
-        return (None, scan);
+        return (None, None);
     };
-    let mut batches = cluster::ReadBatches::new(from, upto, bytes);
-    // Counted on every read, not only traced ones: two adds and a branch
-    // a record, against the record's checksum.
-    let read = log.read(segment, &mut |record| {
-        let len = record.len() as u64;
-        if batches.done() {
-            scan.after += 1;
-            scan.after_bytes += len;
-            return;
-        }
-        batches.feed(record);
-        if !batches.started() {
-            scan.before += 1;
-            scan.before_bytes += len;
-        } else if scan.reached.is_none() {
-            scan.reached = Some(Instant::now());
-        }
-        if batches.done() {
-            scan.finished = Some(Instant::now());
-        }
+    let start = cursor
+        .filter(|c| c.segment == segment && c.next == from)
+        .map(|c| c.offset);
+    let (batch, ends) = match read_batches_at(log, segment, start, from, upto, bytes) {
+        (None, _) if start.is_some() => read_batches_at(log, segment, None, from, upto, bytes),
+        read => read,
+    };
+    let next = batch.as_ref().and_then(|b| {
+        let offset = *ends.get(b.len().checked_sub(1)?)?;
+        Some(Cursor {
+            segment,
+            offset,
+            next: from.saturating_add(b.len() as u64),
+        })
     });
-    if read.is_err() {
-        return (None, scan);
-    }
-    (batches.finish(), scan)
+    (batch, next)
 }
 
-fn read_range(log: &Segments<OsDisk>, from: u64, upto: u64) -> (Vec<Vec<u8>>, u64, u64) {
+/// One walk of `segment` for `read_batches`, with the end offset of each
+/// record kept.
+fn read_batches_at(
+    log: &Segments<OsDisk>,
+    segment: u64,
+    start: Option<u64>,
+    from: u64,
+    upto: u64,
+    bytes: usize,
+) -> (Option<Vec<Vec<u8>>>, Vec<u64>) {
+    let mut batches = cluster::ReadBatches::new(from, upto, bytes);
+    // Bounded by what one read keeps: `bytes`, or one batch.
+    let mut ends = Vec::new();
+    let read = log.read_while(segment, start, &mut |record, end| {
+        let kept = batches.kept();
+        batches.feed(record);
+        if batches.kept() > kept {
+            ends.push(end);
+        }
+        !batches.done()
+    });
+    if read.is_err() {
+        return (None, ends);
+    }
+    (batches.finish(), ends)
+}
+
+/// Committed records from `from`, contiguous, none past `upto`, at most
+/// `MAX_RANGE`: the read-back for apply. Started at `cursor` when it
+/// continues there, stopped once it has what it needs; with where it left
+/// off.
+fn read_range(
+    log: &Segments<OsDisk>,
+    from: u64,
+    upto: u64,
+    cursor: Option<Cursor>,
+) -> (Vec<Vec<u8>>, Option<Cursor>) {
     let mut out = Vec::new();
-    let (mut visited, mut visited_bytes) = (0u64, 0u64);
+    let mut left: Option<Cursor> = None;
     // From the segment that holds `from`: a restart reads the log back in
     // ranges, and starting each at the first segment made it quadratic.
     let start = log.segment_of(from).unwrap_or(0);
+    let resume = cursor
+        .filter(|c| c.segment == start && c.next == from)
+        .map(|c| c.offset);
     let keys: Vec<u64> = log.keys().filter(|&k| k >= start).collect();
     for key in keys {
-        if out.len() >= MAX_RANGE {
+        let mut stopped = false;
+        let at = if key == start { resume } else { None };
+        let _ = log.read_while(key, at, &mut |record, end| {
+            let Ok(r) = decode(record) else {
+                return true;
+            };
+            let next = from.saturating_add(out.len() as u64);
+            // Contiguous from `from`: the next one wanted, and no further.
+            if r.lsn == next && r.lsn <= upto {
+                out.push(record.to_vec());
+                left = Some(Cursor {
+                    segment: key,
+                    offset: end,
+                    next: r.lsn.saturating_add(1),
+                });
+            } else if r.lsn > next || r.lsn > upto {
+                stopped = true;
+            }
+            stopped |= out.len() >= MAX_RANGE;
+            !stopped
+        });
+        if stopped {
             break;
         }
-        let _ = log.read(key, &mut |record| {
-            visited += 1;
-            visited_bytes += record.len() as u64;
-            if out.len() >= MAX_RANGE {
-                return;
-            }
-            if let Ok(r) = decode(record) {
-                // Contiguous from `from`: the next one wanted, and no further.
-                if r.lsn == from.saturating_add(out.len() as u64) && r.lsn <= upto {
-                    out.push(record.to_vec());
-                }
-            }
-        });
     }
-    (out, visited, visited_bytes)
+    // A cursor that found nothing: once more from the segment's start.
+    if out.is_empty() && resume.is_some() {
+        return read_range(log, from, upto, None);
+    }
+    (out, left)
 }
 
 #[cfg(test)]
@@ -489,6 +549,99 @@ mod tests {
     use journal::{Entry, Kind};
 
     use super::*;
+
+    /// D-142 A: reads continued through a cursor — catch-up and apply's
+    /// read-back — return exactly what reads from the segment's start
+    /// return, across segment rolls; a cursor gone stale by a truncation
+    /// still gives the right answer, by falling back to the scan.
+    #[test]
+    fn reads_through_a_cursor_match_reads_from_the_start() {
+        let dir =
+            std::env::temp_dir().join(format!("straum-node-wal-cursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = SegmentLimits {
+            wal: storage::WalLimits::default(),
+            segment_bytes: 2048,
+        };
+        let mut log = Segments::open(OsDisk, &dir, limits, &mut |_, _| {}).unwrap();
+        let mut chain = Chain::genesis();
+        for batch in 0..60u8 {
+            let entries: Vec<Entry> = (0..3u8)
+                .map(|i| Entry {
+                    kind: Kind::Publish,
+                    properties: &[],
+                    body: if i == 0 { &[1; 40] } else { &[2; 40] },
+                })
+                .collect();
+            let _ = batch;
+            let first = chain.next_lsn();
+            let mut records = Vec::new();
+            chain.batch(1, &entries, &mut records).unwrap();
+            log.begin(first).unwrap();
+            for record in &records {
+                log.stage(record).unwrap();
+            }
+            log.commit(true).unwrap();
+        }
+        assert!(log.keys().count() > 3, "several segments");
+        let end = chain.next_lsn() - 1;
+
+        // Catch-up: a window of 12 past what was read, under 400 bytes.
+        let (mut from, mut cursor) = (1u64, None);
+        while from <= end {
+            let upto = (from + 11).min(end);
+            let (plain, _) = read_batches(&log, from, upto, 400, None);
+            let (through, left) = read_batches(&log, from, upto, 400, cursor);
+            assert_eq!(through, plain, "read from {from}");
+            let n = plain.map_or(0, |b| b.len() as u64);
+            assert!(n > 0, "read from {from} found nothing");
+            from += n;
+            cursor = left;
+        }
+
+        // Apply's read-back, 7 at a time.
+        let (mut from, mut cursor) = (1u64, None);
+        while from <= end {
+            let upto = (from + 6).min(end);
+            let (plain, _) = read_range(&log, from, upto, None);
+            let (through, left) = read_range(&log, from, upto, cursor);
+            assert_eq!(through, plain, "range from {from}");
+            assert_eq!(plain.len() as u64, upto - from + 1);
+            from = upto + 1;
+            cursor = left;
+        }
+
+        // A cursor kept across a cut (the thread drops it; here it is kept
+        // on purpose): the answer is still the scan's.
+        let (_, stale) = read_batches(&log, 33, 48, 1 << 20, None);
+        let stale = stale.unwrap();
+        // Cut, then the same positions written again, larger: the stale
+        // offset now falls elsewhere.
+        let mut chain = truncate(&mut log, 30).unwrap();
+        while chain.next_lsn() <= end {
+            let entries = [Entry {
+                kind: Kind::Publish,
+                properties: &[],
+                body: &[3; 97],
+            }];
+            let first = chain.next_lsn();
+            let mut records = Vec::new();
+            chain.batch(2, &entries, &mut records).unwrap();
+            log.begin(first).unwrap();
+            for record in &records {
+                log.stage(record).unwrap();
+            }
+            log.commit(true).unwrap();
+        }
+        let next = stale.next;
+        assert!(next > 33 && next <= end);
+        let (plain, _) = read_batches(&log, next, next + 11, 400, None);
+        let (through, _) = read_batches(&log, next, next + 11, 400, Some(stale));
+        assert!(plain.is_some());
+        assert_eq!(through, plain);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A cut inside a batch goes back to that batch's start, and the chain
     /// reported is the one after the batch before it.

@@ -205,12 +205,6 @@ pub enum Stage {
     /// The log thread took the read up; `last` the batch's end, 0 none.
     ReadStarted,
     ReadDone,
-    /// D-139 A: the read reached its start; `first` the records and `last`
-    /// the bytes scanned before it.
-    ReadReached,
-    /// The read was complete; `first` the records and `last` the bytes the
-    /// replay still went through to the segment's end.
-    ReadFinished,
     /// The node loop took the read's answer.
     ReadHandled,
     /// An append handed to the link to `peer`.
@@ -231,9 +225,8 @@ pub enum Stage {
     ReportSent,
     /// Sequencer: a durable report read from the link, from `peer`.
     ReportReceived,
-    /// A read-back of committed records for apply: taken up (`first` the
-    /// records and `last` the bytes it visited), and done (`first` the
-    /// records it brought).
+    /// A read-back of committed records for apply: taken up, and done
+    /// (`first` the records it brought).
     RangeStarted,
     RangeDone,
 }

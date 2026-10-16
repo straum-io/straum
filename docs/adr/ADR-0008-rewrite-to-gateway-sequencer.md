@@ -1827,6 +1827,89 @@ event, monotonic time, nothing read back into a decision.
     rate is bounded by that serial read together with the replica's wait
     on its own read-backs (one a read, p90 13–16 ms); which of the two
     dominates is not separated yet. The optimisation is a card (D-142).
+- **D-142 A (2026-10-16):** catch-up reads and read-backs stop once they
+  have what they need, and sequential ones resume where the last left
+  off.
+  - *What changed:*
+    - `storage`: `scan` takes a resume offset and a per-record check
+      that can stop the walk; `Segments::read_while` hands records over
+      with their end offsets until told to stop, from the segment's start
+      or from such an offset. A resumed walk numbers nothing (sequence
+      `None`).
+    - `node::wal`: `read_batches` and `read_range` stop once `ReadBatches`
+      is done, or once a read-back has `MAX_RANGE` records or passed what
+      it wants. A cursor per replica being caught up and one for apply's
+      read-back — a segment, an end offset, the next position — start a
+      read that continues there. A cursor read that finds nothing is
+      tried again from the segment's start. At most voters + 1 cursors.
+    - D-139 A's always-on per-read counting (`wal::Scan`) is removed;
+      read-backs keep their two clock reads, like reads (D-136 A).
+  - *Unified-stream §3*, amended by the user (2026-10-16) to say what it
+    meant: a reader that can be in progress during a truncation or
+    compaction holds a pin; reads serialised with them on the log thread
+    need none. These reads — the only readers of a live log — are such:
+    every read, read-back, truncation and compaction runs on the one log
+    thread, one after another, so no read is in progress while a segment
+    is cut or removed. A cursor is a position, not an open reader: it
+    holds no file and pins nothing, and truncation and compaction drop
+    every cursor before they change a segment. A read from a cursor that
+    no longer matches falls back to the scan (tested: a stale cursor
+    across a cut and a rewrite gives the scan's answer). The refcount
+    `Segments` already has (`pin`) stays for readers that span commands —
+    the simulation's — and is not needed here. A reader on another
+    thread (mmap, a separate reader, §3's "likely candidates") would need
+    it; none exists.
+  - *Measured to protocol (CLAUDE.md §11; in-process, container,
+    preliminary): base (D-139's path) against both, five alternating
+    rounds, windows 256 / 1 024 / 4 096 with paired controls, and cap's
+    failover mode; medians over the rounds:*
+
+    | | base | both |
+    |---|---|---|
+    | read p50 (256 / 1 024 / 4 096) | 13.8 / 16.6 / 16.1 ms | 0.02 / 0.03 / 0.04 ms |
+    | catch-up commit p99 | 89 / 103 / 105 ms | 1.8 / 1.9 / 2.0 ms |
+    | commits a second in catch-up | 6 400 / 9 600 / 12 200 | 311 000 / 310 000 / 308 000 |
+    | failovers within 1 s (cap 64, 10 a round) | 4 of 10, every round | 10 of 10, every round |
+    | survivor lag at the stop | about 80 000 | 0 |
+
+    Controls without a restart: commit p99 1.4–3.2 ms, 306 000–312 000
+    commits a second, both trees; publishes a second in the failover
+    mode the same in both (about 310 000–327 000). With both, the
+    restarted replica caught up under load in every trial — at 1 024 and
+    4 096 before the first sample, one second in — so those catch-up
+    figures compare against a replica with nothing left to read; window
+    256 is the comparison that holds. The failover result was not looked
+    for: base's survivors lagged about 80 000 positions behind the
+    sequencer, slow catch-up reads that kept them there, and the new
+    majority had to close that before committing; with both they lag 0,
+    and D-84 A's target (9 in 10 within 1 s) holds in this harness.
+  - *Each change alone (three interleaved rounds, 256 and 1 024, before the
+    protocol run):*
+
+    | | read p50 | catch-up commit p99 | commits a second in catch-up |
+    |---|---|---|---|
+    | base (D-139's path) | 13–16 ms | 80–96 ms | 6 000–11 400 |
+    | early stop | 7–9 ms | 60–90 ms | 16 000–59 000 |
+    | cursor | 4–10 ms | 50–82 ms | 8 000–142 000 |
+    | both | 0.02–0.03 ms | 1.4–1.9 ms | 313 000–324 000 |
+
+    Controls without a restart: commit p99 1.3–1.9 ms and about 315 000
+    commits a second in every tree. With both, the lagging replica caught
+    up under load in every trial (at 1 024 before the first sample, one
+    second in); its appends waited 0.04 ms at p50 and a read-back took
+    0.07 ms, against 11–14 ms and 15–18 ms in base. Each change alone
+    removed one half of the replay and left the other: the early stop the
+    part after a read, the cursor the part before it. Alone, each also let
+    the closed-loop load commit faster, so the lag could grow at window
+    256 while the cluster wrote more.
+  - *Not established:* a cold disk (the segments were in the page cache);
+    the sync, about 0 in this container; a Linux host (D-138: these
+    numbers support the change, not a default).
+  - *Open risk:* the single-thread argument is enforced by the code's
+    structure, not by `Segments`: a future reader on another thread —
+    §3's mmap or a separate reader — must take a pin, and an offset it
+    holds across a truncation or compaction is only safe because a stale
+    one fails to a scan; a segment removed under such a reader is not.
 - **D-137 A (2026-10-16):** D-124's candidate is the tree as it is, with
   the D-132, D-135 A and D-136 A instrumentation in the node loop. This
   amends D-131's freeze; the instrumentation's own cost is not isolated,

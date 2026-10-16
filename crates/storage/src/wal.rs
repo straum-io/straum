@@ -204,7 +204,15 @@ impl<D: Disk> Wal<D> {
                 ..Recovery::default()
             }
         } else {
-            scan(&mut file, &limits, length, &mut |_| true, &mut |_, _, _| {})?
+            scan(
+                &mut file,
+                &limits,
+                length,
+                None,
+                &mut |_| true,
+                &mut |_| true,
+                &mut |_, _, _| {},
+            )?
         };
 
         // Appends continue at the end of the durable prefix: the tail is gone.
@@ -475,6 +483,14 @@ fn scan(
     file: &mut (impl Read + Seek),
     limits: &WalLimits,
     length: u64,
+    // Where to start: the first record when `None`; otherwise an offset a
+    // walk of this file handed `go_on` before — a record boundary. A walk
+    // resumed there cannot number records: it hands each over with no
+    // sequence (D-142 A).
+    resume: Option<u64>,
+    // Asked with each record's end offset before that record is handed
+    // over; `false` stops the walk there (D-142 A).
+    go_on: &mut impl FnMut(u64) -> bool,
     // Called once with this file's retention floor as soon as the header is
     // decoded, before any record is handed over; `false` stops the walk.
     ready: &mut impl FnMut(u64) -> bool,
@@ -498,17 +514,25 @@ fn scan(
     if !ready(header.sequence.saturating_add(1)) {
         return Ok(Recovery::default());
     }
+    let begin = match resume {
+        None => header_len(),
+        Some(at) if at >= header_len() && at <= length => {
+            file.seek(SeekFrom::Start(at))?;
+            at
+        }
+        Some(_) => return Err(StorageError::NotFramedRecords),
+    };
     // No further than the file ended when the walk began. A reader of a log
     // that is being appended to — catch-up — read on until `read` came back
     // empty, and under load chased the writer's tail without ever finishing
     // (D-76: the Linux container, `replication_matrix` test 41).
-    let mut file = Read::by_ref(file).take(length.saturating_sub(header_len()));
+    let mut file = Read::by_ref(file).take(length.saturating_sub(begin));
 
     let mut buf: Vec<u8> = Vec::with_capacity(
         SCAN_WINDOW.saturating_add(limits.max_record_bytes.saturating_add(record::HEADER_BYTES)),
     );
     let mut start = 0usize;
-    let mut offset = header_len();
+    let mut offset = begin;
     let mut addressable_offset = offset;
     let mut records = 0u64;
     let mut exhausted = false;
@@ -523,18 +547,23 @@ fn scan(
             } => {
                 // Only records inside the durable prefix are handed over: the
                 // tail is not a record, it is whatever the crash left.
+                let end_at = offset.saturating_add(u64::try_from(total).unwrap_or(0));
+                if !go_on(end_at) {
+                    break;
+                }
                 records = records.saturating_add(1);
                 // `past == 0` is the last record the rewrite kept, not the
                 // first it appended: at or below `header.records` a record
                 // belongs to the filtered set and has no sequence.
                 let sequence = records
                     .checked_sub(header.records)
+                    .filter(|_| resume.is_none())
                     .filter(|past| *past > 0)
                     .map(|past| header.sequence.saturating_add(past));
                 if let (Some(payload), Some(framed)) = (rest.get(from..end), rest.get(..total)) {
                     visit(payload, framed, sequence);
                 }
-                offset = offset.saturating_add(u64::try_from(total).unwrap_or(0));
+                offset = end_at;
                 if records <= header.records {
                     addressable_offset = offset;
                 }
@@ -701,6 +730,8 @@ pub fn compact_on<D: Disk>(
         &mut file,
         &limits,
         length,
+        None,
+        &mut |_| true,
         &mut |_| true,
         &mut |payload, framed, sequence| {
             let size = u64::try_from(framed.len()).unwrap_or(u64::MAX);
@@ -867,7 +898,56 @@ fn replay_with<D: Disk>(
     if length == 0 {
         return Ok(Recovery::default());
     }
-    scan(&mut file, &limits, length, ready, visit)
+    scan(
+        &mut file,
+        &limits,
+        length,
+        None,
+        &mut |_| true,
+        ready,
+        visit,
+    )
+}
+
+/// The records of the log at `path` from `from` — its first record when
+/// `None`, otherwise an end offset this function handed `visit` before
+/// for a record of the same file — each with its end offset, until
+/// `visit` returns `false` (D-142 A). A resumed walk numbers nothing, so
+/// this hands over payloads only. Records from a filtered, compacted
+/// prefix are handed over like the rest.
+pub fn replay_while_on<D: Disk>(
+    disk: &D,
+    path: &Path,
+    limits: WalLimits,
+    from: Option<u64>,
+    visit: &mut impl FnMut(&[u8], u64) -> bool,
+) -> Result<(), StorageError> {
+    let mut file = match disk.open(path, Access::Read) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let length = file.size()?;
+    if length == 0 {
+        return Ok(());
+    }
+    // `go_on` sees each end offset before the record goes to `visit`;
+    // `visit`'s answer for one record stops the walk at the next.
+    let end = std::cell::Cell::new(0u64);
+    let more = std::cell::Cell::new(true);
+    scan(
+        &mut file,
+        &limits,
+        length,
+        from,
+        &mut |at| {
+            end.set(at);
+            more.get()
+        },
+        &mut |_| true,
+        &mut |payload, _, _| more.set(visit(payload, end.get())),
+    )?;
+    Ok(())
 }
 
 /// What a log says it has allocated, read from its header alone.

@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::disk::Disk;
-use crate::wal::{Committed, Retain, Wal, replay_on};
+use crate::wal::{Committed, Retain, Wal, replay_on, replay_while_on};
 use crate::{StorageError, WalLimits};
 
 const EXTENSION: &str = "seg";
@@ -272,6 +272,26 @@ impl<D: Disk + Clone> Segments<D> {
             visit,
         )?;
         Ok(())
+    }
+
+    /// The records of segment `key` from `from` — its first when `None`,
+    /// otherwise an end offset handed out by an earlier call for this
+    /// segment — each with its end offset, until `visit` returns `false`
+    /// (D-142 A). An offset stays valid while the segment is neither cut
+    /// (`truncate`) nor removed; a caller drops its offsets on either.
+    pub fn read_while(
+        &self,
+        key: u64,
+        from: Option<u64>,
+        visit: &mut impl FnMut(&[u8], u64) -> bool,
+    ) -> Result<(), StorageError> {
+        replay_while_on(
+            &self.disk,
+            &segment_path(&self.directory, key),
+            self.limits.wal,
+            from,
+            visit,
+        )
     }
 
     pub fn pin(&mut self, key: u64) -> Pin {

@@ -237,3 +237,64 @@ fn a_cut_survives_a_power_loss() {
         assert_eq!(numbers(&seen), (1..=9).collect::<Vec<_>>(), "torn {torn}");
     }
 }
+
+/// D-142 A: a read that stops early, and one resumed from an end offset an
+/// earlier read handed out, see exactly the records the whole walk sees;
+/// an offset outside the file is refused, and one at its end yields
+/// nothing.
+#[test]
+fn a_read_stopped_early_or_resumed_from_its_offset_matches_the_whole_walk() {
+    let disk = SimDisk::new();
+    let (mut log, _) = open(&disk);
+    let mut key = write(&mut log, 1, 1, 2, true);
+    // A large segment: everything below goes into the first.
+    let big = SegmentLimits {
+        wal: WalLimits::default(),
+        segment_bytes: 1 << 20,
+    };
+    drop(log);
+    let mut log = Segments::open(disk.clone(), &dir(), big, &mut |_, _| {}).unwrap();
+    key = write(&mut log, key, 6, 3, true);
+    let segment = log.keys().next().unwrap();
+
+    let mut whole: Vec<(u64, Vec<u8>)> = Vec::new();
+    log.read_while(segment, None, &mut |r, end| {
+        whole.push((end, r.to_vec()));
+        true
+    })
+    .unwrap();
+    assert_eq!(whole.len() as u64, key - 1);
+
+    for stop in 0..whole.len() {
+        // Stopped after `stop + 1` records: those, and nothing past them.
+        let mut first: Vec<(u64, Vec<u8>)> = Vec::new();
+        log.read_while(segment, None, &mut |r, end| {
+            first.push((end, r.to_vec()));
+            first.len() <= stop
+        })
+        .unwrap();
+        assert_eq!(first, whole[..=stop]);
+        // Resumed from the last one's end: the rest, as the whole walk had it.
+        let mut rest: Vec<(u64, Vec<u8>)> = Vec::new();
+        log.read_while(segment, Some(first[stop].0), &mut |r, end| {
+            rest.push((end, r.to_vec()));
+            true
+        })
+        .unwrap();
+        assert_eq!(rest, whole[stop + 1..]);
+    }
+
+    let end = whole.last().unwrap().0;
+    let mut none = 0;
+    log.read_while(segment, Some(end), &mut |_, _| {
+        none += 1;
+        true
+    })
+    .unwrap();
+    assert_eq!(none, 0);
+    assert!(
+        log.read_while(segment, Some(end + 1), &mut |_, _| true)
+            .is_err()
+    );
+    assert!(log.read_while(segment, Some(0), &mut |_, _| true).is_err());
+}
