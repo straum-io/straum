@@ -131,20 +131,19 @@ STRAUM_READ_BYTES
 ```
 <!-- stable-settings:end -->
 
-The journal's record kinds that are written, and their numbers
-(`journal`'s `the_stable_kinds_are_the_ones_decoded`):
+The journal's record kinds that are written and applied today, and their
+numbers (`journal`'s `the_stable_kinds_are_the_ones_decoded`, and
+`apply`'s `the_stable_kinds_are_written_and_applied_and_the_reserved_are_refused`,
+which fails if a stable kind is not written or a reserved one is applied):
 
 <!-- stable-kinds:begin -->
 ```text
 BatchHeader = 0
 Publish = 1
-Session = 2
 SessionGone = 3
 Subscribe = 4
 Unsubscribe = 5
 Ack = 6
-Connect = 7
-Disconnect = 8
 NodeReset = 9
 SlotStart = 24
 SlotEnd = 25
@@ -152,11 +151,16 @@ SlotEnd = 25
 <!-- stable-kinds:end -->
 
 Reserved kinds (unified-stream §2.7): their numbers are held — no other
-kind will take them — but nothing writes them yet, and their names and
-meaning stay free until 7c or phase 6 builds them. Not stable.
+kind will take them — but nothing writes them yet, `apply` refuses each,
+and their names and meaning stay free until 7c or phase 6 builds them. Not
+stable. `Session`, `Connect` and `Disconnect` were listed as stable by
+mistake until D-145 A moved them here.
 
 <!-- reserved-kinds:begin -->
 ```text
+Session = 2
+Connect = 7
+Disconnect = 8
 SessionExpired = 16
 MessageExpired = 17
 WillPublished = 18

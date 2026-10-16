@@ -1910,6 +1910,215 @@ event, monotonic time, nothing read back into a decision.
     §3's mmap or a separate reader — must take a pin, and an offset it
     holds across a truncation or compaction is only safe because a stale
     one fails to a scan; a segment removed under such a reader is not.
+- **Step 7c design (D-144 A, 2026-10-16) — for agreement; implementation
+  not authorised until D-146.** The direction D-144 A accepted, and the four
+  definitions it asked for before any code. Revised after the guardian
+  review: the first fence did not survive an entry's removal, and
+  re-proposing a stale `Connect` brought back the late takeover.
+  - *State in `apply`:*
+    - Per client id: `clients: BTreeMap<ClientId, Client>`, `Client
+      { attached: Option<Origin>, connected_at: u64, session:
+      Option<Persisted> }`. `connected_at` is the lsn of the last `Connect`
+      applied for that client id. An entry exists while a connection is
+      attached or a persisted session exists.
+    - `origins: BTreeMap<Origin, ClientId>`, the attached origins. Bounded
+      by live connections.
+    - Clean-session state stays keyed by `Origin`.
+    - The fence: tombstones and a floor, below.
+  - *Records:* `Connect {origin, client_id, seen, clean_start, persist}` and
+    `Disconnect {origin}`. `seen` is the proposing gateway's applied lsn
+    when it proposed. The gateway answers CONNECT only from the effect of
+    applying the committed `Connect`.
+  - **(2) First, the order — which `Connect` wins.**
+    - For a client id, a `Connect` committed at lsn `L` applies only if its
+      proposer had applied every earlier change to that client id:
+      - `L - seen <= W`: proposed within the last `W` positions; `W` is an
+        `apply::Limits` field like `max_connect_tombstones`: part of the
+        replicated decision, the same on every node, in the configuration
+        digest, and listed in `docs/configuration.md` when built;
+      - `seen >=` the lsn of the last change to that client id — its
+        `connected_at` if an entry exists, otherwise its tombstone's
+        removal lsn, otherwise the global floor.
+    - Any other `Connect` is refused as stale (`Refused {to, Stale}`) and
+      changes nothing. The gateway answers that CONNECT at once with
+      CONNACK 0x88 Server unavailable (v5) or 0x03 (3.1.1). There is no
+      re-proposal: an old CONNECT packet is never re-armed, and the client
+      decides whether to reconnect.
+    - So the winner is the last `Connect` to commit among those proposed
+      by a gateway that had seen everything before it. A `Connect` proposed
+      before a newer one committed never wins.
+    - *Tombstones and the floor:*
+      - when an entry is removed, a tombstone `(client_id, lsn)` goes into
+        a queue of at most `max_connect_tombstones` (a new
+        `apply::Limits` field);
+      - tombstones older than `W` positions are pruned, since a `Connect`
+        that could need them is refused by the `W` rule anyway;
+      - when the queue is full, the oldest is pruned and the global floor
+        rises to its lsn.
+
+      So a client id with no entry and no tombstone is checked against the
+      floor: no `Connect` older than any removal it could have missed
+      passes.
+    - *Memory:* `max_connect_tombstones` × (a client id of at most 256 bytes
+      + an lsn), and one u64. Bounded under any input.
+    - *Cost:* a legitimate reconnect through a gateway that has not yet
+      applied that client id's last change, or proposed more than `W`
+      positions before it commits, is refused once; the client reconnects.
+      Under a removal rate the queue cannot hold for `W` positions, the
+      floor refuses more connects that way. That is visible (a counter),
+      never unsafe. `W` and `max_connect_tombstones` are sized from a
+      measurement in stage 2 (D-146).
+    - **Invariant B (checked in the simulation after every record):** a
+      `Connect` changes a client id's state only if no *fence event* for that
+      client id committed after its `seen` — a fence event being exactly what
+      the rule checks: an applied `Connect`, or the removal of the entry
+      (clean disconnect, overflow deletion, `SessionGone`, `NodeReset`), or a
+      rise of the floor. A detachment that keeps a persisted session, and
+      deliveries to its backlog, are not fence events. The rule and the
+      simulation check use this one definition. It never replaces a newer attachment,
+      never clears newer session state, and never recreates a removed one
+      it had not seen removed.
+  - **(1) Atomicity of `Connect` and `Disconnect`.**
+    - Each record is one state transition in `apply`, all or nothing: a
+      deterministic function of the record and the state before it, the
+      same at the same lsn on every node. A record that does not decode
+      stops the node, as now.
+    - One origin's records reach the log in the order they were proposed,
+      at most once; an earlier one that does not commit is given up, never
+      reordered (`cluster::outbox`, D-109 B, D-117 B).
+    - The rules:
+      - `Connect(O)`, if it passes (2): it attaches `O`. An origin attached
+        before it is detached and told `Close {SessionTakenOver}`.
+      - `Disconnect(O)` acts only if `O` is attached: it detaches `O`.
+        Otherwise it changes nothing, and is counted.
+      - `SessionGone(O)` and `NodeReset` detach likewise, and drop clean
+        state as now.
+    - **A `Disconnect` racing a `Connect` not yet complete.**
+      - Same origin: the gateway proposes `Disconnect(O)` only after
+        `Connect(O)`, so the log has them in that order. Both commit:
+        attached, then detached. `Connect` given up or refused: the
+        `Disconnect` finds `O` not attached and changes nothing.
+      - Different origins (`Disconnect(O1)` and `Connect(O2)`): log order
+        decides, and either order ends with `O2` attached if its `Connect`
+        passes (2).
+    - A gateway keeps a `Disconnect` for a closed connection in its outbox
+      until it applies the detachment, or sees `O` not attached. One per
+      closed connection: bounded by the outbox.
+    - **Records from an origin that is not attached** — `Publish`,
+      `Subscribe`, `Unsubscribe`, `Ack` from a connection taken over or
+      never attached — are refused by `apply`: no route, no subscription,
+      no acknowledgement. `Refused {to, request}` makes its gateway close
+      the connection. A taken-over client served for a while by a lagging
+      gateway gets nothing committed in its name. Every connection is
+      attached once its `Connect` applies, since every CONNECT goes
+      through the log after 7c.
+    - **Invariant A (checked in the simulation after every record):** for
+      every client id, `attached` is the origin of the last applied
+      `Connect` for it that passed (2). That holds unless, after it, that
+      origin was detached — by its `Disconnect`, `SessionGone` or
+      `NodeReset` — or its session was deleted (overflow under (3)). At most
+      one origin is attached per client id, and `origins` is its exact
+      inverse.
+  - **(3) Overflow of the disconnected budget.**
+    - The budget: `max_detached_queued_bytes`, inside
+      `max_total_queued_bytes`. It counts the inflight and backlog bytes of
+      sessions with no attachment.
+    - **Attaching never overflows:** the detached budget is part of the
+      total, so moving a session's bytes from detached to attached leaves
+      the total unchanged and no bound is crossed. A resumption is always
+      CONNACK `session_present = 1`. Detaching moves bytes the other way.
+      If the detached budget has no room, the session is deleted as below,
+      at once, by the record that detached it.
+    - **At-most-once delivery** to a detached session with no room in its
+      per-session backlog or in the detached budget: that message alone is
+      dropped and counted (`Load::dropped`, as now). The session stays.
+    - **At-least-once delivery** with no room, or a detachment the budget
+      cannot take: the session is deleted whole.
+      - Its subscriptions go, and the global count drops by them.
+      - Its inflight (sent, unacknowledged) and its backlog — every waiting
+        message, at most once and at least once — are discarded, and their
+        bytes leave the budgets.
+      - The client id's entry goes and leaves a tombstone, so (2) still
+        fences it, and it no longer counts against
+        `max_persisted_sessions`.
+      - Counted as `sessions_dropped`.
+
+      An attached persistent session that overflows is closed and deleted
+      the same way, which is today's rule for any session.
+    - **The next CONNACK**, for a `Connect` with `persist` that passes (2):
+      - an entry exists: it resumes, `session_present = 1`. A resumption is
+        never refused for the limit.
+      - no entry, under the limit: a new, empty session,
+        `session_present = 0`;
+      - no entry, at the limit: refused, nothing created — v5 0x97 Quota
+        exceeded; 3.1.1 0x03 Server unavailable.
+
+      A `Connect` that fails (2) is refused as stale, 0x88 / 0x03, before
+      any of these. "Accepted with `session_present = 0`" means no session
+      was kept: never created, or deleted. MQTT has no code to say which,
+      and none is invented; the counter shows deletions to the operator.
+    - The 3.1.1 code checked: `codec` maps every refusal outside 3.1.1's
+      five codes to 0x03 (`ReasonCode::connack_v311`). The spec's meaning,
+      "the MQTT service is unavailable", tells a client to retry later
+      without implying anything about its credentials or client id. That
+      fits a refusal at a capacity limit or a stale refusal, and is the
+      code 3.1.1 has for it.
+  - **(4) Write and recovery failure — what guarantees "everywhere or
+    nowhere".** Not the record format; the commit rule and the takeover
+    rule:
+    - *Applied only when committed.* A node applies records only up to the
+      commit point it knows (the node loop: `while applied < commit`). The
+      commit point moves only when a majority of voters holds the record
+      durably within the sequencer's own slot (`Sequencer::advance_commit`;
+      `commit_needs_a_majority_durable_and_only_grows`). A replica knows
+      it only as far as its own log goes
+      (`a_replica_knows_the_commit_only_as_far_as_its_own_log`).
+    - *Committed survives.* A new sequencer builds on the longest log of a
+      majority that promised, and that majority meets the one that
+      committed (`a_candidate_catches_up_from_the_longest_log_of_a_majority`,
+      `a_takeover_during_a_catch_up_builds_on_no_stale_prefix_and_keeps_the_fence`).
+      A replica cuts its log only where the slots prove it differs, never
+      below the commit point it knows
+      (`a_follower_cuts_only_where_the_slots_prove_the_logs_differ`). The
+      cluster simulation checks invariant 1 — a committed record is
+      durable on a majority and never cut — after every event, through
+      crashes, power losses with torn writes, partitions and compaction.
+    - *Uncommitted may vanish, unobserved.* A `Connect` that never commits
+      may be cut from a log. No node applied it, and no CONNACK came from
+      it.
+    - *Partial write.* A torn batch at a log's tail is cut on recovery. A
+      failed write stops the node (`Event::Failed`). Its `NodeReset` on
+      restart detaches every origin it had.
+    - *Restart.* Persisted sessions, tombstones and the floor are part of
+      the replicated state and of every snapshot (the snapshot format's
+      version goes up). A restarted node rebuilds them from its snapshot
+      and log, and its state digest must equal the others'.
+    - So: a `Connect` is in the committed log of every node, at one lsn,
+      with the same effect — or in none, and nobody acted on it.
+    - The limits of that claim:
+      - It holds in the model the simulation tests: crash-stop, lost and
+        reordered messages, torn writes, partitions, at most a minority
+        lost for good. It is not a formal proof, and a majority losing its
+        disks at once is outside the model.
+      - A replica compacted past `retain_bytes` (D-57 A) cannot rebuild the
+        state from its log until 7b's state copy exists. It is lost, as
+        today, and persisted sessions don't change that.
+  - *Tests required with the implementation:* invariants A and B in the
+    gateway and cluster simulations. Scenarios:
+    - two `Connect`s racing for one client id through two gateways;
+    - a late `Connect` after a slot change (D-109 B's held proposals);
+    - a late `Connect` after the entry was removed (clean disconnect, and
+      overflow);
+    - tombstone-queue overflow raising the floor;
+    - `Disconnect` racing `Connect`;
+    - records from a taken-over origin;
+    - restart while detached;
+    - the limit, refusing and then resuming;
+    - detached overflow deleting a session, and the next CONNACK.
+
+    Plus `apply` rules one per test, the snapshot round-trip, and the
+    stable-contract update with straum-cli (`Connect` and `Disconnect`
+    leave the reserved block).
 - **D-143 B (2026-10-16; in-process, container, preliminary):** catch-up
   with every node's log evicted from the page cache before the restart
   (`cap`'s `STRAUM_BENCH_COLD=1`: `sync`, then `dd iflag=nocache count=0`
