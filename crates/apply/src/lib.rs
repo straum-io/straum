@@ -10,7 +10,7 @@
 //! [`Proposal`]s and [`Effect`]s back into packets.
 //!
 //! Every bound is decided here, from the log, so that every node refuses the
-//! same thing at the same lsn (CLAUDE.md §7, §8): subscriptions per session
+//! same thing at the same lsn: subscriptions per session
 //! and in total, retained messages in count and bytes, inflight per session,
 //! and the backlog behind it per session and in total. A bound that one
 //! gateway checked alone would not bound the shared state.
@@ -169,7 +169,7 @@ pub enum Effect {
     },
     /// A slow consumer: its backlog was full when an at-least-once message
     /// arrived for it. Its state is already gone; the gateway closes the
-    /// connection (CLAUDE.md §8).
+    /// connection.
     Close {
         to: Origin,
         lsn: u64,
@@ -509,7 +509,7 @@ pub struct Limits {
     pub max_backlog_bytes: usize,
     /// All sessions' inflight and backlog payload bytes together: a
     /// per-session bound times the session count is a product, not a
-    /// bound (CLAUDE.md §7).
+    /// bound.
     pub max_total_queued_bytes: usize,
 }
 
@@ -748,7 +748,7 @@ impl State {
         }
         let bytes = self.retained_bytes.saturating_add(message.size());
         // Beyond a bound the message is still delivered, only not kept
-        // (the old path's rule, CLAUDE.md §6).
+        // (the old path's rule).
         if self.retained.len() >= self.limits.max_retained || bytes > self.limits.max_retained_bytes
         {
             return;
@@ -791,7 +791,7 @@ impl State {
         }
         for (origin, guarantee, retain) in matched {
             // Refcounts, not copies: fan-out shares one payload and one
-            // properties section (CLAUDE.md §7).
+            // properties section.
             let message = Message {
                 retain,
                 ..published.clone()
@@ -805,9 +805,9 @@ impl State {
     /// inflight window and the global queued budget have room; otherwise,
     /// and whenever anything already waits, it joins the backlog behind it:
     /// an at-most-once message must not overtake an earlier one that waits
-    /// (CLAUDE.md §7, ordering — found by the gateway simulation). A backlog
+    /// (ordering — found by the gateway simulation). A backlog
     /// without room drops an at-most-once message and closes the session
-    /// for an at-least-once one (CLAUDE.md §8).
+    /// for an at-least-once one.
     fn deliver(
         &mut self,
         origin: Origin,

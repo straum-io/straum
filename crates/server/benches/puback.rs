@@ -15,8 +15,8 @@
 //! (p50, p99), and the three servers' CPU time per 1 000 PUBACKs — the
 //! work the path costs, which a VM's scheduling disturbs far less than it
 //! does wall-clock time (CPU time is read from `/proc` where there is one,
-//! from `ps` otherwise). Accepted numbers come from a quiet Linux host
-//! (CLAUDE.md §11); anything else is preliminary.
+//! from `ps` otherwise). Accepted numbers come from a quiet Linux host;
+//! anything else is preliminary.
 //!
 //! `cargo bench -p server --bench puback`; `STRAUM_BENCH_SERVER=<path>`
 //! measures another build's `straum-server` with this client. Refuses an

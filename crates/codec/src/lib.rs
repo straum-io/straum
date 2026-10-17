@@ -45,7 +45,7 @@ pub enum Sender {
 }
 
 /// Limits on what a peer may make the decoder hold. Every one bounds a
-/// remote-controlled length or count before it is allocated (CLAUDE.md §8).
+/// remote-controlled length or count before it is allocated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Whole packet, fixed header included.
@@ -57,7 +57,7 @@ pub struct Limits {
     /// User Properties in one property section.
     pub max_user_properties: usize,
     /// Payloads up to this size are copied at ingress instead of sliced out
-    /// of the read buffer (CLAUDE.md §9).
+    /// of the read buffer.
     pub payload_copy_threshold_bytes: usize,
 }
 

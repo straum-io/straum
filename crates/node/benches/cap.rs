@@ -15,7 +15,7 @@
 //!
 //! The target (D-84 A): at least 9 failovers in 10 commit within 1 s; the
 //! cap chosen is the one with the highest throughput that meets it. Only a
-//! quiet Linux host gives numbers for that choice (CLAUDE.md §11); anything
+//! quiet Linux host gives numbers for that choice; anything
 //! from macOS or a container is preliminary.
 //!
 //! `cargo bench -p node --bench cap`; `STRAUM_BENCH_CAPS=64,4096` narrows

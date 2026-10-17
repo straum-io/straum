@@ -1,6 +1,6 @@
 //! One accepted connection, split into halves that move bytes.
 //!
-//! `TcpStream` does not leave this crate (CLAUDE.md §3): callers get a reader
+//! `TcpStream` does not leave this crate: callers get a reader
 //! that fills a budgeted buffer and a writer that takes byte slices. Whether
 //! there is TLS underneath is this module's business and nobody else's.
 
@@ -97,7 +97,7 @@ pub struct Connection {
 }
 
 /// Plain or encrypted; two real implementations, so an enum rather than a
-/// trait object (CLAUDE.md §14).
+/// trait object.
 enum Half {
     Plain(OwnedReadHalf),
     Tls(ReadHalf<TlsStream<TcpStream>>),
@@ -216,8 +216,7 @@ impl Writer {
 /// TLS is a separate decision with its own key material.
 ///
 /// The read budget is the same global one the listener uses, so bytes read
-/// from a peer count against the same ceiling as bytes read from a client
-/// (CLAUDE.md §7).
+/// from a peer count against the same ceiling as bytes read from a client.
 pub async fn connect(
     peer: SocketAddr,
     read_buffer_bytes: usize,

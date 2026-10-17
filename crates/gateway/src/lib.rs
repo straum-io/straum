@@ -12,7 +12,7 @@
 //! [`Gateway::take_actions`]. Time is a monotonic `Duration` the driver
 //! passes in: nothing here reads a clock.
 //!
-//! Bounded (CLAUDE.md §7, §8):
+//! Bounded:
 //!
 //! * connections, and lifecycle proposals awaiting their effect — at either
 //!   bound new connections are refused;
@@ -80,14 +80,13 @@ pub struct Config {
     /// Deliveries of one connection held behind a QoS 1 delivery that waits
     /// for the client's receive maximum, in messages and payload bytes, and
     /// all connections' together. QoS 1 is bounded by `apply`'s inflight
-    /// window; beyond these an at-most-once delivery is dropped
-    /// (CLAUDE.md §8).
+    /// window; beyond these an at-most-once delivery is dropped.
     pub max_waiting: usize,
     pub max_waiting_bytes: usize,
     pub max_total_waiting_bytes: usize,
     /// Lifecycle proposals awaiting their effect. At the bound new
     /// connections are refused: while commits stall, every closed session
-    /// would otherwise add one more (CLAUDE.md §8).
+    /// would otherwise add one more.
     pub max_retries: usize,
 }
 
@@ -102,8 +101,7 @@ pub enum Action {
         conn: ConnId,
     },
     /// Forward to the sequencer, over a link that keeps order: one session's
-    /// publishes must reach the log in the order they were sent (CLAUDE.md
-    /// §7). A broken link may lose its tail; it may not reorder (found by
+    /// publishes must reach the log in the order they were sent. A broken link may lose its tail; it may not reorder (found by
     /// the simulation).
     Propose(Proposal),
 }
@@ -279,7 +277,7 @@ fn room(config: &Config, total_pending_bytes: usize, open: &Open) -> bool {
 fn guarantee(qos: Qos) -> DeliveryGuarantee {
     match qos {
         Qos::AtMostOnce => DeliveryGuarantee::AtMostOnce,
-        // QoS 2 subscriptions are granted QoS 1 (CLAUDE.md §6).
+        // QoS 2 subscriptions are granted QoS 1.
         Qos::AtLeastOnce | Qos::ExactlyOnce => DeliveryGuarantee::AtLeastOnce,
     }
 }

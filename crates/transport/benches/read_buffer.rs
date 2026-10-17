@@ -87,7 +87,7 @@ fn burst_then_small(bencher: divan::Bencher, reclaim: bool) {
 /// `reclaim` settles the charge against the budget, and the budget is one
 /// counter shared by every connection in the process. When nothing changed
 /// there is nothing to settle, so what this measures is whether the common
-/// case still touches that counter (CONSTITUTION.md §27: fewer
+/// case still touches that counter (fewer
 /// synchronization points).
 #[divan::bench(args = [1, 64])]
 fn flush_at_steady_size(bencher: divan::Bencher, flushes: usize) {

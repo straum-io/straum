@@ -1,5 +1,5 @@
-//! Socket settings the broker applies. Kernel parameters are the operator's
-//! (CLAUDE.md §13); these are the `STRAUM_*` values parsed in `server`.
+//! Socket settings the broker applies. Kernel parameters are the operator's;
+//! these are the `STRAUM_*` values parsed in `server`.
 
 use std::net::SocketAddr;
 use std::time::Duration;

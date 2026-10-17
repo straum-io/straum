@@ -1,5 +1,5 @@
 //! Kernel parameters the broker reads, never writes, and the socket options
-//! only some platforms have (CLAUDE.md §13).
+//! only some platforms have.
 //!
 //! Only the file reads are OS-gated. Parsing and the decisions made from it
 //! are portable functions, tested with fixture strings on every platform.

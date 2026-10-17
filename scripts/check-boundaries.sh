@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # Fail if a crate depends, directly or transitively, on something its layer
-# forbids. Dev-dependencies are not checked. Source of truth: CLAUDE.md §2.
+# forbids. Dev-dependencies are not checked.
 # One path since step 8 (D-111): the old broker's crates are gone.
 set -eu
 

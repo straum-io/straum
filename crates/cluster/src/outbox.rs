@@ -11,7 +11,7 @@
 //! forward only into the slot it was sent for (`Message::Forward`), and
 //! that one link delivers in order, losing at most whole forwards.
 //! Sends go strictly in order, and none while an earlier entry waits for its slot to be decided: one session's
-//! proposals reach the log in the order they were made (CLAUDE.md §7).
+//! proposals reach the log in the order they were made.
 
 use std::collections::VecDeque;
 
