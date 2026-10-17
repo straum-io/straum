@@ -3,7 +3,7 @@
 > **History.** This document describes the old leader/follower broker, removed at step 8 on 2026-10-11 (D-111): the crates `broker`, `protocol`, `mqtt`, `replication`, `runtime` and `e2e` are gone, and its code is in git history (commit ffeda02 and earlier). What runs now is the cluster path of ADR-0008, documented in the ADR, `docs/configuration.md` and `docs/testing.md`. Kept as a record of what was built, measured and decided.
 
 An audit of what one established connection allocates, who owns it, and
-whether the declared budget bounds it. Per `CONSTITUTION.md` §29 this is a
+whether the declared budget bounds it. Per `engineering-rules.md` §29 this is a
 correctness question about the stated model, not performance tuning, and
 nothing here is optimized.
 
@@ -309,7 +309,7 @@ A publisher parked on a permit watches no shutdown signal, so shutdown
 closes the permits first, before anything waits: the parked publisher ends
 at once instead of when `STRAUM_SHUTDOWN_GRACE_MS` runs out, and its
 publish, which never reached the log, is sent again by the client as after
-any shutdown (D-10, CLAUDE.md §16). Row 30 checks shutdown under the
+any shutdown (D-10, rules.md §16). Row 30 checks shutdown under the
 default five-second grace finishes in under a second; without the close it
 took 5.003 s.
 

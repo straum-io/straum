@@ -34,7 +34,7 @@ ungraceful handoff; MQTT 5 from the start; sans-IO cores driven by a
 runtime; correctness by deterministic simulation, performance by
 measurement on Linux.
 
-The document takes precedence over CLAUDE.md, which takes precedence over
+The document takes precedence over rules.md, which takes precedence over
 ADRs, which take precedence over everything else.
 
 Separate records cover the decisions this one rests on:

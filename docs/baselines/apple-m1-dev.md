@@ -1,7 +1,7 @@
 # apple-m1-dev
 
 A development Mac, not a benchmark host. Everything here shows **direction
-only** (CLAUDE.md §11, docs/benchmarks.md §6): Apple Silicon moves threads
+only** (rules.md §11, docs/benchmarks.md §6): Apple Silicon moves threads
 between performance and efficiency cores with no portable pinning, so these
 numbers justify no decision on their own. They exist so a later regression
 has something to be compared against other than memory.
@@ -98,7 +98,7 @@ baseline   556065  799479  707895  666644  669577   median 669577
 **No conclusion drawn.** The medians differ by 7%, the candidate spread is
 20% and the baseline spread 44%, and an earlier three-round pass on the same
 machine put the same change 10% the other way. The variance is larger than
-the effect in both directions, which under CLAUDE.md §11 means the
+the effect in both directions, which under rules.md §11 means the
 environment, not the change, is what was measured. Expected, given the fast
 path is a compare-and-store where it used to be a `max` and the out-of-order
 set never allocates while submission order holds.
@@ -164,7 +164,7 @@ orders of magnitude, which nothing here shows.
 buffers only, so its 1 GiB default stops new connections at 65 536 while the
 process is holding about 3.5 GB. The global budget exists precisely because
 per-connection limits times the connection count are a product and not a
-bound (CLAUDE.md §7); it is bounding the wrong product by a factor of three.
+bound (rules.md §7); it is bounding the wrong product by a factor of three.
 
 ### Why 50 000 and 100 000 are absent
 
@@ -233,7 +233,7 @@ the whole difference from the previous entry, where it covered 30% and
 claimed to be the bound.
 
 The remaining ~26 kB is still unattributed: packet-id tables, session state,
-two task futures, channel metadata and allocator rounding. `CONSTITUTION.md`
+two task futures, channel metadata and allocator rounding. `engineering-rules.md`
 §29 forbids calling those bounded by a budget that does not manage them, so
 they are named as outside it in `docs/memory.md` rather than folded in.
 
@@ -344,7 +344,7 @@ connection and 12 000 msg/s with ~50 messages a flush, this is 240 flushes
 a second and half a microsecond an hour; it is invisible and will stay
 invisible. What justifies it is not a throughput number:
 
-* it removes work that provably does nothing (CLAUDE.md §11, first
+* it removes work that provably does nothing (rules.md §11, first
   priority), and
 * the cost it removes scales with the connection count rather than with
   throughput, which is the shape the eight-thread rows show and the shape
@@ -396,7 +396,7 @@ the other changes, not admission.
   backpressure (the D-6 B requirement).
 
 Environment: Apple M1, 8 cores, macOS 26.6.2, rustc 1.97.1. Direction
-only: CLAUDE.md §11 puts the noise floor here at 10%.
+only: rules.md §11 puts the noise floor here at 10%.
 
 ### Results, medians of 5
 
@@ -479,7 +479,7 @@ was durable before its publish arrived.
   follower's sync on the same disk and the round trip: ~5 400 msg/s at
   64 B, p50 17 ms.
 - Not measured here, and needed before any of these numbers is accepted: the
-  same matrix on a quiet Linux host (CLAUDE.md §11).
+  same matrix on a quiet Linux host (rules.md §11).
 
 ### Fan-out: 1 publisher, 10 subscribers
 
@@ -506,7 +506,7 @@ loss: under eight busy loops on the cores the same point drops in every run,
 and a diagnostic build printing the broker's `dropped_messages` matched the
 shortfall exactly every time (21 931 and 21 931, 13 337 and 13 337, ...).
 A subscriber starved of CPU falls behind, its queue fills, and QoS 0 is
-dropped — the overflow policy of CLAUDE.md §8. It is also invisible to an
+dropped — the overflow policy of rules.md §8. It is also invisible to an
 operator today: the runtime does not export `dropped_messages` (card D-14).
 
 The quiet run itself is attributed by that reproduction, not by its own
@@ -621,7 +621,7 @@ the default `STRAUM_WAL_RETAIN_BYTES`; `retain-zero` is the same run with
 `STRAUM_WAL_RETAIN_BYTES=0`, so a rewrite copies the live set only.
 
 **One round, run one after the other rather than alternated, on this
-machine.** It shows direction and nothing more (CLAUDE.md §11); the
+machine.** It shows direction and nothing more (rules.md §11); the
 accepted numbers come from the Linux run (D-13, D-17).
 
 ```text
@@ -737,7 +737,7 @@ copy per at-least-once session in `apply`.
 
 `scripts/linux.sh bench -p codec -p apply -p gateway` (rust:1.85-bookworm in
 the container VM on this Mac, 8 vCPU). It is Linux, but not a quiet Linux host:
-CLAUDE.md §11 accepts no decision on these times. Allocation bytes match
+rules.md §11 accepts no decision on these times. Allocation bytes match
 the macOS run except the 3.1.1 encode (8 B here, 16 B there), the 5 encode
 (16 B, 8–16 B there) and the gateway's 1 KiB publish in (1.551 KB, 1.48 KB
 there); why is not investigated. Medians of divan's 100 samples:
@@ -758,7 +758,7 @@ there); why is not investigated. Medians of divan's 100 samples:
 ## `node/benches/cap.rs` — `max_uncommitted` against throughput and failover (D-84 A), preliminary
 
 2026-10-09, Linux container (`scripts/linux.sh`, podman on Apple M1), so
-**preliminary**: a VM's time and network (CLAUDE.md §11). Not a basis
+**preliminary**: a VM's time and network (rules.md §11). Not a basis
 for the default; D-84 A needs a quiet Linux host. Three nodes on
 loopback, 64 B publishes, a closed loop of 512 in flight, 2 s × 3 rounds
 (median); 10 failovers per cap: the sequencer is stopped while the load
@@ -808,7 +808,7 @@ warm-up, 10 s measured.
 | publish→PUBACK p99 | 1.945 ms | 1.985 ms | +2.1 % |
 | server CPU per 1 000 PUBACKs | 20.43 ms | 20.63 ms | +1.0 % |
 
-Every difference is inside this machine's 10 % noise floor (CLAUDE.md
+Every difference is inside this machine's 10 % noise floor (rules.md
 §11): a result, not proof of zero overhead. Read by D-129 A's rule
 (`scripts/noise.awk`), the run could not have detected a 3 % effect at all:
 each copy's spread between rounds was 2–29 % per quantity, and failover
@@ -1202,7 +1202,7 @@ Commits a second during catch-up (`commit_samples` over the 20 s): base 6 000–
 
 ## D-142 A to protocol, base against both — preliminary (2026-10-16)
 
-CLAUDE.md §11 run: `base` (commit 0c5f007, D-139's path) against `both` (D-142 A as merged), five rounds with the order alternated, each round: `STRAUM_BENCH_MODE=catchup STRAUM_BENCH_WINDOWS=256,1024,4096` at 50 ms with paired controls, then cap's failover mode (`STRAUM_BENCH_CAPS=64 STRAUM_BENCH_FAILOVERS=10`). Linux container, 19:25–20:08; the macOS power log shows no sleep in that window (an earlier attempt that straddled sleeps was discarded). `t=` is when each bench invocation started.
+rules.md §11 run: `base` (commit 0c5f007, D-139's path) against `both` (D-142 A as merged), five rounds with the order alternated, each round: `STRAUM_BENCH_MODE=catchup STRAUM_BENCH_WINDOWS=256,1024,4096` at 50 ms with paired controls, then cap's failover mode (`STRAUM_BENCH_CAPS=64 STRAUM_BENCH_FAILOVERS=10`). Linux container, 19:25–20:08; the macOS power log shows no sleep in that window (an earlier attempt that straddled sleeps was discarded). `t=` is when each bench invocation started.
 
 ```text
 t=1792167931 variant=base round=1 catchup window=256 heartbeat_ms=50 lag_first=618150 lag_rate_under_load=-1465 lag_at_stop=590265 recovery_rate=5191 positions_per_tick=220 still_tick_share=0.015 bytes_in_flight_mean=4528 bytes_in_flight_max=271722 positions_in_flight_mean=35 commit_samples=155587 commit_p50_ms=1.301 commit_p99_ms=172.644 commit_p999_ms=194.253 commit_max_ms=203.789

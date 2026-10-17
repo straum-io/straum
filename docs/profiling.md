@@ -13,7 +13,7 @@ Why is the generated code slow?      assembly, LLVM IR
 ```
 
 Do not add speculative optimizations before a profile identifies the bottleneck
-(CLAUDE.md §11).
+(rules.md §11).
 
 ## Tools by platform
 
@@ -71,7 +71,7 @@ Prefer changes that let the compiler generate better code (restructured loops,
 slices with proven lengths, `#[inline]` where measured) over hand-written
 assembly or unsafe. Do not remove a bounds check with `get_unchecked` because it
 appears in the listing; the decoder's lint set exists to keep those checks
-(CLAUDE.md §3). Removing one requires the unsafe procedure in §14.
+(rules.md §3). Removing one requires the unsafe procedure in §14.
 
 ## Interpreting a profile
 

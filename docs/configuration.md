@@ -213,7 +213,7 @@ so a batch of the largest packets fits one link frame.
 | `max_topic_levels` | `32` | |
 | `max_client_id_bytes` | `256` | 3.1.1 requires accepting 1–23 bytes; more is allowed. |
 | `max_filters_per_subscribe` | `64` | Per SUBSCRIBE/UNSUBSCRIBE packet. |
-| `payload_copy_threshold_bytes` | `512` | Payloads up to this size are copied at ingress instead of sliced (CLAUDE.md §9). |
+| `payload_copy_threshold_bytes` | `512` | Payloads up to this size are copied at ingress instead of sliced (rules.md §9). |
 | `max_user_properties` | `32` | User Properties in one MQTT 5 property section; more is refused before the next is kept (Implementation specific error, 0x83). |
 
 ### `apply` and `gateway` (ADR-0008 step 3b-2)

@@ -82,7 +82,7 @@ touch; the old path keeps working until a step replaces it (D-49).
    contract, in `sim` without MQTT; 3b-2 the sans-IO gateway over `codec`:
    proposals, PUBACK on commit, delivery after commit, and a bound on
    proposals awaiting commit per publisher and in total, in messages and in
-   bytes (CLAUDE.md §7, §8; step 2 bounds the sequencer's queue by count
+   bytes (rules.md §7, §8; step 2 bounds the sequencer's queue by count
    only, which is enough while no remote input reaches it);
    `sim`: invariant 4. Invariant 7 at this step means one gateway: at most one
    live session per client id within it; across gateways it waits for step 7.
@@ -327,7 +327,7 @@ beside `broker`:
 Not yet: sessions and inflight at-least-once state (step 7) — a subscription
 belongs to an `Origin` and lives until unsubscribed; the state is unbounded —
 subscriptions per origin, retained messages — and nothing closes an
-origin, so a closed session's subscriptions stay (CLAUDE.md §7, §8) until
+origin, so a closed session's subscriptions stay (rules.md §7, §8) until
 3b-2 brings session close and the bounds (D-63); a routing index (every
 subscription is tried per publish, marked in the code); the log in this
 simulation is never compacted, since rebuilding state after compaction
@@ -380,7 +380,7 @@ Found by these simulations and fixed:
 
 - **Ordering in `apply`**: an at-most-once delivery overtook an earlier
   at-least-once one waiting in the backlog. Now nothing overtakes what
-  waits (CLAUDE.md §7).
+  waits (rules.md §7).
 - **Resend storms in `cluster`**: under a slow network every heartbeat
   resent a window to replicas that were only slow. A resend now needs a
   whole period without progress, and each resend without progress doubles
@@ -447,7 +447,7 @@ comes from an incarnation counter made durable before use. Recovery
 verifies the chain record by record as it reads, holding one record at a
 time. Baselines of `codec`, `apply` and `gateway` are in
 `docs/baselines/apple-m1-dev.md`, on macOS and in the Linux container, both
-preliminary (CLAUDE.md §11: no quiet Linux host). Evidence: `crates/node/tests/cluster.rs`, five tests
+preliminary (rules.md §11: no quiet Linux host). Evidence: `crates/node/tests/cluster.rs`, five tests
 over real sockets and files, stable over eight runs; removing the hand-off
 of applied effects to the gateway fails the MQTT test. The MQTT test
 checks every PUBACK against the node's applied acceptances: the node
@@ -1518,7 +1518,7 @@ is the link redial backoff (up to 1 s) outlasting the takeover window
 **D-113 A (2026-10-12): D-108 closes as not reproduced.** 100 container
 runs of the node and server tests on the current tree, and 100 runs of the
 server test at a6986ea (before D-109) beside them, every run's output kept
-(in `/private/tmp/claude-501/-Users-stan-Projects-straum/d3e8fb69-0454-4e47-a8c2-0ac86e2dda88/scratchpad/d113/{current,base}/run-*.log`, temporary, not in the repository), nothing retried:
+(in `<tmp>/d113/{current,base}/run-*.log`, temporary, not in the repository), nothing retried:
 - current tree: 94 passed; the 6 failures are all the server test at its
   handoff — node 0 no longer the sequencer when SIGUSR1 comes (D-122);
 - a6986ea: 95 passed; the 5 failures are the same assertion;
@@ -1859,7 +1859,7 @@ event, monotonic time, nothing read back into a decision.
     the simulation's — and is not needed here. A reader on another
     thread (mmap, a separate reader, §3's "likely candidates") would need
     it; none exists.
-  - *Measured to protocol (CLAUDE.md §11; in-process, container,
+  - *Measured to protocol (rules.md §11; in-process, container,
     preliminary): base (D-139's path) against both, five alternating
     rounds, windows 256 / 1 024 / 4 096 with paired controls, and cap's
     failover mode; medians over the rounds:*

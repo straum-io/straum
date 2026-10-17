@@ -18,10 +18,10 @@ do not foreclose them.
 
 ---
 
-## 0. Conflicts with CLAUDE.md, resolved
+## 0. Conflicts with rules.md, resolved
 
 These rules arrived after the broker design was fixed. Where they disagreed
-with it, the resolution is below and the affected section of `CLAUDE.md` was
+with it, the resolution is below and the affected section of `rules.md` was
 updated in the same change.
 
 | Conflict | Resolution |

@@ -5,7 +5,7 @@
 Target: about 1,000,000 small messages/sec on modern server hardware for the
 in-memory broker benchmark. A target, not a production guarantee.
 
-Process rules are in CLAUDE.md §11. This file is the protocol.
+Process rules are in rules.md §11. This file is the protocol.
 
 ## 1. Levels
 

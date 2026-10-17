@@ -6,7 +6,7 @@
 - Decided by: Stanislav
 - Source: docs/architecture/unified-stream.md §2.7, §6
 - Supersedes: "Out of scope: MQTT 5, QoS 2, shared subscriptions" in the
-  former CLAUDE.md §6 (now docs/architecture/current-implementation.md) and
+  former rules.md §6 (now docs/architecture/current-implementation.md) and
   docs/archive/VISION.md V4 where it ruled MQTT 5 out
 
 ## Context

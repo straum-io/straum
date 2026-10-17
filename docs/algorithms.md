@@ -288,7 +288,7 @@ This is a heuristic, not a universal rule.
 
 If a lower level is measurably faster for the real workload, use it.
 
-The agent must explain the contention and ownership reason for the choice.
+The author must explain the contention and ownership reason for the choice.
 
 ---
 
@@ -681,7 +681,7 @@ Keep the benchmark when it protects against regression.
 
 ## 22. Anti-Patterns
 
-The agent must not optimize by:
+The author must not optimize by:
 
 ```text
 replacing every HashMap with a faster-looking structure
@@ -734,11 +734,11 @@ A latency improvement that multiplies memory by ten is a trade-off.
 
 A memory reduction that increases CPU cost by 50% is a trade-off.
 
-The agent must report the trade-off rather than calling it an optimization.
+The author must report the trade-off rather than calling it an optimization.
 
 ---
 
-## 24. Required Agent Behavior
+## 24. Required Process
 
 Before changing an important algorithm or data structure:
 

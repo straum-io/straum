@@ -4,7 +4,7 @@
 
 What the code does today, as of 2026-10-04. The target is
 `docs/architecture/unified-stream.md`, which takes precedence wherever the
-two differ; ADR-0001 records the move. These sections were in `CLAUDE.md`
+two differ; ADR-0001 records the move. These sections were in `rules.md`
 (§3–§6 and §16) until it was rewritten for the unified stream; they moved
 here unchanged so that nothing was dropped — except that they were taken
 from the working tree, which held two edits not yet in history: the

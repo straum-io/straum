@@ -13,8 +13,8 @@ The vision-guardian treats unconfirmed items as soft: a conflict with one is
 reported as a note, never as a DRIFT verdict.
 
 This file answers one question for every change: **does it move Straum
-towards what it is for?** `CONSTITUTION.md` says how work is done;
-`CLAUDE.md` says how the system is built; this file says why it exists and
+towards what it is for?** `engineering-rules.md` says how work is done;
+`rules.md` says how the system is built; this file says why it exists and
 what it deliberately is not.
 
 Keep it under two screens. It is loaded by the guardian on every closeout.

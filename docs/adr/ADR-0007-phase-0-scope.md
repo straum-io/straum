@@ -10,7 +10,7 @@
 ## Context
 
 Phase 0 of the unified stream is: gap analysis and ADRs, an updated
-CLAUDE.md, a simulation harness for the existing leader/follower replication
+rules.md, a simulation harness for the existing leader/follower replication
 with invariants 1, 3 and 5, a versioned WAL record format with a properties
 section, and an MQTT codec model with properties and reason codes. D-28
 planned four stages for the simulation: (1) a disk boundary and a simulated

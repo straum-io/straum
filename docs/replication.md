@@ -102,7 +102,7 @@ it holds.
 
 ## 108. Contradiction map
 
-Against `docs/storage.md` §73–§104 and `CLAUDE.md` §7–§8.
+Against `docs/storage.md` §73–§104 and `rules.md` §7–§8.
 
 | # | Finding | Class | Blocks replication? |
 |---|---|---|---|
@@ -114,7 +114,7 @@ Against `docs/storage.md` §73–§104 and `CLAUDE.md` §7–§8.
 | C6 | `Broker::replay_retained` iterated a `HashMap` | correctness (determinism) | **fixed** — the matches are sorted by topic before delivery |
 | C7 | `StorageError::Poisoned` is terminal for the log; there is no equivalent for "quorum lost", and the two are different classes of state — local storage unrecoverable versus distributed availability | architecture | yes — losing a peer must withhold acknowledgement, never kill the WAL |
 | C8 | `pending_durable` has no explicit bound; its depth today is limited by the WAL channel, which a network round-trip widens | performance / §8 | **fixed** — quorum widened the window, and the only bound left was `STRAUM_MAX_AWAITING_QUORUM` × records per commit, a product. Now `STRAUM_MAX_PENDING_DURABLE`, counted in publishes, taken as a permit at the publisher's reader before its record goes to the log, so only that publisher waits (D-6, D-7, docs/memory.md §9) |
-| C9 | `CLAUDE.md` §16 shutdown had no step that flushed replication | correctness | **fixed** — the leader drains after the WAL writer stops, and what may still be leader-only is stated (§120) |
+| C9 | `rules.md` §16 shutdown had no step that flushed replication | correctness | **fixed** — the leader drains after the WAL writer stops, and what may still be leader-only is stated (§120) |
 | C10 | No metric left the process; `Metrics` had no exporter and no caller in `server` | observability | **fixed** — Prometheus text on `STRAUM_METRICS_ADDR`, including the replication gauges |
 | C11 | `docs/storage.md` §80 defines three modes; a fourth changes a table that four documents quote | documentation | no |
 | C12 | **The WAL sequence regressed across compaction plus restart**, and so did the correlation: both were derived from what survived a rewrite | **correctness / durability** | **fixed** — `STRAUMW3` carries the allocation state in the header (§116) |
@@ -168,7 +168,7 @@ A crash there loses an acknowledged message. `lib.rs:584` is where the filter
 discards the token; the broker is correct given what it was told.
 
 The window is not rare: it opens whenever a submitter blocks on a full queue,
-which is the designed behaviour under load (`CLAUDE.md` §8).
+which is the designed behaviour under load (`rules.md` §8).
 
 ### Closed, in this order
 
@@ -380,7 +380,7 @@ is that case.
 
 The length is the one field acted on before the checksum can be computed,
 because it says where the batch ends and therefore how much the reader is
-asked to buffer (CLAUDE.md §8). Corrupted upwards it is either past the limit
+asked to buffer (rules.md §8). Corrupted upwards it is either past the limit
 or it makes the decoder ask for more bytes, which is the same answer a frame
 still in flight gets; the checksum refuses it once that many bytes exist. A
 read deadline, not the codec, is what stops a peer from parking the reader
@@ -845,7 +845,7 @@ counted as dropped, and nothing is holding batches anywhere else.
 
 **Direction only.** A development Mac, two nodes in one process on one host
 over loopback. That is not a network measurement and nothing here justifies a
-decision on its own (CLAUDE.md §11); a number that does has to come from a
+decision on its own (rules.md §11); a number that does has to come from a
 quiet Linux host with the two nodes on separate machines.
 
 ```text
@@ -1041,7 +1041,7 @@ claim that "dropped is not lost" rests on, and which nothing had tested.
 
 ## 124. The 667 msg/s anomaly was the harness
 
-Worked through the order in `.claude/skills/performance-investigation`, and
+Worked through the order in the performance-investigation skill, and
 two hypotheses died on the way, which is the point of having an order.
 
 **Reproduced.** 667 msg/s twice, to three figures. Re-running the whole table
@@ -1191,7 +1191,7 @@ Storage never learns that peers exist. `Peer::on_durable` still means one
 thing — this peer has written and synced everything through a position —
 and nothing about whether that is enough. Putting the quorum question in
 `report()` would have let the wire format decide the runtime's durability
-semantics, which is now `CONSTITUTION.md` §30.
+semantics, which is now `engineering-rules.md` §30.
 
 **Nothing polls.** The watermark is recomputed when the local position moves
 or a peer reports, and `on_local`/`on_peer` return the new value only when
@@ -1259,7 +1259,7 @@ network hiccup permanent.
 The free `quorum_watermark` function this replaced is gone. It computed the
 same value from a slice, had its own tests, and was used by nothing but
 them — two implementations of one calculation is what
-`docs/algorithms.md` §5 and `CONSTITUTION.md` §22 both forbid. Its cases
+`docs/algorithms.md` §5 and `engineering-rules.md` §22 both forbid. Its cases
 that were not already covered moved into the coordinator's tests.
 
 Recomputed on each event rather than maintained incrementally: the
@@ -1365,7 +1365,7 @@ be acknowledged. So the queue does not drop. When it reaches
 `STRAUM_MAX_AWAITING_QUORUM` the broker loop stops reading the log's
 reports, which makes the writer thread wait, which fills the log queue,
 which the connection reader awaits, which reaches the publisher's TCP
-window — the backpressure that is already there (CLAUDE.md §4). A memory
+window — the backpressure that is already there (rules.md §4). A memory
 limit creates backpressure here; it never creates a silent loss of state.
 
 It counts commits, so it bounds the reports and not what the broker holds:

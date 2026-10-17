@@ -118,7 +118,7 @@ Invariants are checked after every step:
 8. Time-dependent decisions (expiry, will) are made once and applied identically on all nodes.
 
 ## 6. Phases
-0. **Audit and foundation.** Gap analysis and ADR, updated CLAUDE.md. Simulation harness for the existing leader/follower replication with invariants 1, 3, 5. Versioned WAL record format with a properties section. MQTT codec model with properties and reason codes.
+0. **Audit and foundation.** Gap analysis and ADR, updated rules.md. Simulation harness for the existing leader/follower replication with invariants 1, 3, 5. Versioned WAL record format with a properties section. MQTT codec model with properties and reason codes.
 1. **Fencing and quorum.** `(slot, lsn, prev_hash)` format, durable promise, 3 nodes with majority commit, ungraceful transition, truncation by the slot table.
 2. **Graceful handoff.** `SlotEnd`/`SlotStart`, successor schedule, optional rotation.
 3. **Gateway/sequencer separation.** Forwarding, PUBACK on commit, sessions, inflight QoS1 and retained through the log, reconnection to any node. MQTT 5 semantics: expiry and will through the log, session takeover, subscription options, Assigned Client Identifier.
