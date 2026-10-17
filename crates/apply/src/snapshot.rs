@@ -103,7 +103,7 @@ impl State {
     /// Appends the state as a snapshot at [`State::applied`].
     ///
     /// The whole state is written into `out`: as large as the state, which
-    /// the limits bound (CLAUDE.md §7).
+    /// the limits bound.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.put_u8(VERSION);
         for field in limits_fields(&self.limits) {

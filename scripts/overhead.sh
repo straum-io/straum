@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # The cost of measuring (D-124): two source trees, a baseline and a
 # candidate, built in release and measured in alternating rounds — the
-# order flipped each round — with medians at the end (CLAUDE.md §11).
+# order flipped each round — with medians at the end.
 #
 # Each round runs, for each tree:
 #   cap     node/benches/cap.rs at cap 64: publishes/s through a node

@@ -80,7 +80,7 @@ pub struct MqttConfig {
     /// `node` and `first_session` are the node's to set and are overwritten.
     pub gateway: gateway::Config,
     /// Packets queued per connection; a client that lets the queue fill is
-    /// closed (CLAUDE.md §8: a writer that makes no progress).
+    /// closed (a writer that makes no progress).
     pub write_queue: usize,
 }
 

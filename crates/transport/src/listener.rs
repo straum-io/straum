@@ -15,7 +15,7 @@ use crate::tls::Tls;
 use crate::{TransportConfig, TransportError};
 
 /// How long the accept loop waits out a descriptor shortage. Retrying
-/// immediately would burn a core and log a river (CLAUDE.md §3).
+/// immediately would burn a core and log a river.
 const EXHAUSTED_BACKOFF: Duration = Duration::from_millis(50);
 
 pub struct Listener {

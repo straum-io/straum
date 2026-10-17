@@ -212,7 +212,7 @@ fn main() {
     // `cargo test --all-targets` runs this program too, as a debug build and
     // with no arguments, and would do minutes of real fsyncs to measure a
     // build whose numbers mean nothing. Every real run is a release build,
-    // so that is the line, not the arguments (CLAUDE.md §17).
+    // so that is the line, not the arguments.
     if cfg!(debug_assertions) {
         eprintln!("commit: built without optimisation; use `cargo bench` or a --release build");
         return;

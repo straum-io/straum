@@ -489,7 +489,7 @@ async fn an_mqtt_publish_on_one_node_reaches_a_subscriber_on_another() {
                 "PUBACK {i} from {name} before its publish was committed"
             );
         }
-        // In publish order (CLAUDE.md §7).
+        // In publish order.
         for i in 0..10u8 {
             let rumqttc::Packet::Publish(publish) = next(&mut sub_packets, |p| {
                 matches!(p, rumqttc::Packet::Publish(_))

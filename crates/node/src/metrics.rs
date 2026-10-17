@@ -551,8 +551,8 @@ fn counter(out: &mut String, name: &str, help: &str, value: u64) {
 }
 
 impl Snapshot {
-    /// The Prometheus text exposition format, written by hand (CLAUDE.md
-    /// §15): every name starts `straum_`.
+    /// The Prometheus text exposition format, written by hand:
+    /// every name starts `straum_`.
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(8 * 1024);
         let s = &self.status;
@@ -976,8 +976,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Serves the Prometheus text over HTTP: every request, whatever it asks,
 /// gets the current snapshot (D-112). Plain HTTP/1.1, one response per
-/// connection, written by hand (CLAUDE.md §15). At most `MAX_SCRAPES` at
-/// once: memory stays bounded however many connect (CLAUDE.md §7). Ends
+/// connection, written by hand. At most `MAX_SCRAPES` at
+/// once: memory stays bounded however many connect. Ends
 /// with the node.
 pub async fn serve(
     listener: tokio::net::TcpListener,
@@ -1114,7 +1114,7 @@ mod serving {
 
     /// A burst of silent connections takes at most `MAX_SCRAPES` at a time,
     /// each closed after `IO_TIMEOUT`; a real scrape behind them is still
-    /// answered (D-112, CLAUDE.md §7: bounded under any input).
+    /// answered (D-112: bounded under any input).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn silent_connections_are_bounded_and_closed_and_a_scrape_still_answers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

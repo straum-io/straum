@@ -2,7 +2,7 @@
 //! bounds checks and written with length checks.
 //!
 //! Every length here is remote-controlled when reading, so the module refuses
-//! indexing, unchecked arithmetic and truncating casts (CLAUDE.md §3).
+//! indexing, unchecked arithmetic and truncating casts.
 #![deny(
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,

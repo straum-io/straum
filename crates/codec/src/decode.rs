@@ -1,7 +1,7 @@
 //! Incremental decoding of MQTT 3.1.1 and 5 packets, in either direction.
 //!
 //! Every length in a packet is remote-controlled, so this module refuses
-//! indexing, unchecked arithmetic and truncating casts (CLAUDE.md §3).
+//! indexing, unchecked arithmetic and truncating casts.
 #![deny(
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
@@ -567,7 +567,7 @@ fn check_size(bytes: &[u8], limits: &Limits) -> Result<(), DecodeError> {
 
 fn payload(bytes: Bytes, limits: &Limits) -> Bytes {
     // A small payload sliced out of the read buffer keeps the whole buffer
-    // chunk alive while it waits in a slow subscriber's queue (CLAUDE.md §9).
+    // chunk alive while it waits in a slow subscriber's queue.
     // One copy here, not one per subscriber.
     if bytes.len() <= limits.payload_copy_threshold_bytes {
         Bytes::copy_from_slice(&bytes)

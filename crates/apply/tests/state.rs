@@ -276,7 +276,7 @@ fn the_global_queued_bound_counts_inflight_and_closes_whoever_would_exceed_it() 
         ],
     );
     // Inflight counts: a's "xx" holds two of the three bytes, so b's copy
-    // of the same message would make four (CLAUDE.md §7: a per-session
+    // of the same message would make four (a per-session
     // bound times the session count is not a bound).
     assert!(effects.contains(&Effect::Close { to: b, lsn: 6 }));
     assert!(

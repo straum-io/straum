@@ -1,5 +1,5 @@
 //! The log on disk, on a thread of its own: storage does blocking file I/O,
-//! and `sync_data` never runs on the node loop (CLAUDE.md §3, storage).
+//! and `sync_data` never runs on the node loop.
 //!
 //! It also keeps the node's snapshot (D-67 B): one file, replaced
 //! atomically, written before any segment below it is removed, so a start
@@ -222,7 +222,7 @@ pub fn start(
 > {
     std::fs::create_dir_all(&directory)?;
     // Verified as it is read: recovery holds one record at a time, not the
-    // log (CLAUDE.md §7).
+    // log.
     let mut verifier: Option<Verifier> = None;
     let mut broken: Option<ChainError> = None;
     let mut first_lsn = None;

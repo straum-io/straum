@@ -1,8 +1,7 @@
 //! Who may connect, and what they may do once connected.
 //!
 //! Pure policy: no I/O, no clock, no async. The files are read by `server`
-//! and their contents parsed here, so the decisions are testable everywhere
-//! (CLAUDE.md §13).
+//! and their contents parsed here, so the decisions are testable everywhere.
 //!
 //! Verifying a password is deliberately expensive — that is what a password
 //! hash is for — so it never runs in the broker loop. The runtime does it on

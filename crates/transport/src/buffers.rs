@@ -2,8 +2,8 @@
 //! packet to arrive, and what all connections together are allowed to hold.
 //!
 //! Per-connection limits alone are not a bound: a limit times the connection
-//! count is a product, not a budget. The same reasoning CLAUDE.md §8 applies
-//! to queued egress bytes applies to the read side.
+//! count is a product, not a budget. The reasoning that bounds
+//! queued egress bytes applies to the read side.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -146,7 +146,7 @@ impl ConnectionBuffer {
             // Nothing moved, so there is nothing to settle. The budget is one
             // counter shared by every connection in the process, and a
             // read-modify-write of zero on it is work that does not
-            // contribute to the result (CLAUDE.md §11). This is the common
+            // contribute to the result. This is the common
             // case: every flush of a buffer that never had to grow.
             return;
         }

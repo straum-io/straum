@@ -17,7 +17,7 @@
 //!   same state there.
 //!
 //! At the end every session ends and every node applies the whole log: no
-//! session may be left in the state (CLAUDE.md §7, "closing a session
+//! session may be left in the state ("closing a session
 //! removes all of its subscriptions and inflight state").
 //!
 //! The log here is in memory and never compacted: a node that restarts

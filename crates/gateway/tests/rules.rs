@@ -521,7 +521,7 @@ fn a_session_nobody_can_name_is_refused_in_3_1_1() {
 
 /// A client that takes one QoS 1 delivery and never acknowledges it holds
 /// everything behind it; the at-most-once deliveries queued there are
-/// bounded, and beyond the bound dropped and counted (CLAUDE.md §8).
+/// bounded, and beyond the bound dropped and counted.
 #[test]
 fn deliveries_held_behind_a_stalled_client_are_bounded() {
     let mut rig = Rig::ready();
@@ -561,7 +561,7 @@ fn deliveries_held_behind_a_stalled_client_are_bounded() {
 
 /// While nothing commits, every closed session leaves a `SessionGone` to
 /// retry; at the bound the gateway refuses new connections instead of
-/// growing (CLAUDE.md §8).
+/// growing.
 #[test]
 fn lifecycle_retries_are_bounded_while_nothing_commits() {
     let mut rig = Rig::ready();

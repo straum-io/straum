@@ -33,7 +33,7 @@ fi
 if [ "$#" -eq 0 ]; then
     # --tests rather than --all-targets: it skips the benchmarks entirely,
     # where --all-targets builds them all and runs divan's short pass
-    # (CLAUDE.md §17, D-4).
+    # (D-4).
     set -- test --workspace --tests
 fi
 
