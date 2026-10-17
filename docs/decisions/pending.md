@@ -33,7 +33,7 @@ skill. When the user answers `D-<n>: <choice>`, the card moves to
 - **The winner:** when an older CONNECT's `Connect` commits after a newer one, the newer always wins. The older is refused, and its client is told to reconnect.
 - **The fence's cost:** a legitimate reconnect through a gateway that has not yet applied that client id's last change, or whose `Connect` commits more than `W` positions after `seen`, is refused once, and the client reconnects. `W` and `max_connect_tombstones` are sized in stage 2.
 
-**Vision.** D-144 A (implementation only once the four are agreed); unified-stream §1, §2, invariant 7; CLAUDE.md §7 (the tombstones bounded), §8, §12; D-138 (5); D-141 (straum-cli told before `Connect`/`Disconnect` leave the reserved block).
+**Vision.** D-144 A (implementation only once the four are agreed); unified-stream §1, §2, invariant 7; rules.md §7 (the tombstones bounded), §8, §12; D-138 (5); D-141 (straum-cli told before `Connect`/`Disconnect` leave the reserved block).
 
 ### A. Agree the revised four; authorise stages 1–2, then decide again — recommended
 - **What we do:**
@@ -55,7 +55,7 @@ skill. When the user answers `D-<n>: <choice>`, the card moves to
 
 **Discarded.**
 - Re-proposing a stale `Connect` transparently: it re-arms an old CONNECT packet and can take a session over from a newer connection, which D-144 (2) excludes.
-- Unbounded tombstones: violates CLAUDE.md §7.
+- Unbounded tombstones: violates rules.md §7.
 
 **Recommendation.** A. The fence is sound on paper and bounded; stages 1–2 let the simulation show invariants A and B hold and size it, before any client depends on it. B if you'd rather not take a decision between stages. C only if stage 2 shows tombstones aren't worth their memory.
 

@@ -87,7 +87,7 @@ replicate, connhold; storage: commit), чтобы `cargo test --all-targets` и�
 Так выполнено всё, что обещал A, а сценарии не меняются.
 Одно обещание A буквально не выполнено: «документы не меняются». Документы
 о запуске бенчей действительно не тронуты, но комментарий над командами в
-CLAUDE.md §17 переписан — прежний текст утверждал, что рукописные бенчи не
+rules.md §17 переписан — прежний текст утверждал, что рукописные бенчи не
 отличают тест от бенча, и после защиты стал неверным.
 Проверено: `cargo test -p e2e --all-targets` — 27 с вместо 779 с, `-p
 storage` — 8 с, все тесты зелёные; `cargo bench -p e2e --bench connhold` и
@@ -98,19 +98,9 @@ Rejected options: B — ловушка оставалась бы для любо
 проверено, не работает; `RUN_BENCHMARKS=1` — лишний шаг к каждому измерению.
 Card: docs/decisions/archive/cards-to-D-55.md
 
-## D-5. Что Stop-гейт должен делать при повторном Stop
-Date: 2026-10-02
-Choice: A — при повторном Stop гейт пропускает проверку, только если дерево не
-менялось с последнего провала (хеш через `.claude/hooks/diff-hash.sh` в
-`.claude/state/gate-failed.sha`, удаляется при успехе); распознавание
-`stop_hook_active` — та же регулярка с пробелами, что в require-closeout.sh.
-Пользователь добавил: к тестам больше не возвращаться.
-Выполнено: scripts/agent/gate.sh. Проверено: метка совпадает с текущим
-хешем — выход 0 за 0 с; метка устарела — полный прогон, 0 за 7 с, метка
-снята.
-Rejected options: B — расширяет пропуск; C — правка после провала остаётся
-непроверенной.
-Card: docs/decisions/archive/cards-to-D-55.md
+## D-5. Moved to straum-dev-plan
+
+This record concerns the agent Stop gate; it is kept in `straum-dev-plan`, `decisions/straum-agent-records.md`.
 
 ## D-6. Какой архитектурный шаг следующий после закрытия C4
 Date: 2026-10-02
@@ -126,7 +116,7 @@ B — только после A: иначе бенчмарк меряет сис
 контрактом памяти. C — после B: бенчмарк и граница дадут фактическую
 нагрузку на узел.
 Статус B (2026-10-02): измерено на этой машине (Apple M1, только
-направление, CLAUDE.md §11). overhead_admission = 24–33 нс на долговечную
+направление, rules.md §11). overhead_admission = 24–33 нс на долговечную
 публикацию, без выделений памяти, без конкуренции — один поток берёт и
 возвращает разрешения (`runtime/benches/admission.rs`); это около 0.1%
 процессорного времени публикации при `fsynced` с одним издателем. Сквозь всю
@@ -144,7 +134,7 @@ docs/baselines/apple-m1-dev.md, «D-6 B». Найдено попутно: пре
 Статус A (2026-10-02): сделан, кроме отчёта о производительности. Цикл
 брокера — горячий путь: на каждое пробуждение добавились длина очереди,
 вычитание и `min`, `select!` вырос до четырёх веток, отчёты лога ушли в
-свой канал. Не измерено. По CLAUDE.md §11/§17 это обязательство, а не
+свой канал. Не измерено. По rules.md §11/§17 это обязательство, а не
 выбор, и оно переходит в B: B включает прогон BASE (9dfa3bb) против A,
 по очереди, не меньше 5 раундов, для `fsynced` и `memory`, 1 издатель и 10
 подписчиков — помимо сравнения `quorum` и `fsynced`.
@@ -344,11 +334,9 @@ became the leading architectural source (ADR-0001…0005, commit `9719dcd`).
 Open questions from the transition: D-35…D-38. D-33 and D-34 were re-read
 against it (notes on the cards).
 
-## D-35. Где в порядке приоритета стоит CONSTITUTION.md
-Date: 2026-10-04
-Choice: A
-Rejected options: B — between CLAUDE.md and ADR; C — merge into CLAUDE.md, constitution superseded whole.
-Card: docs/decisions/archive/cards-to-D-55.md
+## D-35. Moved to straum-dev-plan
+
+This record concerns the precedence of the agent rule files; it is kept in `straum-dev-plan`, `decisions/straum-agent-records.md`.
 
 ## D-36. Что становится с уровнями надёжности при «commit = большинство, PUBACK и доставка только после commit»
 Date: 2026-10-04
@@ -362,11 +350,9 @@ Choice: A
 Rejected options: B — prev_hash and slot already in phase-0 v4 (later done by ADR-0008 step 1 under D-48 C); C — finish D-28 stages 3–4 first.
 Card: docs/decisions/archive/cards-to-D-55.md
 
-## D-38. Отслеживать ли в git `.claude/`, `docs/decisions/` и `docs/VISION.md`
-Date: 2026-10-04
-Choice: A
-Rejected options: B — mark VISION.md superseded whole, track as archive; C — leave untracked.
-Card: docs/decisions/archive/cards-to-D-55.md
+## D-38. Moved to straum-dev-plan
+
+This record concerns tracking the agent configuration in git; it is kept in `straum-dev-plan`, `decisions/straum-agent-records.md`.
 
 ## D-39. Закоммитить ли застейдженную работу D-28 (этапы 1–2) и D-30…D-32 отдельным коммитом до фазы 0
 Date: 2026-10-04
@@ -440,7 +426,7 @@ Card: docs/decisions/archive/cards-to-D-55.md
 
 ## D-50. Чем считать `prev_hash` батча
 Date: 2026-10-05
-Choice: A — xxh3-128; unified-stream §4.1 covers Straum's own code, third-party crates are judged as dependencies (CLAUDE.md §2). Recorded in ADR-0002.
+Choice: A — xxh3-128; unified-stream §4.1 covers Straum's own code, third-party crates are judged as dependencies (rules.md §2). Recorded in ADR-0002.
 Rejected options: B — BLAKE3; C — own 64-bit FNV-1a without dependencies.
 Card: docs/decisions/archive/cards-to-D-55.md
 
@@ -487,7 +473,7 @@ Card: docs/decisions/archive/cards.md
 ## D-57. What the log keeps for a replica that falls behind (re-reads the withdrawn D-47)
 Date: 2026-10-05
 Choice: A — the sequencer's compaction floor is min(commit, slowest live replica's durable), but the log never keeps more than a byte bound; a replica beyond it is lost and counted. A record compacted after commit counts as held (invariant 1 above the floor).
-Rejected options: B — compact to the commit point, lost replicas wait for a state-copy step. Never compacting past a replica — unbounded disk (CLAUDE.md §7).
+Rejected options: B — compact to the commit point, lost replicas wait for a state-copy step. Never compacting past a replica — unbounded disk (rules.md §7).
 Card: docs/decisions/archive/cards.md
 
 ## D-58. When the sequencer may ship a batch: after its own sync, or in parallel
@@ -511,7 +497,7 @@ Card: docs/decisions/archive/cards.md
 ## D-61. Revise D-59 A: move the contract types from 3a to 3b?
 Date: 2026-10-06
 Choice: A — D-59 A revised: the protocol-neutral contract types are defined in 3b, with their first user.
-Rejected options: B — keep D-59 A and define them before anything uses them (CLAUDE.md §14).
+Rejected options: B — keep D-59 A and define them before anything uses them (rules.md §14).
 Card: docs/decisions/archive/cards.md
 
 ## D-62. The next step
@@ -610,7 +596,7 @@ Card: docs/decisions/archive/cards.md
 ## D-79. The slot table past 4096 slot changes
 Date: 2026-10-09
 Choice: A — supersedes D-73 A's "in the `apply` snapshot" part: `apply::State` no longer keeps the table (its digest drops the term); the node keeps the committed slot table — built only from committed records — writes it in its snapshot file beside the state, and prunes it by the compaction floor, so no count bound and no remainder of the D-57 A deviation.
-Rejected options: none outright; B (raise the count bound, accept the rest) not chosen. No bound at all was rejected on the card (CLAUDE.md §7).
+Rejected options: none outright; B (raise the count bound, accept the rest) not chosen. No bound at all was rejected on the card (rules.md §7).
 Card: docs/decisions/archive/cards.md
 
 ## D-78. Step 7 of ADR-0008
@@ -1035,7 +1021,7 @@ Card: docs/decisions/archive/cards.md
 ## D-142. Stop replaying whole segments for catch-up reads and read-backs
 Date: 2026-10-16
 Choice: A — (1) stop segment scans as soon as a read or read-back has what it needs; (2) a position-only read cursor per replica and one for apply, so sequential reads resume from the previous position; (3) cursors invalidated on truncation and compaction; (4) each change measured on its own against D-139's baseline before they are combined; (5) the always-on per-read scan counting removed after measurement; (6) the full guardian review, with unified-stream §3's segment-refcount requirement resolved explicitly before the change is accepted. Justified by the measured 55–63 MB of unneeded scanning a read, catch-up commit p99 of 83–131 ms, and replica recovery that can outlast the 30 s `commit_timeout`. Cold-disk performance stays unmeasured, an open risk.
-Amended 2026-10-16 after the guardian review: unified-stream §3 is amended (the user's choice over a recorded deviation or a pin for every reader) — a reader that can be in progress during a truncation or compaction holds a pin; reads serialised with them on the log thread need none. And the measurement is rerun to CLAUDE.md §11 — five alternating rounds, windows 256, 1 024 and 4 096, and cap's failover mode — before the change is accepted.
+Amended 2026-10-16 after the guardian review: unified-stream §3 is amended (the user's choice over a recorded deviation or a pin for every reader) — a reader that can be in progress during a truncation or compaction holds a pin; reads serialised with them on the log thread need none. And the measurement is rerun to rules.md §11 — five alternating rounds, windows 256, 1 024 and 4 096, and cap's failover mode — before the change is accepted.
 Rejected options: B (a sparse index), C (early stop only), D (accept as a limitation) not chosen.
 Card: docs/decisions/archive/cards.md
 

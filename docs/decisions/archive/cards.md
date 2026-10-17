@@ -155,7 +155,7 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 
 **Context.** The D-54 card called option B, a hash per record, "literally §2.2". §2.2 says two things: "every WAL record carries `(slot, lsn, prev_hash)`" *and* "`prev_hash` is computed over the group-commit batch, not per message". B satisfies the first and contradicts the second. A third reading satisfies both, and the card did not offer it: every record carries the hash of the *previous batch*. B is built as chosen (`crates/journal`, pinned format hash).
 **Why now.** The format is not written by the running server yet; after step 4 a change means record version 5.
-**Vision.** unified-stream §2.2; CLAUDE.md "every deviation from unified-stream.md is recorded in an ADR".
+**Vision.** unified-stream §2.2; rules.md "every deviation from unified-stream.md is recorded in an ADR".
 
 ### A. Every record carries the previous batch's hash — recommended
 - **What we do:** `journal`: the record header keeps its `prev_hash` field, but it holds the hash of the previous *batch*; the batch hash covers all the batch's record bytes; `Verifier` checks every record against the previous batch's hash. Tests and the pinned value updated; `sim` unchanged in shape.
@@ -198,7 +198,7 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 
 **Context.** A replica whose next record has been compacted away cannot be caught up from the log; it needs a copy of the state, which no step builds yet. In step 2 the sequencer may compact up to its commit point, and a catch-up that stalls for a heartbeat period gives up its pin; the 1000-seed sweep lost 1 306 replicas this way. With both replicas lost, the cluster stops committing (checked).
 **Why now.** It decides the sequencer's compaction floor before step 4 makes it real, and whether "lost" is an outcome or a defect (unified-stream §5.1, invariant 1 "never lost"). The step-2 simulation already uses one definition: a node that compacted a record after it was committed counts as holding it (`crates/sim/tests/cluster.rs`, invariant 1). A and B keep that check; another definition changes it.
-**Vision.** unified-stream §3 (refcount), §5 (invariant 1, compaction during catch-up); CLAUDE.md §7 (bounded memory and disk).
+**Vision.** unified-stream §3 (refcount), §5 (invariant 1, compaction during catch-up); rules.md §7 (bounded memory and disk).
 
 ### A. Keep for the slowest live replica, up to a byte bound — recommended
 - **What we do:** floor = min(commit, slowest known replica's durable), but never more than `STRAUM_WAL_RETAIN_BYTES` behind the end; a replica beyond that is lost and counted (as D-18 did on the old path). A compacted record below every replica's position is consumed, not lost (U1 above the floor).
@@ -231,7 +231,7 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 
 **Recommendation.** A.
 **What would change it.** A snapshot step scheduled before step 4 → B.
-**Rejected.** Never compact past a replica — a dead replica holds the disk forever (CLAUDE.md §7).
+**Rejected.** Never compact past a replica — a dead replica holds the disk forever (rules.md §7).
 
 **Answer:** `D-57: A` · `D-57: B`
 
@@ -330,7 +330,7 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 
 **Context.** Under D-57 A a replica that falls further behind than the byte bound is lost: the log no longer holds what it needs next, and nothing in ADR-0008 can give it a copy of the state. The 1000-seed sweep lost 1 180 replicas this way (bound 5 000 bytes in the simulation). With two of three lost, the cluster stops committing (checked). A lost replica still counts as a voter: with one lost, one more failure stops commit.
 **Why now.** Step 4 makes clusters real; without a way back, an operator's only remedy for a lost replica is undocumented.
-**Vision.** unified-stream §2.5, §3, §6 (phase 4: metadata and membership); CLAUDE.md §7.
+**Vision.** unified-stream §2.5, §3, §6 (phase 4: metadata and membership); rules.md §7.
 
 ### A. A state-copy step in ADR-0008, after step 7 — recommended
 - **What we do:** add a step "state copy". Once the floor has passed a replica, the segments it needs are gone, so the copy is a snapshot of the *applied* state at a committed lsn — a deterministic function of the committed log (§1) — plus the log after that lsn; the replica installs both and resumes with `Chain::resume` at that lsn. After step 7, not step 3: step 3 applies publishes and subscriptions only, while sessions, expiry and wills enter the log at step 7; a snapshot format fixed earlier would change again.
@@ -387,7 +387,7 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 
 ### A. Revise D-59 A: define them in 3b, with the gateway that uses them — recommended
 - **What we do:** 3b writes the gateway, the apply function and, between them, the types: proposals as `journal` entries, committed effects as deliveries and acknowledgements with reason codes. Shaped by their first two users at once.
-- **Result:** no type without a user (CLAUDE.md §14).
+- **Result:** no type without a user (rules.md §14).
 - **Cost:** part of 3b.
 - **Risks:** 3b is larger → it stays one reviewable change, or is split again at the card.
 - **Invariants:** —.
@@ -399,7 +399,7 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 - **What we do:** a contract module before the gateway exists, as D-59 A says.
 - **Result:** the card's text, literally.
 - **Cost:** S now, likely reshaped in 3b.
-- **Risks:** speculative types (CLAUDE.md §14: start concrete).
+- **Risks:** speculative types (rules.md §14: start concrete).
 - **Invariants:** —.
 - **Reversibility:** easy.
 - **Check:** compiles; nothing uses it yet.
@@ -479,10 +479,10 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 
 **Context.** Steps 1, 2, 3a and 3b-1 are done. 3b-2 is the sans-IO gateway over `codec`: MQTT connections in, proposals to the sequencer, `apply` effects back out as CONNACK/PUBACK/SUBACK/UNSUBACK and deliveries; one live session per client id within a gateway; bounds on proposals awaiting commit per publisher and in total, in messages and in bytes. The codec's cost against `mqtt` is still unmeasured.
 **Why now.** Until 3b-2 no MQTT client reaches the new path.
-**Vision.** unified-stream §2.1, §2.3; ADR-0003, ADR-0005; CLAUDE.md §7, §8.
+**Vision.** unified-stream §2.1, §2.3; ADR-0003, ADR-0005; rules.md §7, §8.
 
 ### A. Step 3b-2 now — recommended
-- **What we do:** new crate `gateway` (sans-IO): per-connection protocol state on `codec` (keep-alive deadlines from a passed-in instant, topic aliases, receive maximum), proposals with bounds, effects to packets. Session close goes through the log: when a connection ends, the gateway proposes a `SessionGone` record (kind 3, reserved), and `apply` drops that origin's subscriptions and inflight state, so closing a session removes them on every node (CLAUDE.md §7). `apply` bounds its own state from the log, so every node refuses the same way: subscriptions per origin and retained messages in count and bytes; a subscribe or retained publish beyond a bound is applied as a refusal (SUBACK failure, publish delivered but not retained, as the old path does). `sim` drives MQTT 3.1.1 and 5 clients through `codec` against three nodes: invariant 4 at the PUBACK and delivery packets, invariant 7 within a gateway, session close, the bounds.
+- **What we do:** new crate `gateway` (sans-IO): per-connection protocol state on `codec` (keep-alive deadlines from a passed-in instant, topic aliases, receive maximum), proposals with bounds, effects to packets. Session close goes through the log: when a connection ends, the gateway proposes a `SessionGone` record (kind 3, reserved), and `apply` drops that origin's subscriptions and inflight state, so closing a session removes them on every node (rules.md §7). `apply` bounds its own state from the log, so every node refuses the same way: subscriptions per origin and retained messages in count and bytes; a subscribe or retained publish beyond a bound is applied as a refusal (SUBACK failure, publish delivered but not retained, as the old path does). `sim` drives MQTT 3.1.1 and 5 clients through `codec` against three nodes: invariant 4 at the PUBACK and delivery packets, invariant 7 within a gateway, session close, the bounds.
 - **Result:** an MQTT publish goes through the new path end to end in simulation.
 - **Cost:** L.
 - **Risks:** the size of the step → the D-64 answer decides whether inflight state is in it.
@@ -525,7 +525,7 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 **Vision.** unified-stream §1; ADR-0003; ADR-0005.
 
 ### A. Through the log now: Ack records applied by `apply` — recommended
-- **What we do:** the gateway proposes an `Ack` record (kind 6, reserved) for each subscriber PUBACK; `apply` keeps inflight per `Origin` (delivery lsn → message), adds on delivery, removes on committed Ack. Bounds, decided in `apply` from the log so every node agrees: at most `STRAUM_MAX_INFLIGHT` inflight per origin, further at-least-once deliveries wait in a per-origin backlog bounded in messages and bytes, and a delivery that finds the backlog full is applied as a `Close(SlowConsumer)` effect for that origin — the old path's overflow rule (CLAUDE.md §8), now the effect of a committed record. A closed origin's inflight and backlog go with its `SessionGone` record (D-63 A). A gateway that takes over a session after step 7 resends from that state.
+- **What we do:** the gateway proposes an `Ack` record (kind 6, reserved) for each subscriber PUBACK; `apply` keeps inflight per `Origin` (delivery lsn → message), adds on delivery, removes on committed Ack. Bounds, decided in `apply` from the log so every node agrees: at most `STRAUM_MAX_INFLIGHT` inflight per origin, further at-least-once deliveries wait in a per-origin backlog bounded in messages and bytes, and a delivery that finds the backlog full is applied as a `Close(SlowConsumer)` effect for that origin — the old path's overflow rule (rules.md §8), now the effect of a committed record. A closed origin's inflight and backlog go with its `SessionGone` record (D-63 A). A gateway that takes over a session after step 7 resends from that state.
 - **Result:** no inflight state outside the log; nothing to migrate at step 7.
 - **Cost:** M on top of 3b-2.
 - **Risks:** one log record per subscriber acknowledgement → log volume grows with fan-out; measured at step 4.
@@ -608,7 +608,7 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 
 **Context.** Steps 1–3 are done in simulation: log format, three-node replication, codec, apply function, gateway. Nothing runs in the server yet. Step 4 is the runtime driver: inter-node links over TCP, forwarding (FIFO, nothing across a restart — the two transport requirements the simulations found), the WAL on disk, configuration and its startup checks, e2e tests; cluster mode stays refused by the server's configuration until step 7. None of `codec`, `apply` or `gateway` has been measured.
 **Why now.** The rest of the plan needs a cluster that runs.
-**Vision.** unified-stream §4, §6; ADR-0004, ADR-0006, ADR-0008; CLAUDE.md §11.
+**Vision.** unified-stream §4, §6; ADR-0004, ADR-0006, ADR-0008; rules.md §11.
 
 ### A. Step 4, starting with baselines — recommended
 - **What we do:** every node's `apply` limits compared at link setup, a mismatch refusing the link; first the benchmarks the new code needs before it is on a hot path: `codec` decode/encode against `mqtt` on the same 3.1.1 packets, `apply` per publish and per fan-out, `gateway` per packet — allocations counted, macOS preliminary, Linux numbers recorded in `docs/baselines/`. Then the driver: tokio tasks for links, sequencer, replica, gateway and WAL writer; e2e tests with `rumqttc` against a three-node cluster on loopback.
@@ -649,9 +649,9 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 ````markdown
 ## D-67. How the new path keeps its log bounded on disk before state copy exists
 
-**Context.** `node` never removes a segment (`crates/node/src/wal.rs`), so disk use grows with the log (CLAUDE.md §7; D-57 A rejected "unbounded disk"). It cannot simply call `Sequencer::compaction_floor` and `Segments::remove_through`. A node rebuilds `apply::State` from lsn 1 at every start (`crates/node/src/lib.rs`, the `Range` reads), and a removed segment would leave it nothing to rebuild from. Recovery memory is already bounded: the log is now verified record by record (`wal::start`).
+**Context.** `node` never removes a segment (`crates/node/src/wal.rs`), so disk use grows with the log (rules.md §7; D-57 A rejected "unbounded disk"). It cannot simply call `Sequencer::compaction_floor` and `Segments::remove_through`. A node rebuilds `apply::State` from lsn 1 at every start (`crates/node/src/lib.rs`, the `Range` reads), and a removed segment would leave it nothing to rebuild from. Recovery memory is already bounded: the log is now verified record by record (`wal::start`).
 **Why now.** This is a §7 invariant gap in step 4, which the vision review found. Every later step builds on this log.
-**Vision.** unified-stream §1 (the state is a deterministic function of the committed log), §3 (segmented WAL, compaction); D-57 A; D-60 A (state copy at 7b); CLAUDE.md §7.
+**Vision.** unified-stream §1 (the state is a deterministic function of the committed log), §3 (segmented WAL, compaction); D-57 A; D-60 A (state copy at 7b); rules.md §7.
 
 ### A. A hard cap on the log until 7b — recommended
 - **What we do:**
@@ -663,7 +663,7 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 - **Result:** disk is bounded by `max_log_bytes` plus one segment. A full cluster stops taking publishes instead of growing.
 - **Cost:** S.
 - **Risks:** once the reserve is used up too, a full log is terminal until its data is wiped. Inflight is never released, and a restarted gateway's `NodeReset` never commits, so it accepts no connections. This is acceptable only while cluster mode is test-only (until step 7), and it is visible through `Status.full`.
-- **Invariants:** CLAUDE.md §7 holds. Invariants 1, 3 and 5 are untouched because nothing is removed.
+- **Invariants:** rules.md §7 holds. Invariants 1, 3 and 5 are untouched because nothing is removed.
 - **Reversibility:** easy. Step 7b replaces it with compaction plus snapshots.
 - **Check:** `cargo test -p node`, with a new test `a_full_log_refuses_and_still_restarts`.
 - **Fact / hypothesis:** fact.
@@ -708,7 +708,7 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 
 **Context.** ADR-0008 step 4 lists "configuration and its startup checks (ADR-0006)". `node::NodeConfig` exists, but only tests build it. Nothing reads `STRAUM_*`, and the server refuses cluster mode until step 7 (ADR-0008, "Cluster mode is test-only until step 7"). The one startup check done is the `apply` limits digest at every link.
 **Why now.** Step 4 cannot be called done while this is open and unrecorded.
-**Vision.** ADR-0006 (cluster mode, majority commit only); ADR-0008 step plan; CLAUDE.md §8 (every limit has an env var).
+**Vision.** ADR-0006 (cluster mode, majority commit only); ADR-0008 step plan; rules.md §8 (every limit has an env var).
 
 ### A. Move it to step 7, recorded in ADR-0008 — recommended
 - **What we do:** ADR-0008's step plan moves "configuration and its startup checks" from step 4 to step 7, which is where the server stops refusing cluster mode. docs/configuration.md says so (it already does).
@@ -723,7 +723,7 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 ### B. Do it now
 - **What we do:**
   - the `STRAUM_CLUSTER_*` variables (`NODE`, `PEERS`, `LISTEN`, `DATA`) and the `apply`/gateway limits are parsed into `NodeConfig` by a `node::config` module;
-  - `server` gains an edge to `node` (a new row in the CLAUDE.md §2 table), but `runtime` does not, so the old path stays uncoupled (D-49 A);
+  - `server` gains an edge to `node` (a new row in the rules.md §2 table), but `runtime` does not, so the old path stays uncoupled (D-49 A);
   - startup checks for an odd voter count, this node in the voter list, unique addresses, and limits within the validation ranges;
   - the server still refuses to start in cluster mode.
 - **Result:** configuration code and tests exist, but nothing reaches them.
@@ -787,13 +787,13 @@ batch, in the header (ADR-0008 Progress, "Interpretation").
 - **What we do:**
   - hold proposals the sequencer refuses, instead of dropping them, in a bounded queue that stops reading links and clients when it is full;
   - wire `auth` into CONNECT;
-  - export the `node` metrics (CLAUDE.md §15);
+  - export the `node` metrics (rules.md §15);
   - take the test hooks off the loop: `Status.digest`, and the per-record effects clone, which is already skipped when no test listens;
   - add an e2e load generator over `node`, with a container baseline (preliminary).
 - **Result:** the new path checks credentials, can be observed, has a preliminary end-to-end number, and drops nothing at the sequencer.
 - **Cost:** M.
 - **Risks:** low. Container numbers are preliminary (§11).
-- **Invariants:** CLAUDE.md §8 "nothing dropped" is restored for proposals.
+- **Invariants:** rules.md §8 "nothing dropped" is restored for proposals.
 - **Reversibility:** easy.
 - **Check:**
   - `cargo test -p node`, with new tests for wrong credentials and a full sequencer queue;
@@ -958,7 +958,7 @@ Still waiting:
 - auth wiring;
 - metrics.
 **Why now.** D-70 A's reason for putting step 6 second, "it builds on paths not yet simulated", no longer applies: takeover under compaction and gateways now runs in simulation. D-72 and D-73 are still open.
-**Vision.** ADR-0008 step plan; unified-stream §2.4 (graceful handoff); CLAUDE.md §10 (nothing accidental on the hot path).
+**Vision.** ADR-0008 step plan; unified-stream §2.4 (graceful handoff); rules.md §10 (nothing accidental on the hot path).
 
 ### A. D-73 first, then step 6 — recommended
 - **What we do:**
@@ -984,7 +984,7 @@ Still waiting:
 - **Result:** the new path is measurable and observable.
 - **Cost:** M.
 - **Risks:** low.
-- **Invariants:** CLAUDE.md §8, "nothing dropped", restored for proposals.
+- **Invariants:** rules.md §8, "nothing dropped", restored for proposals.
 - **Reversibility:** easy.
 - **Check:** `cargo test -p node`; a baseline in `docs/baselines/`.
 - **Fact / hypothesis:** It is a hypothesis that early numbers guide steps 6–7.
@@ -1069,7 +1069,7 @@ Still waiting:
 **Recommendation.** A. The snapshot already is the log-derived record that compaction relies on, so the slot table belongs with it, and no new file is needed. Choose B if snapshots are to stay pure application state.
 **What would change it.** A requirement that the snapshot hold only `apply`'s state.
 **Rejected.**
-- Compaction keeps each slot's first segment: segments go only from the front, so keeping one keeps every later one, and under a stable sequencer the log would never compact (CLAUDE.md §7; D-57's rejected "never compacting past a replica").
+- Compaction keeps each slot's first segment: segments go only from the front, so keeping one keeps every later one, and under a stable sequencer the log would never compact (rules.md §7; D-57's rejected "never compacting past a replica").
 - Keeping the exemption permanently: it contradicts D-57 A without a decision.
 
 **Answer:** `D-73: A` · `D-73: B` · `D-73: C` · `D-73: discuss` · `D-73: defer`
@@ -1081,8 +1081,8 @@ Still waiting:
 **Context.** `e2e/tests/replication_matrix.rs::a_follower_that_stops_reading_is_cut_off_and_caught_up` fails 2 of 3 isolated runs in `scripts/linux.sh` with "a follower that stopped reading was never cut off". It passes on macOS.
 - Nothing under e2e, runtime, replication or storage/src changed in step 6, so the failure is not caused by it. Whether it fails at BASE ffeda02 has not been run.
 - Separately, one full container run had one unnamed failure; two later full runs were clean (477 passed).
-- The test covers the CLAUDE.md §8 row "Follower stops reading for `STRAUM_WRITE_STALL_TIMEOUT_MS`". D-75 freezes the old path to bug fixes.
-**Vision.** CLAUDE.md §8: every path in the table has a test. §13: Linux is production.
+- The test covers the rules.md §8 row "Follower stops reading for `STRAUM_WRITE_STALL_TIMEOUT_MS`". D-75 freezes the old path to bug fixes.
+**Vision.** rules.md §8: every path in the table has a test. §13: Linux is production.
 
 ### A. Find out, then fix — recommended
 - **What we do:**
@@ -1154,7 +1154,7 @@ Container validation stays intermittently red until step 8 removes the old path.
 - Rotation every few heartbeats reaches the cap within hours.
 - No simulation reaches it.
 - `apply` cannot prune by the compaction floor: it does not see the floor, and its state is compared across nodes by digest.
-**Vision.** CLAUDE.md §7 (memory bounded); D-57 A (lost only past the byte bound).
+**Vision.** rules.md §7 (memory bounded); D-57 A (lost only past the byte bound).
 
 ### A. Prune by the floor, outside `apply` — recommended
 - **Supersedes:** D-73 A's "in the `apply` snapshot" part. The new evidence is this card's remainder. D-73 A's rule stays: the table is built only from committed records.
@@ -1176,7 +1176,7 @@ Container validation stays intermittently red until step 8 removes the old path.
 - **Risks:** rotation at short intervals still crosses the bound eventually.
 
 **Rejected.**
-- No bound at all: it breaks CLAUDE.md §7.
+- No bound at all: it breaks rules.md §7.
 
 **Answer:** `D-79: A` · `D-79: B` · `D-79: discuss`
 ````
@@ -1351,7 +1351,7 @@ A takeover needs about a hundred events or more: silence, a durable promise, a m
 - **What we do:**
   1. confirm the rates on 10 000 seeds;
   2. trace the quiet failed cycles to a cause, starting with the unexplained 14%;
-  3. make catch-up fetch up to a byte bound per round trip instead of one batch (a configured limit, CLAUDE.md §8);
+  3. make catch-up fetch up to a byte bound per round trip instead of one batch (a configured limit, rules.md §8);
   4. gate the cycle rate at 9 in 10 within 2 000 events, on the cycles where a majority stays up. The near-unbounded uncommitted tail stays in the seeds that run it today: capping it would pass the gate by testing less.
 - **Cost:** M–L.
 - **Risks:** catch-up is on the takeover path, so every sweep reruns.
@@ -1427,7 +1427,7 @@ Failover correlates with the uncommitted tail a new sequencer must move. The mec
 ## D-83. A default for `read_bytes`
 
 **Context.** `NodeConfig.read_bytes`, the bytes one catch-up or fetch read moves per round trip (D-81 A), has no default; the node tests use 64 KiB. It is clamped to half of `max_frame`, and a batch larger than that alone still goes out whole. Step 7a brings configuration from the environment and needs a default.
-**Vision.** CLAUDE.md §8 (every limit has a default and an owner); docs/configuration.md.
+**Vision.** rules.md §8 (every limit has a default and an owner); docs/configuration.md.
 
 ### A. 64 KiB default with an env var, in 7a — recommended
 - **What we do:** `STRAUM_READ_BYTES`, default 64 KiB, checked at startup against `max_frame` and the largest batch.
@@ -1464,7 +1464,7 @@ The largest that keeps 9 in 10 is therefore 96. I shipped 64 instead, for margin
 
 The gate for the group with no bound is 85%, the measured 87.1% less its spread.
 **Why now.** Step 7a makes this constant the server's default.
-**Vision.** CLAUDE.md §11 (no limit chosen without a measurement on Linux); unified-stream §1 (predictability before peak speed). unified-stream does not say whether a liveness criterion measured in simulation may set a production limit on its own; your answer here decides it.
+**Vision.** rules.md §11 (no limit chosen without a measurement on Linux); unified-stream §1 (predictability before peak speed). unified-stream does not say whether a liveness criterion measured in simulation may set a production limit on its own; your answer here decides it.
 
 ### A. Measure on Linux, then choose by a stated target — recommended
 - **What we do:** three nodes on a Linux host.
@@ -1516,7 +1516,7 @@ Throughput also collapses at caps of 1024 and 4096 (16 k and 7 k against about 3
 
 Update 2026-10-09, after the D-85 failover fixes (stale read answers, read routing, progress keepalives, patience, older-slot fetches; ADR-0008). In the same container: every failover commits again (max 8.6 s), and throughput rose to about 350–450 k at caps 64–256. But failovers within 1 s are 2, 7, 2, 5, 9 and 10 of 10 for caps 64, 96, 128, 256, 1024 and 4096, and the misses still go with a survivor 30 000–255 000 records behind. Eventual liveness is fixed; bounded failover time is not, and B is its lever. The collapse at caps of 1024 and up remains.
 **Why now.** D-84 A's target, 9 in 10 failovers within 1 s, may be unreachable by the cap alone, and step 7a is waiting on a default.
-**Vision.** unified-stream §1 (predictability before peak speed; time never decides), §2.3 (commit by majority); CLAUDE.md §11.
+**Vision.** unified-stream §1 (predictability before peak speed; time never decides), §2.3 (commit by majority); rules.md §11.
 
 ### A. Repeat on a Linux host, then decide — recommended
 - **What we do:** run `cargo bench -p node --bench cap` on a quiet Linux host and record both curves and the lag. If the lag pattern holds, the next card is a lag bound (B). If it doesn't, the cap alone is chosen as D-84 A says.
@@ -1779,7 +1779,7 @@ Your condition was "never block commit for an available majority". L2 reads it a
 ## D-94. A Linux host for step 6 (D-84 A; D-89: `L`, `T`, the cap)
 
 **Context.** Step 6 of your order — Linux benchmarks and production settings — needs a quiet Linux host; none is available here. The cap bench (`node/benches/cap.rs`) is ready; flow control can be measured off and on once `node` sets `lag_bound`.
-**Vision.** CLAUDE.md §11, §13 (accepted numbers come from a quiet Linux host); D-84 A.
+**Vision.** rules.md §11, §13 (accepted numbers come from a quiet Linux host); D-84 A.
 
 ### A. You provide a quiet Linux host (ssh); I run the cap bench with flow control off and on — recommended
 - **Cost:** M, your host time.
@@ -2007,10 +2007,10 @@ One reading to confirm: condition 2 ("the number of takeovers returns to the lev
 
 **Context.** 7a lets `server` start a node on the new path behind an experimental switch (D-78 A, D-102 A).
 - **Where the new path lives:** in `node` (links, sequencer or replica, the log on disk, the gateway over TCP; `publish = false`). It depends on `apply`, `cluster`, `gateway`, `journal`, `storage` and `transport`.
-- **What the boundaries allow:** `server` may depend on `runtime` only (CLAUDE.md §2, enforced by `scripts/check-boundaries.sh`). `runtime` is the old path's driver.
+- **What the boundaries allow:** `server` may depend on `runtime` only (rules.md §2, enforced by `scripts/check-boundaries.sh`). `runtime` is the old path's driver.
 
-Wiring the switch therefore changes the dependency table, which is a decision, not a detail (CLAUDE.md §17: no silent changes). D-78 A's precondition holds: D-72 was settled by D-80 B (liveness per fault cycle, not a rate), made concrete by D-81 A and D-82 A.
-**Vision.** CLAUDE.md §2 (enforced boundaries); D-49 A (the new crates beside the old path until step 8); D-75 (old path frozen).
+Wiring the switch therefore changes the dependency table, which is a decision, not a detail (rules.md §17: no silent changes). D-78 A's precondition holds: D-72 was settled by D-80 B (liveness per fault cycle, not a rate), made concrete by D-81 A and D-82 A.
+**Vision.** rules.md §2 (enforced boundaries); D-49 A (the new crates beside the old path until step 8); D-75 (old path frozen).
 
 ### A. `server` depends on `node` directly — recommended
 - **What we do:**
@@ -2053,7 +2053,7 @@ Undecided:
   - `heartbeat` and `takeover_ticks` have no measured defaults;
   - the tests and the simulation use 50 ms and 3, and the simulation shows 3 heartbeats churns under random delivery (D-99);
   - none of it is measured on a real network (D-94 C).
-**Vision.** ADR-0006 (startup checks); CLAUDE.md §8 (every limit with a default and an owner in configuration.md); D-102 A (5: no unmeasured production claims).
+**Vision.** ADR-0006 (startup checks); rules.md §8 (every limit with a default and an owner in configuration.md); D-102 A (5: no unmeasured production claims).
 
 ### A. Explicit env, timing defaults marked experimental — recommended
 - **What we do:**
@@ -2092,7 +2092,7 @@ Undecided:
 - **What exists:** `cluster::Voter::hand_off` (step 6, `SlotEnd` and the successor schedule) is reachable only from tests. `node::Node` has no command for it.
 - **What D-78 A asks:** an operator `hand_off` in 7a.
 - **Precedent:** the server already handles SIGTERM and Ctrl-C (`#[cfg(unix)]` in `main.rs`), and has a hand-written HTTP listener for metrics (`STRAUM_METRICS_ADDR`).
-**Vision.** unified-stream §2.4 (planned handoff); CLAUDE.md §13 (platform code); ADR-0008 step 6.
+**Vision.** unified-stream §2.4 (planned handoff); rules.md §13 (platform code); ADR-0008 step 6.
 
 ### A. A signal: SIGUSR1 asks the node to hand its slot over — recommended
 - **What we do:**
@@ -2127,8 +2127,8 @@ Undecided:
 - the server's configuration is unit-tested;
 - a manual smoke run on loopback passed: three server processes, a QoS 1 publish across nodes, an operator handoff, refused CONNECTs, clean shutdown (ADR-0008, "Step 7a").
 
-Nothing automated starts the server binary in this mode. D-102 A says 7a is not complete until the new server path passes its correctness checks. The rules allow the MQTT client `rumqttc` only in the e2e and node tests (CLAUDE.md §2).
-**Vision.** D-102 A (transition criterion); CLAUDE.md §2 (dev-dependencies), §17.
+Nothing automated starts the server binary in this mode. D-102 A says 7a is not complete until the new server path passes its correctness checks. The rules allow the MQTT client `rumqttc` only in the e2e and node tests (rules.md §2).
+**Vision.** D-102 A (transition criterion); rules.md §2 (dev-dependencies), §17.
 
 ### A. A server integration test with a hand-written MQTT client — recommended
 - **What we do:**
@@ -2162,7 +2162,7 @@ Nothing automated starts the server binary in this mode. D-102 A says 7a is not 
 - the links between nodes are plain TCP, protected only by the frame version and the configuration digest, which are not authentication.
 
 Anyone who can reach the ports can publish, subscribe, or join the link protocol with a guessed digest.
-**Vision.** CLAUDE.md scope (TLS optional); D-102 A (experimental, not production-ready); ADR-0008 "Not yet in step 4" (credentials not checked).
+**Vision.** rules.md scope (TLS optional); D-102 A (experimental, not production-ready); ADR-0008 "Not yet in step 4" (credentials not checked).
 
 ### A. Client credentials and TLS before 7a counts as complete — recommended
 - **Amends D-102 A:** it adds a completion criterion D-78 A and D-102 A do not contain.
@@ -2198,7 +2198,7 @@ Anyone who can reach the ports can publish, subscribe, or join the link protocol
 **Context.** One validation run in the Linux container failed two node tests that pass everywhere else: `a_node_with_other_limits_is_refused_and_the_others_go_on` and `a_restarted_sequencer_resumes_where_its_log_ends`, both at a node's start. Three reruns in the container and every host run passed.
 - **The suspected cause, not proven:** the tests' `free_port()` binds port 0, reads the number and releases it before the node binds it, so a test running in parallel can take the port first. Two more cluster tests in that file make it likelier.
 - **The cause is not confirmed:** the failing run kept no error text.
-**Vision.** CLAUDE.md §17 (failure paths tested; no flaky gate).
+**Vision.** rules.md §17 (failure paths tested; no flaky gate).
 
 ### A. Bind first, then tell the peers
 - **What we do:** each node binds port 0 itself (`Node::start` already reports `listen`); the test starts the nodes, then gives each its peers' real addresses.
@@ -2224,7 +2224,7 @@ Anyone who can reach the ports can publish, subscribe, or join the link protocol
 - **In the test:** the resend is acknowledged on the second attempt.
 
 It is safe, but every handoff — planned, as an operator's command — costs publishers up to 30 s.
-**Vision.** unified-stream §2.4 (planned handoff); CLAUDE.md §8 (today: "the proposal is dropped, never acknowledged; `commit_timeout` closes its publisher"); §7 (bounded memory); D-102 A.
+**Vision.** unified-stream §2.4 (planned handoff); rules.md §8 (today: "the proposal is dropped, never acknowledged; `commit_timeout` closes its publisher"); §7 (bounded memory); D-102 A.
 
 ### A. Pass the queue on at the handoff — recommended
 - **What we do:** the outgoing sequencer forwards the proposals it still holds, in order, to the successor with the handoff — the successor is known then, from the schedule. A proposal reaching a node while no successor is known yet is dropped as today. The drop at a planned handoff is fixed at its source, in the handoff protocol.
@@ -2263,7 +2263,7 @@ It is safe, but every handoff — planned, as an operator's command — costs pu
   - the old path has client credentials (`auth`: password file, ACL) and client TLS (`transport`, rustls);
   - the new path has neither;
   - its links are plain TCP whose HELLO carries a version and a configuration digest — integrity of intent, not authentication.
-**Vision.** CLAUDE.md scope (TLS optional), §2 (`auth`, `transport`); D-102 A; unified-stream §1.
+**Vision.** rules.md scope (TLS optional), §2 (`auth`, `transport`); D-102 A; unified-stream §1.
 
 ### A. Clients first, then mutual TLS between nodes — recommended
 - **What we do:**
@@ -2333,7 +2333,7 @@ Your order after D-106–D-108 is the rest of 7a, then measurements on a Linux h
 - **Since then:** 24 container runs and every host run passed. The tests now report `Node::start`'s error.
 - **One candidate removed:** the bind-and-release port race in the test helper. Each test binary now takes ports from a block of its own, numbered by a counter.
 - **The cause is not established.**
-**Vision.** D-108 (diagnose; never mask by retries); CLAUDE.md §17.
+**Vision.** D-108 (diagnose; never mask by retries); rules.md §17.
 
 ### A. Keep it open with a long container loop that keeps the logs — recommended
 - **What we do:** 100 runs of the node tests in the container, keeping the full output of any failure.
@@ -2358,7 +2358,7 @@ Your order after D-106–D-108 is the rest of 7a, then measurements on a Linux h
 - §6, phase 0: a harness "for the existing leader/follower replication".
 
 Both the replication and the harness were deleted at step 8 (D-111). ADR-0008 records the deviation, but the level-1 text now contradicts the tree.
-**Vision.** CLAUDE.md "Sources, in order of precedence" (level 1 decides; the lower is corrected); D-111.
+**Vision.** rules.md "Sources, in order of precedence" (level 1 decides; the lower is corrected); D-111.
 
 ### A. Amend unified-stream.md to say what was removed and when — recommended
 - **What we do:** you edit it, or approve the edit: the intro and §6 phase 0 say the old path existed until step 8 (D-111), and point to ADR-0008.
@@ -2381,7 +2381,7 @@ Both the replication and the harness were deleted at step 8 (D-111). ADR-0008 re
 - **What the node does:** sending it again would put it behind the later one, so it is given up and logged ("proposals lost before a later one of this node committed"). Its publisher is closed by `commit_timeout` (30 s), as before D-109.
 - **What never happens:** a duplicate or a reorder. Only a loss, which at-least-once covers through the client's resend.
 - **Unknown:** how often this happens under load. Nothing counts it yet (D-112).
-**Vision.** CLAUDE.md §7 (ordering), §8; D-109 B's condition ("no republishing without well-defined deduplication"); D-112 A.
+**Vision.** rules.md §7 (ordering), §8; D-109 B's condition ("no republishing without well-defined deduplication"); D-112 A.
 
 ### A. Count it first, decide on the number — recommended
 - **What we do:** the metrics of D-112 count these losses (`proposals_given_up`) next to the queue and link drops. If the Linux runs show them under a realistic load, this card comes back with the number.
@@ -2416,7 +2416,7 @@ Both the replication and the harness were deleted at step 8 (D-111). ADR-0008 re
 **Context.** Seen once while checking D-109 by mutation. Two node tests failed after 31 s, but the test process took about 7 more minutes to exit.
 - **Why:** `Node` does not stop when dropped (its documented contract). A test that panics never reaches `Cluster::shutdown`, and its nodes keep running until the runtime is torn down.
 - **Scope:** a passing run is unaffected. A failing one is slow to report, and in the container loop of D-113 it would stretch each failing run.
-**Vision.** CLAUDE.md §17 (failure paths tested); D-113 (diagnostics kept, nothing retried).
+**Vision.** rules.md §17 (failure paths tested); D-113 (diagnostics kept, nothing retried).
 
 ### A. Stop the nodes when the test `Cluster` is dropped — recommended
 - **What we do:** a `Drop` on the test helper `Cluster` sends each node its stop, without awaiting. Test code only; `Node`'s contract stays as it is.
@@ -2514,7 +2514,7 @@ Both the replication and the harness were deleted at step 8 (D-111). ADR-0008 re
   - not met for in-slot give-ups after a full queue or a lost link tail (D-115). The publisher is never acknowledged; it is closed at `commit_timeout`.
 - **Within the existing limits:** a count bound, `max_queue` = 1 024 entries per node. That is the sequencer's own bound, without a byte budget of its own: up to 256 MiB at worst.
 
-**Vision.** D-109 B; D-112 A; unified-stream §1, §7; CLAUDE.md §7.
+**Vision.** D-109 B; D-112 A; unified-stream §1, §7; rules.md §7.
 
 ### A. Closed, with D-115 and D-117 open — recommended
 - **What we do:** D-109 counts as closed. "Accepted" means acknowledged to a client: none is lost, and none was acknowledged before its commit. The next steps are D-113, then D-114, with D-117 before D-112's measurements.
@@ -2545,13 +2545,13 @@ Both the replication and the harness were deleted at step 8 (D-111). ADR-0008 re
 - **What is counted now, and what is not:**
   - counted: refusals at a full outbox (`Status::refused`), give-ups (`Status::given_up`), forwards a full or sealed sequencer queue refused (`Voter::forwards_refused`, not yet in `Status`);
   - not counted: forwards lost on a link, or dropped by a node not leading their slot. D-112's metrics must cover these paths (D-115 A).
-**Vision.** D-109 B, D-115 A (measure first; a forwarding acknowledgement is not a durable commit), D-119 A (the outbox bound becomes a real resource bound; explicit backpressure or fail-fast, never silent loss); CLAUDE.md §7, §8.
+**Vision.** D-109 B, D-115 A (measure first; a forwarding acknowledgement is not a durable commit), D-119 A (the outbox bound becomes a real resource bound; explicit backpressure or fail-fast, never silent loss); rules.md §7, §8.
 
 ### A. Cap each node's outbox at `max_queue / voters` — recommended
 - **What we do:** each node holds at most 341 proposals with three voters, so every outbox together fits the sequencer's queue and a resend burst cannot overflow it. The sequencer's bound and memory stay as they are. A node at its cap refuses new proposals, counted (`Status::refused`), and its publisher waits as at any refusal: explicit backpressure.
 - **Strandings:** counted in D-112 (the oldest sent entry's age in heartbeats). The stranding itself is decided on that number.
 - **Check:** the takeover simulation, with its assertions unchanged; refused forwards at the sequencer should fall to those from a sealed queue.
-- **Cost:** S. A fixed 7a limit changes (`docs/configuration.md`); a behaviour change by CLAUDE.md §8.
+- **Cost:** S. A fixed 7a limit changes (`docs/configuration.md`); a behaviour change by rules.md §8.
 - **Risks:** a third of today's per-node admission, at a byte cost still unbounded per entry (up to 341 × 256 KiB per node).
 
 ### B. Grow the sequencer's queue to voters × `max_queue`
@@ -2583,7 +2583,7 @@ Both the replication and the harness were deleted at step 8 (D-111). ADR-0008 re
 - **The node and server tests:** they now clean up after themselves (D-116).
 
 Nothing breaks: names carry the process and thread ids. But the directories grow with every validation run, and in D-113's loops with every run.
-**Vision.** CLAUDE.md §17 (failure paths tested); D-116 A (cleanup on success and failure).
+**Vision.** rules.md §17 (failure paths tested); D-116 A (cleanup on success and failure).
 
 ### A. Each test removes its directory in a guard dropped at its end — recommended
 - **What we do:** the storage and transport test helpers return a guard that removes the directory on drop, success or failure. Same shape as D-116. Test code only.
@@ -2643,7 +2643,7 @@ Nothing breaks: names carry the process and thread ids. But the directories grow
 - **What can follow:** the gateway closes a client after 1.5 × its keep-alive with no packet received. A client idle through a long full spell can be closed for silence the node caused.
 - **How long a full spell lasts:** as long as commits stall — for example, no majority. In that case `commit_timeout` (30 s) closes the publishers anyway.
 - **Unmeasured:** how often a spell outlasts a keep-alive. D-112 can count reads withheld and how long.
-**Vision.** D-120 A ("failure or backpressure, never silent loss"); CLAUDE.md §8; MQTT 3.1.1 §3.1.2.10 and MQTT 5 §3.1.2.10 (keep-alive).
+**Vision.** D-120 A ("failure or backpressure, never silent loss"); rules.md §8; MQTT 3.1.1 §3.1.2.10 and MQTT 5 §3.1.2.10 (keep-alive).
 
 ### A. Measure first, in D-112 — recommended
 - **What we do:** D-112 counts spells of withheld reads and their length. This card comes back with the number if spells approach a keep-alive.
@@ -2675,7 +2675,7 @@ Nothing breaks: names carry the process and thread ids. But the directories grow
 - three counter increments in the gateway, per publish, PUBACK and delivery.
 
 `Measured` always runs, even with no metrics listener, so the same build cannot be compared with metrics off. No Linux host has been available so far (D-84); container numbers are preliminary.
-**Vision.** CLAUDE.md §11 (baseline, one variable, ≥ 5 alternating rounds, medians; macOS and containers show direction only), §17 (hot-path changes carry a performance report); D-112 ("no measurement overhead that distorts the result"); D-84 A.
+**Vision.** rules.md §11 (baseline, one variable, ≥ 5 alternating rounds, medians; macOS and containers show direction only), §17 (hot-path changes carry a performance report); D-112 ("no measurement overhead that distorts the result"); D-84 A.
 
 ### A. Overhead against 071db00 first, then the gated measurements — recommended
 - **What we do:**
@@ -2691,7 +2691,7 @@ Nothing breaks: names carry the process and thread ids. But the directories grow
 - **Risks:** a branch per event to switch it, and a node that measures nothing unless asked: a stall seen only after the fact cannot be explained.
 
 **Rejected.**
-- *Measure with the metrics on, without the overhead check:* D-112 forbids measurement overhead that distorts the result, and CLAUDE.md §11 asks for a baseline first.
+- *Measure with the metrics on, without the overhead check:* D-112 forbids measurement overhead that distorts the result, and rules.md §11 asks for a baseline first.
 
 **Recommendation.** A. B only if A shows an overhead above the floor that cannot be removed.
 
@@ -2744,7 +2744,7 @@ Missing:
 - at most 4 scrapes at once, with 2 s timeouts, and a test.
 
 It is a new public surface you did not ask for. The benchmark harness can read `Node::metrics` in-process instead.
-**Vision.** D-112; D-107 (exposure); CLAUDE.md §15 (metrics nobody can read are metrics nobody acts on); "do not do work the task did not ask for".
+**Vision.** D-112; D-107 (exposure); rules.md §15 (metrics nobody can read are metrics nobody acts on); "do not do work the task did not ask for".
 
 ### A. Keep the listener as built — recommended
 - **What we do:** keep it. A three-process run (the server, the e2e test, a Linux host) has no other way to read the metrics.
@@ -2771,7 +2771,7 @@ It is a new public surface you did not ask for. The benchmark harness can read `
 
 Its first run, in the container on the development Mac, put every median within 3.3 %, inside that machine's 10 % noise floor. That result is preliminary (`docs/baselines/apple-m1-dev.md`). No Linux host has been available (D-84). The accepted result and the gated D-112 measurements wait for one.
 - **Not covered yet:** the container run compared metric collection only. The benches run with no metrics listener, so nothing was scraped during the rounds. The cost of scraping — the listener on, polled every few seconds — is part of D-124's step 4 on the same host.
-**Vision.** CLAUDE.md §11 (accepted numbers from a quiet Linux host, never a container on macOS); D-124 A; D-84 A.
+**Vision.** rules.md §11 (accepted numbers from a quiet Linux host, never a container on macOS); D-124 A; D-84 A.
 
 ### A. A bare-metal Linux machine: one you have, or rented for a few hours — recommended
 - **What we do:**
@@ -2786,7 +2786,7 @@ Its first run, in the container on the development Mac, put every median within 
 ### B. A cloud VM (a dedicated-CPU instance)
 - **What we do:** as A, on a VM with dedicated vCPUs.
 - **Cost:** lower and quicker to get.
-- **What it settles:** CLAUDE.md §11 asks for a quiet Linux host, and a VM is not one. Its numbers would stay preliminary — better than the Mac's, and they do not close D-124.
+- **What it settles:** rules.md §11 asks for a quiet Linux host, and a VM is not one. Its numbers would stay preliminary — better than the Mac's, and they do not close D-124.
 - **Risks:** virtualised time and noisy neighbours on the host.
 
 ### C. Keep the container result as the only one for now
@@ -2832,9 +2832,9 @@ Its first run, in the container on the development Mac, put every median within 
 ## D-129. When is a Linux host's noise low enough?
 
 **Context.** You close D-124 only when the host's noise is low enough to read the result. The runbook measures that noise: this tree against itself, every median with its spread. But no number says what "low enough" is.
-- CLAUDE.md §11 treats differences below 3 % on a pinned, quiet Linux host as noise.
+- rules.md §11 treats differences below 3 % on a pinned, quiet Linux host as noise.
 - The noise run is what shows whether a given host is that quiet.
-**Vision.** CLAUDE.md §11 (noise floor, initial; "if variance is larger than the effect, fix the environment"); D-127 A; D-124.
+**Vision.** rules.md §11 (noise floor, initial; "if variance is larger than the effect, fix the environment"); D-127 A; D-124.
 
 ### A. 3 % for both — recommended
 - **The rule:** a host is accepted when, in the noise run, the two copies' medians differ by less than 3 % on every quantity, and each copy's spread (max − min over min) is below 3 %. Otherwise the run stops after step 1, and steadier conditions or more rounds come first.
@@ -2857,7 +2857,7 @@ Its first run, in the container on the development Mac, put every median within 
 - **Why failover cannot pass:** `cap` measures its failover p50 from 5 failovers per round, and the distribution is bimodal. Most failovers take about 300 ms, some about 1 975 ms. In the container run the spread was over 500 %.
 - **Why this is not just the Mac's noise:** a failover that misses its first takeover waits a further round of `takeover_ticks × patience`, by design (D-85, D-88). A quiet Linux host will likely still show two modes, and the median of 5 can land in either.
 - **Consequence:** as decided, every host fails the noise gate on this quantity alone, and the accepted run never starts.
-**Vision.** D-129 A; D-124 A (failover time among the quantities); CLAUDE.md §11 ("a latency is a gauge of the latest value… the average of a bimodal latency is a number that never happened").
+**Vision.** D-129 A; D-124 A (failover time among the quantities); rules.md §11 ("a latency is a gauge of the latest value… the average of a bimodal latency is a number that never happened").
 
 ### A. Report failover as a distribution, and gate on the others — recommended
 - **What we do:**
@@ -2908,7 +2908,7 @@ Its first run, in the container on the development Mac, put every median within 
 - **What we do:** in `cluster::Sequencer`, a replica's progress report triggers the next read at once, up to the replication window. The heartbeat stays the resend timer only. This is a sans-IO change, with takeover-simulation scenarios for a replica far behind.
 - **Cost:** M.
 - **Risks:** more reads at once on the sequencer's disk; bounded by the window.
-- **Order:** after the accepted D-124 run. It changes the code that run compares (071db00 against this tree), and CLAUDE.md §11 allows one variable at a time.
+- **Order:** after the accepted D-124 run. It changes the code that run compares (071db00 against this tree), and rules.md §11 allows one variable at a time.
 
 ### C. Turn flow control on (D-89)
 - **What we do:** the sequencer holds new batches while an attached replica is more than `L` behind, for at most `T` heartbeats.
@@ -2968,7 +2968,7 @@ Its first run, in the container on the development Mac, put every median within 
 - **So:** the node catches up, slowly — about a minute under this load, longer than its clients' 30 s.
 
 Read size did not show as the limiter in that one run per size. But 512 KiB was 40 % slower than both ends, so one run cannot establish a non-effect. Your step 4 asks for a decision on D-131 B, the next read on the replica's reply. Another suspect, from the code and not measured: the replication window of 256 positions in flight beyond the replica's durable report. At about 28 round trips a second, that is about 7 000 a second.
-**Vision.** D-131 A (measure one variable at a time; no flow control at the same time); CLAUDE.md §11 (repeated measurement over one good number); D-124 (code under its comparison unchanged until its run).
+**Vision.** D-131 A (measure one variable at a time; no flow control at the same time); rules.md §11 (repeated measurement over one good number); D-124 (code under its comparison unchanged until its run).
 
 ### A. Repeat D-131 A, 3 rounds per size, before anything else — recommended
 - **What we do:** the same kill scenario at 64 KiB, 512 KiB and 4 MiB, alternating, 3 rounds each, with the medians and spreads of the lag's rate and the recovery rate, and the running nodes' commit latency and PUBACK. Container first, preliminary.
@@ -2999,11 +2999,11 @@ Read size did not show as the limiter in that one run per size. But 512 KiB was 
 ## D-134. When does failover's p90 call for more failovers?
 
 **Context.** You set D-130 so that if p90 changes substantially between rounds, the count of 50 failovers per round goes up. The runbook prints p90's spread between rounds, `(max − min) / median`, in `scripts/noise.awk`, marked "not gated". But nothing says what "substantially" is, so the trigger cannot be checked mechanically.
-**Vision.** D-130 A; D-129 A (spreads defined the same way); CLAUDE.md §11.
+**Vision.** D-130 A; D-129 A (spreads defined the same way); rules.md §11.
 
 ### A. A p90 spread above 10 % doubles the count — recommended
 - **What we do:** `noise.awk` flags failover p90 when its spread between rounds is above 10 %, and the runbook reruns step 2 with 100 failovers, then 200, until the flag clears or 200 is reached. Each count is reported.
-- **Why 10 %:** a tail estimate from 50 events moves more than a median does; 3 % would rarely clear, and 10 % is the Mac's noise floor in CLAUDE.md §11.
+- **Why 10 %:** a tail estimate from 50 events moves more than a median does; 3 % would rarely clear, and 10 % is the Mac's noise floor in rules.md §11.
 - **Cost:** S; the run grows to about 200 × 1–2 s per round at worst.
 
 ### B. 3 %, as the other quantities
@@ -3037,7 +3037,7 @@ Read size did not show as the limiter in that one run per size. But 512 KiB was 
 - **Not explained:**
   - 4× the window gave about 12× the rate.
   - D-133 also deferred D-131 B "until the heartbeat and window hypotheses are tested". The heartbeat hypothesis is still untested: whether the sequencer sends the next window only at a heartbeat rather than on the replica's reply. That alone could explain the superlinear rate.
-**Vision.** D-133 A→B, D-131 (one variable at a time; D-131 B deferred until the heartbeat and window hypotheses are tested; code under D-124's comparison unchanged before its run); CLAUDE.md §7, §8 (changing a default is a behaviour change), §11.
+**Vision.** D-133 A→B, D-131 (one variable at a time; D-131 B deferred until the heartbeat and window hypotheses are tested; code under D-124's comparison unchanged before its run); rules.md §7, §8 (changing a default is a behaviour change), §11.
 
 ### A. Explain the mechanism and measure the cost, before any change — recommended
 - **What we do:** in the same in-process mode, at windows 256, 1 024 and 4 096:
@@ -3048,7 +3048,7 @@ Read size did not show as the limiter in that one run per size. But 512 KiB was 
 - **Cost:** S; benches only, no change to `cluster` or to the code under D-124.
 
 ### B. A separate, larger window for catch-up only
-- **What we do:** a replica behind by more than the window is sent at a catch-up window, up to a byte budget — for example 64 MiB per peer, owned by `cluster`, as a new `NodeConfig` field. It is fixed in 7a beside the other values and added to CLAUDE.md §7's bounded-memory list and to `docs/configuration.md`. The steady-state window stays at 256, so a healthy replica's in-flight amount does not change. A sans-IO change with takeover-simulation scenarios.
+- **What we do:** a replica behind by more than the window is sent at a catch-up window, up to a byte budget — for example 64 MiB per peer, owned by `cluster`, as a new `NodeConfig` field. It is fixed in 7a beside the other values and added to rules.md §7's bounded-memory list and to `docs/configuration.md`. The steady-state window stays at 256, so a healthy replica's in-flight amount does not change. A sans-IO change with takeover-simulation scenarios.
 - **Preconditions:**
   - A's finding: if heartbeat pacing explains the rate, D-131 B may make B unnecessary;
   - the accepted D-124 run, since B changes `cluster` code under that comparison.
@@ -3086,7 +3086,7 @@ Read size did not show as the limiter in that one run per size. But 512 KiB was 
   - heartbeat pacing at 4 096: the 100 ms runs did not catch up, the 25 and 50 ms runs did.
 - **Open:** the sequencer's commit p50 is bimodal. It is about 1 ms in 19 trials and 55–85 ms in 8: every trial at 25 ms with windows 256 and 1 024, and two at 50 ms.
 
-**Vision.** D-135 A (close it only once the mechanism is investigated and the cost measured; the window stays at 256 until then); D-124 open; D-137 (whether D-124's candidate includes the measuring); CLAUDE.md §11 (find the stage; do not infer the bottleneck from the final number).
+**Vision.** D-135 A (close it only once the mechanism is investigated and the cost measured; the window stays at 256 until then); D-124 open; D-137 (whether D-124's candidate includes the measuring); rules.md §11 (find the stage; do not infer the bottleneck from the final number).
 
 ### A. Split the round trip into its stages, with a control, in the same mode — recommended
 - **What we do:** in `cap`'s catch-up mode, time each boundary per Append to the lagging replica. The samples are matched by the batch's last position over one in-process monotonic clock, with no change to `cluster::wire`:
@@ -3132,7 +3132,7 @@ Read size did not show as the limiter in that one run per size. But 512 KiB was 
   - per Append sent: a sum of the records' lengths and a push onto `Flight`, a queue bounded at 4 096 entries per peer.
 - Their cost is not measured. The run that would measure it is D-124's own, still waiting for a quiet Linux host.
 
-**Vision.** D-124 A, D-131 (no change to the compared code before the run), D-127 (no rewriting of metrics); CLAUDE.md §10 (every addition to the hot path needs a reason), §11.
+**Vision.** D-124 A, D-131 (no change to the compared code before the run), D-127 (no rewriting of metrics); rules.md §10 (every addition to the hot path needs a reason), §11.
 
 ### A. The candidate is the tree as it is, all instrumentation included — recommended
 - **What we do:** D-124 measures the cost of the measuring that will ship, D-132 and D-135 included. Record this in ADR-0008 as an amendment to D-131's freeze. No code change. It also decides that D-124's result is no longer comparable to the D-112-only candidate named in D-127 step (2).
@@ -3174,7 +3174,7 @@ Read size did not show as the limiter in that one run per size. But 512 KiB was 
   - whether Prometheus text may serve as a client contract at all — D-112 made it for measurement;
   - whether an admin API is a core surface that needs an addition to unified-stream.md §2 or §6 through an ADR. §6 has no phase for tools outside the cluster.
 
-**Vision.** D-140, D-138 (security before network exposure; the committed-log boundary; the core authoritative); D-112 (metrics are read by people and tools, nothing read back into a decision); CLAUDE.md §15 (no framework) and "Rules of work"; the brief §3, §9 (no invented protocol; the smallest contract addition).
+**Vision.** D-140, D-138 (security before network exposure; the committed-log boundary; the core authoritative); D-112 (metrics are read by people and tools, nothing read back into a decision); rules.md §15 (no framework) and "Rules of work"; the brief §3, §9 (no invented protocol; the smallest contract addition).
 
 ### A. A CLI-only first slice on the metrics endpoint — recommended
 - **What we do:**
@@ -3230,7 +3230,7 @@ Read size did not show as the limiter in that one run per size. But 512 KiB was 
 - **Not explained:** the replica's own log thread waits 10–20 ms at p90 (`append_queue_W`) during catch-up only.
 - fsync costs about 0 in the container.
 
-**Vision.** CLAUDE.md §7 (bounded under any input), §10 (append and replicate on the hot path), §11 (baseline, one change, Linux for accepted numbers); D-138 (container results may drive exploratory work; truncation and compaction get a full guardian review); D-57 A (retention).
+**Vision.** rules.md §7 (bounded under any input), §10 (append and replicate on the hot path), §11 (baseline, one change, Linux for accepted numbers); D-138 (container results may drive exploratory work; truncation and compaction get a full guardian review); D-57 A (retention).
 
 **Common first step, for A–C** (S; it closes D-135 or reopens the analysis):
 - stamp `read_K` against the read's offset in its segment;
@@ -3294,7 +3294,7 @@ If `read_K` grows with the offset, the cause is confirmed and the option below f
   - `cluster::ReadBatches::done()` says when a read needs nothing more.
 - **Not measured:** a cold disk, where the scanned bytes are disk reads, not memory, would cost more.
 
-**Vision.** CLAUDE.md §7 (bounded under any input), §10 (append and replicate on the hot path), §11 (baseline recorded — D-139 A; one change at a time; Linux for accepted numbers); D-138 (container results drive exploratory work; storage, truncation and compaction get a full guardian review); D-57 A (retention).
+**Vision.** rules.md §7 (bounded under any input), §10 (append and replicate on the hot path), §11 (baseline recorded — D-139 A; one change at a time; Linux for accepted numbers); D-138 (container results drive exploratory work; storage, truncation and compaction get a full guardian review); D-57 A (retention).
 
 ### A. Early stop, then a cursor — two changes, measured apart — recommended
 - **Step 1 — early stop (S):** discarded in D-139's card ("a read still scans everything before its start"); it returns on new evidence, since the part after the read is measured at 5–15 ms a read.
@@ -3354,10 +3354,10 @@ If `read_K` grows with the offset, the cause is confirmed and the option below f
 
 Not measured: a cold disk, the sync on a real disk, a Linux host. D-138's order puts 7c (persistent sessions) first among features. D-124, the accepted Linux comparison, still has no host. The CLI's first slice, D-141, runs in its own repository.
 
-**Vision.** D-138 (order; Linux gates accepted claims and defaults, not features); D-124, D-127; CLAUDE.md §11.
+**Vision.** D-138 (order; Linux gates accepted claims and defaults, not features); D-124, D-127; rules.md §11.
 
 ### A. Go on to 7c, persistent sessions — recommended
-- **What we do:** step 7c of ADR-0008 — sessions that survive a disconnect, through the log, with the gateway's refusal at CONNECT lifted for them only. Wills and expiry stay refused (D-138). With expiry refused, a 3.1.1 session with CleanSession=0 would persist indefinitely, so the design card must name the global bound on persisted sessions and their bytes (CLAUDE.md §7, "per session, and globally") and what happens when it is reached. A card for its design first: the record kinds it writes come out of the reserved block (`SessionExpired` and others) only by a decision, and the straum-cli session is told first (D-141).
+- **What we do:** step 7c of ADR-0008 — sessions that survive a disconnect, through the log, with the gateway's refusal at CONNECT lifted for them only. Wills and expiry stay refused (D-138). With expiry refused, a 3.1.1 session with CleanSession=0 would persist indefinitely, so the design card must name the global bound on persisted sessions and their bytes (rules.md §7, "per session, and globally") and what happens when it is reached. A card for its design first: the record kinds it writes come out of the reserved block (`SessionExpired` and others) only by a decision, and the straum-cli session is told first (D-141).
 - **Cost:** L, over several tasks.
 
 ### B. Measure the catch-up path on a cold disk first
@@ -3398,7 +3398,7 @@ Not measured: a cold disk, the sync on a real disk, a Linux host. D-138's order 
   - Invariant 7: at most one live session per client id in the cluster.
   - Time only through the log: expiry needs `SessionExpired`, out of scope here.
 
-**Vision.** unified-stream §1, §2, invariant 7; CLAUDE.md §7 (bounded per session and globally), §8 (overflow policy), §12 (explicit lifecycle); D-138 (sessions first; wills and expiry stay refused); D-143 A's conditions; D-141 (contract changes told to straum-cli first).
+**Vision.** unified-stream §1, §2, invariant 7; rules.md §7 (bounded per session and globally), §8 (overflow policy), §12 (explicit lifecycle); D-138 (sessions first; wills and expiry stay refused); D-143 A's conditions; D-141 (contract changes told to straum-cli first).
 
 ### A. Client-id sessions through `Connect` and `Disconnect`, a count bound, and refusal at it — recommended
 - **State:** `apply` gains `persisted: BTreeMap<ClientId, Persisted>`. Each entry holds subscriptions, the inflight and backlog it already keeps per `Origin`, its next delivery id, and `attached: Option<Origin>`. A clean session stays keyed by `Origin` as now.
@@ -3414,7 +3414,7 @@ Not measured: a cold disk, the sync on a real disk, a Linux host. D-138's order 
   5. Not `persist`: a clean session as today, plus the takeover in step 1.
 - **The bound:** `max_persisted_sessions` is a new `apply::Limits` field. Its default comes from a measurement of what one entry costs; 10 000 is a placeholder until then. It is in the configuration digest, as every `apply` limit is.
 
-  Per entry, bytes are already bounded: the client id is at most 256 bytes; subscriptions count against `max_subscriptions`; queued bytes count against `max_total_queued_bytes`. So the count bound makes the whole persisted set bounded, which goes into CLAUDE.md §7.
+  Per entry, bytes are already bounded: the client id is at most 256 bytes; subscriptions count against `max_subscriptions`; queued bytes count against `max_total_queued_bytes`. So the count bound makes the whole persisted set bounded, which goes into rules.md §7.
 - **While detached:**
   - deliveries go to the backlog under the existing per-session bounds, and under a budget of their own for all detached sessions together: `max_detached_queued_bytes`, a new `apply::Limits` field inside `max_total_queued_bytes`. Abandoned sessions then can't fill the shared queued budget and get live QoS 1 subscribers closed by its overflow rule (`apply`, `deliver`);
   - an at-most-once message without room is dropped and counted, as now;
@@ -3473,7 +3473,7 @@ Not measured: a cold disk, the sync on a real disk, a Linux host. D-138's order 
 - straum-cli's checks read the block, and the straum-cli session has been told (2026-10-16).
 - D-144 A would make two of them written.
 
-**Vision.** D-141 (the contract changes only by a recorded decision, the CLI told first); CLAUDE.md "do not change public APIs silently".
+**Vision.** D-141 (the contract changes only by a recorded decision, the CLI told first); rules.md "do not change public APIs silently".
 
 ### A. Move the three to `reserved-kinds` now — recommended
 - **What we do:** the three move to the reserved block, keeping their numbers. The block's text says "written" only for what `apply` writes. The journal test pins a further rule: every stable kind other than `BatchHeader`, `SlotStart` and `SlotEnd` is one `apply::Proposal::kind()` returns.
