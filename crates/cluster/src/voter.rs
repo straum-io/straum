@@ -482,7 +482,7 @@ impl Voter {
             }
         };
         while let Some(proposal) = self.outbox.next(slot) {
-            // ponytail: a copy per send, the outbox keeps the original until
+            // A copy per send, the outbox keeps the original until
             // it commits; unmeasured (D-112).
             let proposal = proposal.clone();
             match (to, &mut self.role) {

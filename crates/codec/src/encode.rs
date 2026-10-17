@@ -26,7 +26,7 @@ pub fn encode(
     out: &mut BytesMut,
 ) -> Result<(), EncodeError> {
     let v5 = version == Version::V5;
-    // ponytail: the body goes to a scratch buffer to learn its length; write
+    // The body goes to a scratch buffer to learn its length; write
     // in place behind a reserved length if an encode benchmark asks (phase 5).
     let mut body = BytesMut::new();
     let first = match packet {
