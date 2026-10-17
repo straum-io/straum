@@ -60,3 +60,53 @@ skill. When the user answers `D-<n>: <choice>`, the card moves to
 **Recommendation.** A. The fence is sound on paper and bounded; stages 1–2 let the simulation show invariants A and B hold and size it, before any client depends on it. B if you'd rather not take a decision between stages. C only if stage 2 shows tombstones aren't worth their memory.
 
 **Answer:** `D-146: A` · `D-146: B` · `D-146: C` · `D-146: discuss`
+
+## D-147. Correct the opening of unified-stream.md: is leader/follower replication still "implemented"?
+
+**Context.** `docs/architecture/unified-stream.md:3` says "durable leader/follower replication implemented". D-111 (2026-10-11) removed the old leader/follower path completely; the server now runs only the experimental gateway/sequencer cluster path (ADR-0008, D-102 A). Found by `grep -n 'leader/follower' docs/architecture/unified-stream.md` during the move to straum-io.
+**Why now.** The opening is level-1/3 text (the "Sources" order): a reader, or a reviewer checking against it, is told a removed path exists. Constitution §14.1 forbids presenting stale current state as fact.
+**Vision.** unified-stream §1 (the log is the only source of truth), §7 (the owner decides the document's text); ADR-0008; D-111; D-102 A.
+
+### A. Replace the clause with the current state — recommended
+- **What we do:** in `docs/architecture/unified-stream.md:3`, replace "durable leader/follower replication implemented" with "a gateway/sequencer cluster that commits by majority (ADR-0008), experimental and not production-ready (D-102 A); the old leader/follower path was removed at step 8 (D-111)". Nothing else in the document changes.
+- **Result:** `grep -n 'replication implemented' docs/architecture/unified-stream.md` finds nothing; the opening matches `docs/architecture/current-implementation.md`.
+- **Cost:** S: one sentence.
+- **Risks:** the step-0 line (`unified-stream.md:121`) still describes the old harness → it is a historical plan step, left as is.
+- **Invariants:** none; text only.
+- **Contracts:** none.
+- **Cross-repo:** none.
+- **Reversibility:** easy.
+- **Check:** the grep above; read the opening against ADR-0008 and D-111.
+- **Fact / hypothesis:** fact: the clause and D-111.
+
+### B. Delete the clause without a replacement
+- **What we do:** drop "durable leader/follower replication implemented" from line 3.
+- **Result:** no false statement; the opening no longer says what replicates the log.
+- **Cost:** S.
+- **Risks:** the opening under-describes the system → `current-implementation.md` carries it.
+- **Invariants:** none.
+- **Contracts:** none.
+- **Cross-repo:** none.
+- **Reversibility:** easy.
+- **Check:** as A.
+- **Fact / hypothesis:** fact.
+
+### C. Do nothing / defer
+- **When this is right:** if unified-stream.md is to be rewritten after 7c, and the line goes with it.
+- **Cost of waiting:** the highest-ranked document states something false about the code.
+
+**Comparison**
+
+| | A | B | C |
+|---|---|---|---|
+| Fit with vision | full | partial | none |
+| Risk to invariants | none | none | none |
+| Cost | S | S | none |
+| Reversibility | easy | easy | easy |
+
+**Recommendation.** A, because the opening is what readers take as the summary of the system. B if the owner wants the opening to describe direction only, not state.
+**What would change it.** A decision to bring back a leader/follower mode.
+**Rejected.**
+- Correct it inside the migration PR without a card — violates unified-stream §7 (the owner decides this document's text; M-8 A).
+
+**Answer:** `D-147: A` · `D-147: B, but …` · `D-147: discuss` · `D-147: defer`
