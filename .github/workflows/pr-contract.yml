@@ -1,0 +1,55 @@
+name: pr-contract
+
+# The PR body carries every field of .github/pull_request_template.md and one
+# Issue link between the markers (Constitution §9). Copy of
+# straum-dev-plan templates/github/workflows/pr-contract.yml (ECO-D-4).
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  pr-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the PR body
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          body="$(printf '%s' "${PR_BODY:-}" | tr -d '\r')"
+          fail=0
+          err() { echo "pr-contract: $*" >&2; fail=1; }
+
+          for field in "Issue ID" "Scope" "Acceptance Criteria" "What Changed" "Why" \
+                       "Tests Usage" "Performance" "Compatibility and Risks" "Completion Status"; do
+              # Text between this heading and the next "## " heading, without HTML comments.
+              section="$(printf '%s\n' "$body" | awk -v h="## $field" '
+                  $0 == h { on = 1; next }
+                  on && /^## / { exit }
+                  on { print }' | sed 's/<!--[^>]*-->//g' | grep -v '^[[:space:]]*$')"
+              if ! printf '%s\n' "$body" | grep -qxF "## $field"; then
+                  err "missing section \"## $field\""
+              elif [ -z "$section" ] && [ "$field" != "Issue ID" ]; then
+                  err "section \"## $field\" is empty"
+              fi
+          done
+
+          links="$(printf '%s' "$body" | grep -oE '<!--ISSUE-->[^<]*<!--/ISSUE-->' || true)"
+          count="$(printf '%s' "$links" | grep -c . || true)"
+          if [ "$count" -ne 1 ]; then
+              err "expected one <!--ISSUE-->…<!--/ISSUE--> link, found $count"
+          elif ! printf '%s' "$links" | grep -qE '^<!--ISSUE-->https://github\.com/straum-io/[A-Za-z0-9._-]+/issues/[0-9]+<!--/ISSUE-->$'; then
+              err "the Issue link must be https://github.com/straum-io/<repository>/issues/<number>: $links"
+          fi
+
+          for placeholder in "Observable, testable condition." \
+                             "Problem, affected components, intended behavior. Explicit exclusions." \
+                             "The underlying problem, the evidence, and the reason for each material design choice."; do
+              printf '%s\n' "$body" | grep -qF "$placeholder" && err "template placeholder left: \"$placeholder\""
+          done
+
+          [ "$fail" -eq 0 ] && echo "pr-contract: ok"
+          exit "$fail"
