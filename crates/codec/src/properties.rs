@@ -477,7 +477,7 @@ pub(crate) fn auth(reader: &mut Reader, limits: &Limits) -> Result<AuthPropertie
 /// Writes one section: properties into a scratch buffer, then its length and
 /// the bytes. The scratch buffer is one allocation per encoded MQTT 5 packet
 /// that has properties.
-// ponytail: scratch buffer per section; write in place behind a reserved
+// Scratch buffer per section; write in place behind a reserved
 // length if an encode benchmark shows it (phase 5).
 pub(crate) struct Writer(BytesMut);
 

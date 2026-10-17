@@ -768,7 +768,7 @@ impl State {
         lsn: u64,
         out: &mut Vec<Effect>,
     ) {
-        // ponytail: every subscription is tried; a routing index (the old
+        // Every subscription is tried; a routing index (the old
         // broker's trie) when a benchmark asks, phase 5.
         let mut matched = Vec::new();
         for (origin, session) in &self.sessions {

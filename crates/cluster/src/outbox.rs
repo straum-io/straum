@@ -104,7 +104,7 @@ impl Outbox {
             self.sent = 0;
             return Vec::new();
         }
-        // ponytail: a scan of the sent prefix per committed record; it is
+        // A scan of the sent prefix per committed record; it is
         // the head almost always for this node's own records, and the
         // prefix is bounded by `max`.
         let Some(at) = self
