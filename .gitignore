@@ -23,8 +23,5 @@ target
 # macOS
 .DS_Store
 
-# graphify knowledge graph: generated, rebuilt with `graphify update .` (D-75)
-graphify-out/
-
 # Baseline worktrees for scripts/overhead.sh (D-124).
 .bench/
