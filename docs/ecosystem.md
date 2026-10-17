@@ -1,16 +1,17 @@
 # The ecosystem: `straum-cli` and `straum-console`
 
-Level 4 (CLAUDE.md, "Sources"): where this brief and the architecture
-disagree, unified-stream.md, CLAUDE.md and the ADRs decide. Adopted as
+Level 4 (rules.md, "Sources"): where this brief and the architecture
+disagree, unified-stream.md, rules.md and the ADRs decide. Adopted as
 the plan for the next steps by D-140 (2026-10-16), which supersedes
 D-138 (7).
 
 ## Where it starts (2026-10-16)
 
-- `rubtsov-stan/straum-cli` (Go) and `rubtsov-stan/straum-console`
+- `straum-io/straum-cli` (Go) and `straum-io/straum-console`
   (full-stack web console): private, empty apart from `README.md`,
   `LICENSE` and `.gitignore`. No stack, contract, tests or CI to preserve
-  yet.
+  yet. The repositories moved from the `rubtsov-stan` account to
+  `straum-io` on 2026-10-17 and are public there.
 - What the core exposes to a client outside the cluster:
   - MQTT 3.1.1 and 5 (`STRAUM_CLUSTER_MQTT_LISTEN`), no credentials yet
     (D-110);
@@ -24,7 +25,7 @@ D-138 (7).
 - There is no administrative API and no machine-readable contract. The
   brief's Stage 1 starts from that gap: an administrative interface is a
   core change (an ADR), and every effect it has on shared state goes
-  through the log (CLAUDE.md, "Rules of work").
+  through the log (rules.md, "Rules of work").
 - Constraints carried from D-138: security before network exposure — an
   administrative surface is authenticated before it leaves loopback; a
   trusted network is a deployment assumption, never authentication.
@@ -56,12 +57,12 @@ Do not claim that work is complete unless the relevant implementation and verifi
 
 This task concerns two repositories:
 
-1. `rubtsov-stan/straum-cli`
+1. `straum-io/straum-cli`
    - A command-line client for interacting with Straum.
    - Written in Go.
    - Intended for operators, developers, and automation.
 
-2. `rubtsov-stan/straum-console`
+2. `straum-io/straum-console`
    - Straum's administrator console.
    - A web application that includes **both its frontend and backend**.
    - Intended for observing the Straum cluster and performing authorized administrative operations.
