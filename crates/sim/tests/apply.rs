@@ -60,6 +60,11 @@ const LIMITS: Limits = Limits {
     max_backlog: 3,
     max_backlog_bytes: 24,
     max_total_queued_bytes: 40,
+    // Step 7c's bounds: not read by `State::new`.
+    connect_window: 4096,
+    max_connect_tombstones: 16,
+    max_persisted_sessions: 16,
+    max_detached_queued_bytes: 16,
 };
 
 fn seeds() -> std::ops::Range<u64> {
@@ -441,6 +446,11 @@ impl Reference {
                 self.sessions
                     .retain(|(o, _)| !(o.node == node && o.session < below));
                 out.push(Effect::Reset { node, below, lsn });
+            }
+            // Step 7c's records: `State::new` refuses them, and this model
+            // follows it; the step 7c simulation is `sim/tests/connect.rs`.
+            Proposal::Connect { .. } | Proposal::Disconnect { .. } => {
+                panic!("a step 7c record in the apply simulation")
             }
         }
         self.tidy();
