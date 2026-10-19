@@ -62,7 +62,10 @@ cluster must agree on the voters, the first slot, the timing and these
 bounds: they go into the configuration digest each link's HELLO carries, and
 a link from a node that differs is refused. Wills, persistent sessions and
 session expiry are refused at CONNECT until step 7c. SIGUSR1 asks the node to
-hand its slot over (a protocol handoff, D-105 A); SIGTERM or Ctrl-C stops it.
+hand its slot over (a protocol handoff, D-105 A); SIGTERM or Ctrl-C stops it,
+with exit code 0. A node that stops by itself — its log fails, a committed
+record does not apply, a panic — logs why, and the process exits non-zero so
+a supervisor restarts it (D-152 A).
 
 ### Stable metrics (D-141 A)
 

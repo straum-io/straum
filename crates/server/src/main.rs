@@ -61,7 +61,17 @@ async fn run(config: node::NodeConfig) -> ExitCode {
         }
     };
     tracing::info!(listen = %node.listen, mqtt = ?node.mqtt, metrics = ?node.metrics_listen, "node started");
-    serve_hand_offs(&node).await;
+    // A node whose loop has ended serves nothing: the process exits, so a
+    // supervisor sees it and restarts it (D-152 A).
+    let stopped = tokio::select! {
+        () = serve_hand_offs(&node) => false,
+        () = node.stopped() => true,
+    };
+    if stopped {
+        tracing::error!("the node loop ended (the error above says why); the process exits");
+        node.shutdown().await;
+        return ExitCode::FAILURE;
+    }
     tracing::info!("stopping");
     node.shutdown().await;
     ExitCode::SUCCESS
