@@ -57,6 +57,11 @@ fn written(proposal: &Proposal) {
         | Proposal::Ack { .. }
         | Proposal::SessionGone { .. }
         | Proposal::NodeReset { .. } => {}
+        // Reserved: `State::new` refuses them, so they are no sample (D-145,
+        // D-146 A).
+        Proposal::Connect { .. } | Proposal::Disconnect { .. } => {
+            panic!("a reserved kind among the samples")
+        }
     }
 }
 

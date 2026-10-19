@@ -28,15 +28,17 @@
     clippy::cast_possible_truncation
 )]
 
+mod clients;
 mod snapshot;
 
+pub use clients::ClientView;
 pub use snapshot::SnapshotError;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use bytes::{BufMut, Bytes};
-use domain::{DeliveryGuarantee, Topic, TopicError, TopicFilter};
+use domain::{ClientId, DeliveryGuarantee, Topic, TopicError, TopicFilter};
 use journal::{Kind, Record};
 
 /// Where a proposal came from and where its effects go: a session at one
@@ -115,6 +117,30 @@ pub enum Proposal {
     /// A gateway restarted: every session it had, numbered below `below`, is
     /// gone. Its new sessions are numbered from `below` up.
     NodeReset { node: u8, below: u64 },
+    /// A client's CONNECT (step 7c, D-146 A): attaches `origin` to
+    /// `client_id` if it passes the fence. `seen` is the proposing gateway's
+    /// applied lsn when it proposed; `persist` keeps the session across
+    /// disconnects. Applied only by a [`State::with_connect`].
+    Connect {
+        origin: Origin,
+        client_id: ClientId,
+        seen: u64,
+        clean_start: bool,
+        persist: bool,
+    },
+    /// The connection of `origin` ended: it is detached, and its session
+    /// kept if it persists. Applied only by a [`State::with_connect`].
+    Disconnect { origin: Origin },
+}
+
+/// Why a `Connect` was refused (step 7c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Its proposer had not applied the client id's last change, or it was
+    /// proposed more than `connect_window` positions before it committed.
+    Stale,
+    /// A new persisted session at `max_persisted_sessions`.
+    Quota,
 }
 
 /// What applying a committed record makes observable. Every node computes
@@ -176,6 +202,72 @@ pub enum Effect {
     },
 }
 
+/// What applying a committed record of step 7c makes observable (D-146 A):
+/// handed out by [`State::apply_connect`] beside the [`Effect`]s, so nothing
+/// that matches on `Effect` sees them before the gateway stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientEffect {
+    /// the `Connect` at `lsn` attached `to`. `session_present` is
+    /// CONNACK's: an existing session was resumed.
+    Connected {
+        to: Origin,
+        session_present: bool,
+        lsn: u64,
+    },
+    /// the `Connect` at `lsn` changed nothing; its gateway refuses
+    /// the CONNECT and never proposes it again.
+    ConnectRefused {
+        to: Origin,
+        reason: Refusal,
+        lsn: u64,
+    },
+    /// a newer `Connect` for its client id detached `to`; its
+    /// gateway closes it (SessionTakenOver).
+    TakenOver { to: Origin, lsn: u64 },
+    /// the `Disconnect` at `lsn` applied; `attached` is whether it
+    /// found `to` attached and detached it.
+    Disconnected {
+        to: Origin,
+        attached: bool,
+        lsn: u64,
+    },
+    /// a record from `to`, an origin not attached, changed
+    /// nothing; nothing is committed in its name, and its gateway closes it.
+    /// `request` is the record's, if it has one.
+    Refused {
+        to: Origin,
+        request: Option<u64>,
+        lsn: u64,
+    },
+    /// a detached session was deleted whole, its budget full.
+    SessionDeleted { lsn: u64 },
+}
+
+impl ClientEffect {
+    /// The session the effect is for, if it is for one.
+    pub fn to(&self) -> Option<Origin> {
+        match self {
+            Self::Connected { to, .. }
+            | Self::ConnectRefused { to, .. }
+            | Self::TakenOver { to, .. }
+            | Self::Disconnected { to, .. }
+            | Self::Refused { to, .. } => Some(*to),
+            Self::SessionDeleted { .. } => None,
+        }
+    }
+
+    pub fn lsn(&self) -> u64 {
+        match self {
+            Self::Connected { lsn, .. }
+            | Self::ConnectRefused { lsn, .. }
+            | Self::TakenOver { lsn, .. }
+            | Self::Disconnected { lsn, .. }
+            | Self::Refused { lsn, .. }
+            | Self::SessionDeleted { lsn } => *lsn,
+        }
+    }
+}
+
 impl Effect {
     /// The session the effect is for, if it is for one.
     pub fn to(&self) -> Option<Origin> {
@@ -215,13 +307,23 @@ pub enum ApplyError {
     Topic(u64, TopicError),
     #[error("record kind {0:?} is not applied before a later step")]
     NotYet(Kind),
+    /// A [`State::with_connect`] is applied by [`State::apply_connect`], which
+    /// hands out its client effects; `apply` would drop them.
+    #[error("a state with client ids is applied by apply_connect")]
+    ClientEffects,
 }
 
-/// A topic or filter longer than 65 535 bytes: MQTT cannot carry one, so a
-/// gateway proposing it has a bug. Refused rather than truncated.
+/// A topic or filter longer than 65 535 bytes, which MQTT cannot carry, or a
+/// client id longer than [`MAX_CLIENT_ID_BYTES`]: a gateway proposing it has
+/// a bug. Refused rather than truncated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("a topic or filter longer than 65535 bytes")]
+#[error("a topic or filter longer than 65535 bytes, or a client id longer than its bound")]
 pub struct TooLong;
+
+/// The longest client id a `Connect` carries: what bounds each client entry
+/// and tombstone (step 7c). The codec's default, which the gateway enforces
+/// at CONNECT.
+pub const MAX_CLIENT_ID_BYTES: usize = 256;
 
 fn put_short(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), TooLong> {
     let length = u16::try_from(bytes.len()).map_err(|_| TooLong)?;
@@ -272,6 +374,8 @@ impl Proposal {
             Self::Ack { .. } => Kind::Ack,
             Self::SessionGone { .. } => Kind::SessionGone,
             Self::NodeReset { .. } => Kind::NodeReset,
+            Self::Connect { .. } => Kind::Connect,
+            Self::Disconnect { .. } => Kind::Disconnect,
         }
     }
 
@@ -281,7 +385,9 @@ impl Proposal {
     /// subscribe `[guarantee u8][options u8][filter_len u16][filter]`, an
     /// unsubscribe `[filter_len u16][filter]`. Ack: `[node][session]
     /// [delivery u64]`. SessionGone: `[node][session]`. NodeReset:
-    /// `[node u8][below u64]`.
+    /// `[node u8][below u64]`. Connect: `[node][session][seen u64]
+    /// [flags u8: clean_start 1, persist 2][client_id_len u16][client_id]`.
+    /// Disconnect: `[node][session]`.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), TooLong> {
         match self {
             Self::Publish {
@@ -326,10 +432,25 @@ impl Proposal {
                 put_origin(*origin, out);
                 out.put_u64(*delivery);
             }
-            Self::SessionGone { origin } => put_origin(*origin, out),
+            Self::SessionGone { origin } | Self::Disconnect { origin } => put_origin(*origin, out),
             Self::NodeReset { node, below } => {
                 out.put_u8(*node);
                 out.put_u64(*below);
+            }
+            Self::Connect {
+                origin,
+                client_id,
+                seen,
+                clean_start,
+                persist,
+            } => {
+                if client_id.as_bytes().len() > MAX_CLIENT_ID_BYTES {
+                    return Err(TooLong);
+                }
+                put_origin(*origin, out);
+                out.put_u64(*seen);
+                out.put_u8(u8::from(*clean_start) | (u8::from(*persist) << 1));
+                put_short(client_id.as_bytes(), out)?;
             }
         }
         Ok(())
@@ -399,6 +520,32 @@ impl Proposal {
                 let below = body.u64()?;
                 body.finish()?;
                 Self::NodeReset { node, below }
+            }
+            Kind::Connect => {
+                let origin = body.origin()?;
+                let seen = body.u64()?;
+                let flags = body.byte()?;
+                if flags & !0b11 != 0 {
+                    return Err(ApplyError::Malformed(lsn));
+                }
+                let id = body.short()?;
+                if id.len() > MAX_CLIENT_ID_BYTES {
+                    return Err(ApplyError::Malformed(lsn));
+                }
+                let client_id = ClientId::new(id).map_err(|_| ApplyError::Malformed(lsn))?;
+                body.finish()?;
+                Self::Connect {
+                    origin,
+                    client_id,
+                    seen,
+                    clean_start: flags & 1 != 0,
+                    persist: flags & 0b10 != 0,
+                }
+            }
+            Kind::Disconnect => {
+                let origin = body.origin()?;
+                body.finish()?;
+                Self::Disconnect { origin }
             }
             other => return Err(ApplyError::NotYet(other)),
         };
@@ -529,6 +676,38 @@ impl Default for Limits {
     }
 }
 
+/// Step 7c's bounds (D-146 A), read only by a [`State::with_connect`]. Kept
+/// apart from [`Limits`] until the gateway stage, so nothing that builds
+/// `Limits` changes before then (D-153); every node must be given the same
+/// ones once they act.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnectLimits {
+    /// A `Connect` passes only if it commits at most this many positions
+    /// after its `seen`.
+    pub connect_window: u64,
+    /// Removed client entries remembered for the fence; when full, the
+    /// oldest goes and the floor rises to it.
+    pub max_connect_tombstones: usize,
+    /// Client ids with a session kept across disconnects.
+    pub max_persisted_sessions: usize,
+    /// Inflight and backlog bytes of detached sessions, inside
+    /// `Limits::max_total_queued_bytes`.
+    pub max_detached_queued_bytes: usize,
+}
+
+impl Default for ConnectLimits {
+    /// Placeholders: stage 2 showed the sizes depend on rates only a Linux
+    /// cluster gives, in log positions (D-153).
+    fn default() -> Self {
+        Self {
+            connect_window: 4096,
+            max_connect_tombstones: 10_000,
+            max_persisted_sessions: 10_000,
+            max_detached_queued_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Message {
     topic: Topic,
@@ -591,10 +770,17 @@ pub struct State {
     retained_bytes: usize,
     /// Inflight and backlog bytes of every session.
     queued_bytes: usize,
+    /// Step 7c: client ids, the fence and persisted sessions (`clients`).
+    clients: Option<clients::Clients>,
+    /// Step 7c's effects of the record being applied: empty between
+    /// records, so no state compares or hashes differently for it.
+    client_out: Vec<ClientEffect>,
 }
 
 impl State {
-    /// Empty: nothing applied, lsn 0.
+    /// Empty: nothing applied, lsn 0. `Connect` and `Disconnect` are refused
+    /// as not yet built, and every origin may propose: the path as it runs
+    /// until the gateway proposes a `Connect` for every CONNECT (step 7c).
     pub fn new(limits: Limits) -> Self {
         Self {
             limits,
@@ -604,6 +790,22 @@ impl State {
             retained: BTreeMap::new(),
             retained_bytes: 0,
             queued_bytes: 0,
+            clients: None,
+            client_out: Vec::new(),
+        }
+    }
+
+    /// Empty, with step 7c's client ids (D-146 A): `Connect` and
+    /// `Disconnect` apply, an origin proposes only once attached, and a
+    /// session may persist across disconnects. Stages 1 and 2 only: nothing
+    /// runs it outside tests and the simulation yet.
+    pub fn with_connect(limits: Limits, connect: ConnectLimits) -> Self {
+        Self {
+            clients: Some(clients::Clients {
+                limits: connect,
+                ..clients::Clients::default()
+            }),
+            ..Self::new(limits)
         }
     }
 
@@ -625,6 +827,30 @@ impl State {
     /// observable to `out`. Batch headers, `SlotStart` and `SlotEnd` advance the
     /// position and change nothing else. Records must come in lsn order, each exactly once.
     pub fn apply(&mut self, record: &Record<'_>, out: &mut Vec<Effect>) -> Result<(), ApplyError> {
+        if self.clients.is_some() {
+            return Err(ApplyError::ClientEffects);
+        }
+        self.apply_record(record, out)
+    }
+
+    /// As [`State::apply`], and step 7c's effects of the record are appended
+    /// to `clients` (D-146 A).
+    pub fn apply_connect(
+        &mut self,
+        record: &Record<'_>,
+        out: &mut Vec<Effect>,
+        clients: &mut Vec<ClientEffect>,
+    ) -> Result<(), ApplyError> {
+        let applied = self.apply_record(record, out);
+        clients.append(&mut self.client_out);
+        applied
+    }
+
+    fn apply_record(
+        &mut self,
+        record: &Record<'_>,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), ApplyError> {
         let expected = self.applied.checked_add(1).ok_or(ApplyError::OutOfOrder {
             lsn: record.lsn,
             expected: u64::MAX,
@@ -637,6 +863,9 @@ impl State {
         }
         // A slot's first and last records mark a change of sequencer: they
         // are part of the log's order and change no state (steps 5, 6).
+        if self.clients.is_none() && matches!(record.kind, Kind::Connect | Kind::Disconnect) {
+            return Err(ApplyError::NotYet(record.kind));
+        }
         if !matches!(
             record.kind,
             Kind::BatchHeader | Kind::SlotStart | Kind::SlotEnd
@@ -660,6 +889,26 @@ impl State {
     }
 
     fn effect(&mut self, proposal: Proposal, lsn: u64, out: &mut Vec<Effect>) {
+        // Step 7c: nothing is committed in the name of an origin that is not
+        // attached — taken over, or never connected.
+        let asks = match &proposal {
+            Proposal::Publish {
+                origin, request, ..
+            }
+            | Proposal::Subscribe {
+                origin, request, ..
+            }
+            | Proposal::Unsubscribe {
+                origin, request, ..
+            } => Some((*origin, Some(*request))),
+            Proposal::Ack { origin, .. } => Some((*origin, None)),
+            _ => None,
+        };
+        if let Some((to, request)) = asks.filter(|&(origin, _)| self.unattached(origin)) {
+            self.client_out
+                .push(ClientEffect::Refused { to, request, lsn });
+            return;
+        }
         match proposal {
             Proposal::Publish {
                 origin,
@@ -712,20 +961,41 @@ impl State {
             }
             Proposal::Ack { origin, delivery } => self.ack(origin, delivery, lsn, out),
             Proposal::SessionGone { origin } => {
+                // A persisted session is detached and kept; clean state goes.
+                self.detach(origin, lsn);
                 self.drop_session(origin);
                 out.push(Effect::Gone { to: origin, lsn });
             }
             Proposal::NodeReset { node, below } => {
-                let gone: Vec<Origin> = self
+                let mut gone: Vec<Origin> = self
                     .sessions
                     .keys()
+                    .chain(self.attached_origins())
                     .filter(|o| o.node == node && o.session < below)
                     .copied()
                     .collect();
+                gone.sort_unstable();
+                gone.dedup();
                 for origin in gone {
+                    self.detach(origin, lsn);
                     self.drop_session(origin);
                 }
                 out.push(Effect::Reset { node, below, lsn });
+            }
+            Proposal::Connect {
+                origin,
+                client_id,
+                seen,
+                clean_start,
+                persist,
+            } => self.connect(origin, &client_id, seen, clean_start, persist, lsn, out),
+            Proposal::Disconnect { origin } => {
+                let attached = self.detach(origin, lsn);
+                self.client_out.push(ClientEffect::Disconnected {
+                    to: origin,
+                    attached,
+                    lsn,
+                });
             }
         }
     }
@@ -798,6 +1068,7 @@ impl State {
             };
             self.deliver(origin, message, guarantee, lsn, out);
         }
+        self.route_detached(published, guarantee, lsn);
     }
 
     /// Hands `message` to `origin`, in order. With nothing waiting it goes at
@@ -849,12 +1120,14 @@ impl State {
             self.queued_bytes = total.saturating_add(size);
         } else if at_least_once {
             self.drop_session(origin);
+            // Step 7c: a persisted session goes whole too, and its client id
+            // is fenced.
+            self.forget_client(origin, lsn);
             out.push(Effect::Close { to: origin, lsn });
         }
     }
 
     fn ack(&mut self, origin: Origin, delivery: u64, lsn: u64, out: &mut Vec<Effect>) {
-        let max_inflight = self.limits.max_inflight;
         // Every committed acknowledgement is answered, also one retried
         // after it was applied or one for a session that is gone: the
         // gateway retries an acknowledgement until it sees `Acked`, and
@@ -872,8 +1145,21 @@ impl State {
         let Some(acked) = session.inflight.remove(&delivery) else {
             return;
         };
-        let mut released = acked.size();
+        let released = acked.size();
         session.inflight_bytes = session.inflight_bytes.saturating_sub(released);
+        self.queued_bytes = self.queued_bytes.saturating_sub(released);
+        self.drain(origin, lsn, out);
+    }
+
+    /// Hands `origin` what waits in its backlog, in order, while its
+    /// inflight window has room: after an acknowledgement, and when a
+    /// detached session is resumed (step 7c).
+    fn drain(&mut self, origin: Origin, lsn: u64, out: &mut Vec<Effect>) {
+        let max_inflight = self.limits.max_inflight;
+        let Some(session) = self.sessions.get_mut(&origin) else {
+            return;
+        };
+        let mut released = 0usize;
         // The backlog drains in order until an at-least-once message finds
         // the window full again. A message moving into the window stays in
         // the queued budget; one going out at most once leaves it.
@@ -973,6 +1259,9 @@ impl State {
         self.applied.hash(&mut hasher);
         self.sessions.hash(&mut hasher);
         self.retained.hash(&mut hasher);
+        if let Some(clients) = &self.clients {
+            clients.hash(&mut hasher);
+        }
         hasher.finish()
     }
 }
