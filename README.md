@@ -155,6 +155,25 @@ Release versions are published to Docker Hub by
 [`.github/workflows/release.yml`](.github/workflows/release.yml) for
 `linux/amd64` and `linux/arm64`, with provenance and an SBOM attached.
 
+## Install the Debian package
+
+Each release on [GitHub](https://github.com/straum-io/straum/releases) has
+`.deb` packages for amd64 and arm64 (Debian 12, Ubuntu 22.04 and newer),
+with `SHA256SUMS` and build provenance. The package installs
+`/usr/bin/straum-server`, a `straum` systemd service and its settings file;
+it does not start anything.
+
+```sh
+sudo apt install ./straum_<version>_<arch>.deb
+sudoedit /etc/default/straum          # node id, peers, listen addresses
+sudo systemctl enable --now straum
+```
+
+The service runs as a dynamic user with its data in `/var/lib/straum` and
+a tight sandbox (`systemd-analyze security` rates it 1.4). Run it on hosts
+or VMs; in containers use the Docker image, since the sandbox needs
+namespaces a container usually cannot create.
+
 ## Run on Kubernetes
 
 [`deploy/kubernetes`](deploy/kubernetes) is a Kustomize package: a

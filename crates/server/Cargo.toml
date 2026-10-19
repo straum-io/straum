@@ -23,3 +23,21 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [[bench]]
 name = "puback"
 harness = false
+
+# Debian package, built by .github/workflows/release.yml with cargo-deb.
+[package.metadata.deb]
+name = "straum"
+maintainer = "straum-io <https://github.com/straum-io/straum/issues>"
+copyright = "straum-io"
+license-file = ["../../LICENSE", "0"]
+extended-description = "A clustered MQTT 3.1.1 and 5 broker that acknowledges a publish only after a majority of its nodes has committed it to one replicated log. Experimental, not production-ready."
+section = "net"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/straum-server", "usr/bin/", "755"],
+    ["debian/straum.default", "etc/default/straum", "644"],
+    ["../../README.md", "usr/share/doc/straum/README.md", "644"],
+]
+conf-files = ["/etc/default/straum"]
+systemd-units = { unit-name = "straum", unit-scripts = "debian", enable = false, start = false }

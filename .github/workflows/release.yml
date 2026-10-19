@@ -1,9 +1,11 @@
 name: release
 
 # A pushed version tag builds the straum-server image for linux/amd64 and
-# linux/arm64 and publishes it to Docker Hub (Constitution §12.3: images only
-# for release versions). A pull request that touches the build only builds
-# the amd64 image, without pushing.
+# linux/arm64 and publishes it to Docker Hub, builds the Debian packages for
+# both, and creates the GitHub release with the packages, their checksums and
+# provenance (Constitution §12.3: only release versions are published). A pull
+# request that touches the build builds the amd64 image and both packages,
+# without publishing anything.
 #
 # Needs, in the repository settings:
 #   variable DOCKERHUB_NAMESPACE  the Docker Hub user or organization
@@ -79,3 +81,73 @@ jobs:
           sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Debian packages for amd64 and arm64, built natively in a Debian 12
+  # container so the package needs only libc6 >= 2.34 (Debian 12, Ubuntu
+  # 22.04 and newer). A pull request builds them as a check.
+  deb:
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-latest, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-deb
+      - name: Build the package
+        env:
+          REF: ${{ github.ref_name }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          if [ "${GITHUB_EVENT_NAME}" = push ]; then
+              # v0.1.0-rc.1 -> 0.1.0~rc.1, which sorts before 0.1.0 in dpkg.
+              version="$(printf '%s' "${REF#v}" | tr '-' '~')"
+          else
+              version="0.0.0~pr${PR}"
+          fi
+          cargo deb --locked -p server --deb-version "$version"
+          ls -l target/debian/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+  # The GitHub release for a version tag: the packages, their checksums and
+  # build provenance. The image is on Docker Hub (job image).
+  github-release:
+    if: github.event_name == 'push'
+    needs: [image, deb]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.deb | tee SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.deb
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          IMAGE: ${{ vars.DOCKERHUB_NAMESPACE }}/straum
+        run: |
+          set -eu
+          pre=""
+          case "$TAG" in *-*) pre="--prerelease" ;; esac
+          gh release create "$TAG" dist/*.deb dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag $pre \
+            --title "$TAG" --generate-notes \
+            --notes "Experimental, not production-ready. Image: \`docker pull ${IMAGE}:${TAG#v}\` (linux/amd64, linux/arm64). Packages: \`sudo apt install ./straum_<version>_<arch>.deb\`, then edit /etc/default/straum and \`systemctl enable --now straum\`. Verify a package: \`sha256sum -c SHA256SUMS\` or \`gh attestation verify <file> -R ${GITHUB_REPOSITORY}\`."
