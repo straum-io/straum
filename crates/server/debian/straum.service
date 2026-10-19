@@ -1,0 +1,42 @@
+[Unit]
+Description=Straum MQTT broker node (experimental)
+Documentation=https://github.com/straum-io/straum
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Settings: /etc/default/straum (docs/configuration.md). The node refuses to
+# start until it is configured.
+EnvironmentFile=/etc/default/straum
+Environment=STRAUM_CLUSTER_DATA_DIR=/var/lib/straum
+ExecStart=/usr/bin/straum-server
+DynamicUser=yes
+StateDirectory=straum
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
