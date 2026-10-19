@@ -1,0 +1,81 @@
+name: release
+
+# A pushed version tag builds the straum-server image for linux/amd64 and
+# linux/arm64 and publishes it to Docker Hub (Constitution §12.3: images only
+# for release versions). A pull request that touches the build only builds
+# the amd64 image, without pushing.
+#
+# Needs, in the repository settings:
+#   variable DOCKERHUB_NAMESPACE  the Docker Hub user or organization
+#   secrets  DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (an access token with write scope)
+on:
+  push:
+    tags: ['v*.*.*']
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - 'crates/**'
+      - .github/workflows/release.yml
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    env:
+      PUBLISH: ${{ github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: The tag is on main and names a release
+        if: env.PUBLISH == 'true'
+        env:
+          NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+        run: |
+          set -eu
+          [ -n "$NAMESPACE" ] || { echo "release: set the DOCKERHUB_NAMESPACE variable" >&2; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "release: $GITHUB_REF_NAME is not on main" >&2; exit 1; }
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ vars.DOCKERHUB_NAMESPACE || 'straum' }}/straum
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ env.PUBLISH == 'true' && !contains(github.ref_name, '-') }}
+          labels: |
+            org.opencontainers.image.title=straum-server
+            org.opencontainers.image.description=Clustered MQTT broker (experimental, not production-ready)
+            org.opencontainers.image.licenses=Apache-2.0
+
+      # ponytail: arm64 builds under QEMU, slow for a Rust workspace; move to
+      # native arm64 runners with a manifest merge if release builds get too long.
+      - uses: docker/setup-qemu-action@v3
+        if: env.PUBLISH == 'true'
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: env.PUBLISH == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ env.PUBLISH == 'true' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ env.PUBLISH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

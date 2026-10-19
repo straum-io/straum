@@ -1,0 +1,17 @@
+# A three-node Straum cluster: kubectl apply -k deploy/kubernetes
+# Set the image and the three peer ClusterIPs (peers.yaml) for your cluster.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+labels:
+  - pairs:
+      app.kubernetes.io/name: straum
+    includeSelectors: false
+resources:
+  - peers.yaml
+  - statefulset.yaml
+  - services.yaml
+  - networkpolicy.yaml
+images:
+  - name: straum
+    newName: straum
+    newTag: local

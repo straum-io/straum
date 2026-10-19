@@ -1,0 +1,40 @@
+# One Service per node with a fixed ClusterIP: STRAUM_CLUSTER_PEERS takes
+# socket addresses, not host names, and a pod's own IP changes on restart.
+# Pick three free addresses inside your cluster's service CIDR (the values
+# below fit the default 10.96.0.0/12) and keep them in step with
+# STRAUM_CLUSTER_PEERS in statefulset.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: straum-0
+spec:
+  clusterIP: 10.96.100.10
+  selector:
+    statefulset.kubernetes.io/pod-name: straum-0
+  ports:
+    - name: link
+      port: 7000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: straum-1
+spec:
+  clusterIP: 10.96.100.11
+  selector:
+    statefulset.kubernetes.io/pod-name: straum-1
+  ports:
+    - name: link
+      port: 7000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: straum-2
+spec:
+  clusterIP: 10.96.100.12
+  selector:
+    statefulset.kubernetes.io/pod-name: straum-2
+  ports:
+    - name: link
+      port: 7000
