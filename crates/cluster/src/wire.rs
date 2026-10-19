@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! frame    [ length u32 ][ type u8 ][ payload ]     length = 1 + payload
-//! HELLO    1  [ version u16 ][ node u8 ][ slot u64 ][ config u64 ]
+//! HELLO    1  [ version u16 ][ node u8 ][ slot u64 ][ config u64 ][ incarnation u64 ]
 //! APPEND   2  [ slot u64 ][ prev u64 ][ prev_slot u64 ][ commit u64 ][ records ]
 //! ACK      3  [ slot u64 ][ last_slot u64 ][ end u64 ][ durable u64 ][ cut u8 ][ report u64 ]
 //! FORWARD  4  [ slot u64 ][ kind u8 ][ properties_len u32 ][ properties ][ body ]
@@ -20,9 +20,12 @@
 //! of its configuration — the cluster parameters every node must share and
 //! its `apply` limits; a receiver whose version or digest differs refuses
 //! the link (the layouts change between versions; the parameters decide
-//! the schedule and what the log means). Nothing sent to
-//! one process reaches its successor: a link does not outlive either end,
-//! and a sender drops what it queued for a link that broke.
+//! the schedule and what the log means). It also carries the sender's
+//! incarnation: a peer seen with another one has restarted, and a link to
+//! it dialled before then may lead to a process that is gone (D-151 A).
+//! Nothing sent to one process reaches its successor: a link does not
+//! outlive either end, and a sender drops what it queued for a link that
+//! broke.
 //!
 //! Every length is remote-controlled: this module refuses indexing,
 //! unchecked arithmetic and truncating casts, and a frame longer than
@@ -40,8 +43,9 @@ use crate::{Message, NodeId, Proposal};
 /// The layout of every frame below. A link from another version is refused
 /// at its HELLO (ADR-0008 step 7a, D-78 A): ACK and FETCHED changed shape
 /// in steps 5 and 6, and a node of another build would misread them.
-/// Version 2: FORWARD carries the slot it is sent for (D-117 B).
-pub const WIRE_VERSION: u16 = 2;
+/// Version 2: FORWARD carries the slot it is sent for (D-117 B). Version 3:
+/// HELLO carries the incarnation (D-151 A).
+pub const WIRE_VERSION: u16 = 3;
 
 const HELLO: u8 = 1;
 const APPEND: u8 = 2;
@@ -60,6 +64,8 @@ pub enum Frame {
         slot: u64,
         /// A digest of what every node must share (`node::cluster_digest`).
         config: u64,
+        /// Which life of the sender this is (`node`'s durable incarnation).
+        incarnation: u64,
     },
     Message(Message),
 }
@@ -111,12 +117,12 @@ pub fn encode(frame: &Frame, out: &mut Vec<u8>) -> Result<(), WireError> {
             node,
             slot,
             config,
+            incarnation,
         } => {
             out.push(HELLO);
             out.extend_from_slice(&version.to_be_bytes());
             out.push(*node);
-            out.extend_from_slice(&slot.to_be_bytes());
-            out.extend_from_slice(&config.to_be_bytes());
+            put_u64s(&[*slot, *config, *incarnation], out);
         }
         Frame::Message(Message::Append {
             slot,
@@ -263,12 +269,18 @@ pub fn decode(buf: &[u8], max_frame: usize) -> Result<Option<(Frame, usize)>, Wi
     };
     let mut r = Reader(frame);
     let frame = match r.u8()? {
-        HELLO => Frame::Hello {
-            version: r.u16()?,
-            node: r.u8()?,
-            slot: r.u64()?,
-            config: r.u64()?,
-        },
+        HELLO => {
+            let version = r.u16()?;
+            Frame::Hello {
+                version,
+                node: r.u8()?,
+                slot: r.u64()?,
+                config: r.u64()?,
+                // Read as its own version wrote it, so a link from version
+                // 2 is refused for its version, not as malformed.
+                incarnation: if version >= 3 { r.u64()? } else { 0 },
+            }
+        }
         APPEND => Frame::Message(Message::Append {
             slot: r.u64()?,
             prev: r.u64()?,

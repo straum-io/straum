@@ -56,7 +56,8 @@ times a packet of 256 KiB, about 85 MiB, per node at worst, a count without
 a byte budget of its own (D-119 A); while it is full the node reads none
 of its MQTT clients. A queue below one proposal per voter is refused at startup
 (`ConfigError::Queue`), so the shares always fit it. A link to a down peer is redialled at least once per
-heartbeat (D-122 A). And the gateway's and `apply`'s limits at the values in `node::experimental`. Every node of one
+heartbeat (D-122 A), and at once when the peer comes back as a new process:
+its HELLO carries its incarnation (D-151 A). And the gateway's and `apply`'s limits at the values in `node::experimental`. Every node of one
 cluster must agree on the voters, the first slot, the timing and these
 bounds: they go into the configuration digest each link's HELLO carries, and
 a link from a node that differs is refused. Wills, persistent sessions and
