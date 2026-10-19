@@ -36,8 +36,8 @@ priority = "optional"
 depends = "$auto"
 assets = [
     ["target/release/straum-server", "usr/bin/", "755"],
-    ["debian/straum.default", "etc/default/straum", "644"],
+    ["../../debian/straum.default", "etc/default/straum", "644"],
     ["../../README.md", "usr/share/doc/straum/README.md", "644"],
 ]
 conf-files = ["/etc/default/straum"]
-systemd-units = { unit-name = "straum", unit-scripts = "debian", enable = false, start = false }
+systemd-units = { unit-name = "straum", unit-scripts = "../../debian", enable = false, start = false }
