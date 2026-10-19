@@ -654,7 +654,8 @@ pub struct Limits {
 
 impl Default for Limits {
     /// The old path's defaults where it has one (docs/configuration.md).
-    /// The four step 7c bounds are provisional until stage 2 sizes them.
+    /// The four step 7c bounds are provisional: stage 2 showed they depend
+    /// on rates only a Linux cluster gives, in log positions (D-153).
     fn default() -> Self {
         Self {
             max_subscriptions_per_session: 1024,
