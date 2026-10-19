@@ -1,0 +1,45 @@
+name: ci
+
+# The validation of rules.md §17 on every PR and on main. The Linux container
+# run of scripts/linux.sh is not needed here: the runner is Linux.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Benches are built, not run (D-4).
+      - run: cargo test --workspace --all-targets --no-run
+      - run: cargo test --workspace --tests
+      - run: scripts/check-boundaries.sh
+
+  # Line, region and function coverage, reported, not gated (ECO-D-7).
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage
+        run: |
+          {
+            echo '```text'
+            cargo llvm-cov --workspace --tests --summary-only | tail -1
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

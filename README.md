@@ -116,6 +116,78 @@ Everything binds to loopback. Any other address is refused unless you set
 `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1`, and then only on a network you
 trust: nothing is authenticated or encrypted yet.
 
+## Run with Docker
+
+Build the image (about 40 MB, a distroless base, runs as a non-root user):
+
+```sh
+docker build -t straum .
+```
+
+Three nodes on their own network. Containers need addresses beyond
+loopback, so this sets `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1`: keep that
+network private, since nothing is authenticated or encrypted yet.
+
+```sh
+docker network create --subnet 10.89.42.0/24 straum
+PEERS=0=10.89.42.10:7000,1=10.89.42.11:7000,2=10.89.42.12:7000
+for i in 0 1 2; do
+  docker run -d --name straum-$i --network straum --ip 10.89.42.1$i \
+    -v straum-$i:/var/lib/straum \
+    -p 188$((3 + i)):1883 -p 910$i:9100 \
+    -e STRAUM_EXPERIMENTAL_CLUSTER=1 \
+    -e STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1 \
+    -e STRAUM_CLUSTER_NODE_ID=$i \
+    -e STRAUM_CLUSTER_PEERS=$PEERS \
+    -e STRAUM_CLUSTER_LISTEN=0.0.0.0:7000 \
+    -e STRAUM_CLUSTER_MQTT_LISTEN=0.0.0.0:1883 \
+    -e STRAUM_CLUSTER_METRICS_LISTEN=0.0.0.0:9100 \
+    straum
+done
+```
+
+The ports map as in the quick start (MQTT on 1883–1885, metrics on
+9100–9102), so the same `straum-cli` commands work. Each node keeps its log
+in its volume and picks up where it left off after a restart. Peers are
+given as IP addresses: the node does not resolve host names.
+
+Release versions are published to Docker Hub by
+[`.github/workflows/release.yml`](.github/workflows/release.yml) for
+`linux/amd64` and `linux/arm64`, with provenance and an SBOM attached.
+
+## Run on Kubernetes
+
+[`deploy/kubernetes`](deploy/kubernetes) is a Kustomize package: a
+three-replica StatefulSet with a volume per node, one Service per node for
+the links, a `straum-mqtt` Service for clients, a headless Service for
+per-pod metrics, and a NetworkPolicy that keeps the links to Straum pods.
+It needs Kubernetes 1.28 or newer (each pod takes its node id from the
+`apps.kubernetes.io/pod-index` label).
+
+```sh
+kubectl apply -k deploy/kubernetes
+kubectl rollout status statefulset/straum
+kubectl port-forward svc/straum-mqtt 1883:1883
+```
+
+Before applying, set two things:
+
+- **The image**, in `kustomization.yaml` (`images:`).
+- **Three free ClusterIPs** in `peers.yaml`, inside your service CIDR, and
+  the same three in `STRAUM_CLUSTER_PEERS` in `statefulset.yaml`. The node
+  takes socket addresses, not host names, so each peer gets a Service with a
+  fixed IP that survives pod restarts. The defaults fit the common
+  `10.96.0.0/12`.
+
+The pods run as a non-root user with a read-only root filesystem.
+Kubernetes service links are off, because the server refuses unknown
+`STRAUM_*` variables.
+
+One limitation to know before you rely on it: a pod that restarts can stay
+behind and not serve clients
+([#13](https://github.com/straum-io/straum/issues/13)); the other two keep
+the cluster available.
+
 ## Compared with others
 
 Need a broker in production today? Use Mosquitto on a single node, or a
