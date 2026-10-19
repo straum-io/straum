@@ -13,11 +13,51 @@ A PUBACK from a single-node broker means one machine has your message. In
 Straum it means the message is in the log of a majority of the cluster, so
 a three-node cluster keeps every acknowledged message when one node dies.
 
-The same log drives everything else. Delivery, retained messages and
-session state all come from applying committed records in order, and
-nothing changes shared state beside the log. Two nodes with the same log
-prefix are in the same state, which keeps failover predictable and makes
-the cluster testable.
+## The idea
+
+A Straum cluster is one mechanism, not a set of nodes that happen to talk
+to each other.
+
+- **One log decides.** Everything a client can observe, from a PUBACK to a
+  delivery, a retained message or a change of sequencer, is the result of
+  applying a committed record. No node changes shared state any other way.
+- **Nodes are deterministic.** A node is a function of the committed log
+  and its input events: two nodes with the same log prefix hold the same
+  state.
+- **Predictable over fast.** Who takes over next is known in advance,
+  handing the sequencer role over is routine, and each failure has one
+  defined reaction.
+- **Clocks don't decide.** Timeouts only start a transition; the log and
+  the majority decide how it ends.
+- **Proof before claims.** Correctness is shown by deterministic
+  simulation, performance only by measurements on Linux. No "faster"
+  without numbers.
+
+The goal it has to prove: a replicated MQTT 3.1.1 and 5 broker where a
+PUBACK means a majority committed the message, a planned leader change
+keeps client connections open, simulation checks correctness, and any
+`unsafe` code is isolated, justified and verified.
+
+Under the hood the protocol is a variant of Viewstamped Replication and
+Multi-Paxos with a deterministic owner per epoch, plus a few ideas from
+Solana's leader schedule. It is not a new consensus algorithm, and
+consensus only comes in when an owner fails.
+
+**Who it's for:** telemetry and industrial systems where a lost message
+costs money (metering, billing, SCADA events, audit trails), edge-to-cloud
+gateways that want a small, predictable binary, and teams that need a
+replicated broker under a permissive license without a JVM or BEAM
+runtime.
+
+**When goals conflict, this order wins:** an acknowledged message is
+committed; memory stays bounded; operations stay predictable (explicit
+backpressure and failure modes, configuration errors at startup);
+performance per CPU cycle, measured; then protocol coverage.
+
+**What it won't become:** a benchmark winner at the cost of those
+guarantees, a rule engine or integration hub, a broker with a management
+UI built in (that is [straum-console](https://github.com/straum-io/straum-console),
+outside the broker process), or a server for protocols other than MQTT.
 
 ## What it does
 
