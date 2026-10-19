@@ -161,7 +161,7 @@ On Ubuntu 22.04, 24.04 and 26.04, add the PPA and let apt keep Straum up
 to date (amd64 and arm64):
 
 ```sh
-sudo add-apt-repository ppa:@PPA@
+sudo add-apt-repository ppa:straum/straum
 sudo apt install straum
 ```
 
