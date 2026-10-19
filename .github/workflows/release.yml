@@ -132,9 +132,14 @@ jobs:
           pattern: deb-*
           merge-multiple: true
           path: dist
+      # GitHub renames "~" in asset names to "."; rename first so SHA256SUMS
+      # names the files as they are downloaded. The package version inside
+      # (0.1.0~rc.1) is unchanged.
       - name: Checksums
         working-directory: dist
-        run: sha256sum *.deb | tee SHA256SUMS
+        run: |
+          for f in *~*.deb; do [ -e "$f" ] && mv "$f" "$(printf %s "$f" | tr "~" .)"; done
+          sha256sum *.deb | tee SHA256SUMS
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/*.deb
