@@ -166,6 +166,8 @@ pub struct Node {
     metrics: mpsc::Sender<oneshot::Sender<metrics::Snapshot>>,
     trace: mpsc::Sender<TraceRequest>,
     status: watch::Receiver<Status>,
+    /// Closed once the node loop has ended (`Node::stopped`).
+    ended: watch::Receiver<()>,
     stop: Option<oneshot::Sender<()>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     wal: Option<std::thread::JoinHandle<()>>,
@@ -679,6 +681,7 @@ impl Node {
         let (proposals, mut proposals_rx) = mpsc::channel::<Proposal>(1024);
         let (effects, _) = broadcast::channel(4096);
         let (status_tx, status) = watch::channel(Status::default());
+        let (ended_tx, ended) = watch::channel(());
         let (stop, mut stop_rx) = oneshot::channel::<()>();
         let (hand_offs, mut hand_offs_rx) =
             mpsc::channel::<oneshot::Sender<Result<(), cluster::ClusterError>>>(4);
@@ -732,6 +735,10 @@ impl Node {
         // (D-73 A, D-79 A).
         let mut committed_slots = snapshot_slots;
         tasks.push(tokio::spawn(async move {
+            // However the loop ends — stopped, a failed log, a record that
+            // does not apply, a panic — this is dropped, and `Node::stopped`
+            // sees the channel close (D-152 A).
+            let _ended = ended_tx;
             let mut snapshot = state.applied();
             let mut snapshotting = false;
             let mut retained_floor = 0u64;
@@ -1045,6 +1052,7 @@ impl Node {
             trace,
             effects,
             status,
+            ended,
             stop: Some(stop),
             tasks,
             wal: Some(wal_thread),
@@ -1110,6 +1118,15 @@ impl Node {
 
     pub fn status(&self) -> watch::Receiver<Status> {
         self.status.clone()
+    }
+
+    /// Resolves once the node loop has ended — `shutdown`, or a failure it
+    /// logged: a failed log, a committed record that does not decode or
+    /// apply, or a panic. A node in this state serves nothing; its process
+    /// should exit (D-152 A).
+    pub async fn stopped(&self) {
+        let mut ended = self.ended.clone();
+        while ended.changed().await.is_ok() {}
     }
 
     /// Every committed record's effects, as this node applies them, with
