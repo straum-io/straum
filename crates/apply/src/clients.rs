@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, VecDeque};
 use bytes::Bytes;
 use domain::{ClientId, DeliveryGuarantee};
 
-use crate::{Effect, Message, Origin, Refusal, Session, State};
+use crate::{ClientEffect, ConnectLimits, Effect, Message, Origin, Refusal, Session, State};
 
 /// One client id's entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -49,6 +49,7 @@ pub struct ClientView {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Clients {
+    pub(crate) limits: ConnectLimits,
     pub(crate) by_id: BTreeMap<Bytes, Client>,
     /// The attached origins: the exact inverse of the entries' `attached`.
     pub(crate) origins: BTreeMap<Origin, Bytes>,
@@ -185,10 +186,10 @@ impl State {
         lsn: u64,
         out: &mut Vec<Effect>,
     ) {
-        let limits = self.limits;
         let Some(mut clients) = self.clients.take() else {
             return;
         };
+        let limits = clients.limits;
         let id = Bytes::copy_from_slice(client_id.as_bytes());
         clients.prune(lsn, limits.connect_window);
         // Proposed by a gateway that had applied the client id's last
@@ -211,7 +212,7 @@ impl State {
         };
         if let Some(reason) = refusal {
             self.clients = Some(clients);
-            out.push(Effect::ConnectRefused {
+            self.client_out.push(ClientEffect::ConnectRefused {
                 to: origin,
                 reason,
                 lsn,
@@ -226,7 +227,8 @@ impl State {
             kept = Some(match previous.attached {
                 Some(old) => {
                     clients.origins.remove(&old);
-                    out.push(Effect::TakenOver { to: old, lsn });
+                    self.client_out
+                        .push(ClientEffect::TakenOver { to: old, lsn });
                     self.sessions.remove(&old).unwrap_or_default()
                 }
                 None => {
@@ -263,7 +265,7 @@ impl State {
         );
         clients.origins.insert(origin, id);
         self.clients = Some(clients);
-        out.push(Effect::Connected {
+        self.client_out.push(ClientEffect::Connected {
             to: origin,
             session_present,
             lsn,
@@ -276,11 +278,11 @@ impl State {
     /// Detaches `origin`, if attached: its session is kept detached if it
     /// persists and the detached budget has room, and deleted whole
     /// otherwise, leaving a tombstone. Returns whether it was attached.
-    pub(crate) fn detach(&mut self, origin: Origin, lsn: u64, out: &mut Vec<Effect>) -> bool {
-        let limits = self.limits;
+    pub(crate) fn detach(&mut self, origin: Origin, lsn: u64) -> bool {
         let Some(mut clients) = self.clients.take() else {
             return false;
         };
+        let limits = clients.limits;
         let attached = match clients.origins.remove(&origin) {
             None => false,
             Some(id) => {
@@ -297,7 +299,7 @@ impl State {
                     self.release(&session);
                     clients.remove(&id, lsn, limits.max_connect_tombstones);
                     if persist {
-                        out.push(Effect::SessionDeleted { lsn });
+                        self.client_out.push(ClientEffect::SessionDeleted { lsn });
                     }
                 }
                 true
@@ -310,8 +312,8 @@ impl State {
     /// The session of attached `origin` is gone (dropped for overflow):
     /// its entry goes too, leaving a tombstone.
     pub(crate) fn forget_client(&mut self, origin: Origin, lsn: u64) {
-        let max = self.limits.max_connect_tombstones;
         if let Some(clients) = self.clients.as_mut() {
+            let max = clients.limits.max_connect_tombstones;
             if let Some(id) = clients.origins.remove(&origin) {
                 clients.remove(&id, lsn, max);
             }
@@ -327,12 +329,12 @@ impl State {
         published: &Message,
         guarantee: DeliveryGuarantee,
         lsn: u64,
-        out: &mut Vec<Effect>,
     ) {
         let limits = self.limits;
         let Some(mut clients) = self.clients.take() else {
             return;
         };
+        let bounds = clients.limits;
         let mut matched = Vec::new();
         for (id, client) in &clients.by_id {
             let Some(session) = &client.detached else {
@@ -366,7 +368,7 @@ impl State {
             };
             let fits = session.backlog.len() < limits.max_backlog
                 && session.backlog_bytes.saturating_add(size) <= limits.max_backlog_bytes
-                && detached.saturating_add(size) <= limits.max_detached_queued_bytes
+                && detached.saturating_add(size) <= bounds.max_detached_queued_bytes
                 && total.saturating_add(size) <= limits.max_total_queued_bytes;
             let at_least_once = guarantee == DeliveryGuarantee::AtLeastOnce;
             if fits {
@@ -385,8 +387,8 @@ impl State {
                         clients.detached_bytes.saturating_sub(queued(&session));
                     self.release(&session);
                 }
-                clients.remove(&id, lsn, limits.max_connect_tombstones);
-                out.push(Effect::SessionDeleted { lsn });
+                clients.remove(&id, lsn, bounds.max_connect_tombstones);
+                self.client_out.push(ClientEffect::SessionDeleted { lsn });
             }
         }
         self.clients = Some(clients);

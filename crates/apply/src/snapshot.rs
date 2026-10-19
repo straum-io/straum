@@ -11,10 +11,11 @@
 //! The format is versioned and local to one node: it changes when the state
 //! does, and a node refuses a version it does not know rather than guess
 //! (D-67 B). Version 1 is the state without client ids; version 2 adds step
-//! 7c's (D-146 A), and only a `State::with_connect` writes it.
+//! 7c's (D-146 A): only a `State::with_connect` writes it, and only
+//! `State::decode_connect` reads it, so a node on `State::new` never takes one.
 //!
 //! ```text
-//! [version][limits: 8 × u64, version 2: 12][applied u64]
+//! [version][limits: 8 × u64; version 2 adds `ConnectLimits`, 4 × u64][applied u64]
 //! [sessions u64] { [node u8][session u64] session }
 //! [retained u64] { [guarantee u8][message] }
 //! version 2:
@@ -35,7 +36,8 @@ use domain::{ClientId, Topic, TopicFilter};
 
 use crate::clients::{Client, Clients};
 use crate::{
-    Body, Limits, MAX_CLIENT_ID_BYTES, Message, Session, State, guarantee_byte, options_byte,
+    Body, ConnectLimits, Limits, MAX_CLIENT_ID_BYTES, Message, Session, State, guarantee_byte,
+    options_byte,
 };
 
 const VERSION: u8 = 1;
@@ -51,7 +53,7 @@ pub enum SnapshotError {
     Malformed,
 }
 
-fn limits_fields(limits: &Limits, connect: bool) -> Vec<u64> {
+fn limits_fields(limits: &Limits, connect: Option<&ConnectLimits>) -> Vec<u64> {
     let wide = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
     let mut fields: Vec<u64> = [
         limits.max_subscriptions_per_session,
@@ -66,12 +68,12 @@ fn limits_fields(limits: &Limits, connect: bool) -> Vec<u64> {
     .into_iter()
     .map(wide)
     .collect();
-    if connect {
+    if let Some(connect) = connect {
         fields.extend([
-            limits.connect_window,
-            wide(limits.max_connect_tombstones),
-            wide(limits.max_persisted_sessions),
-            wide(limits.max_detached_queued_bytes),
+            connect.connect_window,
+            wide(connect.max_connect_tombstones),
+            wide(connect.max_persisted_sessions),
+            wide(connect.max_detached_queued_bytes),
         ]);
     }
     fields
@@ -209,8 +211,12 @@ impl State {
     /// The whole state is written into `out`: as large as the state, which
     /// the limits bound.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        let connect = self.clients.is_some();
-        out.put_u8(if connect { VERSION_CONNECT } else { VERSION });
+        let connect = self.clients.as_ref().map(|c| &c.limits);
+        out.put_u8(if connect.is_some() {
+            VERSION_CONNECT
+        } else {
+            VERSION
+        });
         for field in limits_fields(&self.limits, connect) {
             out.put_u64(field);
         }
@@ -264,23 +270,43 @@ impl State {
     /// that are there; nothing is allocated from a count before its
     /// entries are read.
     pub fn decode(limits: Limits, bytes: &[u8]) -> Result<Self, SnapshotError> {
+        Self::decode_with(limits, None, bytes)
+    }
+
+    /// As [`State::decode`], for a [`State::with_connect`]'s snapshot
+    /// (version 2), taken under `connect` as well.
+    pub fn decode_connect(
+        limits: Limits,
+        connect: ConnectLimits,
+        bytes: &[u8],
+    ) -> Result<Self, SnapshotError> {
+        Self::decode_with(limits, Some(connect), bytes)
+    }
+
+    fn decode_with(
+        limits: Limits,
+        connect: Option<ConnectLimits>,
+        bytes: &[u8],
+    ) -> Result<Self, SnapshotError> {
         let mut body = Body(bytes, 0);
         let malformed = |_| SnapshotError::Malformed;
         let version = body.byte().map_err(malformed)?;
-        let connect = match version {
-            VERSION => false,
-            VERSION_CONNECT => true,
-            other => return Err(SnapshotError::Version(other)),
+        let expected = if connect.is_some() {
+            VERSION_CONNECT
+        } else {
+            VERSION
         };
-        for field in limits_fields(&limits, connect) {
+        if version != expected {
+            return Err(SnapshotError::Version(version));
+        }
+        for field in limits_fields(&limits, connect.as_ref()) {
             if body.u64().map_err(malformed)? != field {
                 return Err(SnapshotError::Limits);
             }
         }
-        let mut state = if connect {
-            State::with_connect(limits)
-        } else {
-            State::new(limits)
+        let mut state = match connect {
+            Some(connect) => State::with_connect(limits, connect),
+            None => State::new(limits),
         };
         state.applied = body.u64().map_err(malformed)?;
         let sessions = body.u64().map_err(malformed)?;
@@ -302,8 +328,9 @@ impl State {
         }
         state.retained = retained;
         let mut detached_within = true;
-        if connect {
+        if let Some(bounds) = connect {
             let mut clients = Clients {
+                limits: bounds,
                 floor: body.u64().map_err(malformed)?,
                 ..Clients::default()
             };
@@ -355,9 +382,9 @@ impl State {
                 clients.latest.insert(id.clone(), lsn);
                 clients.tombstones.push_back((id, lsn));
             }
-            let bounded = clients.tombstones.len() <= limits.max_connect_tombstones
-                && clients.persisted <= limits.max_persisted_sessions
-                && clients.detached_bytes <= limits.max_detached_queued_bytes;
+            let bounded = clients.tombstones.len() <= bounds.max_connect_tombstones
+                && clients.persisted <= bounds.max_persisted_sessions
+                && clients.detached_bytes <= bounds.max_detached_queued_bytes;
             if !bounded {
                 return Err(SnapshotError::Malformed);
             }

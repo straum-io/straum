@@ -60,11 +60,6 @@ const LIMITS: Limits = Limits {
     max_backlog: 3,
     max_backlog_bytes: 24,
     max_total_queued_bytes: 40,
-    // Step 7c's bounds: not read by `State::new`.
-    connect_window: 4096,
-    max_connect_tombstones: 16,
-    max_persisted_sessions: 16,
-    max_detached_queued_bytes: 16,
 };
 
 fn seeds() -> std::ops::Range<u64> {

@@ -200,34 +200,38 @@ pub enum Effect {
         to: Origin,
         lsn: u64,
     },
-    /// Step 7c: the `Connect` at `lsn` attached `to`. `session_present` is
+}
+
+/// What applying a committed record of step 7c makes observable (D-146 A):
+/// handed out by [`State::apply_connect`] beside the [`Effect`]s, so nothing
+/// that matches on `Effect` sees them before the gateway stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientEffect {
+    /// the `Connect` at `lsn` attached `to`. `session_present` is
     /// CONNACK's: an existing session was resumed.
     Connected {
         to: Origin,
         session_present: bool,
         lsn: u64,
     },
-    /// Step 7c: the `Connect` at `lsn` changed nothing; its gateway refuses
+    /// the `Connect` at `lsn` changed nothing; its gateway refuses
     /// the CONNECT and never proposes it again.
     ConnectRefused {
         to: Origin,
         reason: Refusal,
         lsn: u64,
     },
-    /// Step 7c: a newer `Connect` for its client id detached `to`; its
+    /// a newer `Connect` for its client id detached `to`; its
     /// gateway closes it (SessionTakenOver).
-    TakenOver {
-        to: Origin,
-        lsn: u64,
-    },
-    /// Step 7c: the `Disconnect` at `lsn` applied; `attached` is whether it
+    TakenOver { to: Origin, lsn: u64 },
+    /// the `Disconnect` at `lsn` applied; `attached` is whether it
     /// found `to` attached and detached it.
     Disconnected {
         to: Origin,
         attached: bool,
         lsn: u64,
     },
-    /// Step 7c: a record from `to`, an origin not attached, changed
+    /// a record from `to`, an origin not attached, changed
     /// nothing; nothing is committed in its name, and its gateway closes it.
     /// `request` is the record's, if it has one.
     Refused {
@@ -235,10 +239,33 @@ pub enum Effect {
         request: Option<u64>,
         lsn: u64,
     },
-    /// Step 7c: a detached session was deleted whole, its budget full.
-    SessionDeleted {
-        lsn: u64,
-    },
+    /// a detached session was deleted whole, its budget full.
+    SessionDeleted { lsn: u64 },
+}
+
+impl ClientEffect {
+    /// The session the effect is for, if it is for one.
+    pub fn to(&self) -> Option<Origin> {
+        match self {
+            Self::Connected { to, .. }
+            | Self::ConnectRefused { to, .. }
+            | Self::TakenOver { to, .. }
+            | Self::Disconnected { to, .. }
+            | Self::Refused { to, .. } => Some(*to),
+            Self::SessionDeleted { .. } => None,
+        }
+    }
+
+    pub fn lsn(&self) -> u64 {
+        match self {
+            Self::Connected { lsn, .. }
+            | Self::ConnectRefused { lsn, .. }
+            | Self::TakenOver { lsn, .. }
+            | Self::Disconnected { lsn, .. }
+            | Self::Refused { lsn, .. }
+            | Self::SessionDeleted { lsn } => *lsn,
+        }
+    }
 }
 
 impl Effect {
@@ -251,13 +278,8 @@ impl Effect {
             | Self::Deliver { to, .. }
             | Self::Acked { to, .. }
             | Self::Gone { to, .. }
-            | Self::Close { to, .. }
-            | Self::Connected { to, .. }
-            | Self::ConnectRefused { to, .. }
-            | Self::TakenOver { to, .. }
-            | Self::Disconnected { to, .. }
-            | Self::Refused { to, .. } => Some(*to),
-            Self::Reset { .. } | Self::SessionDeleted { .. } => None,
+            | Self::Close { to, .. } => Some(*to),
+            Self::Reset { .. } => None,
         }
     }
 
@@ -270,13 +292,7 @@ impl Effect {
             | Self::Acked { lsn, .. }
             | Self::Gone { lsn, .. }
             | Self::Reset { lsn, .. }
-            | Self::Close { lsn, .. }
-            | Self::Connected { lsn, .. }
-            | Self::ConnectRefused { lsn, .. }
-            | Self::TakenOver { lsn, .. }
-            | Self::Disconnected { lsn, .. }
-            | Self::Refused { lsn, .. }
-            | Self::SessionDeleted { lsn } => *lsn,
+            | Self::Close { lsn, .. } => *lsn,
         }
     }
 }
@@ -291,6 +307,10 @@ pub enum ApplyError {
     Topic(u64, TopicError),
     #[error("record kind {0:?} is not applied before a later step")]
     NotYet(Kind),
+    /// A [`State::with_connect`] is applied by [`State::apply_connect`], which
+    /// hands out its client effects; `apply` would drop them.
+    #[error("a state with client ids is applied by apply_connect")]
+    ClientEffects,
 }
 
 /// A topic or filter longer than 65 535 bytes, which MQTT cannot carry, or a
@@ -638,24 +658,10 @@ pub struct Limits {
     /// per-session bound times the session count is a product, not a
     /// bound.
     pub max_total_queued_bytes: usize,
-    /// Step 7c (D-146 A), read only by a [`State::with_connect`]: a
-    /// `Connect` passes only if it commits at most this many positions after
-    /// its `seen`.
-    pub connect_window: u64,
-    /// Removed client entries remembered for the fence; when full, the
-    /// oldest goes and the floor rises to it.
-    pub max_connect_tombstones: usize,
-    /// Client ids with a session kept across disconnects.
-    pub max_persisted_sessions: usize,
-    /// Inflight and backlog bytes of detached sessions, inside
-    /// `max_total_queued_bytes`.
-    pub max_detached_queued_bytes: usize,
 }
 
 impl Default for Limits {
     /// The old path's defaults where it has one (docs/configuration.md).
-    /// The four step 7c bounds are provisional: stage 2 showed they depend
-    /// on rates only a Linux cluster gives, in log positions (D-153).
     fn default() -> Self {
         Self {
             max_subscriptions_per_session: 1024,
@@ -666,6 +672,34 @@ impl Default for Limits {
             max_backlog: 16_384,
             max_backlog_bytes: 8 * 1024 * 1024,
             max_total_queued_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// Step 7c's bounds (D-146 A), read only by a [`State::with_connect`]. Kept
+/// apart from [`Limits`] until the gateway stage, so nothing that builds
+/// `Limits` changes before then (D-153); every node must be given the same
+/// ones once they act.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnectLimits {
+    /// A `Connect` passes only if it commits at most this many positions
+    /// after its `seen`.
+    pub connect_window: u64,
+    /// Removed client entries remembered for the fence; when full, the
+    /// oldest goes and the floor rises to it.
+    pub max_connect_tombstones: usize,
+    /// Client ids with a session kept across disconnects.
+    pub max_persisted_sessions: usize,
+    /// Inflight and backlog bytes of detached sessions, inside
+    /// `Limits::max_total_queued_bytes`.
+    pub max_detached_queued_bytes: usize,
+}
+
+impl Default for ConnectLimits {
+    /// Placeholders: stage 2 showed the sizes depend on rates only a Linux
+    /// cluster gives, in log positions (D-153).
+    fn default() -> Self {
+        Self {
             connect_window: 4096,
             max_connect_tombstones: 10_000,
             max_persisted_sessions: 10_000,
@@ -738,6 +772,9 @@ pub struct State {
     queued_bytes: usize,
     /// Step 7c: client ids, the fence and persisted sessions (`clients`).
     clients: Option<clients::Clients>,
+    /// Step 7c's effects of the record being applied: empty between
+    /// records, so no state compares or hashes differently for it.
+    client_out: Vec<ClientEffect>,
 }
 
 impl State {
@@ -754,6 +791,7 @@ impl State {
             retained_bytes: 0,
             queued_bytes: 0,
             clients: None,
+            client_out: Vec::new(),
         }
     }
 
@@ -761,9 +799,12 @@ impl State {
     /// `Disconnect` apply, an origin proposes only once attached, and a
     /// session may persist across disconnects. Stages 1 and 2 only: nothing
     /// runs it outside tests and the simulation yet.
-    pub fn with_connect(limits: Limits) -> Self {
+    pub fn with_connect(limits: Limits, connect: ConnectLimits) -> Self {
         Self {
-            clients: Some(clients::Clients::default()),
+            clients: Some(clients::Clients {
+                limits: connect,
+                ..clients::Clients::default()
+            }),
             ..Self::new(limits)
         }
     }
@@ -786,6 +827,30 @@ impl State {
     /// observable to `out`. Batch headers, `SlotStart` and `SlotEnd` advance the
     /// position and change nothing else. Records must come in lsn order, each exactly once.
     pub fn apply(&mut self, record: &Record<'_>, out: &mut Vec<Effect>) -> Result<(), ApplyError> {
+        if self.clients.is_some() {
+            return Err(ApplyError::ClientEffects);
+        }
+        self.apply_record(record, out)
+    }
+
+    /// As [`State::apply`], and step 7c's effects of the record are appended
+    /// to `clients` (D-146 A).
+    pub fn apply_connect(
+        &mut self,
+        record: &Record<'_>,
+        out: &mut Vec<Effect>,
+        clients: &mut Vec<ClientEffect>,
+    ) -> Result<(), ApplyError> {
+        let applied = self.apply_record(record, out);
+        clients.append(&mut self.client_out);
+        applied
+    }
+
+    fn apply_record(
+        &mut self,
+        record: &Record<'_>,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), ApplyError> {
         let expected = self.applied.checked_add(1).ok_or(ApplyError::OutOfOrder {
             lsn: record.lsn,
             expected: u64::MAX,
@@ -840,7 +905,8 @@ impl State {
             _ => None,
         };
         if let Some((to, request)) = asks.filter(|&(origin, _)| self.unattached(origin)) {
-            out.push(Effect::Refused { to, request, lsn });
+            self.client_out
+                .push(ClientEffect::Refused { to, request, lsn });
             return;
         }
         match proposal {
@@ -896,7 +962,7 @@ impl State {
             Proposal::Ack { origin, delivery } => self.ack(origin, delivery, lsn, out),
             Proposal::SessionGone { origin } => {
                 // A persisted session is detached and kept; clean state goes.
-                self.detach(origin, lsn, out);
+                self.detach(origin, lsn);
                 self.drop_session(origin);
                 out.push(Effect::Gone { to: origin, lsn });
             }
@@ -911,7 +977,7 @@ impl State {
                 gone.sort_unstable();
                 gone.dedup();
                 for origin in gone {
-                    self.detach(origin, lsn, out);
+                    self.detach(origin, lsn);
                     self.drop_session(origin);
                 }
                 out.push(Effect::Reset { node, below, lsn });
@@ -924,8 +990,8 @@ impl State {
                 persist,
             } => self.connect(origin, &client_id, seen, clean_start, persist, lsn, out),
             Proposal::Disconnect { origin } => {
-                let attached = self.detach(origin, lsn, out);
-                out.push(Effect::Disconnected {
+                let attached = self.detach(origin, lsn);
+                self.client_out.push(ClientEffect::Disconnected {
                     to: origin,
                     attached,
                     lsn,
@@ -1002,7 +1068,7 @@ impl State {
             };
             self.deliver(origin, message, guarantee, lsn, out);
         }
-        self.route_detached(published, guarantee, lsn, out);
+        self.route_detached(published, guarantee, lsn);
     }
 
     /// Hands `message` to `origin`, in order. With nothing waiting it goes at

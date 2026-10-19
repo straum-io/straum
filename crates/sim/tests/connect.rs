@@ -37,7 +37,7 @@
 
 use std::collections::BTreeMap;
 
-use apply::{Effect, Limits, Origin, Proposal, Refusal, State};
+use apply::{ClientEffect, ConnectLimits, Effect, Limits, Origin, Proposal, Refusal, State};
 use bytes::Bytes;
 use domain::{ClientId, DeliveryGuarantee as G, Topic, TopicFilter};
 use journal::{Chain, Entry, decode};
@@ -80,6 +80,7 @@ impl Rng {
 #[derive(Debug, Clone, Copy)]
 struct Params {
     limits: Limits,
+    connect: ConnectLimits,
     /// A gateway applies up to this many positions behind the commit.
     lag: u64,
     /// A proposal commits up to this many steps after it is proposed; one
@@ -103,11 +104,13 @@ fn params() -> Params {
             max_backlog: 3,
             max_backlog_bytes: 6,
             max_total_queued_bytes: 40,
+            ..Limits::default()
+        },
+        connect: ConnectLimits {
             connect_window: 64,
             max_connect_tombstones: 4,
             max_persisted_sessions: 4,
             max_detached_queued_bytes: 8,
-            ..Limits::default()
         },
         lag: 12,
         delay: 8,
@@ -198,7 +201,7 @@ impl World {
         Self {
             rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
             p,
-            state: State::with_connect(p.limits),
+            state: State::with_connect(p.limits, p.connect),
             chain: Chain::genesis(),
             log: Vec::new(),
             pending: Vec::new(),
@@ -386,14 +389,17 @@ impl World {
                 &mut records,
             )
             .unwrap();
-        let mut effects = Vec::new();
+        let (mut effects, mut clients) = (Vec::new(), Vec::new());
         let mut lsn = 0;
         let before = self.present();
         let (floor, _) = self.state.connect_fence();
         for record in &records {
             let decoded = decode(record).unwrap();
             lsn = decoded.lsn;
-            if let Err(e) = self.state.apply(&decoded, &mut effects) {
+            if let Err(e) = self
+                .state
+                .apply_connect(&decoded, &mut effects, &mut clients)
+            {
                 self.fail(&format!("lsn {lsn} does not apply: {e}"));
             }
         }
@@ -402,8 +408,8 @@ impl World {
         if self.state.connect_fence().0 > floor {
             self.stats.floor_rises += 1;
         }
-        self.observe(&pending, lsn, &effects);
-        self.check(before, &pending.proposal, lsn, &effects);
+        self.observe(&pending, lsn, &effects, &clients);
+        self.check(before, &pending.proposal, lsn, &effects, &clients);
     }
 
     fn present(&self) -> Vec<bool> {
@@ -413,10 +419,23 @@ impl World {
     }
 
     /// What the effects tell the clients and the counters.
-    fn observe(&mut self, pending: &Pending, lsn: u64, effects: &[Effect]) {
+    fn observe(
+        &mut self,
+        pending: &Pending,
+        lsn: u64,
+        effects: &[Effect],
+        clients: &[ClientEffect],
+    ) {
         for effect in effects {
+            if let Effect::Close { to, .. } = effect {
+                if let Some(c) = self.conns.get_mut(to) {
+                    c.closed = true;
+                }
+            }
+        }
+        for effect in clients {
             match effect {
-                Effect::Connected {
+                ClientEffect::Connected {
                     to,
                     session_present,
                     ..
@@ -429,7 +448,8 @@ impl World {
                         self.stats.newest_committed += 1;
                     }
                     // Scenario 8: at the limit, a resumption still passes.
-                    let at_limit = self.state.persisted().0 >= self.p.limits.max_persisted_sessions;
+                    let at_limit =
+                        self.state.persisted().0 >= self.p.connect.max_persisted_sessions;
                     if *session_present && self.quota_seen && at_limit {
                         self.stats.quota_then_resumed += 1;
                     }
@@ -438,7 +458,7 @@ impl World {
                         self.deleted[client] = false;
                     }
                 }
-                Effect::ConnectRefused { to, reason, .. } => {
+                ClientEffect::ConnectRefused { to, reason, .. } => {
                     let conn = self.conns.get_mut(to).unwrap();
                     conn.closed = true;
                     let client = conn.client;
@@ -448,7 +468,7 @@ impl World {
                             let Proposal::Connect { seen, .. } = pending.proposal else {
                                 unreachable!()
                             };
-                            if lsn.saturating_sub(seen) > self.p.limits.connect_window {
+                            if lsn.saturating_sub(seen) > self.p.connect.connect_window {
                                 self.stats.late_after_slot_change += 1;
                             } else if self.oracle.removed_after(client, seen) {
                                 self.stats.late_after_removal += 1;
@@ -466,12 +486,12 @@ impl World {
                         }
                     }
                 }
-                Effect::TakenOver { to, .. } | Effect::Close { to, .. } => {
+                ClientEffect::TakenOver { to, .. } => {
                     if let Some(c) = self.conns.get_mut(to) {
                         c.closed = true;
                     }
                 }
-                Effect::Refused { to, .. } => {
+                ClientEffect::Refused { to, .. } => {
                     self.stats.from_taken_over += 1;
                     if let Some(c) = self.conns.get_mut(to) {
                         c.closed = true;
@@ -482,25 +502,33 @@ impl World {
         }
     }
 
-    fn check(&mut self, before: Vec<bool>, proposal: &Proposal, lsn: u64, effects: &[Effect]) {
-        for effect in effects {
-            match effect {
-                Effect::Connected { to, .. } => {
-                    let Proposal::Connect { seen, .. } = proposal else {
-                        self.fail(&format!("Connected from {proposal:?}"));
-                    };
-                    let client = self.conns[to].client;
-                    let last = self.oracle.fenced.get(&client).copied().unwrap_or(0);
-                    if last > *seen {
-                        self.fail(&format!(
-                            "invariant B: client {client} changed at lsn {last}, after its Connect's seen {seen} (lsn {lsn})"
-                        ));
-                    }
-                    self.oracle.fenced.insert(client, lsn);
-                    self.oracle.expected.insert(client, *to);
+    fn check(
+        &mut self,
+        before: Vec<bool>,
+        proposal: &Proposal,
+        lsn: u64,
+        effects: &[Effect],
+        clients: &[ClientEffect],
+    ) {
+        for effect in clients {
+            if let ClientEffect::Connected { to, .. } = effect {
+                let Proposal::Connect { seen, .. } = proposal else {
+                    self.fail(&format!("Connected from {proposal:?}"));
+                };
+                let client = self.conns[to].client;
+                let last = self.oracle.fenced.get(&client).copied().unwrap_or(0);
+                if last > *seen {
+                    self.fail(&format!(
+                        "invariant B: client {client} changed at lsn {last}, after its Connect's seen {seen} (lsn {lsn})"
+                    ));
                 }
-                Effect::Close { to, .. } => self.oracle.expected.retain(|_, o| o != to),
-                _ => {}
+                self.oracle.fenced.insert(client, lsn);
+                self.oracle.expected.insert(client, *to);
+            }
+        }
+        for effect in effects {
+            if let Effect::Close { to, .. } = effect {
+                self.oracle.expected.retain(|_, o| o != to);
             }
         }
         let detached = |o: &Origin| match proposal {
@@ -516,9 +544,9 @@ impl World {
                     self.oracle.fenced.insert(c, lsn);
                     self.oracle.removed.insert(c, lsn);
                     // Scenario 9: this record deleted a detached session.
-                    if effects
+                    if clients
                         .iter()
-                        .any(|e| matches!(e, Effect::SessionDeleted { .. }))
+                        .any(|e| matches!(e, ClientEffect::SessionDeleted { .. }))
                     {
                         self.deleted[c] = true;
                     }
@@ -539,7 +567,7 @@ impl World {
                 }
             }
         }
-        let limits = self.p.limits;
+        let limits = self.p.connect;
         let (_, tombstones) = self.state.connect_fence();
         let (persisted, detached_bytes) = self.state.persisted();
         if tombstones > limits.max_connect_tombstones
@@ -563,7 +591,7 @@ impl World {
         });
         let mut bytes = Vec::new();
         self.state.encode(&mut bytes);
-        let restarted = State::decode(self.p.limits, &bytes)
+        let restarted = State::decode_connect(self.p.limits, self.p.connect, &bytes)
             .unwrap_or_else(|e| self.fail(&format!("the snapshot does not decode: {e}")));
         if restarted != self.state || restarted.digest() != self.state.digest() {
             self.fail("a restarted node holds another state");
@@ -611,11 +639,11 @@ fn run(seed: u64, p: Params) -> Stats {
         }
     }
     // The whole log replayed by a fresh node gives the same state.
-    let mut replayed = State::with_connect(p.limits);
-    let mut effects = Vec::new();
+    let mut replayed = State::with_connect(p.limits, p.connect);
+    let (mut effects, mut clients) = (Vec::new(), Vec::new());
     for record in &world.log {
         replayed
-            .apply(&decode(record).unwrap(), &mut effects)
+            .apply_connect(&decode(record).unwrap(), &mut effects, &mut clients)
             .unwrap();
     }
     if replayed != world.state {
@@ -674,7 +702,7 @@ fn client_ids_keep_invariants_a_and_b_and_every_scenario_occurs() {
     for (scenario, count) in scenarios {
         assert!(count > 0, "scenario never occurred: {scenario}");
     }
-    assert!(total.max_tombstones <= params().limits.max_connect_tombstones);
+    assert!(total.max_tombstones <= params().connect.max_connect_tombstones);
 }
 
 /// The fence's cost: the share of clients' newest CONNECTs refused as
@@ -692,8 +720,8 @@ fn connect_refusal_rates() {
             for &lag in &[4u64, 16, 64] {
                 let mut p = params();
                 p.clients = clients;
-                p.limits.connect_window = window;
-                p.limits.max_connect_tombstones = tombstones;
+                p.connect.connect_window = window;
+                p.connect.max_connect_tombstones = tombstones;
                 p.lag = lag;
                 let (mut newest, mut refused, mut older, mut floor) = (0, 0, 0, 0);
                 for seed in seeds() {

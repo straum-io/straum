@@ -1004,14 +1004,6 @@ impl Gateway {
             }
             Effect::Close { .. } => self.close(conn, Some(ReasonCode::QuotaExceeded)),
             Effect::Acked { .. } | Effect::Gone { .. } | Effect::Reset { .. } => {}
-            // Step 7c's effects: no record that makes them is proposed or
-            // applied outside `apply`'s tests and the simulation yet (D-146 A).
-            Effect::Connected { .. }
-            | Effect::ConnectRefused { .. }
-            | Effect::TakenOver { .. }
-            | Effect::Disconnected { .. }
-            | Effect::Refused { .. }
-            | Effect::SessionDeleted { .. } => {}
         }
         // An answer freed room: read on.
         self.pump(conn);

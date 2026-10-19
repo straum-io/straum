@@ -5,7 +5,9 @@
 
 use std::collections::BTreeMap;
 
-use apply::{ApplyError, Effect, Limits, Origin, Proposal, Refusal, State};
+use apply::{
+    ApplyError, ClientEffect, ConnectLimits, Effect, Limits, Origin, Proposal, Refusal, State,
+};
 use bytes::Bytes;
 use domain::{ClientId, DeliveryGuarantee as G, Topic, TopicFilter};
 use journal::{Chain, Entry, Kind, decode};
@@ -80,19 +82,23 @@ fn at(i: u64) -> u64 {
     2 * (i + 1)
 }
 
-fn run_with(limits: Limits, proposals: &[Proposal]) -> (State, Vec<Effect>) {
-    let mut state = State::with_connect(limits);
+fn run_with(
+    (limits, connect): (Limits, ConnectLimits),
+    proposals: &[Proposal],
+) -> (State, Vec<Effect>, Vec<ClientEffect>) {
+    let mut state = State::with_connect(limits, connect);
     let mut effects = Vec::new();
+    let mut clients = Vec::new();
     for record in log(proposals) {
         state
-            .apply(&decode(&record).unwrap(), &mut effects)
+            .apply_connect(&decode(&record).unwrap(), &mut effects, &mut clients)
             .unwrap();
     }
-    (state, effects)
+    (state, effects, clients)
 }
 
-fn run(proposals: &[Proposal]) -> (State, Vec<Effect>) {
-    run_with(Limits::default(), proposals)
+fn run(proposals: &[Proposal]) -> (State, Vec<Effect>, Vec<ClientEffect>) {
+    run_with((Limits::default(), ConnectLimits::default()), proposals)
 }
 
 fn attached(state: &State, client: &str) -> Option<Origin> {
@@ -132,26 +138,87 @@ fn a_connect_and_a_disconnect_round_trip_as_records() {
     }
 }
 
+fn long_id(bytes: usize) -> ClientId {
+    ClientId::new(Bytes::from(vec![b'x'; bytes])).unwrap()
+}
+
+/// D-153 precision 8: 256 bytes is Straum's bound on a client id (the
+/// codec's default `max_client_id_bytes`), not MQTT's maximum of 65 535. A
+/// longer one is refused before it reaches the log, as a record from the
+/// log, and from a snapshot.
 #[test]
-fn a_client_id_past_its_bound_is_not_encoded() {
-    let long = ClientId::new(Bytes::from(vec![b'x'; apply::MAX_CLIENT_ID_BYTES + 1])).unwrap();
-    let proposal = Proposal::Connect {
+fn a_client_id_of_256_bytes_passes_and_257_is_refused_on_every_path() {
+    assert_eq!(apply::MAX_CLIENT_ID_BYTES, 256);
+    let connect_with = |id: ClientId| Proposal::Connect {
         origin: origin(1, 1),
-        client_id: long,
+        client_id: id,
         seen: 0,
         clean_start: true,
-        persist: false,
+        persist: true,
     };
-    assert!(proposal.encode(&mut Vec::new()).is_err());
+
+    // 256: encoded, committed, applied, and through a snapshot.
+    let at_bound = connect_with(long_id(256));
+    let (state, _, clients) = run(std::slice::from_ref(&at_bound));
+    assert!(matches!(clients[..], [ClientEffect::Connected { .. }]));
+    assert!(state.client(&[b'x'; 256]).is_some());
+    let mut bytes = Vec::new();
+    state.encode(&mut bytes);
+    let decoded =
+        State::decode_connect(Limits::default(), ConnectLimits::default(), &bytes).unwrap();
+    assert_eq!(decoded, state);
+
+    // 257: not encoded, so no gateway can write it to the log.
+    assert!(connect_with(long_id(257)).encode(&mut Vec::new()).is_err());
+
+    // 257 in a record anyway: malformed, the node stops rather than apply it.
+    let mut body = Vec::new();
+    at_bound.encode(&mut body).unwrap();
+    let length = body.len() - 256 - 2;
+    body[length..length + 2].copy_from_slice(&257u16.to_be_bytes());
+    body.push(b'x');
+    let mut records = Vec::new();
+    Chain::genesis()
+        .batch(
+            1,
+            &[Entry {
+                kind: Kind::Connect,
+                properties: &[],
+                body: &body,
+            }],
+            &mut records,
+        )
+        .unwrap();
+    let mut fresh = State::with_connect(Limits::default(), ConnectLimits::default());
+    let mut out = Vec::new();
+    let mut clients = Vec::new();
+    fresh
+        .apply_connect(&decode(&records[0]).unwrap(), &mut out, &mut clients)
+        .unwrap();
+    assert_eq!(
+        fresh.apply_connect(&decode(&records[1]).unwrap(), &mut out, &mut clients),
+        Err(ApplyError::Malformed(2))
+    );
+
+    // 257 in a snapshot: refused.
+    let at = bytes
+        .windows(258)
+        .position(|w| w[..2] == 256u16.to_be_bytes() && w[2..].iter().all(|&b| b == b'x'))
+        .unwrap();
+    let mut long = bytes[..at].to_vec();
+    long.extend_from_slice(&257u16.to_be_bytes());
+    long.extend(std::iter::repeat_n(b'x', 257));
+    long.extend_from_slice(&bytes[at + 258..]);
+    assert!(State::decode_connect(Limits::default(), ConnectLimits::default(), &long).is_err());
 }
 
 #[test]
 fn a_connect_attaches_its_origin() {
     let a = origin(1, 1);
-    let (state, effects) = run(&[connect(a, "c", 0, true, false)]);
+    let (state, _, clients) = run(&[connect(a, "c", 0, true, false)]);
     assert_eq!(
-        effects,
-        vec![Effect::Connected {
+        clients,
+        vec![ClientEffect::Connected {
             to: a,
             session_present: false,
             lsn: at(0)
@@ -164,7 +231,7 @@ fn a_connect_attaches_its_origin() {
 #[test]
 fn nothing_is_committed_for_an_origin_that_is_not_attached() {
     let a = origin(1, 1);
-    let (state, effects) = run(&[
+    let (state, _, clients) = run(&[
         subscribe(a, "t", G::AtLeastOnce),
         publish(a, "t", b"x", G::AtMostOnce),
         Proposal::Ack {
@@ -173,19 +240,19 @@ fn nothing_is_committed_for_an_origin_that_is_not_attached() {
         },
     ]);
     assert_eq!(
-        effects,
+        clients,
         vec![
-            Effect::Refused {
+            ClientEffect::Refused {
                 to: a,
                 request: Some(8),
                 lsn: at(0)
             },
-            Effect::Refused {
+            ClientEffect::Refused {
                 to: a,
                 request: Some(7),
                 lsn: at(1)
             },
-            Effect::Refused {
+            ClientEffect::Refused {
                 to: a,
                 request: None,
                 lsn: at(2)
@@ -198,20 +265,20 @@ fn nothing_is_committed_for_an_origin_that_is_not_attached() {
 #[test]
 fn a_newer_connect_takes_the_session_over_and_the_old_origin_is_refused() {
     let (a, b) = (origin(1, 1), origin(2, 1));
-    let (state, effects) = run(&[
+    let (state, _, clients) = run(&[
         connect(a, "c", 0, true, false),
         subscribe(a, "t", G::AtMostOnce),
         // Node 2 had applied both before it proposed.
         connect(b, "c", at(1), false, false),
         publish(a, "t", b"late", G::AtMostOnce),
     ]);
-    assert!(effects.contains(&Effect::TakenOver { to: a, lsn: at(2) }));
-    assert!(effects.contains(&Effect::Connected {
+    assert!(clients.contains(&ClientEffect::TakenOver { to: a, lsn: at(2) }));
+    assert!(clients.contains(&ClientEffect::Connected {
         to: b,
         session_present: true,
         lsn: at(2)
     }));
-    assert!(effects.contains(&Effect::Refused {
+    assert!(clients.contains(&ClientEffect::Refused {
         to: a,
         request: Some(7),
         lsn: at(3)
@@ -223,14 +290,14 @@ fn a_newer_connect_takes_the_session_over_and_the_old_origin_is_refused() {
 #[test]
 fn a_clean_start_takeover_clears_the_session() {
     let (a, b, p) = (origin(1, 1), origin(2, 1), origin(3, 1));
-    let (_, effects) = run(&[
+    let (_, effects, clients) = run(&[
         connect(a, "c", 0, true, false),
         subscribe(a, "t", G::AtMostOnce),
         connect(b, "c", at(1), true, false),
         connect(p, "p", at(2), true, false),
         publish(p, "t", b"x", G::AtMostOnce),
     ]);
-    assert!(effects.contains(&Effect::Connected {
+    assert!(clients.contains(&ClientEffect::Connected {
         to: b,
         session_present: false,
         lsn: at(2)
@@ -241,28 +308,31 @@ fn a_clean_start_takeover_clears_the_session() {
 #[test]
 fn a_connect_whose_proposer_had_not_seen_the_last_change_is_refused() {
     let (a, b) = (origin(1, 1), origin(2, 1));
-    let (state, effects) = run(&[
+    let (state, _, clients) = run(&[
         connect(a, "c", 0, true, false),
         // Proposed before node 2 applied `a`'s Connect.
         connect(b, "c", 1, true, false),
     ]);
-    assert!(effects.contains(&Effect::ConnectRefused {
+    assert!(clients.contains(&ClientEffect::ConnectRefused {
         to: b,
         reason: Refusal::Stale,
         lsn: at(1)
     }));
-    assert!(!effects.contains(&Effect::TakenOver { to: a, lsn: at(1) }));
+    assert!(!clients.contains(&ClientEffect::TakenOver { to: a, lsn: at(1) }));
     assert_eq!(attached(&state, "c"), Some(a));
 }
 
 #[test]
 fn a_connect_older_than_the_window_is_refused() {
-    let limits = Limits {
-        connect_window: 3,
-        ..Limits::default()
-    };
+    let limits = (
+        Limits::default(),
+        ConnectLimits {
+            connect_window: 3,
+            ..ConnectLimits::default()
+        },
+    );
     let a = origin(1, 1);
-    let (_, effects) = run_with(
+    let (_, _, clients) = run_with(
         limits,
         &[
             connect(origin(9, 1), "other", 0, true, false),
@@ -271,7 +341,7 @@ fn a_connect_older_than_the_window_is_refused() {
             connect(a, "c", 2, true, false),
         ],
     );
-    assert!(effects.contains(&Effect::ConnectRefused {
+    assert!(clients.contains(&ClientEffect::ConnectRefused {
         to: a,
         reason: Refusal::Stale,
         lsn: at(2)
@@ -281,10 +351,10 @@ fn a_connect_older_than_the_window_is_refused() {
 #[test]
 fn a_seen_at_or_past_its_own_lsn_is_refused() {
     let a = origin(1, 1);
-    let (_, effects) = run(&[connect(a, "c", at(0), true, false)]);
+    let (_, _, clients) = run(&[connect(a, "c", at(0), true, false)]);
     assert_eq!(
-        effects,
-        vec![Effect::ConnectRefused {
+        clients,
+        vec![ClientEffect::ConnectRefused {
             to: a,
             reason: Refusal::Stale,
             lsn: at(0)
@@ -295,11 +365,11 @@ fn a_seen_at_or_past_its_own_lsn_is_refused() {
 #[test]
 fn an_origin_connects_once() {
     let a = origin(1, 1);
-    let (state, effects) = run(&[
+    let (state, _, clients) = run(&[
         connect(a, "c", 0, true, false),
         connect(a, "d", at(0), true, false),
     ]);
-    assert!(effects.contains(&Effect::ConnectRefused {
+    assert!(clients.contains(&ClientEffect::ConnectRefused {
         to: a,
         reason: Refusal::Stale,
         lsn: at(1)
@@ -310,24 +380,24 @@ fn an_origin_connects_once() {
 #[test]
 fn a_disconnect_removes_a_clean_entry_and_fences_a_connect_that_had_not_seen_it() {
     let (a, b, c) = (origin(1, 1), origin(2, 1), origin(2, 2));
-    let (state, effects) = run(&[
+    let (state, _, clients) = run(&[
         connect(a, "c", 0, true, false),
         Proposal::Disconnect { origin: a },
         // Seen the Connect, not the removal.
         connect(b, "c", at(0), true, false),
         connect(c, "c", at(1), true, false),
     ]);
-    assert!(effects.contains(&Effect::Disconnected {
+    assert!(clients.contains(&ClientEffect::Disconnected {
         to: a,
         attached: true,
         lsn: at(1)
     }));
-    assert!(effects.contains(&Effect::ConnectRefused {
+    assert!(clients.contains(&ClientEffect::ConnectRefused {
         to: b,
         reason: Refusal::Stale,
         lsn: at(2)
     }));
-    assert!(effects.contains(&Effect::Connected {
+    assert!(clients.contains(&ClientEffect::Connected {
         to: c,
         session_present: false,
         lsn: at(3)
@@ -338,10 +408,10 @@ fn a_disconnect_removes_a_clean_entry_and_fences_a_connect_that_had_not_seen_it(
 #[test]
 fn a_disconnect_of_an_origin_not_attached_changes_nothing() {
     let a = origin(1, 1);
-    let (state, effects) = run(&[Proposal::Disconnect { origin: a }]);
+    let (state, _, clients) = run(&[Proposal::Disconnect { origin: a }]);
     assert_eq!(
-        effects,
-        vec![Effect::Disconnected {
+        clients,
+        vec![ClientEffect::Disconnected {
             to: a,
             attached: false,
             lsn: at(0)
@@ -353,7 +423,7 @@ fn a_disconnect_of_an_origin_not_attached_changes_nothing() {
 #[test]
 fn a_persisted_session_waits_detached_and_resumes_with_what_arrived() {
     let (a, b, p) = (origin(1, 1), origin(2, 1), origin(3, 1));
-    let (state, effects) = run(&[
+    let (state, effects, clients) = run(&[
         connect(a, "c", 0, true, true),
         subscribe(a, "t", G::AtLeastOnce),
         Proposal::Disconnect { origin: a },
@@ -368,7 +438,7 @@ fn a_persisted_session_waits_detached_and_resumes_with_what_arrived() {
             .any(|e| matches!(e, Effect::Deliver { lsn, .. } if *lsn < at(6))),
         "nothing goes out while detached"
     );
-    assert!(effects.contains(&Effect::Connected {
+    assert!(clients.contains(&ClientEffect::Connected {
         to: b,
         session_present: true,
         lsn: at(6)
@@ -389,12 +459,15 @@ fn a_persisted_session_waits_detached_and_resumes_with_what_arrived() {
 
 #[test]
 fn a_detached_session_drops_an_at_most_once_message_it_has_no_room_for() {
-    let limits = Limits {
-        max_detached_queued_bytes: 1,
-        ..Limits::default()
-    };
+    let limits = (
+        Limits::default(),
+        ConnectLimits {
+            max_detached_queued_bytes: 1,
+            ..ConnectLimits::default()
+        },
+    );
     let (a, p) = (origin(1, 1), origin(3, 1));
-    let (state, effects) = run_with(
+    let (state, _, clients) = run_with(
         limits,
         &[
             connect(a, "c", 0, true, true),
@@ -406,9 +479,9 @@ fn a_detached_session_drops_an_at_most_once_message_it_has_no_room_for() {
         ],
     );
     assert!(
-        !effects
+        !clients
             .iter()
-            .any(|e| matches!(e, Effect::SessionDeleted { .. }))
+            .any(|e| matches!(e, ClientEffect::SessionDeleted { .. }))
     );
     assert_eq!(
         state.persisted(),
@@ -419,12 +492,15 @@ fn a_detached_session_drops_an_at_most_once_message_it_has_no_room_for() {
 
 #[test]
 fn a_detached_session_with_no_room_for_an_at_least_once_message_is_deleted() {
-    let limits = Limits {
-        max_detached_queued_bytes: 1,
-        ..Limits::default()
-    };
+    let limits = (
+        Limits::default(),
+        ConnectLimits {
+            max_detached_queued_bytes: 1,
+            ..ConnectLimits::default()
+        },
+    );
     let (a, b, p) = (origin(1, 1), origin(2, 1), origin(3, 1));
-    let (state, effects) = run_with(
+    let (state, _, clients) = run_with(
         limits,
         &[
             connect(a, "c", 0, true, true),
@@ -435,8 +511,8 @@ fn a_detached_session_with_no_room_for_an_at_least_once_message_is_deleted() {
             connect(b, "c", at(4), false, true),
         ],
     );
-    assert!(effects.contains(&Effect::SessionDeleted { lsn: at(4) }));
-    assert!(effects.contains(&Effect::Connected {
+    assert!(clients.contains(&ClientEffect::SessionDeleted { lsn: at(4) }));
+    assert!(clients.contains(&ClientEffect::Connected {
         to: b,
         session_present: false,
         lsn: at(5)
@@ -446,13 +522,18 @@ fn a_detached_session_with_no_room_for_an_at_least_once_message_is_deleted() {
 
 #[test]
 fn a_detachment_the_detached_budget_cannot_take_deletes_the_session() {
-    let limits = Limits {
-        max_detached_queued_bytes: 0,
-        max_inflight: 1,
-        ..Limits::default()
-    };
+    let limits = (
+        Limits {
+            max_inflight: 1,
+            ..Limits::default()
+        },
+        ConnectLimits {
+            max_detached_queued_bytes: 0,
+            ..ConnectLimits::default()
+        },
+    );
     let (a, p) = (origin(1, 1), origin(3, 1));
-    let (state, effects) = run_with(
+    let (state, _, clients) = run_with(
         limits,
         &[
             connect(a, "c", 0, true, true),
@@ -462,19 +543,22 @@ fn a_detachment_the_detached_budget_cannot_take_deletes_the_session() {
             Proposal::Disconnect { origin: a },
         ],
     );
-    assert!(effects.contains(&Effect::SessionDeleted { lsn: at(4) }));
+    assert!(clients.contains(&ClientEffect::SessionDeleted { lsn: at(4) }));
     assert_eq!(state.client(b"c"), None);
     assert_eq!(state.persisted(), (0, 0));
 }
 
 #[test]
 fn a_new_persisted_session_at_the_limit_is_refused_and_a_resumption_never_is() {
-    let limits = Limits {
-        max_persisted_sessions: 1,
-        ..Limits::default()
-    };
+    let limits = (
+        Limits::default(),
+        ConnectLimits {
+            max_persisted_sessions: 1,
+            ..ConnectLimits::default()
+        },
+    );
     let (a, b, c) = (origin(1, 1), origin(2, 1), origin(2, 2));
-    let (state, effects) = run_with(
+    let (state, _, clients) = run_with(
         limits,
         &[
             connect(a, "c", 0, true, true),
@@ -483,13 +567,13 @@ fn a_new_persisted_session_at_the_limit_is_refused_and_a_resumption_never_is() {
             connect(c, "c", at(2), false, true),
         ],
     );
-    assert!(effects.contains(&Effect::ConnectRefused {
+    assert!(clients.contains(&ClientEffect::ConnectRefused {
         to: b,
         reason: Refusal::Quota,
         lsn: at(1)
     }));
     assert_eq!(state.client(b"d"), None);
-    assert!(effects.contains(&Effect::Connected {
+    assert!(clients.contains(&ClientEffect::Connected {
         to: c,
         session_present: true,
         lsn: at(3)
@@ -500,12 +584,15 @@ fn a_new_persisted_session_at_the_limit_is_refused_and_a_resumption_never_is() {
 /// `Connect` adds a persisted session, so the limit applies to it too.
 #[test]
 fn a_clean_entry_made_persistent_at_the_limit_is_refused() {
-    let limits = Limits {
-        max_persisted_sessions: 1,
-        ..Limits::default()
-    };
+    let limits = (
+        Limits::default(),
+        ConnectLimits {
+            max_persisted_sessions: 1,
+            ..ConnectLimits::default()
+        },
+    );
     let (a, b, c) = (origin(1, 1), origin(1, 2), origin(2, 1));
-    let (state, effects) = run_with(
+    let (state, _, clients) = run_with(
         limits,
         &[
             connect(a, "p", 0, true, true),
@@ -513,7 +600,7 @@ fn a_clean_entry_made_persistent_at_the_limit_is_refused() {
             connect(c, "q", at(1), false, true),
         ],
     );
-    assert!(effects.contains(&Effect::ConnectRefused {
+    assert!(clients.contains(&ClientEffect::ConnectRefused {
         to: c,
         reason: Refusal::Quota,
         lsn: at(2)
@@ -525,17 +612,17 @@ fn a_clean_entry_made_persistent_at_the_limit_is_refused() {
 #[test]
 fn a_disconnect_applied_twice_acts_once() {
     let a = origin(1, 1);
-    let (_, effects) = run(&[
+    let (_, _, clients) = run(&[
         connect(a, "c", 0, true, false),
         Proposal::Disconnect { origin: a },
         Proposal::Disconnect { origin: a },
     ]);
-    assert!(effects.contains(&Effect::Disconnected {
+    assert!(clients.contains(&ClientEffect::Disconnected {
         to: a,
         attached: true,
         lsn: at(1)
     }));
-    assert!(effects.contains(&Effect::Disconnected {
+    assert!(clients.contains(&ClientEffect::Disconnected {
         to: a,
         attached: false,
         lsn: at(2)
@@ -544,12 +631,15 @@ fn a_disconnect_applied_twice_acts_once() {
 
 #[test]
 fn a_full_tombstone_queue_raises_the_floor_and_the_floor_fences() {
-    let limits = Limits {
-        max_connect_tombstones: 1,
-        ..Limits::default()
-    };
+    let limits = (
+        Limits::default(),
+        ConnectLimits {
+            max_connect_tombstones: 1,
+            ..ConnectLimits::default()
+        },
+    );
     let (a, b, c) = (origin(1, 1), origin(1, 2), origin(2, 1));
-    let (state, effects) = run_with(
+    let (state, _, clients) = run_with(
         limits,
         &[
             connect(a, "x", 0, true, false),
@@ -562,7 +652,7 @@ fn a_full_tombstone_queue_raises_the_floor_and_the_floor_fences() {
         ],
     );
     assert_eq!(state.connect_fence(), (at(1), 1));
-    assert!(effects.contains(&Effect::ConnectRefused {
+    assert!(clients.contains(&ClientEffect::ConnectRefused {
         to: c,
         reason: Refusal::Stale,
         lsn: at(4)
@@ -571,12 +661,15 @@ fn a_full_tombstone_queue_raises_the_floor_and_the_floor_fences() {
 
 #[test]
 fn tombstones_older_than_the_window_are_pruned_without_raising_the_floor() {
-    let limits = Limits {
-        connect_window: 4,
-        ..Limits::default()
-    };
+    let limits = (
+        Limits::default(),
+        ConnectLimits {
+            connect_window: 4,
+            ..ConnectLimits::default()
+        },
+    );
     let (a, b, c) = (origin(1, 1), origin(1, 2), origin(2, 1));
-    let (state, _) = run_with(
+    let (state, _, _) = run_with(
         limits,
         &[
             connect(a, "x", 0, true, false),
@@ -593,7 +686,7 @@ fn tombstones_older_than_the_window_are_pruned_without_raising_the_floor() {
 #[test]
 fn session_gone_and_node_reset_detach_and_keep_a_persisted_session() {
     let (a, b, c) = (origin(1, 1), origin(1, 2), origin(2, 1));
-    let (state, _) = run(&[
+    let (state, _, _) = run(&[
         connect(a, "p", 0, true, true),
         connect(b, "q", at(0), true, false),
         Proposal::SessionGone { origin: a },
@@ -609,13 +702,16 @@ fn session_gone_and_node_reset_detach_and_keep_a_persisted_session() {
 
 #[test]
 fn an_attached_persisted_session_that_overflows_is_closed_and_deleted() {
-    let limits = Limits {
-        max_inflight: 1,
-        max_backlog: 0,
-        ..Limits::default()
-    };
+    let limits = (
+        Limits {
+            max_inflight: 1,
+            max_backlog: 0,
+            ..Limits::default()
+        },
+        ConnectLimits::default(),
+    );
     let (a, p) = (origin(1, 1), origin(3, 1));
-    let (state, effects) = run_with(
+    let (state, effects, _) = run_with(
         limits,
         &[
             connect(a, "c", 0, true, true),
@@ -642,11 +738,16 @@ fn a_snapshot_round_trips_client_ids_tombstones_and_detached_sessions() {
         connect(p, "p", at(4), true, false),
         publish(p, "t", b"1", G::AtLeastOnce),
     ];
-    let (state, _) = run(&proposals);
+    let (state, _, _) = run(&proposals);
     let mut bytes = Vec::new();
     state.encode(&mut bytes);
     assert_eq!(bytes[0], 2, "step 7c writes version 2");
-    let decoded = State::decode(Limits::default(), &bytes).unwrap();
+    let decoded =
+        State::decode_connect(Limits::default(), ConnectLimits::default(), &bytes).unwrap();
+    assert!(
+        State::decode(Limits::default(), &bytes).is_err(),
+        "a node on State::new never takes a version 2 snapshot"
+    );
     assert_eq!(decoded, state);
     assert_eq!(decoded.digest(), state.digest());
 
@@ -743,18 +844,22 @@ fn proposals(ops: &[Op]) -> Vec<Proposal> {
         .collect()
 }
 
-fn small() -> Limits {
-    Limits {
-        max_inflight: 1,
-        max_backlog: 2,
-        max_backlog_bytes: 2,
-        max_total_queued_bytes: 6,
-        connect_window: 8,
-        max_connect_tombstones: 2,
-        max_persisted_sessions: 2,
-        max_detached_queued_bytes: 2,
-        ..Limits::default()
-    }
+fn small() -> (Limits, ConnectLimits) {
+    (
+        Limits {
+            max_inflight: 1,
+            max_backlog: 2,
+            max_backlog_bytes: 2,
+            max_total_queued_bytes: 6,
+            ..Limits::default()
+        },
+        ConnectLimits {
+            connect_window: 8,
+            max_connect_tombstones: 2,
+            max_persisted_sessions: 2,
+            max_detached_queued_bytes: 2,
+        },
+    )
 }
 
 /// Invariants A and B, checked after every record from the effects and
@@ -784,27 +889,29 @@ impl Oracle {
         proposal: &Proposal,
         lsn: u64,
         effects: &[Effect],
+        clients: &[ClientEffect],
     ) {
+        for effect in clients {
+            if let ClientEffect::Connected { to, .. } = effect {
+                let Proposal::Connect {
+                    client_id, seen, ..
+                } = proposal
+                else {
+                    panic!("Connected from {proposal:?}");
+                };
+                let name = name(client_id);
+                let last = self.fenced.get(name).copied().unwrap_or(0);
+                assert!(
+                    last <= *seen,
+                    "invariant B: {name} changed at lsn {last}, after its Connect's seen {seen} (lsn {lsn})"
+                );
+                self.fenced.insert(name, lsn);
+                self.expected.insert(name, *to);
+            }
+        }
         for effect in effects {
-            match effect {
-                Effect::Connected { to, .. } => {
-                    let Proposal::Connect {
-                        client_id, seen, ..
-                    } = proposal
-                    else {
-                        panic!("Connected from {proposal:?}");
-                    };
-                    let name = name(client_id);
-                    let last = self.fenced.get(name).copied().unwrap_or(0);
-                    assert!(
-                        last <= *seen,
-                        "invariant B: {name} changed at lsn {last}, after its Connect's seen {seen} (lsn {lsn})"
-                    );
-                    self.fenced.insert(name, lsn);
-                    self.expected.insert(name, *to);
-                }
-                Effect::Close { to, .. } => self.expected.retain(|_, o| o != to),
-                _ => {}
+            if let Effect::Close { to, .. } = effect {
+                self.expected.retain(|_, o| o != to);
             }
         }
         let detached = |o: &Origin| match proposal {
@@ -848,16 +955,17 @@ proptest! {
     fn invariants_a_and_b_hold_after_every_record(ops in proptest::collection::vec(op(), 1..80)) {
         let proposals = proposals(&ops);
         let records = log(&proposals);
-        let mut state = State::with_connect(small());
+        let mut state = State::with_connect(small().0, small().1);
         let mut oracle = Oracle::default();
-        let mut effects = Vec::new();
+        let (mut effects, mut clients) = (Vec::new(), Vec::new());
         for (batch, proposal) in records.chunks(2).zip(&proposals) {
-            state.apply(&decode(&batch[0]).unwrap(), &mut effects).unwrap();
+            state.apply_connect(&decode(&batch[0]).unwrap(), &mut effects, &mut clients).unwrap();
             let record = decode(&batch[1]).unwrap();
             let before = present(&state);
             effects.clear();
-            state.apply(&record, &mut effects).unwrap();
-            oracle.check(before, &state, proposal, record.lsn, &effects);
+            clients.clear();
+            state.apply_connect(&record, &mut effects, &mut clients).unwrap();
+            oracle.check(before, &state, proposal, record.lsn, &effects, &clients);
         }
     }
 
@@ -871,25 +979,26 @@ proptest! {
         let proposals = proposals(&ops);
         let records = log(&proposals);
         let cut = (cut * 2).min(records.len());
-        let mut whole = State::with_connect(small());
-        let mut whole_effects = Vec::new();
+        let mut whole = State::with_connect(small().0, small().1);
+        let (mut whole_effects, mut whole_clients) = (Vec::new(), Vec::new());
         for record in &records {
-            whole.apply(&decode(record).unwrap(), &mut whole_effects).unwrap();
+            whole.apply_connect(&decode(record).unwrap(), &mut whole_effects, &mut whole_clients).unwrap();
         }
-        let mut first = State::with_connect(small());
-        let mut effects = Vec::new();
+        let mut first = State::with_connect(small().0, small().1);
+        let (mut effects, mut clients) = (Vec::new(), Vec::new());
         for record in &records[..cut] {
-            first.apply(&decode(record).unwrap(), &mut effects).unwrap();
+            first.apply_connect(&decode(record).unwrap(), &mut effects, &mut clients).unwrap();
         }
         let mut bytes = Vec::new();
         first.encode(&mut bytes);
-        let mut restarted = State::decode(small(), &bytes).unwrap();
+        let mut restarted = State::decode_connect(small().0, small().1, &bytes).unwrap();
         prop_assert_eq!(&restarted, &first);
         for record in &records[cut..] {
-            restarted.apply(&decode(record).unwrap(), &mut effects).unwrap();
+            restarted.apply_connect(&decode(record).unwrap(), &mut effects, &mut clients).unwrap();
         }
         prop_assert_eq!(&restarted, &whole);
         prop_assert_eq!(restarted.digest(), whole.digest());
         prop_assert_eq!(effects, whole_effects);
+        prop_assert_eq!(clients, whole_clients);
     }
 }
