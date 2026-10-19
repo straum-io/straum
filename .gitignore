@@ -25,3 +25,6 @@ target
 
 # Baseline worktrees for scripts/overhead.sh (D-124).
 .bench/
+
+# Coverage artifacts of cargo llvm-cov (child processes of the server tests)
+*.profraw
