@@ -13,6 +13,7 @@ fn frames() -> Vec<Frame> {
             node: 2,
             slot: 1,
             config: 0xdead_beef,
+            incarnation: 3,
         },
         Frame::Message(Message::Append {
             slot: 1,
@@ -134,5 +135,30 @@ fn malformed_frames_are_refused() {
             1 << 20
         ),
         Err(WireError::UnknownKind(200))
+    );
+}
+
+/// A version 2 HELLO has no incarnation: it decodes as that version wrote
+/// it, so its link is refused for its version rather than as malformed.
+#[test]
+fn a_version_2_hello_decodes_without_an_incarnation() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&20u32.to_be_bytes());
+    bytes.push(1);
+    bytes.extend_from_slice(&2u16.to_be_bytes());
+    bytes.push(2);
+    bytes.extend_from_slice(&1u64.to_be_bytes());
+    bytes.extend_from_slice(&0xdead_beefu64.to_be_bytes());
+    let (frame, used) = decode(&bytes, 1 << 20).unwrap().unwrap();
+    assert_eq!(used, bytes.len());
+    assert_eq!(
+        frame,
+        Frame::Hello {
+            version: 2,
+            node: 2,
+            slot: 1,
+            config: 0xdead_beef,
+            incarnation: 0,
+        }
     );
 }

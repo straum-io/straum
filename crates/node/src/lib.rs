@@ -604,7 +604,20 @@ impl Node {
         let slot = config.core.slot;
         let id = config.core.id;
 
+        // This process's life, durable before use: numbers the gateway's
+        // sessions, orders this node's reports past its restarts, and tells
+        // peers in HELLO that this is a new process (D-151 A).
+        let life = incarnation(&config.data)?;
+
         let (inbound, mut inbound_rx) = mpsc::channel::<link::Inbound>(1024);
+        let (seen, incarnations): (BTreeMap<_, _>, Vec<_>) = config
+            .peers
+            .iter()
+            .map(|&(peer, _)| {
+                let (tx, rx) = watch::channel(0u64);
+                ((peer, tx), rx)
+            })
+            .unzip();
         let mut tasks = vec![tokio::spawn(link::listen(
             listener,
             config.core.nodes.clone(),
@@ -612,9 +625,10 @@ impl Node {
             digest,
             config.max_frame,
             inbound,
+            Arc::new(seen),
         ))];
         let mut links = BTreeMap::new();
-        for &(peer, address) in &config.peers {
+        for (&(peer, address), incarnation) in config.peers.iter().zip(incarnations) {
             let (tx, rx) = mpsc::channel(config.link_queue);
             links.insert(peer, tx);
             tasks.push(tokio::spawn(link::dial(
@@ -624,17 +638,15 @@ impl Node {
                     node: id,
                     slot,
                     config: digest,
+                    incarnation: life,
                 },
                 rx,
                 config.transport,
                 Arc::clone(&budget),
                 config.heartbeat,
+                incarnation,
             )));
         }
-
-        // This process's life, durable before use: numbers the gateway's
-        // sessions and orders this node's reports past its restarts.
-        let life = incarnation(&config.data)?;
         let started = tokio::time::Instant::now();
         let (mqtt_tx, mut mqtt_rx) = mpsc::channel::<mqtt::Event>(1024);
         let mut mqtt_listen = None;

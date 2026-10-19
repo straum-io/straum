@@ -44,8 +44,8 @@ struct Cluster {
     addresses: Vec<SocketAddr>,
     mqtt: Vec<SocketAddr>,
     nodes: Vec<Option<Node>>,
-    /// One link dialled through a proxy: (from, to, the proxy's address).
-    via: Option<(u8, u8, SocketAddr)>,
+    /// Links dialled through a proxy: (from, to, the proxy's address).
+    via: Vec<(u8, u8, SocketAddr)>,
 }
 
 fn gateway() -> gateway::Config {
@@ -175,12 +175,12 @@ fn publish(id: u8, request: u64) -> cluster::Proposal {
 
 impl Cluster {
     async fn start(test: &'static str) -> Self {
-        Self::start_via(test, None).await
+        Self::start_via(test, Vec::new()).await
     }
 
-    /// As `start`, with node `from`'s link to node `to` dialled through
-    /// `address` instead (a proxy, D-122).
-    async fn start_via(test: &'static str, via: Option<(u8, u8, SocketAddr)>) -> Self {
+    /// As `start`, with each listed link from node `from` to node `to`
+    /// dialled through `address` instead (a proxy, D-122, D-151).
+    async fn start_via(test: &'static str, via: Vec<(u8, u8, SocketAddr)>) -> Self {
         for id in 0..NODES {
             let _ = std::fs::remove_dir_all(data_dir(test, id));
         }
@@ -204,7 +204,7 @@ impl Cluster {
 
     fn config(&self, id: u8, limits: Limits) -> NodeConfig {
         let mut config = config(self.test, id, &self.addresses, &self.mqtt, limits);
-        if let Some((_, to, address)) = self.via.filter(|v| v.0 == id) {
+        for &(_, to, address) in self.via.iter().filter(|v| v.0 == id) {
             for peer in &mut config.peers {
                 if peer.0 == to {
                     peer.1 = address;
@@ -687,6 +687,7 @@ async fn a_link_from_another_frame_version_is_refused() {
                     &cluster.mqtt,
                     Limits::default(),
                 )),
+                incarnation: 1,
             },
             &mut bytes,
         )
@@ -1021,7 +1022,7 @@ async fn restart_behind_a_slow_link(test: &'static str, delay_ms: u64) -> (Clust
     let delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let target = Arc::new(std::sync::OnceLock::new());
     let proxy = delaying_proxy(Arc::clone(&target), Arc::clone(&delay));
-    let mut cluster = Cluster::start_via(test, Some((0, 1, proxy))).await;
+    let mut cluster = Cluster::start_via(test, vec![(0, 1, proxy)]).await;
     let _ = target.set(cluster.addresses[1]);
     let first = cluster.converged(2).await;
     assert!(
@@ -1130,6 +1131,101 @@ async fn a_link_slower_than_the_takeover_window_fences_the_live_owner() {
             .count();
     }
     assert_eq!(sevens, 1, "node 0's request 7 committed {sevens} times");
+    cluster.shutdown().await;
+}
+
+/// A link proxy whose flows outlive the node behind it (D-151), as a
+/// conntrack entry to a pod IP that is gone does: bytes pass on to `target`
+/// until it closes, and from then on the dialler's connection stays open
+/// and is no longer read, so the dialler sees no error. A new connection
+/// reaches whatever listens at `target` now. Counts the connections it
+/// accepts. Until `target` is set, a connection is dropped.
+fn stale_proxy(
+    target: Arc<std::sync::OnceLock<SocketAddr>>,
+    accepted: Arc<std::sync::atomic::AtomicU64>,
+) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let address = free_port();
+    let listener = std::net::TcpListener::bind(address).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((inbound, _)) = listener.accept().await else {
+                return;
+            };
+            accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let target = Arc::clone(&target);
+            tokio::spawn(async move {
+                let Some(&target) = target.get() else { return };
+                let Ok(outbound) = tokio::net::TcpStream::connect(target).await else {
+                    return;
+                };
+                let (mut from, held) = inbound.into_split();
+                let (mut closed, mut to) = outbound.into_split();
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut probe = [0u8; 1];
+                loop {
+                    tokio::select! {
+                        n = from.read(&mut buf) => match n {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => if to.write_all(&buf[..n]).await.is_err() { break },
+                        },
+                        // A node never writes on a link: this returns when it closes.
+                        _ = closed.read(&mut probe) => break,
+                    }
+                }
+                let _held = (from, held);
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    address
+}
+
+/// D-151 A (straum#13): nodes 1 and 2 reach node 0 through flows that
+/// outlive its process. Restarted, node 0 can send but would hear nothing,
+/// and every `3 × takeover_ticks` heartbeats its promise would fence the
+/// sequencer. Its new incarnation in HELLO makes both redial: it catches
+/// up, and the links then stay as they are — no further redials, no slot
+/// change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_node_behind_stale_links_is_redialled_and_catches_up() {
+    let target = Arc::new(std::sync::OnceLock::new());
+    let accepted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let proxy = stale_proxy(Arc::clone(&target), Arc::clone(&accepted));
+    let mut cluster = Cluster::start_via("stale-links", vec![(1, 0, proxy), (2, 0, proxy)]).await;
+    let _ = target.set(cluster.addresses[0]);
+    let first = cluster.converged(2).await;
+    cluster.stop(0).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    cluster.restart(0, Limits::default()).await;
+    // A slot change commits a `SlotStart`: past `first` on every node, node
+    // 0 included, only if node 0 hears the others.
+    let caught = cluster.converged(first.applied + 1).await;
+    let links = accepted.load(std::sync::atomic::Ordering::Relaxed);
+    let slots: Vec<u64> = (0..NODES)
+        .map(|id| cluster.node(id).status().borrow().slot)
+        .collect();
+    let watch = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < watch {
+        for id in 0..NODES {
+            let s = *cluster.node(id).status().borrow();
+            assert_eq!(
+                s.slot,
+                slots[usize::from(id)],
+                "node {id} changed slot: {s:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::Relaxed),
+        links,
+        "links to node 0 kept redialling between healthy nodes"
+    );
+    cluster.publish(0, 0).await;
+    cluster.converged(caught.applied + 1).await;
     cluster.shutdown().await;
 }
 
