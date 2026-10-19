@@ -1,0 +1,28 @@
+#!/usr/bin/make -f
+# The Launchpad source package, assembled by scripts/ppa.sh. Launchpad
+# builders have no network, so cargo builds from the crates vendored in
+# vendor/, with Ubuntu's versioned Rust toolchain (the default rustc is
+# older than the 1.85 the workspace needs).
+export PATH := /usr/lib/rust-1.91/bin:$(PATH)
+export CARGO_HOME := $(CURDIR)/debian/cargo-home
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	mkdir -p $(CARGO_HOME)
+	printf '[source.crates-io]\nreplace-with = "vendor"\n[source.vendor]\ndirectory = "%s/vendor"\n' '$(CURDIR)' > $(CARGO_HOME)/config.toml
+	cargo build --release --locked --offline -p server --bin straum-server
+
+# The tests run in CI on every pull request.
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -D -m 755 target/release/straum-server debian/straum/usr/bin/straum-server
+
+# Like the cargo-deb package: installed, not enabled or started.
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
+
+override_dh_auto_clean:
+	rm -rf target debian/cargo-home

@@ -1,0 +1,19 @@
+Source: straum
+Section: net
+Priority: optional
+# scripts/ppa.sh replaces @MAINTAINER@ with the uploader's key identity.
+Maintainer: @MAINTAINER@
+Build-Depends: debhelper-compat (= 13), cargo-1.91, rustc-1.91
+Standards-Version: 4.6.2
+Homepage: https://github.com/straum-io/straum
+Vcs-Browser: https://github.com/straum-io/straum
+Vcs-Git: https://github.com/straum-io/straum.git
+Rules-Requires-Root: no
+
+Package: straum
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: clustered MQTT broker (experimental)
+ A clustered MQTT 3.1.1 and 5 broker that acknowledges a publish only after
+ a majority of its nodes has committed it to one replicated log.
+ Experimental, not production-ready.

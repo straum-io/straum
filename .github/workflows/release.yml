@@ -3,13 +3,17 @@ name: release
 # A pushed version tag builds the straum-server image for linux/amd64 and
 # linux/arm64 and publishes it to Docker Hub, builds the Debian packages for
 # both, and creates the GitHub release with the packages, their checksums and
-# provenance (Constitution §12.3: only release versions are published). A pull
-# request that touches the build builds the amd64 image and both packages,
+# provenance, and uploads Ubuntu source packages to the Launchpad PPA (Constitution
+# §12.3: only release versions are published). A pull request that touches
+# the build builds the amd64 image, both packages and the noble source package,
 # without publishing anything.
 #
 # Needs, in the repository settings:
 #   variable DOCKERHUB_NAMESPACE  the Docker Hub user or organization
+#   variable LAUNCHPAD_PPA        the PPA as OWNER/NAME (ppa:OWNER/NAME)
 #   secrets  DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (an access token with write scope)
+#   secret   PPA_GPG_KEY          an armored private key without passphrase,
+#                                 registered on the Launchpad account
 on:
   push:
     tags: ['v*.*.*']
@@ -20,6 +24,8 @@ on:
       - Cargo.toml
       - Cargo.lock
       - 'crates/**'
+      - 'debian/**'
+      - scripts/ppa.sh
       - .github/workflows/release.yml
 
 permissions:
@@ -156,3 +162,49 @@ jobs:
             --repo "$GITHUB_REPOSITORY" --verify-tag $pre \
             --title "$TAG" --generate-notes \
             --notes "Experimental, not production-ready. Image: \`docker pull ${IMAGE}:${TAG#v}\` (linux/amd64, linux/arm64). Packages: \`sudo apt install ./straum_<version>_<arch>.deb\`, then edit /etc/default/straum and \`systemctl enable --now straum\`. Verify a package: \`sha256sum -c SHA256SUMS\` or \`gh attestation verify <file> -R ${GITHUB_REPOSITORY}\`."
+
+  # Ubuntu source packages for the Launchpad PPA, which builds them per series
+  # and architecture (scripts/ppa.sh, debian/). A pull request builds the noble
+  # source package and then builds it with the network cut off, as Launchpad
+  # does.
+  ppa:
+    needs: [image, deb]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -qy --no-install-recommends dpkg-dev debhelper dput
+      - name: Build the source packages
+        env:
+          REF: ${{ github.ref_name }}
+          PR: ${{ github.event.pull_request.number }}
+          PPA: ${{ vars.LAUNCHPAD_PPA }}
+          KEY: ${{ secrets.PPA_GPG_KEY }}
+        run: |
+          set -eu
+          if [ "${GITHUB_EVENT_NAME}" = push ]; then
+              [ -n "$PPA" ] || { echo "release: set the LAUNCHPAD_PPA variable" >&2; exit 1; }
+              [ -n "$KEY" ] || { echo "release: set the PPA_GPG_KEY secret" >&2; exit 1; }
+              printf '%s\n' "$KEY" | gpg --batch --import
+              scripts/ppa.sh "$(printf '%s' "${REF#v}" | tr '-' '~')" jammy noble resolute
+          else
+              PPA_UNSIGNED=1 scripts/ppa.sh "0.0.0~pr${PR}" noble
+          fi
+      - name: Build offline, as Launchpad does
+        if: github.event_name == 'pull_request'
+        run: |
+          set -eu
+          cd target/ppa
+          dpkg-source -x *.dsc build
+          sudo apt-get build-dep -qy ./build
+          cd build
+          sudo unshare --net dpkg-buildpackage -b -us -uc
+          dpkg-deb -I ../straum_*.deb
+          dpkg-deb -c ../straum_*.deb
+      - name: Upload to the PPA
+        if: github.event_name == 'push'
+        env:
+          PPA: ${{ vars.LAUNCHPAD_PPA }}
+        run: dput "ppa:$PPA" target/ppa/*_source.changes
