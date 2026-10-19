@@ -1,11 +1,11 @@
 //! D-152 A: a `straum-server` whose node loop ends exits non-zero, rather
 //! than idling as a process that serves nothing. One node runs alone; its
-//! loop is ended by its log failing, the data directory turned read-only
-//! before a promise. Unix only: signals and permissions.
+//! loop is ended by its log failing: a directory stands where its next
+//! promise file must be created, which fails for any user. Unix only:
+//! signals.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -64,17 +64,6 @@ fn exited(child: &mut Child, within: Duration) -> Option<std::process::ExitStatu
     None
 }
 
-/// Every directory under `dir`, read-only or writable again.
-fn read_only(dir: &Path, on: bool) {
-    for entry in std::fs::read_dir(dir).unwrap().flatten() {
-        if entry.file_type().unwrap().is_dir() {
-            read_only(&entry.path(), on);
-        }
-    }
-    let mode = if on { 0o555 } else { 0o755 };
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
-}
-
 #[test]
 fn a_server_whose_node_loop_ends_exits_non_zero() {
     let root = std::env::temp_dir().join(format!("straum-server-loop-end-{}", std::process::id()));
@@ -106,13 +95,12 @@ fn a_server_whose_node_loop_ends_exits_non_zero() {
     assert!(exited(&mut child, Duration::from_secs(10)).is_some_and(|s| s.success()));
 
     // Second life: alone, it promises slot 4 after nine heartbeats of
-    // silence, and the read-only directory fails that promise.
+    // silence, and the directory in the way fails that promise.
+    std::fs::create_dir(data.join("promise.next")).unwrap();
     let second = root.join("log-2");
     let mut child = spawn(&data, &peers, mqtt, &second);
     wait_for_log(&second, "node started");
-    read_only(&data, true);
     let status = exited(&mut child, Duration::from_secs(10));
-    read_only(&data, false);
     if status.is_none() {
         let _ = child.kill();
     }

@@ -1412,25 +1412,11 @@ async fn a_lagging_replica_is_visible_from_both_sides() {
     cluster.shutdown().await;
 }
 
-/// Makes every directory under `dir` read-only, or writable again.
-#[cfg(unix)]
-fn read_only(dir: &std::path::Path, on: bool) {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = if on { 0o555 } else { 0o755 };
-    for entry in std::fs::read_dir(dir).unwrap().flatten() {
-        if entry.file_type().unwrap().is_dir() {
-            read_only(&entry.path(), on);
-        }
-    }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
-}
-
 /// D-152 A: a node whose loop ends — here its log fails, the disk refusing
 /// a promise — reports it through `Node::stopped`, which a healthy node
 /// never does. Node 0 runs alone: restarted after it promised slot 1, it
-/// promises slot 4 after nine heartbeats of silence, into a read-only data
-/// directory.
-#[cfg(unix)]
+/// promises slot 4 after nine heartbeats of silence, and a directory where
+/// the promise file must be created fails that write, for any user.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_whose_loop_ends_reports_it_stopped() {
     let test = "loop-end";
@@ -1446,6 +1432,7 @@ async fn a_node_whose_loop_ends_reports_it_stopped() {
         .unwrap();
     node.shutdown().await;
 
+    std::fs::create_dir(data_dir(test, 0).join("promise.next")).unwrap();
     let node = start().await.unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(200), node.stopped())
@@ -1453,9 +1440,7 @@ async fn a_node_whose_loop_ends_reports_it_stopped() {
             .is_err(),
         "a running node is not stopped"
     );
-    read_only(&data_dir(test, 0), true);
     let ended = tokio::time::timeout(Duration::from_secs(10), node.stopped()).await;
-    read_only(&data_dir(test, 0), false);
     assert!(
         ended.is_ok(),
         "the loop ended on a failed log, and stopped did not say so"
