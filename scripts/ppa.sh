@@ -30,6 +30,9 @@ rm -rf "$out"
 mkdir -p "$src"
 git -C "$root" archive HEAD | tar -x -C "$src"
 (cd "$src" && cargo vendor --locked --versioned-dirs vendor >/dev/null)
+# dpkg-source leaves out files such as *.orig, so drop the per-file checksums
+# and keep each crate's package checksum, as Debian's Rust packages do.
+find "$src/vendor" -name .cargo-checksum.json -exec sed -i 's/"files":{[^}]*}/"files":{}/' {} +
 tar -C "$out" --exclude="straum-$version/debian" -cJf "$out/straum_$version.orig.tar.xz" "straum-$version"
 sed -i "s|@MAINTAINER@|$maintainer|" "$src/debian/control"
 
