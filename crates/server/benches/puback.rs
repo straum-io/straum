@@ -26,7 +26,11 @@
 //!   less what the node applied) in positions and in milliseconds;
 //! * `STRAUM_BENCH_CHURN=<clients>` adds clients that connect, disconnect
 //!   and connect again in a loop, each a new clean session whose end is a
-//!   `SessionGone` record: the session-removal rate the cluster sustains.
+//!   `SessionGone` record. Unpaced, they find the most the cluster takes,
+//!   and starve the publishers (their proposals refused at a full outbox);
+//!   `STRAUM_BENCH_CHURN_RATE=<sessions/s>` paces them together to that
+//!   rate, a removal rate under the publishers' load. The count is of
+//!   DISCONNECTs written, not of `SessionGone` records committed.
 //!
 //! `cargo bench -p server --bench puback`; `STRAUM_BENCH_SERVER=<path>`
 //! measures another build's `straum-server` with this client. Refuses an
@@ -602,12 +606,14 @@ fn report_positions(samples: &[Positions], every_ms: u64) {
 fn churner(
     address: SocketAddr,
     name: String,
+    every: Duration,
     ended: Arc<AtomicU64>,
     measuring: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let mut n = 0u64;
     while !stop.load(Ordering::Relaxed) {
+        let started = Instant::now();
         n += 1;
         let Some(mut stream) =
             try_connect(address, &format!("{name}-{n}"), Duration::from_secs(10))
@@ -618,6 +624,8 @@ fn churner(
         if stream.write_all(&[0xE0, 0x00]).is_ok() && measuring.load(Ordering::Relaxed) {
             ended.fetch_add(1, Ordering::Relaxed);
         }
+        // Paced: one session every `every`; zero, as fast as it goes.
+        std::thread::sleep(every.saturating_sub(started.elapsed()));
     }
 }
 
@@ -723,6 +731,13 @@ fn main() {
     // churning sessions.
     let positions_ms: u64 = env("STRAUM_BENCH_POSITIONS_MS", 0);
     let churn: usize = env("STRAUM_BENCH_CHURN", 0);
+    let churn_rate: f64 = env("STRAUM_BENCH_CHURN_RATE", 0.0);
+    // Each churner's share of the rate, as the time between its sessions.
+    let churn_every = if churn_rate > 0.0 {
+        Duration::from_secs_f64(churn as f64 / churn_rate)
+    } else {
+        Duration::ZERO
+    };
     let mut servers = Servers::start(scrape_ms > 0 || !events.is_empty() || positions_ms > 0);
     let measuring = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
@@ -785,7 +800,14 @@ fn main() {
                 Arc::clone(&stop),
             );
             std::thread::spawn(move || {
-                churner(address, format!("churn-{i}"), ended, measuring, stop)
+                churner(
+                    address,
+                    format!("churn-{i}"),
+                    churn_every,
+                    ended,
+                    measuring,
+                    stop,
+                )
             })
         })
         .collect();
@@ -988,9 +1010,9 @@ fn main() {
             .iter()
             .flatten()
             .map(|t| value(t, "straum_mqtt_closed_total"))
-            .sum();
+            .fold(0.0, |a, b| a + b);
         println!(
-            "churn clients={churn} sessions_ended_per_s={:.0} closed_total={closed:.0}",
+            "churn clients={churn} rate={churn_rate:.0} sessions_ended_per_s={:.0} closed_total={closed:.0}",
             ended.load(Ordering::Relaxed) as f64 / seconds.as_secs_f64()
         );
     }
