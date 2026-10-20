@@ -155,7 +155,7 @@ else
     run rates-heavy rates heavy STRAUM_BENCH_SECONDS=60 STRAUM_BENCH_PUBLISHERS=24 STRAUM_BENCH_WINDOW=32
     run rates-events rates events STRAUM_BENCH_SECONDS=300 STRAUM_BENCH_EVENTS="${events%,}"
     run rates-churn-100 rates churn STRAUM_BENCH_SECONDS=60 STRAUM_BENCH_CHURN=8 STRAUM_BENCH_CHURN_RATE=100
-    run rates-churn-1000 rates churn STRAUM_BENCH_SECONDS=60 STRAUM_BENCH_CHURN=8 STRAUM_BENCH_CHURN_RATE=1000
+    run rates-churn-1000 rates churn STRAUM_BENCH_SECONDS=60 STRAUM_BENCH_CHURN=32 STRAUM_BENCH_CHURN_RATE=1000
     run rates-saturation rates saturation STRAUM_BENCH_SECONDS=30 STRAUM_BENCH_CHURN=64
     for file in "$OUT"/rates-*.txt; do
         stage=${file##*/rates-}

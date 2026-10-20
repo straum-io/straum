@@ -1028,13 +1028,12 @@ fn main() {
         accounts.iter().filter(|a| a.gave_up.is_some()).count(),
     );
     // Each event apart: the longest any publisher waited between two
-    // PUBACKs, among the pauses that ended after it and before the next
-    // event, or before the end of the run (D-128): a pause the event caused
-    // begins at the last PUBACK before it.
-    for (i, (kind, node, at)) in happened.iter().enumerate() {
-        let until = happened
-            .get(i + 1)
-            .map_or(Instant::now(), |&(_, _, next)| next);
+    // PUBACKs, among the pauses that span it — begun at the last PUBACK
+    // before it, ended after it (D-128). A pause is credited to the event it
+    // spans however late it ends, so a long hold is never dropped because
+    // the next event came first (straum#23). `-` when no publisher's pause
+    // spans it.
+    for (kind, node, at) in &happened {
         // Publisher `i` talks to node `i % 3`: the event's own node's
         // clients apart from the others' — after a kill, its clients wait
         // for it to come back, the others only for the takeover.
@@ -1044,10 +1043,12 @@ fn main() {
                 .enumerate()
                 .filter(|(p, _)| (p % usize::from(NODES) == *node) == own)
                 .flat_map(|(_, a)| a.gaps.iter())
-                .filter(|&&(_, e)| e > *at && e <= until)
+                .filter(|&&(s, e)| s <= *at && e > *at)
                 .map(|&(s, e)| e.saturating_duration_since(s))
                 .max()
-                .unwrap_or_default()
+                .map_or("-".to_owned(), |gap| {
+                    format!("{:.1}", gap.as_secs_f64() * 1000.0)
+                })
         };
         // Its node's clients that could not reconnect within `RECONNECT`:
         // their wait has no end to measure.
@@ -1057,10 +1058,10 @@ fn main() {
             .filter(|(p, a)| p % usize::from(NODES) == *node && a.gave_up.is_some_and(|g| g > *at))
             .count();
         println!(
-            "event kind={kind} node={node} at_s={:.1} max_gap_ms_other_nodes={:.1} max_gap_ms_its_node={:.1} its_clients_gave_up={gave_up}",
+            "event kind={kind} node={node} at_s={:.1} max_gap_ms_other_nodes={} max_gap_ms_its_node={} its_clients_gave_up={gave_up}",
             at.saturating_duration_since(started).as_secs_f64(),
-            longest(false).as_secs_f64() * 1000.0,
-            longest(true).as_secs_f64() * 1000.0
+            longest(false),
+            longest(true)
         );
     }
     // After events, each node's position: one behind the commit point is

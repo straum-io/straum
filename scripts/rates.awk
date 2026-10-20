@@ -58,12 +58,19 @@ function keep(key, value) {
     if (p > lag_p99[round]) lag_p99[round] = p
     if (m > lag_max[round]) lag_max[round] = m
 }
-/^churn / { keep("sessions_ended_per_s", field($0, "sessions_ended_per_s")) }
+/^churn / {
+    ended = field($0, "sessions_ended_per_s")
+    keep("sessions_ended_per_s", ended)
+    # Paced: how much of the asked rate the churners reached.
+    rate = field($0, "rate") + 0
+    if (rate > 0) keep("churn_rate_reached_pct", ended / rate * 100)
+}
 /^event / {
     kind = field($0, "kind")
     events[kind]++
-    other[kind, events[kind]] = field($0, "max_gap_ms_other_nodes") + 0
-    own[kind, events[kind]] = field($0, "max_gap_ms_its_node") + 0
+    other[kind, events[kind]] = field($0, "max_gap_ms_other_nodes")
+    own[kind, events[kind]] = field($0, "max_gap_ms_its_node")
+    gave_up[kind] += field($0, "its_clients_gave_up") + 0
     if (!(kind in kinds)) { kinds[kind] = 1; kind_order[++nkinds] = kind }
 }
 
@@ -84,15 +91,24 @@ END {
     for (k = 1; k <= nkinds; k++) {
         kind = kind_order[k]; n = events[kind]
         for (side = 1; side <= 2; side++) {
-            within = 0
+            # `-`: no pause of 20 ms or more spanned the event, or no client
+            # was left to see one: missing, not counted as short.
+            within = 0; m = 0; missing = 0
             for (i = 1; i <= n; i++) {
-                v[i] = (side == 1) ? other[kind, i] : own[kind, i]
-                if (v[i] <= 1000) within++
+                x = (side == 1) ? other[kind, i] : own[kind, i]
+                if (x == "-" || x == "") { missing++; continue }
+                v[++m] = x + 0
+                if (v[m] <= 1000) within++
             }
-            sort(v, n)
+            sort(v, m)
             who = (side == 1) ? "other_nodes" : "its_node"
-            printf "  hold kind=%s clients=%s n=%d p50_ms=%s p90_ms=%s max_ms=%s within_1s=%.0f%%\n", \
-                kind, who, n, quantile(v, n, 0.5), quantile(v, n, 0.9), v[n], within / n * 100
+            if (m == 0) {
+                printf "  hold kind=%s clients=%s n=%d missing=%d\n", kind, who, n, missing
+                continue
+            }
+            printf "  hold kind=%s clients=%s n=%d missing=%d p50_ms=%s p90_ms=%s max_ms=%s within_1s=%.0f%%\n", \
+                kind, who, n, missing, quantile(v, m, 0.5), quantile(v, m, 0.9), v[m], within / m * 100
         }
+        printf "  hold kind=%s its_clients_gave_up=%d\n", kind, gave_up[kind]
     }
 }
