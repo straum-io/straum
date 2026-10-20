@@ -18,6 +18,16 @@
 //! from `ps` otherwise). Accepted numbers come from a quiet Linux host;
 //! anything else is preliminary.
 //!
+//! What sizes the step 7c fence (straum#23, D-153 A), on request:
+//!
+//! * `STRAUM_BENCH_POSITIONS_MS=<ms>` samples every node's commit, applied
+//!   position and log end that often while measuring, and reports the
+//!   positions per second and each node's apply lag (the cluster's commit
+//!   less what the node applied) in positions and in milliseconds;
+//! * `STRAUM_BENCH_CHURN=<clients>` adds clients that connect, disconnect
+//!   and connect again in a loop, each a new clean session whose end is a
+//!   `SessionGone` record: the session-removal rate the cluster sustains.
+//!
 //! `cargo bench -p server --bench puback`; `STRAUM_BENCH_SERVER=<path>`
 //! measures another build's `straum-server` with this client. Refuses an
 //! unoptimised build.
@@ -497,6 +507,120 @@ fn scraper(addresses: Vec<SocketAddr>, every: Duration, stop: Arc<AtomicBool>) -
     scrapes
 }
 
+/// One sample of every node: seconds since the sampler started, and per
+/// node `(commit, applied, log_end)`, `None` where it did not answer.
+type Positions = (f64, Vec<Option<(f64, f64, f64)>>);
+
+/// Every node's positions every `every`, while measuring (straum#23).
+fn positions(
+    addresses: Vec<SocketAddr>,
+    every: Duration,
+    measuring: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) -> Vec<Positions> {
+    let started = Instant::now();
+    let mut samples = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        let at = Instant::now();
+        if measuring.load(Ordering::Relaxed) {
+            let nodes = addresses
+                .iter()
+                .map(|&a| {
+                    fetch(a).map(|t| {
+                        (
+                            value(&t, "straum_commit"),
+                            value(&t, "straum_applied"),
+                            value(&t, "straum_log_end"),
+                        )
+                    })
+                })
+                .collect();
+            samples.push((started.elapsed().as_secs_f64(), nodes));
+        }
+        std::thread::sleep(every.saturating_sub(at.elapsed()));
+    }
+    samples
+}
+
+/// The value at quantile `q` of `values`, sorted in place.
+fn percentile(values: &mut [f64], q: f64) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let n = values.len();
+    values
+        .get(((n as f64 * q) as usize).min(n.saturating_sub(1)))
+        .copied()
+        .unwrap_or(0.0)
+}
+
+/// Positions per second and each node's apply lag, from the samples.
+fn report_positions(samples: &[Positions], every_ms: u64) {
+    let log_end = |s: &Positions| s.1.iter().flatten().map(|p| p.2).fold(0.0f64, f64::max);
+    let records_per_s = match (samples.first(), samples.last()) {
+        (Some(first), Some(last)) if last.0 > first.0 => {
+            (log_end(last) - log_end(first)) / (last.0 - first.0)
+        }
+        _ => 0.0,
+    };
+    println!(
+        "positions samples={} every_ms={every_ms} records_per_s={records_per_s:.0}",
+        samples.len()
+    );
+    for node in 0..usize::from(NODES) {
+        let mut lags: Vec<f64> = samples
+            .iter()
+            .filter_map(|(_, nodes)| {
+                let commit = nodes.iter().flatten().map(|p| p.0).fold(0.0f64, f64::max);
+                nodes
+                    .get(node)
+                    .copied()
+                    .flatten()
+                    .map(|(_, applied, _)| (commit - applied).max(0.0))
+            })
+            .collect();
+        let ms = |positions: f64| {
+            if records_per_s > 0.0 {
+                format!("{:.1}", positions / records_per_s * 1000.0)
+            } else {
+                "-".to_owned()
+            }
+        };
+        let (p50, p99) = (percentile(&mut lags, 0.50), percentile(&mut lags, 0.99));
+        let max = lags.last().copied().unwrap_or(0.0);
+        println!(
+            "apply_lag node={node} samples={} p50={p50:.0} p99={p99:.0} max={max:.0} p50_ms={} p99_ms={} max_ms={}",
+            lags.len(),
+            ms(p50),
+            ms(p99),
+            ms(max)
+        );
+    }
+}
+
+/// A client that connects as a new clean session, disconnects, and does it
+/// again until stopped; counts its sessions ended while measuring. Each
+/// end is a `SessionGone` record (straum#23's removal rate).
+fn churner(
+    address: SocketAddr,
+    name: String,
+    ended: Arc<AtomicU64>,
+    measuring: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut n = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        n += 1;
+        let Some(mut stream) =
+            try_connect(address, &format!("{name}-{n}"), Duration::from_secs(10))
+        else {
+            continue;
+        };
+        // DISCONNECT, then the socket closes.
+        if stream.write_all(&[0xE0, 0x00]).is_ok() && measuring.load(Ordering::Relaxed) {
+            ended.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// A plain sample's value.
 fn value(text: &str, name: &str) -> f64 {
     text.lines()
@@ -595,7 +719,11 @@ fn main() {
         .filter(|e| !e.is_empty())
         .map(str::to_owned)
         .collect();
-    let mut servers = Servers::start(scrape_ms > 0 || !events.is_empty());
+    // straum#23: positions sampled this often (0: not at all), and clients
+    // churning sessions.
+    let positions_ms: u64 = env("STRAUM_BENCH_POSITIONS_MS", 0);
+    let churn: usize = env("STRAUM_BENCH_CHURN", 0);
+    let mut servers = Servers::start(scrape_ms > 0 || !events.is_empty() || positions_ms > 0);
     let measuring = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let delivered = Arc::new(AtomicU64::new(0));
@@ -632,6 +760,35 @@ fn main() {
         let (addresses, stop) = (servers.metrics.clone(), Arc::clone(&stop));
         std::thread::spawn(move || scraper(addresses, Duration::from_millis(scrape_ms), stop))
     });
+    let sampling = (positions_ms > 0).then(|| {
+        let (addresses, measuring, stop) = (
+            servers.metrics.clone(),
+            Arc::clone(&measuring),
+            Arc::clone(&stop),
+        );
+        std::thread::spawn(move || {
+            positions(
+                addresses,
+                Duration::from_millis(positions_ms),
+                measuring,
+                stop,
+            )
+        })
+    });
+    let ended = Arc::new(AtomicU64::new(0));
+    let churners: Vec<_> = (0..churn)
+        .map(|i| {
+            let (address, ended, measuring, stop) = (
+                servers.mqtt[i % 3],
+                Arc::clone(&ended),
+                Arc::clone(&measuring),
+                Arc::clone(&stop),
+            );
+            std::thread::spawn(move || {
+                churner(address, format!("churn-{i}"), ended, measuring, stop)
+            })
+        })
+        .collect();
     std::thread::sleep(warmup);
     let cpu_before = servers.cpu();
     let delivered_before = delivered.load(Ordering::Relaxed);
@@ -780,6 +937,10 @@ fn main() {
         .flat_map(|a| a.latencies.iter().copied())
         .collect();
     let scrapes = scraping.map_or(0, |s| s.join().unwrap_or(0));
+    let samples = sampling.map(|s| s.join().unwrap_or_default());
+    for c in churners {
+        let _ = c.join();
+    }
     let finals: Vec<Option<String>> = servers.metrics.iter().map(|&a| fetch(a)).collect();
     // After events, the same positions 10 s later, with no load: a node
     // still behind is catching up only if its commit moved.
@@ -819,6 +980,20 @@ fn main() {
             )
         },
     );
+    if let Some(samples) = &samples {
+        report_positions(samples, positions_ms);
+    }
+    if churn > 0 {
+        let closed: f64 = finals
+            .iter()
+            .flatten()
+            .map(|t| value(t, "straum_mqtt_closed_total"))
+            .sum();
+        println!(
+            "churn clients={churn} sessions_ended_per_s={:.0} closed_total={closed:.0}",
+            ended.load(Ordering::Relaxed) as f64 / seconds.as_secs_f64()
+        );
+    }
     let sum = |f: fn(&Account) -> u64| accounts.iter().map(f).sum::<u64>();
     println!(
         "publishes acknowledged={} late={} retransmitted={} reconnects={} unacknowledged={} duplicate_acks={} publishers_gave_up={}",
