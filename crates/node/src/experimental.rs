@@ -46,6 +46,9 @@ pub struct Experimental {
     pub retain_bytes: u64,
     /// Where the metrics are served (D-112); `None` serves none.
     pub metrics: Option<SocketAddr>,
+    /// D-162 A, a prototype on a branch: zeros written this far ahead of
+    /// each segment's log (`WalLimits::preallocate_bytes`); 0 is off.
+    pub wal_preallocate_bytes: u64,
 }
 
 /// A configuration refused at startup: nothing is corrected silently
@@ -209,7 +212,10 @@ impl Experimental {
                 .collect(),
             data: self.data.clone(),
             segments: SegmentLimits {
-                wal: WalLimits::default(),
+                wal: WalLimits {
+                    preallocate_bytes: self.wal_preallocate_bytes,
+                    ..WalLimits::default()
+                },
                 segment_bytes: 64 << 20,
             },
             limits: apply::Limits::default(),

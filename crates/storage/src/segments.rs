@@ -141,6 +141,9 @@ impl<D: Disk + Clone> Segments<D> {
         // A segment is sealed durable: otherwise a power loss could take its
         // unsynced tail and keep the next segment, a hole in the log.
         if let Some(active) = self.active.as_mut() {
+            // Its zeros written ahead go with it (D-162 A): the sync below
+            // makes the cut durable.
+            active.wal.trim()?;
             active.wal.commit_with(true)?;
         }
         let path = segment_path(&self.directory, key);

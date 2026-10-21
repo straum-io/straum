@@ -38,6 +38,12 @@ pub struct WalLimits {
     pub max_batch_bytes: usize,
     /// Where adaptation starts, before any storage latency is known.
     pub initial_batch_bytes: usize,
+    /// D-162 A, a prototype: when not 0, the file is written with zeros
+    /// this many bytes past what a batch needs, so a sync flushes data
+    /// only and does not commit a new file size through the filesystem's
+    /// journal each time. Recovery stops at the first zero frame, as at
+    /// any torn tail. 0, the default: the file grows with each batch.
+    pub preallocate_bytes: u64,
 }
 
 impl Default for WalLimits {
@@ -47,6 +53,7 @@ impl Default for WalLimits {
             min_batch_bytes: 65_536,
             max_batch_bytes: 4_194_304,
             initial_batch_bytes: 1_048_576,
+            preallocate_bytes: 0,
         }
     }
 }

@@ -139,6 +139,13 @@ impl Servers {
                 if let Ok(bytes) = std::env::var("STRAUM_BENCH_READ_BYTES") {
                     s.push(("STRAUM_READ_BYTES".to_owned(), bytes));
                 }
+                // D-162 A: the prototype's zeros ahead, passed through.
+                if let Ok(bytes) = std::env::var("STRAUM_BENCH_PREALLOCATE_BYTES") {
+                    s.push((
+                        "STRAUM_EXPERIMENTAL_WAL_PREALLOCATE_BYTES".to_owned(),
+                        bytes,
+                    ));
+                }
                 s
             })
             .collect();

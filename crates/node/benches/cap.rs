@@ -117,8 +117,13 @@ fn config(cap: u64, id: u8, addresses: &[SocketAddr]) -> NodeConfig {
             .map(|p| (p, addresses[usize::from(p)]))
             .collect(),
         data: data_dir(cap, id),
+        // D-162 A: `STRAUM_BENCH_PREALLOCATE_BYTES` writes zeros that far
+        // ahead of each segment's log; 0, the default, as on `main`.
         segments: SegmentLimits {
-            wal: WalLimits::default(),
+            wal: WalLimits {
+                preallocate_bytes: env("STRAUM_BENCH_PREALLOCATE_BYTES", 0),
+                ..WalLimits::default()
+            },
             segment_bytes: 64 << 20,
         },
         limits: Limits::default(),

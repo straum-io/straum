@@ -158,6 +158,9 @@ pub struct Wal<D: Disk = OsDisk> {
     limits: WalLimits,
     write_offset: u64,
     durable_offset: u64,
+    /// Where the zeros written ahead end: the file's length while
+    /// `preallocate_bytes` is set (D-162 A).
+    zeroed_end: u64,
     sequence: u64,
     durable_sequence: u64,
     /// Reused across batches: one buffer per WAL, not one per record.
@@ -237,6 +240,9 @@ impl<D: Disk> Wal<D> {
                 limits,
                 write_offset: recovery.durable_offset,
                 durable_offset: recovery.durable_offset,
+                // The tail was cut above, zeros included: they are written
+                // again with the next batch.
+                zeroed_end: recovery.durable_offset,
                 sequence: recovery.sequence,
                 durable_sequence: recovery.sequence,
                 batch: Vec::new(),
@@ -370,6 +376,12 @@ impl<D: Disk> Wal<D> {
         if !self.batch.is_empty() {
             return Err(StorageError::StagedDuringCompaction);
         }
+        // Compaction measures what it keeps from the file's end: zeros
+        // written ahead (D-162 A) would count as log and shrink the suffix.
+        if self.zeroed_end > self.write_offset {
+            self.file.set_len(self.write_offset)?;
+            self.zeroed_end = self.write_offset;
+        }
 
         let outcome = match compact_on(
             &self.disk,
@@ -398,6 +410,7 @@ impl<D: Disk> Wal<D> {
         self.file = file;
         self.write_offset = end;
         self.durable_offset = end;
+        self.zeroed_end = end;
         Ok(outcome)
     }
 
@@ -435,12 +448,56 @@ impl<D: Disk> Wal<D> {
     }
 
     fn write(&mut self, batch: &[u8]) -> Result<(), StorageError> {
-        if let Err(error) = self.file.write_all(batch) {
+        let written = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+        let end = self.write_offset.saturating_add(written);
+        let ahead = self.limits.preallocate_bytes;
+        let result = if ahead > 0 && end > self.zeroed_end {
+            self.zero_to(end.saturating_add(ahead))
+        } else {
+            Ok(())
+        }
+        .and_then(|()| self.file.write_all(batch));
+        if let Err(error) = result {
             self.failed = true;
             return Err(error.into());
         }
-        let written = u64::try_from(batch.len()).unwrap_or(u64::MAX);
-        self.write_offset = self.write_offset.saturating_add(written);
+        self.write_offset = end;
+        Ok(())
+    }
+
+    /// Writes zeros from where the last ones ended to `to`, then returns to
+    /// the write offset (D-162 A). The next sync makes the new length
+    /// durable once; the syncs after it, until `to`, flush data only. A
+    /// crash anywhere in here leaves zeros or a shorter file, and recovery
+    /// stops at the first zero frame either way.
+    fn zero_to(&mut self, to: u64) -> std::io::Result<()> {
+        const CHUNK: usize = 1 << 20;
+        let zeros = [0u8; 4096];
+        self.file.seek(SeekFrom::Start(self.zeroed_end))?;
+        let mut left = to.saturating_sub(self.zeroed_end);
+        let mut chunk = Vec::with_capacity(CHUNK);
+        while left > 0 {
+            let n = usize::try_from(left).unwrap_or(CHUNK).min(CHUNK);
+            chunk.clear();
+            while chunk.len() < n {
+                let more = n.saturating_sub(chunk.len()).min(zeros.len());
+                chunk.extend_from_slice(zeros.get(..more).unwrap_or_default());
+            }
+            self.file.write_all(&chunk)?;
+            left = left.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
+        }
+        self.zeroed_end = to;
+        self.file.seek(SeekFrom::Start(self.write_offset))?;
+        Ok(())
+    }
+
+    /// Cuts the zeros written ahead (D-162 A), so a sealed file holds only
+    /// its log. Made durable by the caller's next sync.
+    pub fn trim(&mut self) -> Result<(), StorageError> {
+        if self.zeroed_end > self.write_offset {
+            self.file.set_len(self.write_offset)?;
+            self.zeroed_end = self.write_offset;
+        }
         Ok(())
     }
 

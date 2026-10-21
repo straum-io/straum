@@ -175,6 +175,13 @@ impl Settings {
             0,
             u64::MAX,
         )?;
+        // D-162 A: the prototype of pre-zeroed segments, on its branch only.
+        let wal_preallocate_bytes = parser.number(
+            "STRAUM_EXPERIMENTAL_WAL_PREALLOCATE_BYTES",
+            0u64,
+            0,
+            1 << 30,
+        )?;
         let effective = parser.finish()?;
         let mut node = node::Experimental {
             id,
@@ -187,6 +194,7 @@ impl Settings {
             read_bytes,
             retain_bytes,
             metrics,
+            wal_preallocate_bytes,
         }
         .node_config()?;
         // D-160 A: a correct ACL file that grants nobody anything starts,

@@ -25,6 +25,7 @@ fn experimental() -> Experimental {
         read_bytes: node::experimental::DEFAULT_READ_BYTES,
         retain_bytes: node::DEFAULT_RETAIN_BYTES,
         metrics: None,
+        wal_preallocate_bytes: 0,
     }
 }
 
