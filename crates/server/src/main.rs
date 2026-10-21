@@ -30,7 +30,7 @@ fn main() -> ExitCode {
         .init();
     tracing::warn!(
         "EXPERIMENTAL cluster path (ADR-0008): not production-ready; flow control off; \
-         TLS and credentials only when configured (STRAUM_TLS_*, STRAUM_AUTH_*), never between nodes; wills, persistent sessions and session expiry are refused; \
+         TLS and credentials only when configured (STRAUM_TLS_*, STRAUM_AUTH_*, STRAUM_CLUSTER_TLS_*); wills, persistent sessions and session expiry are refused; \
          timing defaults are placeholders, nothing is measured on Linux"
     );
     for (name, value, source) in &settings.effective {
@@ -56,7 +56,8 @@ fn main() -> ExitCode {
         }
     };
     let tls = settings.node.mqtt.as_ref().and_then(|m| m.tls.clone());
-    tokio.block_on(run(settings.node, settings.access, tls))
+    let node_tls = settings.node.tls.clone();
+    tokio.block_on(run(settings.node, settings.access, tls, node_tls))
 }
 
 /// `straum-server hash-password`: the `<hash>` of a `user:<hash>` line of
@@ -89,6 +90,7 @@ async fn run(
     config: node::NodeConfig,
     access: Option<config::Access>,
     tls: Option<transport::Tls>,
+    node_tls: Option<transport::NodeTls>,
 ) -> ExitCode {
     // Before the start, which can take a while: until a handler is in
     // place SIGHUP keeps its default action and would end the process, and
@@ -105,7 +107,7 @@ async fn run(
     // A node whose loop has ended serves nothing: the process exits, so a
     // supervisor sees it and restarts it (D-152 A).
     let stopped = tokio::select! {
-        () = serve_signals(&node, hangup, access.as_ref(), tls.as_ref()) => false,
+        () = serve_signals(&node, hangup, access.as_ref(), tls.as_ref(), node_tls.as_ref()) => false,
         () = node.stopped() => true,
     };
     if stopped {
@@ -147,6 +149,7 @@ async fn serve_signals(
     hangup: Hangup,
     access: Option<&config::Access>,
     tls: Option<&transport::Tls>,
+    node_tls: Option<&transport::NodeTls>,
 ) {
     #[cfg(unix)]
     {
@@ -170,7 +173,7 @@ async fn serve_signals(
                         Some(hangup) => hangup.recv().await,
                         None => std::future::pending().await,
                     }
-                } => reload(node, access, tls).await,
+                } => reload(node, access, tls, node_tls).await,
                 _ = user1.recv() => match node.hand_off().await {
                     Ok(()) => tracing::info!("SIGUSR1: handing the slot over to the next owner"),
                     Err(error) => tracing::warn!(%error, "SIGUSR1: no handoff"),
@@ -180,17 +183,24 @@ async fn serve_signals(
     }
     #[cfg(not(unix))]
     {
-        let _ = (node, hangup, access, tls);
+        let _ = (node, hangup, access, tls, node_tls);
         crate::signal().await;
     }
 }
 
 /// D-166 A: every file read and checked again, then all of it in use, or
 /// none of it: a file that fails leaves the ones in use as they are, never a
-/// looser policy. New connections use what is installed; open ones keep
-/// what they were admitted with.
+/// looser policy. New connections use what is installed; open client
+/// connections keep what they were admitted with. Open links are checked
+/// again under the new link files, and the ones whose peer no longer proves
+/// its node id are closed (D-172 C).
 #[cfg(unix)]
-async fn reload(node: &node::Node, access: Option<&config::Access>, tls: Option<&transport::Tls>) {
+async fn reload(
+    node: &node::Node,
+    access: Option<&config::Access>,
+    tls: Option<&transport::Tls>,
+    node_tls: Option<&transport::NodeTls>,
+) {
     let Some(access) = access else {
         tracing::info!("SIGHUP: no TLS or credential files are configured; nothing to reload");
         return;
@@ -199,6 +209,9 @@ async fn reload(node: &node::Node, access: Option<&config::Access>, tls: Option<
         Ok(reloaded) => {
             if let (Some(tls), Some(loaded)) = (tls, reloaded.tls) {
                 tls.install(loaded);
+            }
+            if let (Some(node_tls), Some(loaded)) = (node_tls, reloaded.node) {
+                node_tls.install(loaded);
             }
             if let Some(authority) = reloaded.authority {
                 if !node.reload_authority(std::sync::Arc::new(authority)).await {

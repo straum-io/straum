@@ -58,6 +58,13 @@ pub enum ConfigError {
     Tls(String),
     #[error("STRAUM_TLS_CERT_PATH and STRAUM_TLS_KEY_PATH go together: set both or neither")]
     TlsPair,
+    #[error("node TLS: {0}")]
+    NodeTls(String),
+    #[error(
+        "STRAUM_CLUSTER_TLS_CERT_PATH, STRAUM_CLUSTER_TLS_KEY_PATH and STRAUM_CLUSTER_TLS_CA_PATH \
+         go together: set all three or none"
+    )]
+    NodeTlsSet,
     #[error(
         "no client could connect: no user in STRAUM_AUTH_PASSWORD_FILE, and anonymous clients \
          refused (STRAUM_AUTH_ALLOW_ANONYMOUS=0)"
@@ -144,6 +151,11 @@ impl Settings {
         let exposed = parser.boolean_flag("STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK")?;
         let (passwords, acl, anonymous) = credentials(&mut parser)?;
         let (certificate, key) = tls_paths(&mut parser)?;
+        let node_files = node_tls_paths(&mut parser)?;
+        let node_tls = match &node_files {
+            Some(files) => Some(files.load(id).map(transport::NodeTls::from_loaded)?),
+            None => None,
+        };
         let authority = load_authority(passwords.as_deref(), acl.as_deref(), anonymous)?;
         let tls = match (&certificate, &key) {
             (Some(certificate), Some(key)) => Some(
@@ -152,10 +164,12 @@ impl Settings {
             ),
             _ => None,
         };
-        // D-164 A: the MQTT listener alone may leave loopback once every
-        // client is encrypted and named, never anonymous. Links, peers and
-        // metrics keep the rule until node-to-node TLS (D-138 (6)).
+        // D-164 A: the MQTT listener may leave loopback once every client
+        // is encrypted and named, never anonymous. ADR-0010: the link
+        // listener and the peers once every link is TLS and every peer
+        // proves its node id. Metrics keep the rule (D-140).
         let mqtt_secured = tls.is_some() && authority.as_ref().is_some_and(secures);
+        let links_secured = node_tls.is_some();
         if !exposed {
             for (name, address) in [
                 ("STRAUM_CLUSTER_MQTT_LISTEN", mqtt),
@@ -163,7 +177,13 @@ impl Settings {
             ]
             .into_iter()
             .filter(|&(name, _)| !(mqtt_secured && name == "STRAUM_CLUSTER_MQTT_LISTEN"))
-            .chain(voters.iter().map(|&(_, a)| ("STRAUM_CLUSTER_PEERS", a)))
+            .filter(|&(name, _)| !(links_secured && name == "STRAUM_CLUSTER_LISTEN"))
+            .chain(
+                voters
+                    .iter()
+                    .filter(|_| !links_secured)
+                    .map(|&(_, a)| ("STRAUM_CLUSTER_PEERS", a)),
+            )
             .chain(metrics.map(|a| ("STRAUM_CLUSTER_METRICS_LISTEN", a)))
             {
                 if !address.ip().is_loopback() {
@@ -217,17 +237,23 @@ impl Settings {
         let warnings = warnings_for(authority.as_ref());
         // D-166 A: what a SIGHUP reloads, if anything is configured.
         let access =
-            (passwords.is_some() || acl.is_some() || certificate.is_some()).then_some(Access {
-                passwords,
-                acl,
-                anonymous,
-                certificate,
-                key,
-            });
+            (passwords.is_some() || acl.is_some() || certificate.is_some() || node_files.is_some())
+                .then_some(Access {
+                    passwords,
+                    acl,
+                    anonymous,
+                    certificate,
+                    key,
+                    node: node_files.map(|files| (id, files)),
+                });
         if let Some(mqtt) = node.mqtt.as_mut() {
             mqtt.authority = authority.map(std::sync::Arc::new);
             mqtt.tls = tls;
         }
+        // Again with the links' TLS: it needs 4 takeover ticks (D-173 A),
+        // and must be this node's.
+        node.tls = node_tls;
+        node.check()?;
         Ok(Self {
             node,
             log_level,
@@ -318,6 +344,8 @@ pub struct Access {
     anonymous: bool,
     certificate: Option<String>,
     key: Option<String>,
+    /// This node's id and its link TLS files (ADR-0010).
+    node: Option<(u8, NodeFiles)>,
 }
 
 /// A reload's files, every one read and checked, none in use yet.
@@ -325,7 +353,47 @@ pub struct Access {
 pub struct Reloaded {
     pub authority: Option<auth::Authority>,
     pub tls: Option<transport::Loaded>,
+    pub node: Option<transport::LoadedNode>,
     pub warnings: Vec<&'static str>,
+}
+
+/// ADR-0010: this node's certificate and key for its links, and the
+/// cluster CA. All three or none.
+#[derive(Debug, Clone)]
+struct NodeFiles {
+    certificate: String,
+    key: String,
+    ca: String,
+}
+
+impl NodeFiles {
+    /// Read and checked: the key matches the certificate, the certificate
+    /// names node `id` and no other, the CA parses.
+    fn load(&self, id: u8) -> Result<transport::LoadedNode, ConfigError> {
+        transport::NodeTls::load(
+            id,
+            Path::new(&self.certificate),
+            Path::new(&self.key),
+            Path::new(&self.ca),
+        )
+        .map_err(|error| ConfigError::NodeTls(error.to_string()))
+    }
+}
+
+fn node_tls_paths(parser: &mut Parser) -> Result<Option<NodeFiles>, ConfigError> {
+    let certificate: Option<String> =
+        parser.optional_value("STRAUM_CLUSTER_TLS_CERT_PATH", "a path")?;
+    let key: Option<String> = parser.optional_value("STRAUM_CLUSTER_TLS_KEY_PATH", "a path")?;
+    let ca: Option<String> = parser.optional_value("STRAUM_CLUSTER_TLS_CA_PATH", "a path")?;
+    match (certificate, key, ca) {
+        (Some(certificate), Some(key), Some(ca)) => Ok(Some(NodeFiles {
+            certificate,
+            key,
+            ca,
+        })),
+        (None, None, None) => Ok(None),
+        _ => Err(ConfigError::NodeTlsSet),
+    }
 }
 
 impl Access {
@@ -344,10 +412,15 @@ impl Access {
             ),
             _ => None,
         };
+        let node = match &self.node {
+            Some((id, files)) => Some(files.load(*id)?),
+            None => None,
+        };
         Ok(Reloaded {
             warnings: warnings_for(authority.as_ref()),
             authority,
             tls,
+            node,
         })
     }
 }
@@ -1051,5 +1124,134 @@ mod tests {
 
         // Without TLS settings or credentials there is nothing to reload.
         assert!(parse(&VALID).unwrap().access.is_none());
+    }
+
+    /// Node `id`'s link files from a fresh cluster CA, its certificate
+    /// naming `names` (ADR-0010).
+    fn node_files(name: &str, id: u8, names: &[&str]) -> (File, File, File) {
+        let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_pem = ca.self_signed(&ca_key).unwrap().pem();
+        let issuer = rcgen::Issuer::new(ca, ca_key);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(
+            names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let certificate = params.signed_by(&key, &issuer).unwrap();
+        (
+            File::new(&format!("{name}-{id}-node.pem"), &certificate.pem()),
+            File::new(&format!("{name}-{id}-node.key"), &key.serialize_pem()),
+            File::new(&format!("{name}-{id}-ca.pem"), &ca_pem),
+        )
+    }
+
+    /// ADR-0010: all three node TLS paths or none; this node's certificate
+    /// must name it; with them, takeover ticks of at least 4 (D-173 A).
+    #[test]
+    fn node_tls_takes_three_paths_a_certificate_naming_this_node_and_four_ticks() {
+        for one in [
+            "STRAUM_CLUSTER_TLS_CERT_PATH",
+            "STRAUM_CLUSTER_TLS_KEY_PATH",
+            "STRAUM_CLUSTER_TLS_CA_PATH",
+        ] {
+            assert_eq!(
+                with(&[(one, "/etc/x.pem")], "").err(),
+                Some(ConfigError::NodeTlsSet),
+                "{one} alone"
+            );
+        }
+        let (cert, key, ca) = node_files("node-tls", 1, &["1.node.straum"]);
+        let files = [
+            ("STRAUM_CLUSTER_TLS_CERT_PATH", cert.path()),
+            ("STRAUM_CLUSTER_TLS_KEY_PATH", key.path()),
+            ("STRAUM_CLUSTER_TLS_CA_PATH", ca.path()),
+        ];
+        let mut pairs = VALID.to_vec();
+        pairs.extend_from_slice(&files);
+        assert_eq!(
+            parse(&pairs).err(),
+            Some(ConfigError::Cluster(node::ConfigError::TlsTakeoverTicks(3)))
+        );
+        pairs.push(("STRAUM_CLUSTER_TAKEOVER_TICKS", "4"));
+        assert!(parse(&pairs).unwrap().node.tls.is_some());
+
+        let (cert, key, ca) = node_files("node-tls-other", 1, &["2.node.straum"]);
+        let mut pairs = VALID.to_vec();
+        pairs.extend_from_slice(&[
+            ("STRAUM_CLUSTER_TLS_CERT_PATH", cert.path()),
+            ("STRAUM_CLUSTER_TLS_KEY_PATH", key.path()),
+            ("STRAUM_CLUSTER_TLS_CA_PATH", ca.path()),
+            ("STRAUM_CLUSTER_TAKEOVER_TICKS", "4"),
+        ]);
+        assert!(
+            matches!(parse(&pairs), Err(ConfigError::NodeTls(e)) if e.contains("not 1.node.straum"))
+        );
+    }
+
+    /// ADR-0010: with node TLS, the link listener and the peers may leave
+    /// loopback; the metrics listener may not, and without node TLS none of
+    /// them may.
+    #[test]
+    fn node_tls_lets_links_and_peers_leave_loopback_and_nothing_else() {
+        let (cert, key, ca) = node_files("node-tls-wide", 1, &["1.node.straum"]);
+        let wide = |extra: &[(&'static str, &'static str)], tls: bool| {
+            let mut pairs: Vec<(&str, &str)> = VALID
+                .iter()
+                .copied()
+                .filter(|(k, _)| *k != "STRAUM_CLUSTER_PEERS")
+                .collect();
+            pairs.push((
+                "STRAUM_CLUSTER_PEERS",
+                "0=10.0.0.1:7000, 1=10.0.0.2:7000, 2=10.0.0.3:7000",
+            ));
+            pairs.push(("STRAUM_CLUSTER_LISTEN", "0.0.0.0:7000"));
+            pairs.push(("STRAUM_CLUSTER_TAKEOVER_TICKS", "4"));
+            if tls {
+                pairs.push(("STRAUM_CLUSTER_TLS_CERT_PATH", cert.path()));
+                pairs.push(("STRAUM_CLUSTER_TLS_KEY_PATH", key.path()));
+                pairs.push(("STRAUM_CLUSTER_TLS_CA_PATH", ca.path()));
+            }
+            pairs.extend_from_slice(extra);
+            parse(&pairs)
+        };
+        assert!(
+            wide(&[], true).is_ok(),
+            "links and peers beyond loopback with TLS"
+        );
+        assert!(matches!(
+            wide(&[], false),
+            Err(ConfigError::Exposed {
+                name: "STRAUM_CLUSTER_LISTEN",
+                ..
+            })
+        ));
+        assert!(matches!(
+            wide(&[("STRAUM_CLUSTER_METRICS_LISTEN", "0.0.0.0:9100")], true),
+            Err(ConfigError::Exposed {
+                name: "STRAUM_CLUSTER_METRICS_LISTEN",
+                ..
+            })
+        ));
+    }
+
+    /// D-172 C with D-166 A: a reload with a node file that no longer loads
+    /// fails as a whole, so nothing of it is installed; files that load are
+    /// handed back for this node.
+    #[test]
+    fn a_reload_fails_whole_on_a_node_file_that_does_not_load() {
+        let (cert, key, ca) = node_files("node-tls-reload", 1, &["1.node.straum"]);
+        let mut pairs = VALID.to_vec();
+        pairs.extend_from_slice(&[
+            ("STRAUM_CLUSTER_TLS_CERT_PATH", cert.path()),
+            ("STRAUM_CLUSTER_TLS_KEY_PATH", key.path()),
+            ("STRAUM_CLUSTER_TLS_CA_PATH", ca.path()),
+            ("STRAUM_CLUSTER_TAKEOVER_TICKS", "4"),
+        ]);
+        let access = parse(&pairs).unwrap().access.unwrap();
+        assert!(access.reload().unwrap().node.is_some());
+        std::fs::write(&ca.0, "not a certificate\n").unwrap();
+        assert!(matches!(access.reload(), Err(ConfigError::NodeTls(_))));
     }
 }

@@ -4,13 +4,15 @@ mod buffers;
 mod config;
 mod connection;
 mod listener;
+mod node_tls;
 pub mod sys;
 mod tls;
 
 pub use buffers::{BufferBudget, BufferError, ConnectionBuffer};
 pub use config::TransportConfig;
-pub use connection::{Accepted, Connection, Reader, Writer, connect};
+pub use connection::{Accepted, Connection, Reader, Writer, connect, connect_node};
 pub use listener::Listener;
+pub use node_tls::{Installed, LoadedNode, NodeTls, Peer, Side, node_name};
 pub use sys::KernelLimits;
 pub use tls::{Loaded, Tls, TlsError};
 

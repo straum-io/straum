@@ -77,6 +77,14 @@ pub enum ConfigError {
     Uncommitted,
     #[error("max_queue {max_queue} is below one proposal per voter ({voters})")]
     Queue { max_queue: usize, voters: usize },
+    #[error(
+        "takeover after {0} heartbeats with TLS between nodes: at least 4, or a stalled \
+         handshake could use the whole window a restarted peer has to hear its sequencer \
+         (ADR-0010, D-173 A)"
+    )]
+    TlsTakeoverTicks(u32),
+    #[error("the node TLS files are node {tls}'s, and this is node {id}")]
+    TlsNode { tls: u8, id: u8 },
 }
 
 impl NodeConfig {
@@ -109,6 +117,20 @@ impl NodeConfig {
         // longer, so that only a handoff changes the sequencer.
         if self.core.takeover_ticks == 0 {
             return Err(ConfigError::TakeoverTicks(self.core.takeover_ticks));
+        }
+        if let Some(tls) = &self.tls {
+            // A backoff, a stalled attempt, the handshake that succeeds,
+            // then up to a heartbeat until the sequencer's next frame:
+            // `3h + t_ok`, inside four (ADR-0010, D-173 A).
+            if self.core.takeover_ticks < 4 {
+                return Err(ConfigError::TlsTakeoverTicks(self.core.takeover_ticks));
+            }
+            if tls.id() != self.core.id {
+                return Err(ConfigError::TlsNode {
+                    tls: tls.id(),
+                    id: self.core.id,
+                });
+            }
         }
         let limit = self.max_frame / 2;
         if self.read_bytes == 0 || self.read_bytes > limit {
@@ -238,6 +260,7 @@ impl Experimental {
             rotate_every: None,
             read_bytes: self.read_bytes,
             metrics: self.metrics,
+            tls: None,
         };
         config.check()?;
         Ok(config)

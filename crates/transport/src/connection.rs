@@ -11,9 +11,10 @@ use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio_rustls::server::TlsStream;
+use tokio_rustls::TlsStream;
 
 use crate::buffers::{BufferBudget, ConnectionBuffer};
+use crate::node_tls::{NodeTls, Peer};
 use crate::tls::Tls;
 use crate::{TransportConfig, TransportError};
 
@@ -71,7 +72,7 @@ impl Accepted {
             }
             Some(tls) => {
                 let stream = tls.acceptor().accept(self.stream).await?;
-                let (read, write) = tokio::io::split(stream);
+                let (read, write) = tokio::io::split(TlsStream::Server(stream));
                 (Half::Tls(read), WriteSide::Tls(write))
             }
         };
@@ -88,6 +89,47 @@ impl Accepted {
             peer: self.peer,
         })
     }
+}
+
+impl Accepted {
+    /// A link from a peer node over TLS (ADR-0010): the handshake first,
+    /// then the buffers, so a connection still in its handshake holds none
+    /// of the budget. Which node the peer is comes with its HELLO, for the
+    /// caller to check with [`NodeTls::check`] before HELLO has any effect.
+    pub async fn establish_node(self, tls: &NodeTls) -> Result<(Connection, Peer), TransportError> {
+        let (stream, peer) = tls.accept(self.stream).await?;
+        let connection = halves(
+            stream,
+            self.peer,
+            self.config.read_buffer_bytes,
+            self.config.write_buffer_bytes,
+            self.budget,
+        )?;
+        Ok((connection, peer))
+    }
+}
+
+fn halves(
+    stream: TlsStream<TcpStream>,
+    peer: SocketAddr,
+    read_buffer_bytes: usize,
+    write_buffer_bytes: usize,
+    budget: Arc<BufferBudget>,
+) -> Result<Connection, TransportError> {
+    let buffer = ConnectionBuffer::new(read_buffer_bytes, Arc::clone(&budget))?;
+    let outgoing = ConnectionBuffer::new(write_buffer_bytes, budget)?;
+    let (read, write) = tokio::io::split(stream);
+    Ok(Connection {
+        reader: Reader {
+            half: Half::Tls(read),
+            buffer,
+        },
+        writer: Writer {
+            half: WriteSide::Tls(write),
+            buffer: outgoing,
+        },
+        peer,
+    })
 }
 
 pub struct Connection {
@@ -209,11 +251,8 @@ impl Writer {
     }
 }
 
-/// Dials a peer and hands back the halves.
-///
-/// Plaintext. The replication link between nodes is not the client-facing
-/// listener: it has its own address and its own configuration, and giving it
-/// TLS is a separate decision with its own key material.
+/// Dials a peer and hands back the halves, in plaintext. [`connect_node`]
+/// is the same over TLS, with the node's own key material (ADR-0010).
 ///
 /// The read budget is the same global one the listener uses, so bytes read
 /// from a peer count against the same ceiling as bytes read from a client.
@@ -242,4 +281,28 @@ pub async fn connect(
         },
         peer,
     })
+}
+
+/// Dials node `id` at `address` over TLS (ADR-0010): the peer must prove
+/// it is `id` ([`NodeTls::check`]) before anything is sent. The caller
+/// bounds the whole of it in time.
+pub async fn connect_node(
+    address: SocketAddr,
+    id: u8,
+    tls: &NodeTls,
+    read_buffer_bytes: usize,
+    write_buffer_bytes: usize,
+    budget: Arc<BufferBudget>,
+) -> Result<(Connection, Peer), TransportError> {
+    let stream = TcpStream::connect(address).await?;
+    stream.set_nodelay(true)?;
+    let (stream, peer) = tls.dial(stream, id).await?;
+    let connection = halves(
+        stream,
+        address,
+        read_buffer_bytes,
+        write_buffer_bytes,
+        budget,
+    )?;
+    Ok((connection, peer))
 }
