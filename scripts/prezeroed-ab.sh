@@ -38,6 +38,15 @@ JOURNAL=$(ls /proc/fs/jbd2 2>/dev/null | grep "^${LOGDEV:-none}-" | head -1 || t
     echo "governors: $(sort /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | uniq -c | tr -s ' ' | tr '\n' ';')"
     echo "loadavg: $(cat /proc/loadavg)"
 } | tee "$OUT/run.log"
+# D-170 A turns the default on only after a run on a host that passes D-129
+# (scripts/linux-run.sh, its noise stage, is the only test of that). These
+# warnings catch the usual misses; no warning does not mean the host passes.
+if grep -qv '^performance$' /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null; then
+    echo "warning: not every CPU uses the performance governor; this run cannot settle D-170 (D-129)" | tee -a "$OUT/run.log"
+fi
+if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || pgrep -x 'gnome-shell|kwin_wayland|kwin_x11|Xorg|Xwayland' >/dev/null 2>&1; then
+    echo "warning: a desktop session is running; this run cannot settle D-170 (D-129)" | tee -a "$OUT/run.log"
+fi
 
 cargo build --release -p server --bin straum-server >/dev/null 2>&1
 PUBACK=$(cargo bench -p server --bench puback --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\))$/\1/p' | tail -1)
