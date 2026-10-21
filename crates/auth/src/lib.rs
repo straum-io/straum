@@ -291,6 +291,18 @@ impl Authority {
                 .is_none_or(Permissions::grants_nothing)
     }
 
+    /// Whether clients may connect but none may publish or subscribe: every
+    /// user, and anonymous clients if let in, granted nothing by the ACL
+    /// file. A start warns, not refuses (D-160 A): a closed configuration
+    /// may be intended, while the policy is being written.
+    pub fn grants_no_action(&self) -> bool {
+        self.users.values().all(|u| u.permissions.grants_nothing())
+            && self
+                .anonymous
+                .as_ref()
+                .is_none_or(Permissions::grants_nothing)
+    }
+
     /// Whether anybody may connect without a user name.
     pub fn allows_anonymous(&self) -> bool {
         self.anonymous.is_some()

@@ -40,6 +40,9 @@ fn main() -> ExitCode {
         };
         tracing::info!(%name, %value, %source, "setting");
     }
+    for warning in &settings.warnings {
+        tracing::warn!("{warning}");
+    }
 
     let tokio = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

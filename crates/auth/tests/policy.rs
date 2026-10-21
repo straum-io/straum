@@ -225,3 +225,20 @@ fn a_configuration_that_grants_nobody_anything_says_so() {
         "users with no rules are still users: they may connect"
     );
 }
+
+/// D-160 A: users who can connect and may do nothing are told apart from a
+/// configuration nobody can use (which a start refuses).
+#[test]
+fn users_granted_nothing_are_reported_not_refused() {
+    let closed = Authority::parse(&passwords(), Some(""), false).unwrap();
+    assert!(closed.grants_no_action());
+    assert!(!closed.grants_nothing());
+    let open_to_alice =
+        Authority::parse(&passwords(), Some("user alice\nsubscribe a/#\n"), false).unwrap();
+    assert!(!open_to_alice.grants_no_action());
+    let no_file = Authority::parse(&passwords(), None, false).unwrap();
+    assert!(!no_file.grants_no_action());
+    let anonymous =
+        Authority::parse(&passwords(), Some("anonymous\nsubscribe public/#\n"), true).unwrap();
+    assert!(!anonymous.grants_no_action());
+}
