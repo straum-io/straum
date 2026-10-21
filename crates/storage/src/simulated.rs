@@ -131,6 +131,62 @@ impl SimDisk {
         state.names = state.durable_names.clone();
     }
 
+    /// The machine loses power with writes in flight in any order
+    /// (ADR-0009): of the 512-byte sectors that differ between what was
+    /// written and what the last sync covered, each keeps either version,
+    /// chosen by `seed`. A file whose length changed comes back at either
+    /// length; bytes no write reached read as zeros. It assumes 512-byte
+    /// sectors are written whole and a file comes back at its written or its
+    /// synced length, never one between; within those, any order. It reaches
+    /// what [`SimDisk::power_loss`] cannot: an unsynced overwrite inside synced
+    /// space, torn. Names as in
+    /// `power_loss`.
+    pub fn power_loss_sectors(&self, seed: u64) {
+        const SECTOR: usize = 512;
+        // splitmix64: deterministic, no dependency.
+        let mut state = seed;
+        let mut coin = move || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            (z ^ (z >> 31)) & 1 == 1
+        };
+        let mut disk = self.state();
+        for inode in &mut disk.inodes {
+            let length = if coin() {
+                inode.written.len()
+            } else {
+                inode.synced.len()
+            };
+            let mut survived = vec![0u8; length];
+            for start in (0..length).step_by(SECTOR) {
+                let end = start.saturating_add(SECTOR).min(length);
+                // One version of the sector, zeros where it holds nothing.
+                let version = |bytes: &[u8]| {
+                    let mut sector = vec![0u8; end.saturating_sub(start)];
+                    let held = bytes.get(start..bytes.len().min(end)).unwrap_or_default();
+                    if let Some(to) = sector.get_mut(..held.len()) {
+                        to.copy_from_slice(held);
+                    }
+                    sector
+                };
+                let (written, synced) = (version(&inode.written), version(&inode.synced));
+                let from = if written != synced && coin() {
+                    written
+                } else {
+                    synced
+                };
+                if let Some(to) = survived.get_mut(start..end) {
+                    to.copy_from_slice(&from);
+                }
+            }
+            inode.written = survived.clone();
+            inode.synced = survived;
+        }
+        disk.names = disk.durable_names.clone();
+    }
+
     /// What a path holds now, if anything. For assertions.
     pub fn contents(&self, path: &Path) -> Option<Vec<u8>> {
         let state = self.state();
