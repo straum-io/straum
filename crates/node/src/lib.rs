@@ -177,10 +177,10 @@ pub struct NodeConfig {
 /// configuration.
 pub const DEFAULT_RETAIN_BYTES: u64 = 64 * 1024 * 1024;
 
-/// MQTT connections one source address may have waiting at once, for a
-/// handshake or a CONNECT (D-165 A): fixed, not a setting. Clients behind one
-/// NAT share it; past it a connection is closed at once and the client
-/// retries.
+/// MQTT connections one source (an IPv4 address or an IPv6 /64, D-168 A)
+/// may have waiting at once, for a handshake or a CONNECT (D-165 A): fixed,
+/// not a setting. Clients behind one NAT share it; past it a connection is
+/// closed at once and the client retries.
 pub const MAX_WAITING_PER_SOURCE: usize = 16;
 
 /// What a node reports about itself.
