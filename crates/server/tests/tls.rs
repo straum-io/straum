@@ -138,28 +138,33 @@ fn an_mqtt_listener_secured_by_tls_and_credentials_serves_beyond_loopback() {
     };
     for id in 0..NODES {
         let log = std::fs::File::create(dir.join(format!("log-{id}"))).unwrap();
-        servers.children.push(
-            Command::new(env!("CARGO_BIN_EXE_straum-server"))
-                .env_clear()
-                .env("STRAUM_EXPERIMENTAL_CLUSTER", "1")
-                .env("STRAUM_CLUSTER_NODE_ID", id.to_string())
-                .env("STRAUM_CLUSTER_PEERS", &peers)
-                // Beyond loopback, with no STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK.
-                .env(
-                    "STRAUM_CLUSTER_MQTT_LISTEN",
-                    format!("0.0.0.0:{}", base + 5 + id),
-                )
-                .env("STRAUM_CLUSTER_DATA_DIR", dir.join(format!("data-{id}")))
-                .env("STRAUM_AUTH_PASSWORD_FILE", &passwords)
-                .env("STRAUM_TLS_CERT_PATH", &cert)
-                .env("STRAUM_TLS_KEY_PATH", &key)
-                .env("NO_COLOR", "1")
-                .stdin(Stdio::null())
-                .stdout(log.try_clone().unwrap())
-                .stderr(log)
-                .spawn()
-                .unwrap(),
-        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_straum-server"));
+        command
+            .env_clear()
+            .env("STRAUM_EXPERIMENTAL_CLUSTER", "1")
+            .env("STRAUM_CLUSTER_NODE_ID", id.to_string())
+            .env("STRAUM_CLUSTER_PEERS", &peers)
+            // Beyond loopback, with no STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK.
+            .env(
+                "STRAUM_CLUSTER_MQTT_LISTEN",
+                format!("0.0.0.0:{}", base + 5 + id),
+            )
+            .env("STRAUM_CLUSTER_DATA_DIR", dir.join(format!("data-{id}")))
+            .env("STRAUM_AUTH_PASSWORD_FILE", &passwords)
+            .env("STRAUM_TLS_CERT_PATH", &cert)
+            .env("STRAUM_TLS_KEY_PATH", &key)
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        // Node 0's metrics on loopback, in this block's free slot (D-167 A).
+        if id == 0 {
+            command.env(
+                "STRAUM_CLUSTER_METRICS_LISTEN",
+                format!("127.0.0.1:{}", base + 3),
+            );
+        }
+        servers.children.push(command.spawn().unwrap());
     }
     let mqtt = base + 5;
     let log = || std::fs::read_to_string(dir.join("log-0")).unwrap_or_default();
@@ -215,4 +220,18 @@ fn an_mqtt_listener_secured_by_tls_and_credentials_serves_beyond_loopback() {
             && waited < Duration::from_secs(19),
         "an idle handshake: {read:?} after {waited:?}"
     );
+
+    // D-167 A: the plaintext client and the idle socket were refused before
+    // the gateway, and node 0 counted them.
+    let mut scrape = TcpStream::connect(("127.0.0.1", base + 3)).unwrap();
+    scrape.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").unwrap();
+    let mut text = String::new();
+    let _ = scrape.read_to_string(&mut text);
+    let failed: u64 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("straum_mqtt_handshake_failed_total "))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("the handshake counter is rendered");
+    // Two: the plaintext client's and the idle socket's.
+    assert!(failed >= 2, "handshakes failed: {failed}");
 }

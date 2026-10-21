@@ -553,6 +553,7 @@ dependencies = [
  "domain",
  "gateway",
  "journal",
+ "rcgen",
  "rumqttc",
  "storage",
  "thiserror 2.0.20",
