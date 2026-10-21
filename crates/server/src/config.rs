@@ -55,9 +55,8 @@ pub enum ConfigError {
     #[error("credentials: {0}")]
     Credentials(#[from] auth::AuthError),
     #[error(
-        "no client could connect and do anything: no user in STRAUM_AUTH_PASSWORD_FILE, and anonymous \
-         clients refused (STRAUM_AUTH_ALLOW_ANONYMOUS=0) or granted nothing by \
-         STRAUM_AUTH_ACL_FILE, which grants only what it lists"
+        "no client could connect: no user in STRAUM_AUTH_PASSWORD_FILE, and anonymous clients \
+         refused (STRAUM_AUTH_ALLOW_ANONYMOUS=0)"
     )]
     NobodyAllowed,
     #[error("cluster: {0}")]
@@ -250,7 +249,7 @@ fn credentials(parser: &mut Parser) -> Result<Option<auth::Authority>, ConfigErr
         rules.as_deref(),
         anonymous,
     )?;
-    if authority.grants_nothing() {
+    if authority.admits_nobody() {
         return Err(ConfigError::NobodyAllowed);
     }
     Ok(Some(authority))
@@ -716,12 +715,20 @@ mod tests {
         let mut pairs = VALID.to_vec();
         pairs.push(("STRAUM_AUTH_PASSWORD_FILE", empty.path()));
         assert_eq!(parse(&pairs).err(), Some(ConfigError::NobodyAllowed));
-        // D-159 A: an ACL file alone, with no `anonymous` section, would let
-        // anonymous clients in to do nothing.
+        // D-161 A: an ACL file alone, with no `anonymous` section, lets
+        // anonymous clients in to do nothing: it starts, with the D-160
+        // warning, and grants nothing.
         let acl = File::new("acl-no-anonymous", "# nothing for anonymous clients\n");
         let mut pairs = VALID.to_vec();
         pairs.push(("STRAUM_AUTH_ACL_FILE", acl.path()));
-        assert_eq!(parse(&pairs).err(), Some(ConfigError::NobodyAllowed));
+        let settings = parse(&pairs).unwrap();
+        assert_eq!(settings.warnings.len(), 1);
+        let auth::Authenticated::Allowed(anonymous) =
+            authority(&settings).unwrap().authenticate(None, None)
+        else {
+            panic!("anonymous clients are let in");
+        };
+        assert!(anonymous.grants_nothing());
     }
 
     #[test]
