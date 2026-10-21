@@ -70,6 +70,13 @@ function keep(key, value) {
     tm = field($0, "time_max_ms") + 0
     if (tm > serving_time[round]) serving_time[round] = tm
 }
+# D-157 A: syncs on the logs' device and records per sync.
+/^disk / {
+    keep("flushes_per_s", field($0, "flushes_per_s"))
+    keep("flush_ms_avg", field($0, "flush_ms_avg"))
+    keep("record_writes_per_flush", field($0, "record_writes_per_flush"))
+    keep("journal_commits_per_flush", field($0, "journal_commits_per_flush"))
+}
 /^serving_again / {
     again++
     again_ms[again] = field($0, "after_ms")

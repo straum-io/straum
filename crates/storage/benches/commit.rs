@@ -208,6 +208,66 @@ fn write_strategies() {
     let _ = fs::remove_file(&path);
 }
 
+/// D-157 A: what one `sync_data` costs by group size, on a file that grows
+/// (as the WAL's does today: each sync also commits the new size through
+/// the filesystem's journal), one extended with `set_len` (sparse: each
+/// write still allocates blocks), and one written with zeros and synced
+/// beforehand (each sync flushes data only). Not the WAL: raw writes of
+/// `RECORD`-byte records, so the layouts differ in nothing else.
+/// `fallocate` (unwritten extents, converted on write) is not tested: std
+/// has no call for it.
+fn sync_cost() {
+    const RECORD: usize = 128;
+    const SYNCS: usize = 500;
+    for records in [1usize, 8, 16, 64, 256] {
+        let group = vec![b'x'; records * RECORD];
+        let size = (group.len() * SYNCS) as u64;
+        for layout in ["growing", "sparse", "prezeroed"] {
+            let path = scratch(&format!("sync-{layout}-{records}"));
+            let mut file = ok(fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(true)
+                .open(&path));
+            match layout {
+                "sparse" => ok(file.set_len(size)),
+                "prezeroed" => {
+                    let zeros = vec![0u8; 1 << 20];
+                    let mut left = size as usize;
+                    while left > 0 {
+                        let n = left.min(zeros.len());
+                        ok(file.write_all(&zeros[..n]));
+                        left -= n;
+                    }
+                    ok(file.sync_all());
+                    ok(std::io::Seek::rewind(&mut file));
+                }
+                _ => {}
+            }
+            let mut syncs = Vec::with_capacity(SYNCS);
+            let started = Instant::now();
+            for _ in 0..SYNCS {
+                ok(file.write_all(&group));
+                let at = Instant::now();
+                ok(file.sync_data());
+                syncs.push(at.elapsed().as_nanos() as u64);
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            syncs.sort_unstable();
+            println!(
+                "sync_cost layout={layout} records_per_sync={records} syncs={SYNCS} sync_p50_us={} sync_p99_us={} syncs_per_s={:.0} records_per_s={:.0}",
+                micros(percentile(&syncs, 0.5)),
+                micros(percentile(&syncs, 0.99)),
+                SYNCS as f64 / elapsed,
+                (SYNCS * records) as f64 / elapsed,
+            );
+            drop(file);
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 fn main() {
     // `cargo test --all-targets` runs this program too, as a debug build and
     // with no arguments, and would do minutes of real fsyncs to measure a
@@ -267,4 +327,8 @@ fn main() {
     println!();
     println!("write strategy, 256 × 4 KiB + one sync (docs/storage.md §98)");
     write_strategies();
+
+    println!();
+    println!("sync cost by group size and file layout, 128 B records (D-157 A)");
+    sync_cost();
 }

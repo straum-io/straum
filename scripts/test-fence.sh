@@ -17,6 +17,7 @@ serving_lag node=1 samples=600 p50=0 p99=45 max=60 time_p99_ms=20 time_max_ms=30
 puback publishers=6 subscribers=3 window=16 payload=64 scrape_ms=0 scrapes=0 pubacks_per_s=1900 p50_ms=50 p99_ms=90 deliveries_per_s=5700 cpu_ms_per_1k=40
 positions samples=600 every_ms=100 records_per_s=2100
 serving_lag node=0 samples=600 p50=0 p99=50 max=70 time_p99_ms=25 time_max_ms=35
+disk device=sda seconds=60.0 writes_per_s=900 flushes_per_s=600 flush_ms_avg=1.500 records_per_s=2100 record_writes_per_flush=10.5 journal_commits_per_s=590 journal_commits_per_flush=0.98
 EOF
 cat > "$dir/rates-events.txt" <<'EOF'
 --- round 1
@@ -50,6 +51,8 @@ expect() {
 }
 expect summary.txt "serving_lag_max median=70 min=60 max=70"
 expect summary.txt "serving_lag_time_max_ms median=35 min=30 max=35"
+expect summary.txt "record_writes_per_flush median=10.5 min=10.5 max=10.5"
+expect summary.txt "journal_commits_per_flush median=0.98"
 expect summary.txt "serving_again n=2 missing=1 p50_ms=2900 p90_ms=2900 max_ms=2900 lag_p50=1150 lag_max=1150"
 # The queue takes its lag time from the time lag, not from W/R.
 # The saturation stage's p99 and rate are left out of W; its removals are not.

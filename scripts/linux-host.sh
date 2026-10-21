@@ -92,6 +92,17 @@ run() {
 
 note "straum linux-host run, mode $MODE, into $OUT"
 
+# D-157 A: the physical disk under TMPDIR, as /proc/diskstats names it (the
+# kernel counts flushes on the whole disk, never on a partition), and the
+# ext4 journal of the filesystem there, under /proc/fs/jbd2 (named after
+# the partition or dm volume), for puback to count flushes and journal
+# commits over each measured window. A volume over several disks counts
+# the first.
+LOGDEV=$(lsblk -no KNAME "$(findmnt -n -o SOURCE -T "$TMPDIR" 2>/dev/null | sed 's/\[.*//')" 2>/dev/null | head -1 || true)
+DISK=$(lsblk -rs -no NAME,TYPE "/dev/${LOGDEV:-none}" 2>/dev/null | awk '$2 == "disk" { print $1; exit }' || true)
+JOURNAL=$(ls /proc/fs/jbd2 2>/dev/null | grep "^${LOGDEV:-none}-" | head -1 || true)
+note "   disk counted: ${DISK:-none}, journal: ${JOURNAL:-none}"
+
 {
     echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "commit: $(git rev-parse HEAD)"
@@ -111,6 +122,11 @@ note "straum linux-host run, mode $MODE, into $OUT"
     df -h "$TMPDIR" 2>/dev/null || true
     findmnt -T "$TMPDIR" -o SOURCE,FSTYPE,OPTIONS 2>/dev/null || true
     lsblk -d -o NAME,ROTA,SIZE,MODEL 2>/dev/null || true
+    # A volatile write cache is what makes a flush cost anything.
+    for c in /sys/block/*/queue/write_cache; do
+        [ -r "$c" ] && echo "write_cache $(echo "$c" | cut -d/ -f4): $(cat "$c")"
+    done
+    echo "disk counted: ${DISK:-none}, journal: ${JOURNAL:-none}"
     for s in net.core.somaxconn net.ipv4.tcp_max_syn_backlog vm.dirty_ratio vm.dirty_background_ratio; do
         echo "$s = $(sysctl -n "$s" 2>/dev/null || echo -)"
     done
@@ -152,7 +168,7 @@ else
         failed=0
         for round in $(seq 1 "$ROUNDS"); do
             echo "--- round $round"
-            if ! env STRAUM_BENCH_POSITIONS_MS=100 "$@" "$PUBACK"; then
+            if ! env STRAUM_BENCH_POSITIONS_MS=100 STRAUM_BENCH_DISK="$DISK" STRAUM_BENCH_JOURNAL="$JOURNAL" "$@" "$PUBACK"; then
                 echo "round $round FAILED"
                 failed=1
             fi
