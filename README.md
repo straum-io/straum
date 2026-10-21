@@ -157,19 +157,11 @@ Release versions are published to Docker Hub by
 
 ## Install the Debian package
 
-On Ubuntu 22.04, 24.04 and 26.04, add the PPA and let apt keep Straum up
-to date (amd64 and arm64):
-
-```sh
-sudo add-apt-repository ppa:straum/straum
-sudo apt install straum
-```
-
-Otherwise, each release on [GitHub](https://github.com/straum-io/straum/releases) has
+Each release on [GitHub](https://github.com/straum-io/straum/releases) has
 `.deb` packages for amd64 and arm64 (Debian 12, Ubuntu 22.04 and newer),
 with `SHA256SUMS` and build provenance. The package installs
 `/usr/bin/straum-server`, a `straum` systemd service and its settings file;
-it does not start anything, and neither does the PPA package. Then:
+it does not start anything. Then:
 
 ```sh
 sudo apt install ./straum_<version>_<arch>.deb
@@ -181,6 +173,9 @@ The service runs as a dynamic user with its data in `/var/lib/straum` and
 a tight sandbox (`systemd-analyze security` rates it 1.4). Run it on hosts
 or VMs; in containers use the Docker image, since the sandbox needs
 namespaces a container usually cannot create.
+
+An Ubuntu PPA (`ppa:straum/straum`) that keeps Straum up to date is
+planned; it is not published yet.
 
 ## Run on Kubernetes
 
