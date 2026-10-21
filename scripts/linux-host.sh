@@ -147,7 +147,7 @@ fi
 
 run tests sh -c 'cargo test --workspace --tests && scripts/check-boundaries.sh'
 
-for sim in takeover:20000 cluster:1000 apply:1000 gateway:1000 connect:1000; do
+for sim in takeover:20000 cluster:1000 apply:1000 gateway:1000 connect:1000 journal:1000; do
     name=${sim%%:*}
     run "sim-$name" env STRAUM_SIM_SEEDS="${sim#*:}" cargo test --release -p sim --test "$name" -- --nocapture
 done

@@ -37,13 +37,18 @@ fn records(disk: &SimDisk) -> Vec<Vec<u8>> {
     seen
 }
 
-fn run(seed: u64) -> (u32, u32) {
+/// `zeros`: zeros written ahead of the log (ADR-0009), 128 bytes, less than
+/// some batches, so extensions happen too; and power lost sector by sector
+/// in any order (`SimDisk::power_loss_sectors`) instead of a torn tail.
+fn run(seed: u64, zeros: bool) -> (u32, u32) {
+    let limits = WalLimits {
+        preallocate_bytes: if zeros { 128 } else { 0 },
+        ..WalLimits::default()
+    };
     let (mut crashes, mut torn) = (0, 0);
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let disk = SimDisk::new();
-    let mut wal = Wal::open_on(disk.clone(), &path(), WalLimits::default())
-        .unwrap()
-        .0;
+    let mut wal = Wal::open_on(disk.clone(), &path(), limits).unwrap().0;
     let mut chain = Chain::genesis();
     // The last lsn of a batch whose synced commit returned, and the chain
     // hash at every such batch: recovery must reproduce the same history,
@@ -82,7 +87,11 @@ fn run(seed: u64) -> (u32, u32) {
 
         if rng.below(8) == 0 {
             drop(wal);
-            disk.power_loss(rng.below(200) as usize);
+            if zeros {
+                disk.power_loss_sectors(rng.next());
+            } else {
+                disk.power_loss(rng.below(200) as usize);
+            }
             let recovered = records(&disk);
             let mut verifier = Verifier::new(Chain::genesis());
             for (at, record) in recovered.iter().enumerate() {
@@ -111,9 +120,7 @@ fn run(seed: u64) -> (u32, u32) {
             // Cut a torn batch before appending. Until the slot table can
             // truncate by lsn (step 2), a rewrite that drops records past the
             // last complete batch does it.
-            wal = Wal::open_on(disk.clone(), &path(), WalLimits::default())
-                .unwrap()
-                .0;
+            wal = Wal::open_on(disk.clone(), &path(), limits).unwrap().0;
             if tail.partial > 0 {
                 let through = tail.chain.next_lsn() - 1;
                 wal.compact(0, Retain::NONE, &mut |record| {
@@ -143,11 +150,29 @@ fn the_chain_survives_power_loss_and_torn_tails() {
         .unwrap_or(50);
     let (mut crashes, mut torn) = (0, 0);
     for seed in 0..seeds {
-        let (c, t) = run(seed);
+        let (c, t) = run(seed, false);
         crashes += c;
         torn += t;
     }
     // Not vacuous: the sweep did lose power, and some of it mid-batch.
     assert!(crashes > 0 && torn > 0, "crashes {crashes}, torn {torn}");
     println!("crashes {crashes}, torn tails {torn}");
+}
+
+/// ADR-0009 (D-170 A): the same chain properties with zeros written ahead of
+/// the log and power lost sector by sector, in any order, over them.
+#[test]
+fn the_chain_survives_sector_torn_power_loss_with_zeros_ahead() {
+    let seeds: u64 = std::env::var("STRAUM_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+    let (mut crashes, mut torn) = (0, 0);
+    for seed in 0..seeds {
+        let (c, t) = run(seed, true);
+        crashes += c;
+        torn += t;
+    }
+    assert!(crashes > 0 && torn > 0, "crashes {crashes}, torn {torn}");
+    println!("with zeros ahead: crashes {crashes}, torn batches {torn}");
 }

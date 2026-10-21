@@ -140,9 +140,20 @@ fn directory() -> PathBuf {
     PathBuf::from("/node")
 }
 
+thread_local! {
+    /// ADR-0009 (D-170 A): zeros written this far ahead of each segment
+    /// (0: none), and power lost sector by sector in any order
+    /// (`SimDisk::power_loss_sectors`) instead of a torn tail. Per test
+    /// thread: the tests that set it run every seed with it.
+    static ZEROS_AHEAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn limits() -> SegmentLimits {
     SegmentLimits {
-        wal: WalLimits::default(),
+        wal: WalLimits {
+            preallocate_bytes: ZEROS_AHEAD.get(),
+            ..WalLimits::default()
+        },
         segment_bytes: 700,
     }
 }
@@ -825,9 +836,15 @@ impl World {
         node.promising = None;
         node.truncate = None;
         if power {
-            let torn = self.rng.below(300) as usize;
+            // The same draw either way, so every seed keeps its scenario.
+            let torn = self.rng.below(300);
             let node = &mut self.nodes[usize::from(id)];
-            node.disk.power_loss(torn);
+            if ZEROS_AHEAD.get() > 0 {
+                node.disk
+                    .power_loss_sectors(torn.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            } else {
+                node.disk.power_loss(torn as usize);
+            }
             self.stats.power_losses += 1;
         }
         // Until it restarts, it holds what it made durable.
@@ -1961,6 +1978,35 @@ fn every_seed_that_stalled_recovers() {
             stats.stalls
         );
     }
+}
+
+/// ADR-0009 (D-170 A): the main sweep's seeds and every check in `run`, with
+/// zeros written 128 bytes ahead of each segment (segments of 700 bytes, so
+/// extensions and seals happen often) and power lost sector by sector, in
+/// any order, instead of a torn tail. `STRAUM_SIM_SEEDS` sweeps more.
+#[test]
+fn three_voters_keep_one_committed_log_with_zeros_ahead_and_sector_torn_power_loss() {
+    ZEROS_AHEAD.set(128);
+    let (mut committed, mut power_losses, mut seeds_run) = (0, 0, 0u64);
+    for seed in seeds() {
+        let stats = run(seed);
+        assert!(
+            stats.stalls.is_empty(),
+            "seed {seed}: fault cycles stalled: {:?}",
+            stats.stalls
+        );
+        committed += stats.committed;
+        power_losses += stats.power_losses;
+        seeds_run += 1;
+    }
+    // Not vacuous: records committed and power was lost, over the zeros.
+    assert!(
+        committed > 0 && power_losses > 0,
+        "committed {committed}, power losses {power_losses}"
+    );
+    println!(
+        "with zeros ahead: {seeds_run} seeds, committed {committed}, power losses {power_losses}"
+    );
 }
 
 /// The cycles that outlasted the old 500 000-event cap, run to their end
