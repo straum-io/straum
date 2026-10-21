@@ -12,8 +12,8 @@ majority of its nodes has committed it to one replicated log.
 
 **Website and docs:** [straum-io.github.io](https://straum-io.github.io/)
 
-> **Status: experimental.** Not production-ready: client TLS and credentials
-> only when configured, no encryption between nodes, flow control off, timing defaults are placeholders, and persistent
+> **Status: experimental.** Not production-ready: client TLS, credentials and
+> TLS between nodes only when configured, flow control off, timing defaults are placeholders, and persistent
 > sessions, wills and session expiry are refused at CONNECT for now.
 
 ## Why
@@ -123,10 +123,11 @@ straum-cli status --node 127.0.0.1:9100,127.0.0.1:9101,127.0.0.1:9102
 
 Everything binds to loopback. Any other address is refused unless you set
 `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1`, and then only on a network you
-trust: links between nodes are neither authenticated nor encrypted. The MQTT
-listener alone may face a network without it once TLS (`STRAUM_TLS_*`) and a
-password file (`STRAUM_AUTH_*`, anonymous clients refused) are configured
-(`docs/configuration.md`).
+trust. Without that setting, the links between nodes may face a network once
+TLS between nodes is configured (`STRAUM_CLUSTER_TLS_*`, each node's
+certificate naming it), and the MQTT listener once TLS (`STRAUM_TLS_*`) and a
+password file (`STRAUM_AUTH_*`, anonymous clients refused) are; the metrics
+endpoint never does (`docs/configuration.md`).
 
 ## Run with Docker
 
@@ -138,7 +139,7 @@ docker build -t straum .
 
 Three nodes on their own network. Containers need addresses beyond
 loopback, so this sets `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1`: keep that
-network private, since nothing is authenticated or encrypted yet.
+network private, since this example sets no TLS or credentials.
 
 ```sh
 docker network create --subnet 10.89.42.0/24 straum

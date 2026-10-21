@@ -389,7 +389,8 @@ subscribe public/#
 ```
 
 A user that appears in the file may do only what its rules allow; a user
-that does not appear may do anything. A rule for a user with no password
+that does not appear may do nothing (D-159 A), and anonymous clients only
+what an `anonymous` section allows. A rule for a user with no password
 is a startup error, because it is a typo, not a permission.
 
 A subscription is allowed when a rule covers everything the filter could
