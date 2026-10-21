@@ -26,7 +26,7 @@ measurements, not intuition, and none is measured yet.
 
 Without `STRAUM_EXPERIMENTAL_CLUSTER=1` the server refuses to start: the
 only path is experimental and **not production-ready** — flow control off,
-client TLS and credentials only when configured (below), none between nodes, timing defaults placeholders, nothing measured on
+TLS and credentials only when configured (below), timing defaults placeholders, nothing measured on
 Linux (D-102 A, D-111). Only the variables below, `STRAUM_LOG_LEVEL`
 (default `info`) and `STRAUM_WORKER_THREADS` (`auto`: the CPUs) are read;
 any other `STRAUM_*` variable is refused at startup (D-104 A).
@@ -36,21 +36,24 @@ any other `STRAUM_*` variable is refused at startup (D-104 A).
 | `STRAUM_EXPERIMENTAL_CLUSTER` | unset | Must be `1`: the operator acknowledges the path is experimental. Unset or `0`: refused, as anything else. |
 | `STRAUM_CLUSTER_NODE_ID` | required | This node's id, 0–255. |
 | `STRAUM_CLUSTER_PEERS` | required | Every voter, this node included: `id=address,…` (socket addresses). Odd, at least three; no id twice. |
-| `STRAUM_CLUSTER_LISTEN` | this node's address in the peers | Where its links listen. |
+| `STRAUM_CLUSTER_LISTEN` | this node's address in the peers | Where its links listen. It and the peers may be beyond loopback without the unauthenticated-network setting when the three `STRAUM_CLUSTER_TLS_*` are set (ADR-0010). |
 | `STRAUM_CLUSTER_MQTT_LISTEN` | `127.0.0.1:1883` | Where MQTT clients connect. Loopback by default (D-107). It may bind beyond loopback without the next-but-one setting only when `STRAUM_TLS_*` and a password file are set and anonymous clients are not let in (D-164 A); otherwise credentials, if any, would cross the network in clear. |
 | `STRAUM_CLUSTER_METRICS_LISTEN` | off | Where the node serves its metrics over plain HTTP, in the Prometheus text format (D-112): every request gets the current snapshot. No credentials; loopback unless the next setting is `1`. A diagnostic interface, not a monitoring system (D-126 A): at most 4 scrapes at once — more wait unaccepted — and each read and write bounded by 2 s. |
-| `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK` | `0` | `1` lets the MQTT listener, the link listener, the peers and the metrics listener use addresses beyond loopback — links, peers and metrics unencrypted and unauthenticated; MQTT clients encrypted only under `STRAUM_TLS_*`, and without it their passwords cross the network in clear: for an isolated, trusted network only. Without it any such address is refused at startup, except the MQTT listener when TLS and a password file with no anonymous clients secure it (D-164 A). The experimental switch is no security mechanism (D-107). |
+| `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK` | `0` | `1` lets the MQTT listener, the link listener, the peers and the metrics listener use addresses beyond loopback — metrics always unencrypted and unauthenticated, links and peers so unless `STRAUM_CLUSTER_TLS_*` are set; MQTT clients encrypted only under `STRAUM_TLS_*`, and without it their passwords cross the network in clear: for an isolated, trusted network only. Without it any such address is refused at startup, except the MQTT listener when TLS and a password file with no anonymous clients secure it (D-164 A), and the link listener and the peers when node TLS is set (ADR-0010). The experimental switch is no security mechanism (D-107). |
 | `STRAUM_CLUSTER_DATA_DIR` | required | The log, the promise, snapshots, and the `cluster` file that pins the directory to its cluster's configuration digest: a node started over another cluster's data is refused. |
 | `STRAUM_CLUSTER_HEARTBEAT_MS` | `50` | 1–10 000. A placeholder, not a recommendation (D-104 A). |
-| `STRAUM_CLUSTER_TAKEOVER_TICKS` | `3` | Heartbeats of silence before a takeover, 1–1 000. A placeholder; the simulation shows 3 churns under random delivery (D-99). |
+| `STRAUM_CLUSTER_TAKEOVER_TICKS` | `3` | Heartbeats of silence before a takeover, 1–1 000. A placeholder; the simulation shows 3 churns under random delivery (D-99). With node TLS at least 4, or the start is refused (D-173 A): a stalled handshake to a restarted peer can take a heartbeat on top of a backoff, the handshake and the wait for the next heartbeat. |
 | `STRAUM_CLUSTER_RETAIN_BYTES` | `67108864` | The log kept behind a slow replica (D-57 A, D-91 A); a starting value, not a measured optimum. |
 | `STRAUM_READ_BYTES` | `65536` | One catch-up or fetch read (D-83 A); at most half the 8 MiB frame — 4 MiB — refused above. |
 | `STRAUM_WAL_PREALLOCATE_BYTES` | `0` | Zeros written this far ahead of each log segment's end (ADR-0009, D-170 A), 0–1 GiB, so a sync flushes data only and does not also commit the file's new length through the filesystem's journal: on the measured ext4 SATA host (preliminary) it raised PUBACK throughput about 2.6×. **Off by default** until a host that passes D-129 confirms that; whether the setting stays, and its meaning, are subject to that run (ADR-0009). Recovery is unchanged (a zero frame ends the log, as any torn tail); a sealed segment is trimmed to its log; readers stop at the written end. At most this much disk per open segment beyond its log; one extension costs one write of this size. |
 | `STRAUM_AUTH_PASSWORD_FILE` | off | MQTT credentials (D-110 A, D-158 A): one `user:<hash>` line per user, `#` comments and blank lines ignored; the hash is argon2, as `straum-server hash-password` prints it for a password given on stdin. Set: every CONNECT is checked, off the node loop, before its CONNACK; a wrong or unknown user gets "bad user name or password" (3.1.1: return code 4), an anonymous client "not authorized" (5) unless `STRAUM_AUTH_ALLOW_ANONYMOUS` lets it in. Read at startup, where unreadable or malformed refuses the start, and again on SIGHUP (below). |
 | `STRAUM_AUTH_ACL_FILE` | off | Topic rules: `user <name>` or `anonymous`, then lines `publish <filter>`, `subscribe <filter>` or `readwrite <filter>`. Read at startup and again on SIGHUP (below). The file grants only what it lists (D-159 A): a user it names may do what its rules allow, one it does not name nothing, and anonymous clients only what an `anonymous` section lists. Without the file every user, and every anonymous client let in, may do anything. A correct file under which clients can connect but nobody, anonymous clients included, may do anything starts, with a warning in the log (D-160 A, D-161 A; an ACL file alone that grants anonymous clients nothing included); a file that cannot be read or parsed refuses the start, never falling back to a looser policy. A refused SUBSCRIBE filter gets "not authorized" (3.1.1: 0x80) and is not proposed; a refused PUBLISH is never proposed: MQTT 5 answers a QoS 1 one "not authorized" (or closes the connection, "not authorized", while earlier QoS 1 publishes still wait for their PUBACKs, which a refusal may not overtake) and drops a QoS 0 one; 3.1.1 closes the connection. A subscription is allowed only where a rule covers all it can match. |
 | `STRAUM_AUTH_ALLOW_ANONYMOUS` | `1` without a password file, `0` with one | Whether a client without a user name is let in (restricted by the ACL file's `anonymous` section). A configuration under which no client could connect is refused at startup: no user, and anonymous clients refused. One where clients connect but may do nothing starts with a warning. |
-| `STRAUM_TLS_CERT_PATH` | off | A PEM certificate chain for the MQTT listener (D-164 A). With it and the next one, the listener speaks TLS only, never plaintext beside it. Both or neither; read at startup, where a file that cannot be read, holds no certificate or a key of another certificate refuses the start, and again on SIGHUP (below). A TLS handshake must finish within the gateway's connect timeout (10 s), and at most 1 024 run at once: a connection past that is closed at once. TLS state per connection (rustls's buffers and session) is not charged to the read-buffer budget; it is bounded by count, at most 1 024 handshakes and 1 024 open connections, not measured in bytes. At most 16 connections from one source address wait at once, for a handshake or a CONNECT (D-165 A); past that the source's next one is closed at once, so one address or one IPv6 /64 cannot take every slot: a source is an IPv4 address, or an IPv6 /64, since a host commonly holds a whole one (D-168 A); an IPv4-mapped address counts as its IPv4 address. Hosts sharing one /64 share the 16: so do every link-local client (fe80::/64, whatever its interface), and, behind a NAT64 that shows IPv4 clients as 64:ff9b::/96, every IPv4 client. Clients behind one NAT share those 16; many sources together, or a host routed a wider prefix, still can fill the 1 024, which is a firewall's job. Each refusal before the gateway is counted, with or without TLS, outside the stable metrics (D-167 A): `straum_mqtt_refused_no_permit_total`, `straum_mqtt_refused_source_full_total`, and `straum_mqtt_handshake_failed_total` (a connection whose setup, read buffers or the TLS handshake, failed or did not finish in time). Clients only: links between nodes are not encrypted (node-to-node TLS comes later, D-138 (6)). |
+| `STRAUM_TLS_CERT_PATH` | off | A PEM certificate chain for the MQTT listener (D-164 A). With it and the next one, the listener speaks TLS only, never plaintext beside it. Both or neither; read at startup, where a file that cannot be read, holds no certificate or a key of another certificate refuses the start, and again on SIGHUP (below). A TLS handshake must finish within the gateway's connect timeout (10 s), and at most 1 024 run at once: a connection past that is closed at once. TLS state per connection (rustls's buffers and session) is not charged to the read-buffer budget; it is bounded by count, at most 1 024 handshakes and 1 024 open connections, not measured in bytes. At most 16 connections from one source address wait at once, for a handshake or a CONNECT (D-165 A); past that the source's next one is closed at once, so one address or one IPv6 /64 cannot take every slot: a source is an IPv4 address, or an IPv6 /64, since a host commonly holds a whole one (D-168 A); an IPv4-mapped address counts as its IPv4 address. Hosts sharing one /64 share the 16: so do every link-local client (fe80::/64, whatever its interface), and, behind a NAT64 that shows IPv4 clients as 64:ff9b::/96, every IPv4 client. Clients behind one NAT share those 16; many sources together, or a host routed a wider prefix, still can fill the 1 024, which is a firewall's job. Each refusal before the gateway is counted, with or without TLS, outside the stable metrics (D-167 A): `straum_mqtt_refused_no_permit_total`, `straum_mqtt_refused_source_full_total`, and `straum_mqtt_handshake_failed_total` (a connection whose setup, read buffers or the TLS handshake, failed or did not finish in time). Clients only: links between nodes have their own settings, `STRAUM_CLUSTER_TLS_*` (below). |
 | `STRAUM_TLS_KEY_PATH` | off | The certificate's private key, PEM. As above. |
+| `STRAUM_CLUSTER_TLS_CERT_PATH` | off | This node's certificate chain for its links, PEM (ADR-0010, D-171 A). With the next two, every link is TLS 1.3, with no session resumption and no early data, and both ends present a certificate the cluster CA signed. All three or none. The certificate must name this node exactly once (below), or the start is refused. A node with them and one without cannot link: turning node TLS on or off means stopping every node, then starting every node with the new settings. |
+| `STRAUM_CLUSTER_TLS_KEY_PATH` | off | Its private key, PEM. As above. |
+| `STRAUM_CLUSTER_TLS_CA_PATH` | off | The cluster CA, PEM: the only certificates a peer's chain may lead to. Use a CA for this cluster alone: its key is the root of every node's identity. As above. |
 
 Credentials checks (D-158 A) run off the node loop, at most one per CPU at once, each argon2 check taking about 19 MiB while it runs; a check waiting for its turn holds one CONNECT's user name and password and is cancelled when its connection goes, so the waiting ones are at most the gateway's 1 024 connections: at worst 1 024 × the 256 KiB packet bound, 256 MiB. Hashes must use `straum-server hash-password`'s parameters (argon2id, m=19456, t=2, p=1): a refusal costs one hash with them, so a stored hash made with others would let a known user name be told from an unknown one by its time.
 
@@ -69,7 +72,7 @@ its HELLO carries its incarnation (D-151 A). And the gateway's and `apply`'s lim
 cluster must agree on the voters, the first slot, the timing and these
 bounds: they go into the configuration digest each link's HELLO carries, and
 a link from a node that differs is refused. Wills, persistent sessions and
-session expiry are refused at CONNECT until step 7c. SIGHUP reads the TLS and credential files again (D-166 A), the ones named at startup: every file is read and checked by the start's rules first, and only if all pass are they used, for new connections; open connections keep what they were admitted with, and a credentials check already started (running, or waiting for its turn) finishes with the old files. If any fails, the log says why and the files in use stay, never a looser policy. A reload never turns TLS or credentials on or off (the settings are not read again); `systemctl reload straum` sends it. SIGUSR1 asks the node to
+session expiry are refused at CONNECT until step 7c. SIGHUP reads the TLS and credential files again (D-166 A), the ones named at startup: every file is read and checked by the start's rules first, and only if all pass are they used, for new connections; open connections keep what they were admitted with, and a credentials check already started (running, or waiting for its turn) finishes with the old files. If any fails, the log says why and the files in use stay, never a looser policy. The node TLS files are in the same set: after they are installed, every open link, dialled or accepted, is checked again with the new CA, its peer's node name and the current time, and one that fails, or cannot be checked, is closed (D-172 C); a renewal under the same CA closes none. A reload never turns TLS or credentials on or off (the settings are not read again); `systemctl reload straum` sends it. SIGUSR1 asks the node to
 hand its slot over (a protocol handoff, D-105 A); SIGTERM or Ctrl-C stops it,
 with exit code 0. A node that stops by itself — its log fails, a committed
 record does not apply, a panic — logs why, and the process exits non-zero so
@@ -146,6 +149,9 @@ STRAUM_AUTH_ACL_FILE
 STRAUM_AUTH_ALLOW_ANONYMOUS
 STRAUM_TLS_CERT_PATH
 STRAUM_TLS_KEY_PATH
+STRAUM_CLUSTER_TLS_CERT_PATH
+STRAUM_CLUSTER_TLS_KEY_PATH
+STRAUM_CLUSTER_TLS_CA_PATH
 ```
 <!-- stable-settings:end -->
 
@@ -291,6 +297,72 @@ in the experimental cluster mode (step 7a); tests build it directly.
 | `link_queue` | Frames queued per peer; beyond, dropped (the protocol resends). |
 | `mqtt.listen`, `mqtt.gateway` | MQTT listener and the gateway settings above. |
 | `mqtt.write_queue` | Packets queued per client; a client that lets it fill is closed. |
+
+## Node certificates (ADR-0010, D-171 A, D-172 C)
+
+Each node's certificate names it with a subjectAltName dNSName
+`<id>.node.straum`: its `STRAUM_CLUSTER_NODE_ID` in decimal, no leading
+zeros, as `2.node.straum` for node 2. The name is checked exactly:
+
+- Of the certificate's dNSNames, those under `node.straum` (compared in
+  lower case, wildcards and ids such as `02` included) must be exactly one,
+  and it must be this node's. A wildcard is refused, and so is a
+  certificate naming two nodes. The Subject CN is not read.
+- extendedKeyUsage includes both serverAuth and clientAuth, or is absent:
+  every node both dials and accepts.
+- A node dialling another closes the link unless the peer's certificate
+  names the node it dialled, before it sends HELLO. A node accepting a link
+  closes it unless the dialler's certificate names the node in its HELLO,
+  before the HELLO has any effect. A HELLO naming the accepting node itself
+  is refused: two hosts hold one node's key.
+- TLS proves which node is speaking and nothing else: HELLO keeps its
+  checks, and the cluster protocol and the committed log keep their rules.
+  No authority comes from an address.
+
+With node TLS, a link's connect and handshake must finish within one
+heartbeat; a stalled attempt is tried again at once. With or without TLS, a
+connection to a link port that has not sent a HELLO it may send within two
+heartbeats of its accept is closed, and at most twice as many as there are
+peers wait at once; one more is closed at once. Without TLS a waiting
+connection holds its read and write buffers from the budget the MQTT
+listener shares, so at most twice the peers times those buffers; with TLS
+it holds none until its handshake is done. Refusals before a HELLO names a
+node (a handshake that fails or stalls) are logged at debug level with
+the source address, since anyone who reaches the port can cause them; too
+many waiting is one warning per burst; refusals of a named node are
+errors. A flood of such
+connections can keep links from forming, which costs availability, not
+safety: shield the link port with a firewall.
+
+One way to issue the files, with `openssl`:
+
+```sh
+# Once per cluster: the CA. Keep ca.key off the nodes.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout ca.key -out ca.pem -days 3650 -subj "/CN=straum cluster CA" \
+  -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign
+
+# Per node, here node 2.
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout node-2.key -out node-2.csr -subj "/CN=node 2"
+openssl x509 -req -in node-2.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+  -out node-2.pem -days 365 -extfile <(printf '%s\n' \
+  'subjectAltName=DNS:2.node.straum' \
+  'extendedKeyUsage=serverAuth,clientAuth' \
+  'keyUsage=critical,digitalSignature')
+```
+
+Node 2 then runs with `STRAUM_CLUSTER_TLS_CERT_PATH=node-2.pem`,
+`STRAUM_CLUSTER_TLS_KEY_PATH=node-2.key`, `STRAUM_CLUSTER_TLS_CA_PATH=ca.pem`
+and `STRAUM_CLUSTER_TAKEOVER_TICKS=4` or more.
+
+To renew, issue a new certificate from the same CA, replace the files and
+send SIGHUP: no link closes. To remove a node, for example after its key
+leaked, give every other node files of a new CA (or new certificates of a
+CA that never signed the removed node), then SIGHUP each: its links to the
+removed node, both ways, close and stay closed. There is no revocation list.
+A peer certificate that expires keeps its link until the next reload checks
+it.
 
 ## Access rules (D-110 A, D-158 A, D-159 A)
 

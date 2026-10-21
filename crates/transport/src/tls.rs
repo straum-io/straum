@@ -30,6 +30,10 @@ pub enum TlsError {
     NoPrivateKey(String),
     #[error("{0}")]
     Rustls(#[from] tokio_rustls::rustls::Error),
+    /// A node certificate or a peer that does not prove the identity
+    /// expected (ADR-0010).
+    #[error("node identity: {0}")]
+    Identity(String),
 }
 
 /// The certificate in use, shared by every clone of a [`Tls`].
@@ -103,7 +107,7 @@ impl Tls {
     }
 }
 
-fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+pub(crate) fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let file = std::fs::File::open(path).map_err(|source| TlsError::Read {
         path: path.display().to_string(),
         source,
@@ -118,7 +122,7 @@ fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     Ok(chain)
 }
 
-fn private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
+pub(crate) fn private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
     let file = std::fs::File::open(path).map_err(|source| TlsError::Read {
         path: path.display().to_string(),
         source,

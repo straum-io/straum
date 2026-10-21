@@ -46,6 +46,59 @@ struct Cluster {
     nodes: Vec<Option<Node>>,
     /// Links dialled through a proxy: (from, to, the proxy's address).
     via: Vec<(u8, u8, SocketAddr)>,
+    /// Each node's link TLS (ADR-0010), or none: plaintext links.
+    tls: Vec<transport::NodeTls>,
+}
+
+/// A cluster CA for TLS between nodes (ADR-0010), issuing node files into a
+/// directory of the test's.
+struct Ca {
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+    pem: String,
+}
+
+impl Ca {
+    fn new() -> Self {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        Self {
+            pem: certificate.pem(),
+            issuer: rcgen::Issuer::new(params, key),
+        }
+    }
+
+    /// Node `id`'s certificate, key and this CA, loaded.
+    fn issue(&self, test: &str, id: u8) -> transport::LoadedNode {
+        let dir = std::env::temp_dir().join(format!(
+            "straum-node-ca-{}-{test}-{id}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let params = rcgen::CertificateParams::new(vec![transport::node_name(id)]).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.signed_by(&key, &self.issuer).unwrap();
+        let (cert, key_file, ca) = (
+            dir.join("node.pem"),
+            dir.join("node.key"),
+            dir.join("ca.pem"),
+        );
+        std::fs::write(&cert, certificate.pem()).unwrap();
+        std::fs::write(&key_file, key.serialize_pem()).unwrap();
+        std::fs::write(&ca, &self.pem).unwrap();
+        let loaded = transport::NodeTls::load(id, &cert, &key_file, &ca).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        loaded
+    }
+
+    fn node(&self, test: &str, id: u8) -> transport::NodeTls {
+        transport::NodeTls::from_loaded(self.issue(test, id))
+    }
 }
 
 fn gateway() -> gateway::Config {
@@ -134,6 +187,7 @@ fn config(
         rotate_every: test.starts_with("rotation").then_some(6),
         read_bytes: 64 * 1024,
         metrics: None,
+        tls: None,
     }
 }
 
@@ -184,6 +238,21 @@ impl Cluster {
     /// As `start`, with each listed link from node `from` to node `to`
     /// dialled through `address` instead (a proxy, D-122, D-151).
     async fn start_via(test: &'static str, via: Vec<(u8, u8, SocketAddr)>) -> Self {
+        Self::start_with(test, via, Vec::new()).await
+    }
+
+    /// As `start_via`, with TLS on every link and each node's files from
+    /// `ca` (ADR-0010).
+    async fn start_tls(test: &'static str, ca: &Ca, via: Vec<(u8, u8, SocketAddr)>) -> Self {
+        let tls = (0..NODES).map(|id| ca.node(test, id)).collect();
+        Self::start_with(test, via, tls).await
+    }
+
+    async fn start_with(
+        test: &'static str,
+        via: Vec<(u8, u8, SocketAddr)>,
+        tls: Vec<transport::NodeTls>,
+    ) -> Self {
         for id in 0..NODES {
             let _ = std::fs::remove_dir_all(data_dir(test, id));
         }
@@ -195,6 +264,7 @@ impl Cluster {
             mqtt,
             nodes: Vec::new(),
             via,
+            tls,
         };
         for id in 0..NODES {
             let node = Node::start(cluster.config(id, Limits::default()))
@@ -207,6 +277,14 @@ impl Cluster {
 
     fn config(&self, id: u8, limits: Limits) -> NodeConfig {
         let mut config = config(self.test, id, &self.addresses, &self.mqtt, limits);
+        if let Some(tls) = self.tls.get(usize::from(id)) {
+            config.tls = Some(tls.clone());
+            // Room for a handshake of a debug build on a busy test host
+            // inside one heartbeat (ADR-0010).
+            config.heartbeat = Duration::from_millis(100);
+            // The least TLS allows (D-173 A).
+            config.core.takeover_ticks = config.core.takeover_ticks.max(4);
+        }
         for &(_, to, address) in self.via.iter().filter(|v| v.0 == id) {
             for peer in &mut config.peers {
                 if peer.0 == to {
@@ -1450,4 +1528,197 @@ async fn a_node_whose_loop_ends_reports_it_stopped() {
     );
     node.shutdown().await;
     let _ = std::fs::remove_dir_all(data_dir(test, 0));
+}
+
+/// ADR-0010: with TLS on every link, a cluster commits and applies one log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_nodes_commit_over_tls_links() {
+    let ca = Ca::new();
+    let cluster = Cluster::start_tls("tls", &ca, Vec::new()).await;
+    let first = cluster.converged(2).await;
+    for request in 0..30u64 {
+        cluster.publish((request % 3) as u8, request).await;
+    }
+    cluster.converged(first.applied + 30).await;
+    cluster.shutdown().await;
+}
+
+/// D-172 C: a renewal from the same CA disturbs no link, so the slot
+/// stays. Node 0 then reloads under a CA that signs no other node: its links
+/// close in both directions and stay closed, so it applies nothing more while
+/// nodes 1 and 2 go on. Given files of the cluster's CA again, it links and
+/// catches up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_cuts_the_links_of_a_peer_that_no_longer_proves_its_name() {
+    let ca = Ca::new();
+    let cluster = Cluster::start_tls("tls-reload", &ca, Vec::new()).await;
+    let first = cluster.converged(2).await;
+
+    cluster.tls[0].install(ca.issue("tls-reload", 0));
+    for request in 0..10u64 {
+        cluster.publish((request % 3) as u8, request).await;
+    }
+    let renewed = cluster.converged(first.applied + 10).await;
+    assert_eq!(renewed.slot, first.slot, "a renewal disturbed the links");
+
+    cluster.tls[0].install(Ca::new().issue("tls-reload", 0));
+    for request in 10..20u64 {
+        cluster.publish(1 + (request % 2) as u8, request).await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (zero, one) = (
+        *cluster.node(0).status().borrow(),
+        *cluster.node(1).status().borrow(),
+    );
+    assert!(
+        zero.applied < one.applied,
+        "node 0 still hears the cluster under another CA: {zero:?} {one:?}"
+    );
+    cluster.publish(2, 20).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        cluster.node(0).status().borrow().applied,
+        zero.applied,
+        "node 0 applied more under another CA"
+    );
+
+    cluster.tls[0].install(ca.issue("tls-reload", 0));
+    cluster.converged(one.applied + 1).await;
+    cluster.shutdown().await;
+}
+
+/// A link proxy that, once `stall` is set, holds the first connection whose
+/// target answers: it accepts and never forwards, a peer that stalls in the
+/// TLS handshake. Every other connection is forwarded as it comes.
+fn stalling_proxy(
+    target: Arc<std::sync::OnceLock<SocketAddr>>,
+    stall: Arc<std::sync::atomic::AtomicBool>,
+) -> SocketAddr {
+    let address = free_port();
+    let listener = std::net::TcpListener::bind(address).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut inbound, _)) = listener.accept().await else {
+                return;
+            };
+            let target = Arc::clone(&target);
+            let stall = Arc::clone(&stall);
+            tokio::spawn(async move {
+                let Some(&target) = target.get() else { return };
+                let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await else {
+                    return;
+                };
+                if stall.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    drop(outbound);
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    drop(inbound);
+                    return;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            });
+        }
+    });
+    address
+}
+
+/// ADR-0010 with D-122 A: the sequencer's first handshake to a restarted
+/// replica stalls, after a backoff begun just before the replica came up.
+/// The stall is abandoned within a heartbeat and is its own wait, the next
+/// handshake succeeds, and the next heartbeat follows within one:
+/// `h + h + t_ok + h` stays inside the four
+/// heartbeats of silence TLS requires before a takeover (D-173 A), so the
+/// slot stays with its live owner. At three it did not (3 runs of 5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_tls_handshake_leaves_the_slot_with_its_live_owner() {
+    let target = Arc::new(std::sync::OnceLock::new());
+    let stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let proxy = stalling_proxy(Arc::clone(&target), Arc::clone(&stall));
+    let ca = Ca::new();
+    let mut cluster = Cluster::start_tls("tls-stall", &ca, vec![(0, 1, proxy)]).await;
+    let _ = target.set(cluster.addresses[1]);
+    let first = cluster.converged(2).await;
+    assert!(
+        cluster.node(0).status().borrow().leading,
+        "node 0 sequences the first slot"
+    );
+    cluster.stop(1).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    stall.store(true, std::sync::atomic::Ordering::Relaxed);
+    cluster.restart(1, Limits::default()).await;
+    let watch = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < watch {
+        for id in 0..NODES {
+            let s = *cluster.node(id).status().borrow();
+            assert!(
+                s.slot <= first.slot,
+                "node {id} moved to slot {}: {s:?}",
+                s.slot
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !stall.load(std::sync::atomic::Ordering::Relaxed),
+        "no handshake was stalled"
+    );
+    cluster.publish(1, 0).await;
+    cluster.converged(first.applied + 2).await;
+    cluster.shutdown().await;
+}
+
+/// ADR-0010: connections to a node's link port that never introduce
+/// themselves hold at most `at_once` permits: one more is closed at once,
+/// while those already waiting are still open, and those are closed once
+/// `within` has passed. The cluster goes on.
+async fn strangers_are_bounded(cluster: &Cluster, at_once: usize) {
+    use tokio::io::AsyncReadExt;
+    let address = cluster.addresses[0];
+    let mut held = Vec::new();
+    for _ in 0..at_once {
+        held.push(tokio::net::TcpStream::connect(address).await.unwrap());
+    }
+    let mut extra = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut byte = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(5), extra.read(&mut byte)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0) | Err(_))),
+        "a connection past the bound was not closed"
+    );
+    for stream in &held {
+        assert!(
+            matches!(stream.try_read(&mut byte), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a waiting connection was closed before the one past the bound"
+        );
+    }
+    for mut stream in held {
+        let closed = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0) | Err(_))),
+            "a connection that never introduced itself stayed open"
+        );
+    }
+    let before = *cluster.node(0).status().borrow();
+    cluster.publish(0, 1000).await;
+    cluster.converged(before.applied + 1).await;
+}
+
+/// The bound holds without TLS too: a change ADR-0010 makes to every
+/// cluster, tested on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plaintext_links_bound_connections_that_never_say_hello() {
+    let cluster = Cluster::start("bounded").await;
+    cluster.converged(2).await;
+    strangers_are_bounded(&cluster, 4).await;
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_links_bound_connections_that_never_finish_a_handshake() {
+    let ca = Ca::new();
+    let cluster = Cluster::start_tls("tls-bounded", &ca, Vec::new()).await;
+    cluster.converged(2).await;
+    strangers_are_bounded(&cluster, 4).await;
+    cluster.shutdown().await;
 }

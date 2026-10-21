@@ -167,6 +167,9 @@ pub struct NodeConfig {
     /// `None`, the default, serves none. Plain HTTP, no credentials:
     /// loopback unless the operator says otherwise (D-107).
     pub metrics: Option<SocketAddr>,
+    /// TLS on every link, each end proving its node id (ADR-0010). `None`:
+    /// plaintext links.
+    pub tls: Option<transport::NodeTls>,
 }
 
 /// The starting `retain_bytes` (D-91 A): 64 MiB, the old path's
@@ -765,10 +768,21 @@ impl Node {
             .unzip();
         let mut tasks = vec![tokio::spawn(link::listen(
             listener,
-            config.core.nodes.clone(),
-            slot,
-            digest,
-            config.max_frame,
+            link::Accepting {
+                own: id,
+                nodes: config.core.nodes.clone(),
+                slot,
+                config: digest,
+                max_frame: config.max_frame,
+                tls: config.tls.clone(),
+                // The handshake within a heartbeat, its HELLO within
+                // another; two links per peer at most, as a peer that
+                // redials may have one closing and one opening.
+                handshakes: link::Handshakes {
+                    within: config.heartbeat * 2,
+                    at_once: config.peers.len() * 2,
+                },
+            },
             inbound,
             Arc::new(seen),
         ))];
@@ -778,6 +792,7 @@ impl Node {
             links.insert(peer, tx);
             tasks.push(tokio::spawn(link::dial(
                 address,
+                peer,
                 Frame::Hello {
                     version: cluster::wire::WIRE_VERSION,
                     node: id,
@@ -790,6 +805,7 @@ impl Node {
                 Arc::clone(&budget),
                 config.heartbeat,
                 incarnation,
+                config.tls.clone(),
             )));
         }
         let started = tokio::time::Instant::now();

@@ -31,7 +31,10 @@
 //! the timer that starts a takeover (50 ms and 3 by default).
 //! `STRAUM_BENCH_DATA_DIRS=/disk0,/disk1,/disk2` puts each node's log on
 //! its own directory: the separate-disk control, meaningful only when they
-//! are separate physical disks.
+//! are separate physical disks. `STRAUM_BENCH_TLS=1` puts every link on TLS
+//! (ADR-0010), each node with a certificate of one throwaway CA; TLS needs
+//! `STRAUM_BENCH_TAKEOVER_TICKS=4` or more (D-173 A), so compare it with a
+//! run without TLS at the same ticks.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::net::SocketAddr;
@@ -95,6 +98,45 @@ fn data_dir(cap: u64, id: u8) -> PathBuf {
         ))
 }
 
+/// Each node's link TLS for `STRAUM_BENCH_TLS=1`, issued once per run by
+/// a throwaway CA; `None` without it.
+fn tls(id: u8) -> Option<transport::NodeTls> {
+    static NODES_TLS: std::sync::OnceLock<Vec<transport::NodeTls>> = std::sync::OnceLock::new();
+    if env("STRAUM_BENCH_TLS", 0u8) != 1 {
+        return None;
+    }
+    let all = NODES_TLS.get_or_init(|| {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_pem = params.self_signed(&ca_key).unwrap().pem();
+        let issuer = rcgen::Issuer::new(params, ca_key);
+        let dir = std::env::temp_dir().join(format!("straum-bench-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let all = (0..NODES)
+            .map(|id| {
+                let key = rcgen::KeyPair::generate().unwrap();
+                let certificate = rcgen::CertificateParams::new(vec![transport::node_name(id)])
+                    .unwrap()
+                    .signed_by(&key, &issuer)
+                    .unwrap();
+                let (c, k, r) = (
+                    dir.join(format!("{id}.pem")),
+                    dir.join(format!("{id}.key")),
+                    dir.join("ca.pem"),
+                );
+                std::fs::write(&c, certificate.pem()).unwrap();
+                std::fs::write(&k, key.serialize_pem()).unwrap();
+                std::fs::write(&r, &ca_pem).unwrap();
+                transport::NodeTls::from_pem_files(id, &c, &k, &r).unwrap()
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        all
+    });
+    all.get(usize::from(id)).cloned()
+}
+
 fn config(cap: u64, id: u8, addresses: &[SocketAddr]) -> NodeConfig {
     NodeConfig {
         core: cluster::Config {
@@ -145,6 +187,7 @@ fn config(cap: u64, id: u8, addresses: &[SocketAddr]) -> NodeConfig {
         rotate_every: None,
         read_bytes: 64 * 1024,
         metrics: None,
+        tls: tls(id),
     }
 }
 
