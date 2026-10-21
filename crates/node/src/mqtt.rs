@@ -2,7 +2,9 @@
 //! Each connection is a reader task and a writer task; nothing here knows
 //! MQTT — the gateway in the node loop does.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
@@ -44,14 +46,37 @@ pub enum Event {
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
-pub async fn listen(listener: Listener, write_queue: usize, events: mpsc::Sender<Event>) {
+/// Bounds on connections before the gateway sees them (D-164 A). A TLS
+/// handshake happens there, so a client that never finishes one would
+/// otherwise hold a task and a socket for good: each must finish `within`,
+/// and at most `at_once` run together; past that, a new connection is
+/// closed at once.
+#[derive(Debug, Clone, Copy)]
+pub struct Handshakes {
+    pub within: Duration,
+    pub at_once: usize,
+}
+
+pub async fn listen(
+    listener: Listener,
+    write_queue: usize,
+    handshakes: Handshakes,
+    events: mpsc::Sender<Event>,
+) {
+    let permits = Arc::new(tokio::sync::Semaphore::new(handshakes.at_once.max(1)));
     loop {
         let Ok(accepted) = listener.accept().await else {
             continue;
         };
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            drop(accepted);
+            continue;
+        };
         let events = events.clone();
         tokio::spawn(async move {
-            let Ok(connection) = accepted.establish().await else {
+            let established = tokio::time::timeout(handshakes.within, accepted.establish()).await;
+            drop(permit);
+            let Ok(Ok(connection)) = established else {
                 return;
             };
             let conn = NEXT.fetch_add(1, Ordering::Relaxed);

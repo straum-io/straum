@@ -225,6 +225,7 @@ impl Experimental {
                 gateway,
                 write_queue: 1024,
                 authority: None,
+                tls: None,
             }),
             retain_bytes: self.retain_bytes,
             snapshot_every: 4096,

@@ -38,9 +38,9 @@ pub enum ConfigError {
     #[error("{0} must be set")]
     Missing(&'static str),
     #[error(
-        "{name} is {address}, reachable beyond this host, with no TLS: credentials, if any, \
-         would cross it in clear; set STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1 to accept that \
-         on an isolated, trusted network"
+        "{name} is {address}, reachable beyond this host; set STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1 \
+         to accept that on an isolated, trusted network (for STRAUM_CLUSTER_MQTT_LISTEN alone, \
+         TLS with a password file and no anonymous clients is enough)"
     )]
     Exposed {
         name: &'static str,
@@ -54,6 +54,10 @@ pub enum ConfigError {
     },
     #[error("credentials: {0}")]
     Credentials(#[from] auth::AuthError),
+    #[error("TLS: {0}")]
+    Tls(String),
+    #[error("STRAUM_TLS_CERT_PATH and STRAUM_TLS_KEY_PATH go together: set both or neither")]
+    TlsPair,
     #[error(
         "no client could connect: no user in STRAUM_AUTH_PASSWORD_FILE, and anonymous clients \
          refused (STRAUM_AUTH_ALLOW_ANONYMOUS=0)"
@@ -123,7 +127,8 @@ impl Settings {
             Some(own) => parser.parse_value("STRAUM_CLUSTER_LISTEN", own, "a socket address")?,
             None => parser.required("STRAUM_CLUSTER_LISTEN", "a socket address")?,
         };
-        // Loopback unless asked: the path has no TLS, so credentials would
+        // Loopback unless asked, or unless TLS and a password file without
+        // anonymous clients secure it (D-164 A): otherwise credentials would
         // cross the network in clear (D-158 A), and the experimental switch
         // is no security mechanism (D-107).
         let mqtt = parser.parse_value(
@@ -135,12 +140,22 @@ impl Settings {
         // same loopback rule as every other listener.
         let metrics = parser.optional_value("STRAUM_CLUSTER_METRICS_LISTEN", "a socket address")?;
         let exposed = parser.boolean_flag("STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK")?;
+        let authority = credentials(&mut parser)?;
+        let tls = tls(&mut parser)?;
+        // D-164 A: the MQTT listener alone may leave loopback once every
+        // client is encrypted and named, never anonymous. Links, peers and
+        // metrics keep the rule until node-to-node TLS (D-138 (6)).
+        let mqtt_secured = tls.is_some()
+            && authority
+                .as_ref()
+                .is_some_and(|a| a.users() > 0 && !a.allows_anonymous());
         if !exposed {
             for (name, address) in [
                 ("STRAUM_CLUSTER_MQTT_LISTEN", mqtt),
                 ("STRAUM_CLUSTER_LISTEN", listen),
             ]
             .into_iter()
+            .filter(|&(name, _)| !(mqtt_secured && name == "STRAUM_CLUSTER_MQTT_LISTEN"))
             .chain(voters.iter().map(|&(_, a)| ("STRAUM_CLUSTER_PEERS", a)))
             .chain(metrics.map(|a| ("STRAUM_CLUSTER_METRICS_LISTEN", a)))
             {
@@ -149,7 +164,6 @@ impl Settings {
                 }
             }
         }
-        let authority = credentials(&mut parser)?;
         let data: String = parser.required("STRAUM_CLUSTER_DATA_DIR", "a directory")?;
         let heartbeat = parser.number(
             "STRAUM_CLUSTER_HEARTBEAT_MS",
@@ -203,6 +217,7 @@ impl Settings {
         }
         if let Some(mqtt) = node.mqtt.as_mut() {
             mqtt.authority = authority.map(std::sync::Arc::new);
+            mqtt.tls = tls;
         }
         Ok(Self {
             node,
@@ -253,6 +268,25 @@ fn credentials(parser: &mut Parser) -> Result<Option<auth::Authority>, ConfigErr
         return Err(ConfigError::NobodyAllowed);
     }
     Ok(Some(authority))
+}
+
+/// D-164 A: TLS on the MQTT listener, from a PEM certificate chain and its
+/// key, read once at startup. Both or neither; a file that cannot be read or
+/// holds no certificate or key refuses the start: a node must never come up
+/// in plaintext instead.
+fn tls(parser: &mut Parser) -> Result<Option<transport::Tls>, ConfigError> {
+    let certificate: Option<String> = parser.optional_value("STRAUM_TLS_CERT_PATH", "a path")?;
+    let key: Option<String> = parser.optional_value("STRAUM_TLS_KEY_PATH", "a path")?;
+    match (certificate, key) {
+        (None, None) => Ok(None),
+        (Some(certificate), Some(key)) => transport::Tls::from_pem_files(
+            std::path::Path::new(&certificate),
+            std::path::Path::new(&key),
+        )
+        .map(Some)
+        .map_err(|error| ConfigError::Tls(error.to_string())),
+        _ => Err(ConfigError::TlsPair),
+    }
 }
 
 impl Parser {
@@ -566,8 +600,8 @@ mod tests {
         );
         // A typo, or a setting of the removed broker: refused, not ignored.
         assert_eq!(
-            with(&[("STRAUM_TLS_CERT_PATH", "/etc/cert.pem")], "").err(),
-            Some(ConfigError::Unknown("STRAUM_TLS_CERT_PATH".to_owned()))
+            with(&[("STRAUM_TLS_CA_PATH", "/etc/ca.pem")], "").err(),
+            Some(ConfigError::Unknown("STRAUM_TLS_CA_PATH".to_owned()))
         );
         assert_eq!(
             with(&[("STRAUM_CLUSTER_HEARTBEAT", "50")], "").err(),
@@ -811,5 +845,102 @@ mod tests {
         assert!(matches!(parse(&pairs), Err(ConfigError::Credentials(_))));
 
         assert!(parse(&VALID).unwrap().warnings.is_empty());
+    }
+
+    /// A throwaway certificate and key for one test (no key is committed).
+    fn certificate(name: &str) -> (File, File) {
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        (
+            File::new(&format!("{name}-cert.pem"), &issued.cert.pem()),
+            File::new(
+                &format!("{name}-key.pem"),
+                &issued.signing_key.serialize_pem(),
+            ),
+        )
+    }
+
+    /// D-164 A: both paths or neither, and a file that does not load
+    /// refuses the start.
+    #[test]
+    fn tls_takes_both_paths_and_refuses_a_file_that_does_not_load() {
+        assert_eq!(
+            with(&[("STRAUM_TLS_CERT_PATH", "/etc/cert.pem")], "").err(),
+            Some(ConfigError::TlsPair)
+        );
+        assert_eq!(
+            with(&[("STRAUM_TLS_KEY_PATH", "/etc/key.pem")], "").err(),
+            Some(ConfigError::TlsPair)
+        );
+        let not_pem = File::new("tls-not-pem", "not a certificate\n");
+        let mut pairs = VALID.to_vec();
+        pairs.push(("STRAUM_TLS_CERT_PATH", not_pem.path()));
+        pairs.push(("STRAUM_TLS_KEY_PATH", not_pem.path()));
+        assert!(matches!(parse(&pairs), Err(ConfigError::Tls(_))));
+        let (cert, key) = certificate("tls-loads");
+        let mut pairs = VALID.to_vec();
+        pairs.push(("STRAUM_TLS_CERT_PATH", cert.path()));
+        pairs.push(("STRAUM_TLS_KEY_PATH", key.path()));
+        let settings = parse(&pairs).unwrap();
+        assert!(settings.node.mqtt.as_ref().unwrap().tls.is_some());
+    }
+
+    /// D-164 A: the MQTT listener alone may leave loopback once TLS and a
+    /// password file without anonymous clients secure it; nothing else may.
+    #[test]
+    fn only_a_tls_and_password_secured_mqtt_listener_leaves_loopback() {
+        let (cert, key) = certificate("tls-guard");
+        let hash = auth::Authority::hash_password(b"pw").unwrap();
+        let passwords = File::new("passwords-tls", &format!("alice:{hash}\n"));
+        let wide = ("STRAUM_CLUSTER_MQTT_LISTEN", "0.0.0.0:8883");
+        let tls = [
+            ("STRAUM_TLS_CERT_PATH", cert.path()),
+            ("STRAUM_TLS_KEY_PATH", key.path()),
+        ];
+        let secured = |extra: &[(&str, &str)]| {
+            let mut pairs = VALID.to_vec();
+            pairs.push(wide);
+            pairs.extend_from_slice(extra);
+            parse(&pairs)
+        };
+        let both = [
+            tls[0],
+            tls[1],
+            ("STRAUM_AUTH_PASSWORD_FILE", passwords.path()),
+        ];
+        assert!(secured(&both).is_ok(), "TLS and named clients only");
+
+        let exposed = |r: Result<Settings, ConfigError>| {
+            matches!(
+                r,
+                Err(ConfigError::Exposed {
+                    name: "STRAUM_CLUSTER_MQTT_LISTEN",
+                    ..
+                })
+            )
+        };
+        assert!(exposed(secured(&tls)), "TLS without credentials");
+        assert!(
+            exposed(secured(&[("STRAUM_AUTH_PASSWORD_FILE", passwords.path())])),
+            "credentials without TLS"
+        );
+        let anonymous = [
+            both[0],
+            both[1],
+            both[2],
+            ("STRAUM_AUTH_ALLOW_ANONYMOUS", "1"),
+        ];
+        assert!(exposed(secured(&anonymous)), "anonymous clients let in");
+
+        // Links, peers and metrics keep the rule.
+        let mut pairs = VALID.to_vec();
+        pairs.extend_from_slice(&both);
+        pairs.push(("STRAUM_CLUSTER_METRICS_LISTEN", "0.0.0.0:9100"));
+        assert!(matches!(
+            parse(&pairs),
+            Err(ConfigError::Exposed {
+                name: "STRAUM_CLUSTER_METRICS_LISTEN",
+                ..
+            })
+        ));
     }
 }
