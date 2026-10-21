@@ -79,6 +79,9 @@ pub struct Settings {
     pub log_level: String,
     pub worker_threads: usize,
     pub effective: Vec<(&'static str, String, Source)>,
+    /// Logged at startup: a configuration that starts but may not be what
+    /// was meant (D-160 A).
+    pub warnings: Vec<&'static str>,
 }
 
 const SWITCH: &str = "STRAUM_EXPERIMENTAL_CLUSTER";
@@ -187,6 +190,18 @@ impl Settings {
             metrics,
         }
         .node_config()?;
+        // D-160 A: a correct ACL file that grants nobody anything starts,
+        // with a warning; it is never read as a permission.
+        let mut warnings = Vec::new();
+        if authority
+            .as_ref()
+            .is_some_and(auth::Authority::grants_no_action)
+        {
+            warnings.push(
+                "STRAUM_AUTH_ACL_FILE grants no user and no anonymous client anything: clients \
+                 can connect, but every PUBLISH and SUBSCRIBE will be refused",
+            );
+        }
         if let Some(mqtt) = node.mqtt.as_mut() {
             mqtt.authority = authority.map(std::sync::Arc::new);
         }
@@ -195,6 +210,7 @@ impl Settings {
             log_level,
             worker_threads,
             effective,
+            warnings,
         })
     }
 }
@@ -754,5 +770,39 @@ mod tests {
         };
         assert!(permissions.may_subscribe(&filter("public/#")));
         assert!(!permissions.may_subscribe(&filter("private/#")));
+    }
+
+    /// D-160 A: a correct ACL file that grants nobody anything starts, with
+    /// a warning, and grants nothing; a malformed one still refuses the
+    /// start, never falling back to a looser policy.
+    #[test]
+    fn a_correct_acl_granting_nothing_starts_with_a_warning_and_a_broken_one_refuses() {
+        let hash = auth::Authority::hash_password(b"pw").unwrap();
+        let passwords = File::new("passwords-d160", &format!("alice:{hash}\n"));
+        let empty = File::new("acl-d160-empty", "# policy not written yet\n");
+        let mut pairs = VALID.to_vec();
+        pairs.push(("STRAUM_AUTH_PASSWORD_FILE", passwords.path()));
+        pairs.push(("STRAUM_AUTH_ACL_FILE", empty.path()));
+        let settings = parse(&pairs).unwrap();
+        assert_eq!(settings.warnings.len(), 1);
+        let authority = authority(&settings).unwrap();
+        let auth::Authenticated::Allowed(alice) =
+            authority.authenticate(Some(b"alice"), Some(b"pw"))
+        else {
+            panic!("alice still connects");
+        };
+        assert!(alice.grants_nothing(), "a warning is not a permission");
+
+        let rules = File::new("acl-d160-rules", "user alice\nreadwrite a/#\n");
+        pairs.pop();
+        pairs.push(("STRAUM_AUTH_ACL_FILE", rules.path()));
+        assert!(parse(&pairs).unwrap().warnings.is_empty());
+
+        let broken = File::new("acl-d160-broken", "user alice\nforbid a/b\n");
+        pairs.pop();
+        pairs.push(("STRAUM_AUTH_ACL_FILE", broken.path()));
+        assert!(matches!(parse(&pairs), Err(ConfigError::Credentials(_))));
+
+        assert!(parse(&VALID).unwrap().warnings.is_empty());
     }
 }
