@@ -135,6 +135,7 @@ fn gateway_config(node: u8, first_session: u64) -> gateway::Config {
         max_waiting_bytes: 4096,
         max_total_waiting_bytes: 16_384,
         max_retries: 64,
+        authenticate: false,
     }
 }
 
@@ -485,6 +486,8 @@ impl World {
         for action in actions {
             match action {
                 Action::Propose(proposal) => self.send(id, proposal),
+                // Credentials are off here (`authenticate: false`).
+                Action::Authenticate { .. } => {}
                 Action::Close { conn } => {
                     if let Some(c) = self.owners.remove(&conn) {
                         self.clients[c].conn = None;

@@ -26,7 +26,7 @@ measurements, not intuition, and none is measured yet.
 
 Without `STRAUM_EXPERIMENTAL_CLUSTER=1` the server refuses to start: the
 only path is experimental and **not production-ready** — flow control off,
-no credentials or TLS, timing defaults placeholders, nothing measured on
+no TLS, credentials only when configured (below), timing defaults placeholders, nothing measured on
 Linux (D-102 A, D-111). Only the variables below, `STRAUM_LOG_LEVEL`
 (default `info`) and `STRAUM_WORKER_THREADS` (`auto`: the CPUs) are read;
 any other `STRAUM_*` variable is refused at startup (D-104 A).
@@ -37,14 +37,19 @@ any other `STRAUM_*` variable is refused at startup (D-104 A).
 | `STRAUM_CLUSTER_NODE_ID` | required | This node's id, 0–255. |
 | `STRAUM_CLUSTER_PEERS` | required | Every voter, this node included: `id=address,…` (socket addresses). Odd, at least three; no id twice. |
 | `STRAUM_CLUSTER_LISTEN` | this node's address in the peers | Where its links listen. |
-| `STRAUM_CLUSTER_MQTT_LISTEN` | `127.0.0.1:1883` | Where MQTT clients connect. Loopback by default: the path has no credentials and no TLS (D-107). |
+| `STRAUM_CLUSTER_MQTT_LISTEN` | `127.0.0.1:1883` | Where MQTT clients connect. Loopback by default: the path has no TLS, so credentials would cross the network in clear (D-107, D-158 A). |
 | `STRAUM_CLUSTER_METRICS_LISTEN` | off | Where the node serves its metrics over plain HTTP, in the Prometheus text format (D-112): every request gets the current snapshot. No credentials; loopback unless the next setting is `1`. A diagnostic interface, not a monitoring system (D-126 A): at most 4 scrapes at once — more wait unaccepted — and each read and write bounded by 2 s. |
-| `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK` | `0` | `1` lets the MQTT listener, the link listener, the peers and the metrics listener use addresses beyond loopback — unauthenticated and unencrypted, for an isolated, trusted network only. Without it any such address is refused at startup. The experimental switch is no security mechanism (D-107). |
+| `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK` | `0` | `1` lets the MQTT listener, the link listener, the peers and the metrics listener use addresses beyond loopback — unencrypted, and unauthenticated except MQTT clients under `STRAUM_AUTH_*`, whose passwords then cross the network in clear: for an isolated, trusted network only. Without it any such address is refused at startup. The experimental switch is no security mechanism (D-107). |
 | `STRAUM_CLUSTER_DATA_DIR` | required | The log, the promise, snapshots, and the `cluster` file that pins the directory to its cluster's configuration digest: a node started over another cluster's data is refused. |
 | `STRAUM_CLUSTER_HEARTBEAT_MS` | `50` | 1–10 000. A placeholder, not a recommendation (D-104 A). |
 | `STRAUM_CLUSTER_TAKEOVER_TICKS` | `3` | Heartbeats of silence before a takeover, 1–1 000. A placeholder; the simulation shows 3 churns under random delivery (D-99). |
 | `STRAUM_CLUSTER_RETAIN_BYTES` | `67108864` | The log kept behind a slow replica (D-57 A, D-91 A); a starting value, not a measured optimum. |
 | `STRAUM_READ_BYTES` | `65536` | One catch-up or fetch read (D-83 A); at most half the 8 MiB frame — 4 MiB — refused above. |
+| `STRAUM_AUTH_PASSWORD_FILE` | off | MQTT credentials (D-110 A, D-158 A): one `user:<hash>` line per user, `#` comments and blank lines ignored; the hash is argon2, as `straum-server hash-password` prints it for a password given on stdin. Set: every CONNECT is checked, off the node loop, before its CONNACK; a wrong or unknown user gets "bad user name or password" (3.1.1: return code 4), an anonymous client "not authorized" (5) unless `STRAUM_AUTH_ALLOW_ANONYMOUS` lets it in. Read once at startup; unreadable or malformed refuses the start. |
+| `STRAUM_AUTH_ACL_FILE` | off | Topic rules: `user <name>` or `anonymous`, then lines `publish <filter>`, `subscribe <filter>` or `readwrite <filter>`. A user it names may do only what its rules allow; one it does not name, anything. A refused SUBSCRIBE filter gets "not authorized" (3.1.1: 0x80) and is not proposed; a refused PUBLISH is never proposed: MQTT 5 answers a QoS 1 one "not authorized" (or closes the connection, "not authorized", while earlier QoS 1 publishes still wait for their PUBACKs, which a refusal may not overtake) and drops a QoS 0 one; 3.1.1 closes the connection. A subscription is allowed only where a rule covers all it can match. |
+| `STRAUM_AUTH_ALLOW_ANONYMOUS` | `1` without a password file, `0` with one | Whether a client without a user name is let in (restricted by the ACL file's `anonymous` section). A configuration no client could connect with is refused at startup. |
+
+Credentials checks (D-158 A) run off the node loop, at most one per CPU at once, each argon2 check taking about 19 MiB while it runs; a check waiting for its turn holds one CONNECT's user name and password and is cancelled when its connection goes, so the waiting ones are at most the gateway's 1 024 connections: at worst 1 024 × the 256 KiB packet bound, 256 MiB. Hashes must use `straum-server hash-password`'s parameters (argon2id, m=19456, t=2, p=1): a refusal costs one hash with them, so a stored hash made with others would let a known user name be told from an unknown one by its time.
 
 Fixed in 7a, not settings: `max_uncommitted` 64 (D-82 A), batches of 16
 records, MQTT packets up to 256 KiB, link frames up to 8 MiB, window 256,
@@ -132,6 +137,9 @@ STRAUM_CLUSTER_HEARTBEAT_MS
 STRAUM_CLUSTER_TAKEOVER_TICKS
 STRAUM_CLUSTER_RETAIN_BYTES
 STRAUM_READ_BYTES
+STRAUM_AUTH_PASSWORD_FILE
+STRAUM_AUTH_ACL_FILE
+STRAUM_AUTH_ALLOW_ANONYMOUS
 ```
 <!-- stable-settings:end -->
 
@@ -185,9 +193,11 @@ connection with the reason `codec` gives it; those are not in this list.
 Success
 GrantedQos1
 BadAuthenticationMethod
+BadUserNameOrPassword
 ClientIdentifierNotValid
 ImplementationSpecificError
 KeepAliveTimeout
+NotAuthorized
 ProtocolError
 QosNotSupported
 QuotaExceeded

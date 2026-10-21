@@ -10,6 +10,9 @@ use config::{Settings, Source};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("hash-password") {
+        return hash_password();
+    }
     let settings = match Settings::parse(std::env::vars()) {
         Ok(settings) => settings,
         Err(error) => {
@@ -27,7 +30,7 @@ fn main() -> ExitCode {
         .init();
     tracing::warn!(
         "EXPERIMENTAL cluster path (ADR-0008): not production-ready; flow control off; \
-         no credentials or TLS; wills, persistent sessions and session expiry are refused; \
+         no TLS, credentials only with STRAUM_AUTH_PASSWORD_FILE or STRAUM_AUTH_ACL_FILE; wills, persistent sessions and session expiry are refused; \
          timing defaults are placeholders, nothing is measured on Linux"
     );
     for (name, value, source) in &settings.effective {
@@ -50,6 +53,32 @@ fn main() -> ExitCode {
         }
     };
     tokio.block_on(run(settings.node))
+}
+
+/// `straum-server hash-password`: the `<hash>` of a `user:<hash>` line of
+/// `STRAUM_AUTH_PASSWORD_FILE`, for the password read from stdin (D-158 A), never from the
+/// arguments, where a process listing or a shell history would keep it.
+fn hash_password() -> ExitCode {
+    let mut password = String::new();
+    if std::io::stdin().read_line(&mut password).is_err() {
+        eprintln!("hash-password: stdin could not be read");
+        return ExitCode::FAILURE;
+    }
+    let password = password.trim_end_matches(['\n', '\r']);
+    if password.is_empty() {
+        eprintln!("hash-password: give the password on stdin, one line");
+        return ExitCode::FAILURE;
+    }
+    match auth::Authority::hash_password(password.as_bytes()) {
+        Ok(hash) => {
+            println!("{hash}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("hash-password: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 async fn run(config: node::NodeConfig) -> ExitCode {

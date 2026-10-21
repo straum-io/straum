@@ -41,6 +41,7 @@ fn config() -> Config {
         max_waiting_bytes: 1 << 20,
         max_total_waiting_bytes: 1 << 24,
         max_retries: 1024,
+        authenticate: false,
     }
 }
 

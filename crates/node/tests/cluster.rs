@@ -66,6 +66,7 @@ fn gateway() -> gateway::Config {
         max_waiting_bytes: 1 << 20,
         max_total_waiting_bytes: 16 << 20,
         max_retries: 1024,
+        authenticate: false,
     }
 }
 
@@ -125,6 +126,7 @@ fn config(
             listen: mqtt[usize::from(id)],
             gateway: gateway(),
             write_queue: 1024,
+            authority: None,
         }),
         retain_bytes: disk(test).1,
         snapshot_every: disk(test).2,

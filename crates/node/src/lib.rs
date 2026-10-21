@@ -82,6 +82,47 @@ pub struct MqttConfig {
     /// Packets queued per connection; a client that lets the queue fill is
     /// closed (a writer that makes no progress).
     pub write_queue: usize,
+    /// Who may connect and what each may do (D-158 A). `None`: anybody,
+    /// anything, as before credentials. Set, the gateway's `authenticate`
+    /// is on and every CONNECT is checked off the node loop.
+    pub authority: Option<Arc<auth::Authority>>,
+}
+
+/// Credentials checks in flight, at most one per connection (D-158 A). A
+/// connection that goes cancels its check, so what waits for a permit is
+/// bounded by the connections, never by how many have come and gone.
+#[derive(Debug, Default)]
+struct Checks(HashMap<u64, tokio::task::AbortHandle>);
+
+impl Checks {
+    fn start(&mut self, conn: u64, check: tokio::task::AbortHandle) {
+        if let Some(old) = self.0.insert(conn, check) {
+            old.abort();
+        }
+    }
+
+    fn finished(&mut self, conn: u64) {
+        self.0.remove(&conn);
+    }
+
+    fn cancel(&mut self, conn: u64) {
+        if let Some(check) = self.0.remove(&conn) {
+            check.abort();
+        }
+    }
+}
+
+/// What a session may do, from the credential files (D-158 A).
+#[derive(Debug)]
+struct Rules(auth::Permissions);
+
+impl gateway::Grant for Rules {
+    fn may_publish(&self, topic: &domain::Topic) -> bool {
+        self.0.may_publish(topic)
+    }
+    fn may_subscribe(&self, filter: &domain::TopicFilter) -> bool {
+        self.0.may_subscribe(filter)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +409,13 @@ struct Loop {
     conns: HashMap<u64, mqtt::Conn>,
     /// Connections whose reader waits for the gateway to want more.
     paused: BTreeSet<u64>,
+    /// Credentials (D-158 A), the checks allowed to run at once, the checks
+    /// in flight by connection, and where their verdicts go: back in as
+    /// MQTT events.
+    authority: Option<Arc<auth::Authority>>,
+    permits: Arc<tokio::sync::Semaphore>,
+    checks: Checks,
+    mqtt_events: mpsc::Sender<mqtt::Event>,
     started: tokio::time::Instant,
     /// What this node measures about itself (D-112); refusals and give-ups
     /// among it (D-115 A: counted, never silent).
@@ -482,15 +530,63 @@ impl Loop {
                         }
                     }
                     Action::Close { conn } => self.drop_conn(conn),
+                    Action::Authenticate {
+                        conn,
+                        username,
+                        password,
+                    } => self.authenticate(conn, username, password),
                 }
             }
         }
     }
 
-    /// Dropping the handle closes the socket once its queue is written.
+    /// Checks a CONNECT's credentials off the loop (D-158 A). A password
+    /// hash is slow by design and argon2 takes about 19 MiB a check, so at
+    /// most one check per CPU runs at once, on a blocking thread, holding
+    /// its permit until the hash is done. A check belongs to its
+    /// connection: the connection going cancels it while it waits, so the
+    /// waiting checks are at most the gateway's connections, each holding
+    /// one CONNECT's user name and password. The verdict comes back in as
+    /// an MQTT event. Without credentials, or if the check fails to run,
+    /// the client is refused: never let in.
+    fn authenticate(
+        &mut self,
+        conn: u64,
+        username: Option<bytes::Bytes>,
+        password: Option<bytes::Bytes>,
+    ) {
+        let authority = self.authority.clone();
+        let permits = Arc::clone(&self.permits);
+        let events = self.mqtt_events.clone();
+        let task = tokio::spawn(async move {
+            let verdict = match (authority, permits.acquire_owned().await) {
+                (Some(authority), Ok(permit)) => tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    match authority.authenticate(username.as_deref(), password.as_deref()) {
+                        auth::Authenticated::Allowed(permissions) => {
+                            gateway::Verdict::Allowed(Box::new(Rules(permissions)))
+                        }
+                        auth::Authenticated::BadCredentials => gateway::Verdict::BadCredentials,
+                        auth::Authenticated::NotAuthorized => gateway::Verdict::NotAuthorized,
+                    }
+                })
+                .await
+                .unwrap_or(gateway::Verdict::NotAuthorized),
+                _ => gateway::Verdict::NotAuthorized,
+            };
+            let _ = events
+                .send(mqtt::Event::Authenticated { conn, verdict })
+                .await;
+        });
+        self.checks.start(conn, task.abort_handle());
+    }
+
+    /// Dropping the handle closes the socket once its queue is written; a
+    /// credentials check still waiting is cancelled.
     fn drop_conn(&mut self, conn: u64) {
         self.conns.remove(&conn);
         self.paused.remove(&conn);
+        self.checks.cancel(conn);
     }
 
     fn credit(&mut self, conn: u64) {
@@ -552,6 +648,12 @@ impl Loop {
             mqtt::Event::Closed { conn } => {
                 gateway.closed(conn);
                 self.drop_conn(conn);
+            }
+            mqtt::Event::Authenticated { conn, verdict } => {
+                gateway.authenticated(conn, verdict, now);
+                self.checks.finished(conn);
+                self.gateway_actions();
+                self.credit(conn);
             }
         }
         self.gateway_actions();
@@ -665,11 +767,16 @@ impl Node {
                     None,
                 )?;
                 mqtt_listen = Some(listener.local_addr()?);
-                tasks.push(tokio::spawn(mqtt::listen(listener, m.write_queue, mqtt_tx)));
+                tasks.push(tokio::spawn(mqtt::listen(
+                    listener,
+                    m.write_queue,
+                    mqtt_tx.clone(),
+                )));
                 Some(Gateway::new(
                     gateway::Config {
                         node: id,
                         first_session,
+                        authenticate: m.authority.is_some(),
                         ..m.gateway
                     },
                     started.elapsed(),
@@ -717,6 +824,12 @@ impl Node {
             gateway,
             conns: HashMap::new(),
             paused: BTreeSet::new(),
+            authority: config.mqtt.as_ref().and_then(|m| m.authority.clone()),
+            checks: Checks::default(),
+            permits: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            )),
+            mqtt_events: mqtt_tx.clone(),
             started,
             measured: metrics::Measured::default(),
             trace: metrics::Trace::default(),
@@ -1178,5 +1291,35 @@ mod tests {
         for cut in 0..5 {
             assert!(decode_snapshot(&bytes[..cut]).is_err());
         }
+    }
+
+    /// D-158 A: a connection that goes takes its waiting check with it, and
+    /// a second check for one connection replaces the first: the checks
+    /// waiting never outnumber the connections.
+    #[tokio::test]
+    async fn a_check_is_cancelled_with_its_connection() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let waiting = |permits: &Arc<tokio::sync::Semaphore>| {
+            let permits = Arc::clone(permits);
+            tokio::spawn(async move {
+                let _ = permits.acquire_owned().await;
+            })
+        };
+        let mut checks = Checks::default();
+        let (first, second, other) = (waiting(&permits), waiting(&permits), waiting(&permits));
+        checks.start(1, first.abort_handle());
+        checks.start(1, second.abort_handle());
+        checks.start(2, other.abort_handle());
+        assert!(first.await.unwrap_err().is_cancelled(), "replaced");
+        assert_eq!(checks.0.len(), 2);
+        checks.cancel(1);
+        assert!(
+            second.await.unwrap_err().is_cancelled(),
+            "its connection went"
+        );
+        checks.finished(2);
+        assert!(checks.0.is_empty());
+        assert!(!other.is_finished(), "a finished check is not cancelled");
+        other.abort();
     }
 }

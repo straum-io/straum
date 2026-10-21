@@ -24,9 +24,22 @@ impl Drop for Conn {
 }
 
 pub enum Event {
-    Opened { conn: u64, handle: Conn },
-    Bytes { conn: u64, bytes: Vec<u8> },
-    Closed { conn: u64 },
+    Opened {
+        conn: u64,
+        handle: Conn,
+    },
+    Bytes {
+        conn: u64,
+        bytes: Vec<u8>,
+    },
+    Closed {
+        conn: u64,
+    },
+    /// A credentials check finished (D-158 A).
+    Authenticated {
+        conn: u64,
+        verdict: gateway::Verdict,
+    },
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
