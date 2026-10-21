@@ -141,6 +141,9 @@ impl<D: Disk + Clone> Segments<D> {
         // A segment is sealed durable: otherwise a power loss could take its
         // unsynced tail and keep the next segment, a hole in the log.
         if let Some(active) = self.active.as_mut() {
+            // Its zeros written ahead go with it (D-162 A): the sync below
+            // makes the cut durable.
+            active.wal.trim()?;
             active.wal.commit_with(true)?;
         }
         let path = segment_path(&self.directory, key);
@@ -265,13 +268,28 @@ impl<D: Disk + Clone> Segments<D> {
 
     /// Hands every record of segment `key`, as written, to `visit`.
     pub fn read(&self, key: u64, visit: &mut impl FnMut(&[u8])) -> Result<(), StorageError> {
-        replay_on(
+        replay_while_on(
             &self.disk,
             &segment_path(&self.directory, key),
             self.limits.wal,
-            visit,
-        )?;
-        Ok(())
+            None,
+            self.written_end(key),
+            &mut |record, _| {
+                visit(record);
+                true
+            },
+        )
+    }
+
+    /// How far a reader of segment `key` may go: the active segment's
+    /// written end, so zeros written ahead of it (ADR-0009) are never read
+    /// and a walk ends where the log did when it began (D-76). `None` for a
+    /// sealed segment, which holds no zeros: its file's length.
+    fn written_end(&self, key: u64) -> Option<u64> {
+        self.active
+            .as_ref()
+            .filter(|active| active.key == key)
+            .map(|active| active.bytes)
     }
 
     /// The records of segment `key` from `from` — its first when `None`,
@@ -290,6 +308,7 @@ impl<D: Disk + Clone> Segments<D> {
             &segment_path(&self.directory, key),
             self.limits.wal,
             from,
+            self.written_end(key),
             visit,
         )
     }

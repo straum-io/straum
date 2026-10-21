@@ -196,6 +196,9 @@ impl Settings {
             0,
             u64::MAX,
         )?;
+        // ADR-0009 (D-170 A): off until a host that passes D-129 confirms it.
+        let wal_preallocate_bytes =
+            parser.number("STRAUM_WAL_PREALLOCATE_BYTES", 0u64, 0, 1 << 30)?;
         let effective = parser.finish()?;
         let mut node = node::Experimental {
             id,
@@ -208,6 +211,7 @@ impl Settings {
             read_bytes,
             retain_bytes,
             metrics,
+            wal_preallocate_bytes,
         }
         .node_config()?;
         let warnings = warnings_for(authority.as_ref());
