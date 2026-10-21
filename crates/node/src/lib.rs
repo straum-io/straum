@@ -177,6 +177,12 @@ pub struct NodeConfig {
 /// configuration.
 pub const DEFAULT_RETAIN_BYTES: u64 = 64 * 1024 * 1024;
 
+/// MQTT connections one source address may have waiting at once, for a
+/// handshake or a CONNECT (D-165 A): fixed, not a setting. Clients behind one
+/// NAT share it; past it a connection is closed at once and the client
+/// retries.
+pub const MAX_WAITING_PER_SOURCE: usize = 16;
+
 /// What a node reports about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Status {
@@ -419,6 +425,10 @@ struct Loop {
     permits: Arc<tokio::sync::Semaphore>,
     checks: Checks,
     mqtt_events: mpsc::Sender<mqtt::Event>,
+    /// Connections not yet admitted, by source (D-165 A); shared with the
+    /// accept loop, which counts them in.
+    waiting: Arc<mqtt::Waiting>,
+    unadmitted: HashMap<u64, std::net::IpAddr>,
     started: tokio::time::Instant,
     /// What this node measures about itself (D-112); refusals and give-ups
     /// among it (D-115 A: counted, never silent).
@@ -590,6 +600,22 @@ impl Loop {
         self.conns.remove(&conn);
         self.paused.remove(&conn);
         self.checks.cancel(conn);
+        if let Some(source) = self.unadmitted.remove(&conn) {
+            self.waiting.leave(source);
+        }
+    }
+
+    /// A connection the gateway has admitted no longer waits (D-165 A).
+    fn admitted(&mut self, conn: u64) {
+        let open = self
+            .gateway
+            .as_ref()
+            .is_some_and(|g| g.session(conn).is_some());
+        if open {
+            if let Some(source) = self.unadmitted.remove(&conn) {
+                self.waiting.leave(source);
+            }
+        }
     }
 
     fn credit(&mut self, conn: u64) {
@@ -636,17 +662,25 @@ impl Loop {
             return;
         };
         match event {
-            mqtt::Event::Opened { conn, handle } => {
+            mqtt::Event::Opened {
+                conn,
+                handle,
+                source,
+            } => {
                 // Refused: the handle is dropped and the socket closes.
                 if gateway.accept(conn, now) {
                     self.conns.insert(conn, handle);
+                    self.unadmitted.insert(conn, source);
                     self.credit(conn);
+                } else {
+                    self.waiting.leave(source);
                 }
             }
             mqtt::Event::Bytes { conn, bytes } => {
                 gateway.received(conn, &bytes, now);
                 self.gateway_actions();
                 self.credit(conn);
+                self.admitted(conn);
             }
             mqtt::Event::Closed { conn } => {
                 gateway.closed(conn);
@@ -657,6 +691,7 @@ impl Loop {
                 self.checks.finished(conn);
                 self.gateway_actions();
                 self.credit(conn);
+                self.admitted(conn);
             }
         }
         self.gateway_actions();
@@ -756,6 +791,7 @@ impl Node {
         }
         let started = tokio::time::Instant::now();
         let (mqtt_tx, mut mqtt_rx) = mpsc::channel::<mqtt::Event>(1024);
+        let waiting = Arc::new(mqtt::Waiting::new(MAX_WAITING_PER_SOURCE));
         let mut mqtt_listen = None;
         let mut metrics_listen = None;
         let gateway = match &config.mqtt {
@@ -777,6 +813,7 @@ impl Node {
                         within: m.gateway.connect_timeout,
                         at_once: m.gateway.max_connections,
                     },
+                    Arc::clone(&waiting),
                     mqtt_tx.clone(),
                 )));
                 Some(Gateway::new(
@@ -837,6 +874,8 @@ impl Node {
                 std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
             )),
             mqtt_events: mqtt_tx.clone(),
+            waiting: Arc::clone(&waiting),
+            unadmitted: HashMap::new(),
             started,
             measured: metrics::Measured::default(),
             trace: metrics::Trace::default(),
