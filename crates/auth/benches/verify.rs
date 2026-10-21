@@ -19,7 +19,7 @@ const HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzb21lc2FsdA$\
                     4xSKQ1Cz5rHEBZH1TkIhNRxrN2hMEa0Wo5Gy5tZ5rRE";
 
 fn authority() -> Authority {
-    match Authority::parse(&format!("device:{HASH}"), "", false) {
+    match Authority::parse(&format!("device:{HASH}"), None, false) {
         Ok(authority) => authority,
         Err(error) => panic!("invalid benchmark credentials: {error}"),
     }

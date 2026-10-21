@@ -129,7 +129,7 @@ fn credentials_decide_who_connects_and_what_each_may_do() {
         std::env::temp_dir().join(format!("straum-server-credentials-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let hash = {
+    let hash = |password: &[u8]| {
         let mut child = Command::new(env!("CARGO_BIN_EXE_straum-server"))
             .arg("hash-password")
             .env_clear()
@@ -137,13 +137,22 @@ fn credentials_decide_who_connects_and_what_each_may_do() {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(b"right\n").unwrap();
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(password).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        drop(child.stdin.take());
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success());
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
     };
+    // bob is a user the ACL does not name: let in, allowed nothing
+    // (D-159 A).
     let passwords = dir.join("passwords");
-    std::fs::write(&passwords, format!("alice:{hash}\n")).unwrap();
+    std::fs::write(
+        &passwords,
+        format!("alice:{}\nbob:{}\n", hash(b"right"), hash(b"bobs")),
+    )
+    .unwrap();
     let acl = dir.join("acl");
     std::fs::write(&acl, "user alice\nreadwrite open/#\n").unwrap();
     let peers = (0..NODES)
@@ -241,4 +250,14 @@ fn credentials_decide_who_connects_and_what_each_may_do() {
         }
     };
     assert!(closed, "the connection stayed open after a refused publish");
+
+    // D-159 A: a user the ACL file does not name gets in and may do nothing.
+    let (mut bob, rc) = connect(mqtt, Some("bob"), Some("bobs")).expect("a CONNACK for bob");
+    assert_eq!(rc, 0);
+    assert_eq!(subscribe(&mut bob, "open/#", 1), 0x80);
+    publish(&mut bob, "open/b", 2);
+    assert!(
+        read_packet(&mut bob, Duration::from_secs(10)).is_none(),
+        "a publish by bob closes the connection"
+    );
 }
