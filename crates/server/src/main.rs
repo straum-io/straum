@@ -30,8 +30,8 @@ fn main() -> ExitCode {
         .init();
     tracing::warn!(
         "EXPERIMENTAL cluster path (ADR-0008): not production-ready; flow control off; \
-         TLS and credentials only when configured (STRAUM_TLS_*, STRAUM_AUTH_*, STRAUM_CLUSTER_TLS_*); wills, persistent sessions and session expiry are refused; \
-         timing defaults are placeholders, nothing is measured on Linux"
+         wills, persistent sessions and session expiry are refused; timing defaults are \
+         placeholders; failover and performance are not confirmed by Linux measurements"
     );
     for (name, value, source) in &settings.effective {
         let source = match source {

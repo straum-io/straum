@@ -12,9 +12,10 @@ majority of its nodes has committed it to one replicated log.
 
 **Website and docs:** [straum-io.github.io](https://straum-io.github.io/)
 
-> **Status: experimental.** Not production-ready: client TLS, credentials and
-> TLS between nodes only when configured, flow control off, timing defaults are placeholders, and persistent
-> sessions, wills and session expiry are refused at CONNECT for now.
+> **Status: experimental.** Not production-ready: flow control is off,
+> failover and performance are not yet confirmed by Linux measurements,
+> timing defaults are placeholders, and persistent sessions, wills and
+> session expiry are refused at CONNECT for now.
 
 ## Why
 
@@ -85,6 +86,9 @@ outside the broker process), or a server for protocols other than MQTT.
 - **Deterministic simulation.** Three-node clusters run under a simulated
   network and disk with the safety invariants checked throughout,
   next to real three-node tests on loopback.
+- **TLS and access control.** TLS for clients and between nodes, where
+  each node's certificate proves which node it is; a password file and
+  topic rules for clients. All off by default; files reload on `SIGHUP`.
 - **Metrics.** Each node can serve Prometheus text; the stable metric and
   setting names are pinned by tests.
 

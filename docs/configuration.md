@@ -26,8 +26,9 @@ measurements, not intuition, and none is measured yet.
 
 Without `STRAUM_EXPERIMENTAL_CLUSTER=1` the server refuses to start: the
 only path is experimental and **not production-ready** — flow control off,
-TLS and credentials only when configured (below), timing defaults placeholders, nothing measured on
-Linux (D-102 A, D-111). Only the variables below, `STRAUM_LOG_LEVEL`
+timing defaults placeholders, failover and performance not confirmed by a
+Linux measurement (D-102 A, D-111). TLS and credentials are not among the
+reasons: they work, off by default (below). Only the variables below, `STRAUM_LOG_LEVEL`
 (default `info`) and `STRAUM_WORKER_THREADS` (`auto`: the CPUs) are read;
 any other `STRAUM_*` variable is refused at startup (D-104 A).
 
