@@ -86,6 +86,9 @@ pub struct MqttConfig {
     /// anything, as before credentials. Set, the gateway's `authenticate`
     /// is on and every CONNECT is checked off the node loop.
     pub authority: Option<Arc<auth::Authority>>,
+    /// TLS on the MQTT listener (D-164 A): with it, the listener speaks
+    /// TLS only. `None`: plaintext.
+    pub tls: Option<transport::Tls>,
 }
 
 /// Credentials checks in flight, at most one per connection (D-158 A). A
@@ -764,12 +767,16 @@ impl Node {
                         ..config.transport
                     },
                     Arc::clone(&budget),
-                    None,
+                    m.tls.clone(),
                 )?;
                 mqtt_listen = Some(listener.local_addr()?);
                 tasks.push(tokio::spawn(mqtt::listen(
                     listener,
                     m.write_queue,
+                    mqtt::Handshakes {
+                        within: m.gateway.connect_timeout,
+                        at_once: m.gateway.max_connections,
+                    },
                     mqtt_tx.clone(),
                 )));
                 Some(Gateway::new(

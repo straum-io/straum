@@ -950,10 +950,13 @@ dependencies = [
  "bytes",
  "domain",
  "node",
+ "rcgen",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "transport",
 ]
 
 [[package]]

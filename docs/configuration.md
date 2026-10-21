@@ -26,7 +26,7 @@ measurements, not intuition, and none is measured yet.
 
 Without `STRAUM_EXPERIMENTAL_CLUSTER=1` the server refuses to start: the
 only path is experimental and **not production-ready** — flow control off,
-no TLS, credentials only when configured (below), timing defaults placeholders, nothing measured on
+client TLS and credentials only when configured (below), none between nodes, timing defaults placeholders, nothing measured on
 Linux (D-102 A, D-111). Only the variables below, `STRAUM_LOG_LEVEL`
 (default `info`) and `STRAUM_WORKER_THREADS` (`auto`: the CPUs) are read;
 any other `STRAUM_*` variable is refused at startup (D-104 A).
@@ -37,9 +37,9 @@ any other `STRAUM_*` variable is refused at startup (D-104 A).
 | `STRAUM_CLUSTER_NODE_ID` | required | This node's id, 0–255. |
 | `STRAUM_CLUSTER_PEERS` | required | Every voter, this node included: `id=address,…` (socket addresses). Odd, at least three; no id twice. |
 | `STRAUM_CLUSTER_LISTEN` | this node's address in the peers | Where its links listen. |
-| `STRAUM_CLUSTER_MQTT_LISTEN` | `127.0.0.1:1883` | Where MQTT clients connect. Loopback by default: the path has no TLS, so credentials would cross the network in clear (D-107, D-158 A). |
+| `STRAUM_CLUSTER_MQTT_LISTEN` | `127.0.0.1:1883` | Where MQTT clients connect. Loopback by default (D-107). It may bind beyond loopback without the next-but-one setting only when `STRAUM_TLS_*` and a password file are set and anonymous clients are not let in (D-164 A); otherwise credentials, if any, would cross the network in clear. |
 | `STRAUM_CLUSTER_METRICS_LISTEN` | off | Where the node serves its metrics over plain HTTP, in the Prometheus text format (D-112): every request gets the current snapshot. No credentials; loopback unless the next setting is `1`. A diagnostic interface, not a monitoring system (D-126 A): at most 4 scrapes at once — more wait unaccepted — and each read and write bounded by 2 s. |
-| `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK` | `0` | `1` lets the MQTT listener, the link listener, the peers and the metrics listener use addresses beyond loopback — unencrypted, and unauthenticated except MQTT clients under `STRAUM_AUTH_*`, whose passwords then cross the network in clear: for an isolated, trusted network only. Without it any such address is refused at startup. The experimental switch is no security mechanism (D-107). |
+| `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK` | `0` | `1` lets the MQTT listener, the link listener, the peers and the metrics listener use addresses beyond loopback — links, peers and metrics unencrypted and unauthenticated; MQTT clients encrypted only under `STRAUM_TLS_*`, and without it their passwords cross the network in clear: for an isolated, trusted network only. Without it any such address is refused at startup, except the MQTT listener when TLS and a password file with no anonymous clients secure it (D-164 A). The experimental switch is no security mechanism (D-107). |
 | `STRAUM_CLUSTER_DATA_DIR` | required | The log, the promise, snapshots, and the `cluster` file that pins the directory to its cluster's configuration digest: a node started over another cluster's data is refused. |
 | `STRAUM_CLUSTER_HEARTBEAT_MS` | `50` | 1–10 000. A placeholder, not a recommendation (D-104 A). |
 | `STRAUM_CLUSTER_TAKEOVER_TICKS` | `3` | Heartbeats of silence before a takeover, 1–1 000. A placeholder; the simulation shows 3 churns under random delivery (D-99). |
@@ -48,6 +48,8 @@ any other `STRAUM_*` variable is refused at startup (D-104 A).
 | `STRAUM_AUTH_PASSWORD_FILE` | off | MQTT credentials (D-110 A, D-158 A): one `user:<hash>` line per user, `#` comments and blank lines ignored; the hash is argon2, as `straum-server hash-password` prints it for a password given on stdin. Set: every CONNECT is checked, off the node loop, before its CONNACK; a wrong or unknown user gets "bad user name or password" (3.1.1: return code 4), an anonymous client "not authorized" (5) unless `STRAUM_AUTH_ALLOW_ANONYMOUS` lets it in. Read once at startup; unreadable or malformed refuses the start. |
 | `STRAUM_AUTH_ACL_FILE` | off | Topic rules: `user <name>` or `anonymous`, then lines `publish <filter>`, `subscribe <filter>` or `readwrite <filter>`. The file grants only what it lists (D-159 A): a user it names may do what its rules allow, one it does not name nothing, and anonymous clients only what an `anonymous` section lists. Without the file every user, and every anonymous client let in, may do anything. A correct file under which clients can connect but nobody, anonymous clients included, may do anything starts, with a warning in the log (D-160 A, D-161 A; an ACL file alone that grants anonymous clients nothing included); a file that cannot be read or parsed refuses the start, never falling back to a looser policy. A refused SUBSCRIBE filter gets "not authorized" (3.1.1: 0x80) and is not proposed; a refused PUBLISH is never proposed: MQTT 5 answers a QoS 1 one "not authorized" (or closes the connection, "not authorized", while earlier QoS 1 publishes still wait for their PUBACKs, which a refusal may not overtake) and drops a QoS 0 one; 3.1.1 closes the connection. A subscription is allowed only where a rule covers all it can match. |
 | `STRAUM_AUTH_ALLOW_ANONYMOUS` | `1` without a password file, `0` with one | Whether a client without a user name is let in (restricted by the ACL file's `anonymous` section). A configuration under which no client could connect is refused at startup: no user, and anonymous clients refused. One where clients connect but may do nothing starts with a warning. |
+| `STRAUM_TLS_CERT_PATH` | off | A PEM certificate chain for the MQTT listener (D-164 A). With it and the next one, the listener speaks TLS only, never plaintext beside it. Both or neither; read once at startup, and a file that cannot be read or holds no certificate refuses the start. A TLS handshake must finish within the gateway's connect timeout (10 s), and at most 1 024 run at once: a connection past that is closed at once. TLS state per connection (rustls's buffers and session) is not charged to the read-buffer budget; it is bounded by count, at most 1 024 handshakes and 1 024 open connections, not measured in bytes. A flood of sockets that never finish a handshake holds every slot for 10 s at a time and new clients are closed meanwhile: no per-source limit exists yet. Clients only: links between nodes are not encrypted (node-to-node TLS comes later, D-138 (6)). |
+| `STRAUM_TLS_KEY_PATH` | off | The certificate's private key, PEM. As above. |
 
 Credentials checks (D-158 A) run off the node loop, at most one per CPU at once, each argon2 check taking about 19 MiB while it runs; a check waiting for its turn holds one CONNECT's user name and password and is cancelled when its connection goes, so the waiting ones are at most the gateway's 1 024 connections: at worst 1 024 × the 256 KiB packet bound, 256 MiB. Hashes must use `straum-server hash-password`'s parameters (argon2id, m=19456, t=2, p=1): a refusal costs one hash with them, so a stored hash made with others would let a known user name be told from an unknown one by its time.
 
@@ -140,6 +142,8 @@ STRAUM_READ_BYTES
 STRAUM_AUTH_PASSWORD_FILE
 STRAUM_AUTH_ACL_FILE
 STRAUM_AUTH_ALLOW_ANONYMOUS
+STRAUM_TLS_CERT_PATH
+STRAUM_TLS_KEY_PATH
 ```
 <!-- stable-settings:end -->
 
@@ -285,13 +289,15 @@ in the experimental cluster mode (step 7a); tests build it directly.
 | `mqtt.listen`, `mqtt.gateway` | MQTT listener and the gateway settings above. |
 | `mqtt.write_queue` | Packets queued per client; a client that lets it fill is closed. |
 
-## Access rules (planned, D-110)
+## Access rules (D-110 A, D-158 A, D-159 A)
 
-The format the `auth` crate reads. Not wired into the new path yet: the server refuses `STRAUM_AUTH_*` and `STRAUM_TLS_*` (D-107, D-110).
+The formats of `STRAUM_AUTH_PASSWORD_FILE` and `STRAUM_AUTH_ACL_FILE`, read by the `auth` crate. What the settings do is in the table above.
 
 The password file is one `user:hash` per line; `#` starts a comment. The
-hash is an argon2 PHC string, so each line carries its own cost
-parameters and they can be changed per user without a code change.
+hash is an argon2 PHC string, as `straum-server hash-password` prints it. A
+PHC string carries its own cost parameters, but use that command's: a
+refusal costs one hash with them, so a stored hash made with others lets a
+known user name be told from an unknown one by its time (D-158 A).
 
 The ACL file names a user, then what that user may do:
 

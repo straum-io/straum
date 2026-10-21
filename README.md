@@ -3,8 +3,8 @@
 A clustered MQTT broker that acknowledges a publish only after a
 majority of its nodes has committed it to one replicated log.
 
-> **Status: experimental.** Not production-ready: no TLS or credentials,
-> flow control off, timing defaults are placeholders, and persistent
+> **Status: experimental.** Not production-ready: client TLS and credentials
+> only when configured, no encryption between nodes, flow control off, timing defaults are placeholders, and persistent
 > sessions, wills and session expiry are refused at CONNECT for now.
 
 ## Why
@@ -114,7 +114,10 @@ straum-cli status --node 127.0.0.1:9100,127.0.0.1:9101,127.0.0.1:9102
 
 Everything binds to loopback. Any other address is refused unless you set
 `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1`, and then only on a network you
-trust: nothing is authenticated or encrypted yet.
+trust: links between nodes are neither authenticated nor encrypted. The MQTT
+listener alone may face a network without it once TLS (`STRAUM_TLS_*`) and a
+password file (`STRAUM_AUTH_*`, anonymous clients refused) are configured
+(`docs/configuration.md`).
 
 ## Run with Docker
 

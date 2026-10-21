@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 auth = { path = "../auth" }
 node = { path = "../node" }
+transport = { path = "../transport" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros"] }
 tracing = "0.1"
@@ -22,6 +23,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 bytes = "1"
 domain = { path = "../domain" }
+# A throwaway certificate per test run, and a client to speak TLS to it.
+rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 # Built, not run, by `cargo test --all-targets` (D-4): it refuses a debug
 # build. `cargo bench -p server --bench puback` (D-124).

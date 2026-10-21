@@ -127,6 +127,7 @@ fn config(
             gateway: gateway(),
             write_queue: 1024,
             authority: None,
+            tls: None,
         }),
         retain_bytes: disk(test).1,
         snapshot_every: disk(test).2,
