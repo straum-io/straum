@@ -212,27 +212,29 @@ fn an_acl_file_grants_only_what_it_lists() {
 }
 
 #[test]
-fn a_configuration_that_grants_nobody_anything_says_so() {
-    // Anonymous clients let in, granted nothing, and no user.
-    let nobody = Authority::parse("", Some("# no anonymous section\n"), true).unwrap();
-    assert!(nobody.grants_nothing());
-    let someone = Authority::parse("", Some("anonymous\nsubscribe public/#\n"), true).unwrap();
-    assert!(!someone.grants_nothing());
+fn a_configuration_nobody_can_connect_with_says_so() {
+    // D-161 A: only "nobody can connect" is refused; anonymous clients let
+    // in with nothing granted can connect (a warning, D-160 A).
+    let nobody = Authority::parse("", Some("anonymous\nsubscribe public/#\n"), false).unwrap();
+    assert!(nobody.admits_nobody());
+    let closed = Authority::parse("", Some("# no anonymous section\n"), true).unwrap();
+    assert!(!closed.admits_nobody());
+    assert!(closed.grants_no_action());
     assert!(
         !Authority::parse(&passwords(), Some(""), false)
             .unwrap()
-            .grants_nothing(),
+            .admits_nobody(),
         "users with no rules are still users: they may connect"
     );
 }
 
 /// D-160 A: users who can connect and may do nothing are told apart from a
-/// configuration nobody can use (which a start refuses).
+/// configuration nobody can connect with (which a start refuses).
 #[test]
 fn users_granted_nothing_are_reported_not_refused() {
     let closed = Authority::parse(&passwords(), Some(""), false).unwrap();
     assert!(closed.grants_no_action());
-    assert!(!closed.grants_nothing());
+    assert!(!closed.admits_nobody());
     let open_to_alice =
         Authority::parse(&passwords(), Some("user alice\nsubscribe a/#\n"), false).unwrap();
     assert!(!open_to_alice.grants_no_action());

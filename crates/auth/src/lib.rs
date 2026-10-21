@@ -281,14 +281,12 @@ impl Authority {
         Ok(Self { users, anonymous })
     }
 
-    /// Whether no client could do anything: no user, and anonymous clients
-    /// refused or granted nothing. A configuration a start refuses.
-    pub fn grants_nothing(&self) -> bool {
-        self.users.is_empty()
-            && self
-                .anonymous
-                .as_ref()
-                .is_none_or(Permissions::grants_nothing)
+    /// Whether no client could connect at all: no user, and anonymous
+    /// clients refused. A configuration a start refuses (D-159 A, D-161 A);
+    /// one where clients connect but may do nothing starts with a warning
+    /// (`grants_no_action`, D-160 A).
+    pub fn admits_nobody(&self) -> bool {
+        self.users.is_empty() && self.anonymous.is_none()
     }
 
     /// Whether clients may connect but none may publish or subscribe: every
