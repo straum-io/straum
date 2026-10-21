@@ -18,9 +18,20 @@
 //! quiet Linux host gives numbers for that choice; anything
 //! from macOS or a container is preliminary.
 //!
+//! Per cap two more lines (D-155 A): `cap_stats`, records per second,
+//! commit latency p50/p95/p99 (proposal to its acceptance applied at the
+//! sequencer), the largest process RSS sampled (Linux only), the largest uncommitted tail
+//! and outbox; `cap_recovery`, the uncommitted tail at each stop and the
+//! restarted node's time to the survivors' commit point. Uncommitted work
+//! bounds throughput; it is not throughput, and PUBACK latency over MQTT is
+//! `server/benches/puback.rs`'s, not this bench's.
+//!
 //! `cargo bench -p node --bench cap`; `STRAUM_BENCH_CAPS=64,4096` narrows
 //! it, `STRAUM_BENCH_HEARTBEAT_MS` and `STRAUM_BENCH_TAKEOVER_TICKS` set
 //! the timer that starts a takeover (50 ms and 3 by default).
+//! `STRAUM_BENCH_DATA_DIRS=/disk0,/disk1,/disk2` puts each node's log on
+//! its own directory: the separate-disk control, meaningful only when they
+//! are separate physical disks.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::net::SocketAddr;
@@ -61,11 +72,27 @@ fn free_port() -> SocketAddr {
     socket.local_addr().unwrap()
 }
 
+/// Node `id`'s log: under the system temp directory, or, for the
+/// separate-disk control (D-155 A, straum#30), under the `id`-th of the
+/// comma-separated `STRAUM_BENCH_DATA_DIRS`, one disk per node: exactly
+/// one directory per node, or the bench stops.
 fn data_dir(cap: u64, id: u8) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "straum-bench-cap-{}-{cap}-{id}",
-        std::process::id()
-    ))
+    std::env::var("STRAUM_BENCH_DATA_DIRS")
+        .ok()
+        .map(|dirs| {
+            let dirs: Vec<&str> = dirs.split(',').collect();
+            assert_eq!(
+                dirs.len(),
+                usize::from(NODES),
+                "STRAUM_BENCH_DATA_DIRS: one directory per node"
+            );
+            PathBuf::from(dirs[usize::from(id)])
+        })
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!(
+            "straum-bench-cap-{}-{cap}-{id}",
+            std::process::id()
+        ))
 }
 
 fn config(cap: u64, id: u8, addresses: &[SocketAddr]) -> NodeConfig {
@@ -186,34 +213,44 @@ impl Cluster {
 }
 
 /// Publishes at `at` in a closed loop of `window` until `stop`; the count
-/// committed goes back through the handle.
+/// committed, and each one's time from proposal to its acceptance applied
+/// here in microseconds (D-155 A), go back through the handle.
 fn load(
     node: &Node,
     at: u8,
     window: u64,
     stop: tokio::sync::watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<u64> {
+) -> tokio::task::JoinHandle<(u64, Vec<u32>)> {
     let mut effects = node.effects();
     let proposals: Vec<cluster::Proposal> = (0..window).map(|r| publish(at, r)).collect();
     let sender = node.proposer();
     tokio::spawn(async move {
         let mut next = window;
-        for proposal in proposals {
+        let mut sent: std::collections::HashMap<u64, Instant> = std::collections::HashMap::new();
+        for (request, proposal) in proposals.into_iter().enumerate() {
+            sent.insert(request as u64, Instant::now());
             let _ = sender.send(proposal).await;
         }
         let mut committed = 0u64;
+        let mut latencies = Vec::new();
         loop {
             if *stop.borrow() {
-                return committed;
+                return (committed, latencies);
             }
             let received = tokio::time::timeout(Duration::from_millis(50), effects.recv()).await;
             let Ok(Ok((_, _, out))) = received else {
                 continue;
             };
             for effect in out {
-                if let Effect::Accepted { to, .. } = effect {
+                if let Effect::Accepted { to, request, .. } = effect {
                     if to.node == at {
                         committed += 1;
+                        if let Some(at_sent) = sent.remove(&request) {
+                            latencies.push(
+                                u32::try_from(at_sent.elapsed().as_micros()).unwrap_or(u32::MAX),
+                            );
+                        }
+                        sent.insert(next, Instant::now());
                         let _ = sender.send(publish(at, next)).await;
                         next += 1;
                     }
@@ -223,7 +260,35 @@ fn load(
     })
 }
 
-async fn throughput(cluster: &Cluster, window: u64, seconds: u64) -> f64 {
+/// One throughput round (D-155 A): publishes committed per second, log
+/// positions per second, each publish's commit latency, and the largest
+/// uncommitted tail, outbox and process RSS seen, sampled every 100 ms —
+/// rarely enough that the sampling costs the run little.
+#[derive(Default)]
+struct Round {
+    rate: f64,
+    records_per_s: f64,
+    latencies: Vec<u32>,
+    uncommitted: u64,
+    outbox_bytes: usize,
+    rss_bytes: Option<u64>,
+}
+
+/// This process's resident set, from `/proc` where there is one.
+fn rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb: u64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()?;
+    Some(kb * 1024)
+}
+
+async fn throughput(cluster: &Cluster, window: u64, seconds: u64) -> Round {
     let leader = cluster
         .leader(Duration::from_secs(10))
         .await
@@ -232,10 +297,29 @@ async fn throughput(cluster: &Cluster, window: u64, seconds: u64) -> f64 {
     let (stop_tx, stop) = tokio::sync::watch::channel(false);
     let task = load(node, leader, window, stop);
     let start = Instant::now();
-    tokio::time::sleep(Duration::from_secs(seconds)).await;
+    let first_end = node.status().borrow().end;
+    let mut round = Round::default();
+    while start.elapsed() < Duration::from_secs(seconds) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let s = *node.status().borrow();
+        round.uncommitted = round.uncommitted.max(s.end.saturating_sub(s.commit));
+        for n in cluster.nodes.iter().flatten() {
+            if let Some(m) = n.metrics().await {
+                round.outbox_bytes = round.outbox_bytes.max(m.voter.outbox_bytes);
+            }
+        }
+        if let Some(rss) = rss_bytes() {
+            round.rss_bytes = Some(round.rss_bytes.unwrap_or(0).max(rss));
+        }
+    }
     let _ = stop_tx.send(true);
-    let committed = task.await.unwrap();
-    committed as f64 / start.elapsed().as_secs_f64()
+    let last_end = node.status().borrow().end;
+    let (committed, latencies) = task.await.unwrap();
+    let elapsed = start.elapsed().as_secs_f64();
+    round.rate = committed as f64 / elapsed;
+    round.records_per_s = last_end.saturating_sub(first_end) as f64 / elapsed;
+    round.latencies = latencies;
+    round
 }
 
 /// Stops the sequencer under load; the time until a later slot commits on
@@ -249,6 +333,12 @@ struct Failover {
     slots: u64,
     abandoned: u64,
     lag: u64,
+    /// The sequencer's uncommitted tail at the stop: work a takeover cuts
+    /// or keeps (D-155 A).
+    uncommitted: u64,
+    /// The stopped node, restarted, until it holds the survivors' commit
+    /// point at its restart; `None` past 30 s.
+    catchup: Option<Duration>,
 }
 
 async fn abandoned(cluster: &Cluster, survivors: &[u8]) -> u64 {
@@ -338,17 +428,39 @@ async fn failover(cluster: &mut Cluster, window: u64) -> Option<Failover> {
         })
         .max()
         .unwrap_or(before.slot);
-    let result = Failover {
+    let mut result = Failover {
         took: taken,
         slots: slot.saturating_sub(before.slot),
         abandoned: abandoned(cluster, &survivors)
             .await
             .saturating_sub(abandoned_before),
         lag,
+        uncommitted: before.end.saturating_sub(before.commit),
+        catchup: None,
     };
+    let target = survivors
+        .iter()
+        .map(|&id| {
+            cluster.nodes[usize::from(id)]
+                .as_ref()
+                .unwrap()
+                .status()
+                .borrow()
+                .commit
+        })
+        .max()
+        .unwrap_or(0);
+    let restarted_at = Instant::now();
     let restarted = Node::start(config(cluster.cap, leader, &cluster.addresses))
         .await
         .unwrap();
+    while restarted_at.elapsed() < Duration::from_secs(30) {
+        if restarted.status().borrow().commit >= target {
+            result.catchup = Some(restarted_at.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     cluster.nodes[usize::from(leader)] = Some(restarted);
     // Settle before the next trial.
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -625,6 +737,61 @@ fn quantiles(v: &mut [f64]) -> String {
     v.sort_by(f64::total_cmp);
     let at = |p: f64| v[((v.len() as f64 * p) as usize).min(v.len() - 1)];
     format!("{:.2}/{:.2}/{:.2}", at(0.5), at(0.9), at(0.99))
+}
+
+/// The `cap_stats` and `cap_recovery` lines of one cap (D-155 A), after
+/// the table: the rate is the median round's, commit latency over every
+/// round's publishes, the rest the largest any round saw. Read blocks are
+/// not measured here (`n/a`): this bench has no MQTT clients.
+fn report(cap: u64, rounds: &[Round], trials: &[Failover]) {
+    let mut rates: Vec<f64> = rounds.iter().map(|r| r.records_per_s).collect();
+    rates.sort_by(f64::total_cmp);
+    let mut latencies: Vec<u32> = rounds
+        .iter()
+        .flat_map(|r| r.latencies.iter().copied())
+        .collect();
+    latencies.sort_unstable();
+    let at = |v: &[u32], q: f64| {
+        v.get(((v.len() as f64 * q) as usize).min(v.len().saturating_sub(1)))
+            .map_or("-".to_owned(), |&us| {
+                format!("{:.2}", f64::from(us) / 1000.0)
+            })
+    };
+    let rss = rounds
+        .iter()
+        .filter_map(|r| r.rss_bytes)
+        .max()
+        .map_or("n/a".to_owned(), |b| {
+            format!("{:.1}", b as f64 / 1_048_576.0)
+        });
+    println!(
+        "cap_stats cap={cap} records_per_s={:.0} commit_p50_ms={} commit_p95_ms={} commit_p99_ms={} commits={} rss_peak_mb={rss} uncommitted_max={} outbox_bytes_max={} read_blocks=n/a",
+        rates.get(rates.len() / 2).copied().unwrap_or(0.0),
+        at(&latencies, 0.5),
+        at(&latencies, 0.95),
+        at(&latencies, 0.99),
+        latencies.len(),
+        rounds.iter().map(|r| r.uncommitted).max().unwrap_or(0),
+        rounds.iter().map(|r| r.outbox_bytes).max().unwrap_or(0),
+    );
+    let mut uncommitted: Vec<u64> = trials.iter().map(|t| t.uncommitted).collect();
+    uncommitted.sort_unstable();
+    let mut catchup: Vec<u32> = trials
+        .iter()
+        .filter_map(|t| t.catchup)
+        .map(|d| u32::try_from(d.as_micros()).unwrap_or(u32::MAX))
+        .collect();
+    catchup.sort_unstable();
+    println!(
+        "cap_recovery cap={cap} failovers={} uncommitted_at_stop_p50={} uncommitted_at_stop_max={} catchup_p50_ms={} catchup_p90_ms={} catchup_max_ms={} catchup_timed_out={}",
+        trials.len(),
+        uncommitted.get(uncommitted.len() / 2).copied().unwrap_or(0),
+        uncommitted.last().copied().unwrap_or(0),
+        at(&catchup, 0.5),
+        at(&catchup, 0.9),
+        at(&catchup, 1.0),
+        trials.len() - catchup.len(),
+    );
 }
 
 /// Time `a` to `b`, ms; 0 when `b` is earlier.
@@ -993,10 +1160,11 @@ async fn main() {
     for cap in caps {
         LAG.store(0, Ordering::Relaxed);
         let mut cluster = Cluster::start(cap).await;
-        let mut rates = Vec::new();
+        let mut measured = Vec::new();
         for _ in 0..rounds {
-            rates.push(throughput(&cluster, window, seconds).await);
+            measured.push(throughput(&cluster, window, seconds).await);
         }
+        let mut rates: Vec<f64> = measured.iter().map(|r| r.rate).collect();
         rates.sort_by(f64::total_cmp);
         let mut trials = Vec::new();
         for _ in 0..failovers {
@@ -1007,6 +1175,8 @@ async fn main() {
                 slots: 0,
                 abandoned: 0,
                 lag: 0,
+                uncommitted: 0,
+                catchup: None,
             }));
         }
         let times: Vec<Option<Duration>> = trials.iter().map(|t| t.took).collect();
@@ -1064,6 +1234,7 @@ async fn main() {
                 of.iter().filter(|t| t.took.is_none()).count(),
             );
         }
+        report(cap, &measured, &trials);
         cluster.shutdown().await;
     }
 }

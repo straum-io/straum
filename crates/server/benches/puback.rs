@@ -23,7 +23,11 @@
 //! * `STRAUM_BENCH_POSITIONS_MS=<ms>` samples every node's commit, applied
 //!   position and log end that often while measuring, and reports the
 //!   positions per second and each node's apply lag (the cluster's commit
-//!   less what the node applied) in positions and in milliseconds;
+//!   less what the node applied) in positions and in milliseconds; with
+//!   `straum_serving`, the lag over the samples where the node served
+//!   clients (`serving_lag`, D-154 A) and, after each kill, how long until
+//!   the node served again and its lag then (`serving_again`). Sampled,
+//!   so a change shorter than the interval can be missed;
 //! * `STRAUM_BENCH_CHURN=<clients>` adds clients that connect, disconnect
 //!   and connect again in a loop, each a new clean session whose end is a
 //!   `SessionGone` record. Unpaced, they find the most the cluster takes,
@@ -511,9 +515,10 @@ fn scraper(addresses: Vec<SocketAddr>, every: Duration, stop: Arc<AtomicBool>) -
     scrapes
 }
 
-/// One sample of every node: seconds since the sampler started, and per
-/// node `(commit, applied, log_end)`, `None` where it did not answer.
-type Positions = (f64, Vec<Option<(f64, f64, f64)>>);
+/// One sample of every node: when it was taken (the events' clock, so a
+/// sample is placed against a kill, D-154 A), and per node `(commit,
+/// applied, log_end, serving)`, `None` where it did not answer.
+type Positions = (Instant, Vec<Option<(f64, f64, f64, bool)>>);
 
 /// Every node's positions every `every`, while measuring (straum#23).
 fn positions(
@@ -522,7 +527,6 @@ fn positions(
     measuring: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) -> Vec<Positions> {
-    let started = Instant::now();
     let mut samples = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         let at = Instant::now();
@@ -535,11 +539,12 @@ fn positions(
                             value(&t, "straum_commit"),
                             value(&t, "straum_applied"),
                             value(&t, "straum_log_end"),
+                            value(&t, "straum_serving") > 0.0,
                         )
                     })
                 })
                 .collect();
-            samples.push((started.elapsed().as_secs_f64(), nodes));
+            samples.push((at, nodes));
         }
         std::thread::sleep(every.saturating_sub(at.elapsed()));
     }
@@ -556,12 +561,18 @@ fn percentile(values: &mut [f64], q: f64) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Positions per second and each node's apply lag, from the samples.
-fn report_positions(samples: &[Positions], every_ms: u64) {
+/// Positions per second and each node's apply lag, from the samples; then,
+/// for D-154 A, each node's lag over the samples where it served clients,
+/// and after each kill how long until the killed node served again and how
+/// far behind it was then.
+fn report_positions(samples: &[Positions], every_ms: u64, kills: &[(usize, Instant)]) {
     let log_end = |s: &Positions| s.1.iter().flatten().map(|p| p.2).fold(0.0f64, f64::max);
+    let commit = |nodes: &[Option<(f64, f64, f64, bool)>]| {
+        nodes.iter().flatten().map(|p| p.0).fold(0.0f64, f64::max)
+    };
     let records_per_s = match (samples.first(), samples.last()) {
         (Some(first), Some(last)) if last.0 > first.0 => {
-            (log_end(last) - log_end(first)) / (last.0 - first.0)
+            (log_end(last) - log_end(first)) / last.0.duration_since(first.0).as_secs_f64()
         }
         _ => 0.0,
     };
@@ -573,12 +584,12 @@ fn report_positions(samples: &[Positions], every_ms: u64) {
         let mut lags: Vec<f64> = samples
             .iter()
             .filter_map(|(_, nodes)| {
-                let commit = nodes.iter().flatten().map(|p| p.0).fold(0.0f64, f64::max);
+                let commit = commit(nodes);
                 nodes
                     .get(node)
                     .copied()
                     .flatten()
-                    .map(|(_, applied, _)| (commit - applied).max(0.0))
+                    .map(|(_, applied, ..)| (commit - applied).max(0.0))
             })
             .collect();
         let ms = |positions: f64| {
@@ -597,6 +608,55 @@ fn report_positions(samples: &[Positions], every_ms: u64) {
             ms(p99),
             ms(max)
         );
+    }
+    // The lag in time is measured, not derived from a rate: how long ago
+    // the cluster's commit last stood at or below what the node has
+    // applied, on the sample clock — late by up to one interval.
+    for node in 0..usize::from(NODES) {
+        let mut lags = Vec::new();
+        let mut times = Vec::new();
+        for (i, (t, nodes)) in samples.iter().enumerate() {
+            let Some((_, applied, _, true)) = nodes.get(node).copied().flatten() else {
+                continue;
+            };
+            lags.push((commit(nodes) - applied).max(0.0));
+            let since = samples[..=i]
+                .iter()
+                .rev()
+                .find(|(_, earlier)| commit(earlier) <= applied)
+                .map_or(samples[0].0, |(at, _)| *at);
+            times.push(t.duration_since(since).as_secs_f64() * 1000.0);
+        }
+        let (p50, p99) = (percentile(&mut lags, 0.50), percentile(&mut lags, 0.99));
+        let time_p99 = percentile(&mut times, 0.99);
+        println!(
+            "serving_lag node={node} samples={} p50={p50:.0} p99={p99:.0} max={:.0} time_p99_ms={time_p99:.0} time_max_ms={:.0}",
+            lags.len(),
+            lags.last().copied().unwrap_or(0.0),
+            times.last().copied().unwrap_or(0.0)
+        );
+    }
+    // After a kill, the first sample with the node down or not serving,
+    // then the first after it where the node serves; `-` when the samples
+    // end first.
+    for &(node, at) in kills {
+        let mut down = false;
+        let back = samples
+            .iter()
+            .skip_while(|(t, _)| *t < at)
+            .find(|(_, nodes)| {
+                let serving = matches!(nodes.get(node).copied().flatten(), Some((.., true)));
+                down |= !serving;
+                down && serving
+            });
+        match back {
+            Some((t, nodes)) => println!(
+                "serving_again node={node} after_ms={:.0} lag_at_serving={:.0}",
+                t.duration_since(at).as_secs_f64() * 1000.0,
+                (commit(nodes) - nodes[node].map_or(0.0, |p| p.1)).max(0.0)
+            ),
+            None => println!("serving_again node={node} after_ms=- lag_at_serving=-"),
+        }
     }
 }
 
@@ -1003,7 +1063,12 @@ fn main() {
         },
     );
     if let Some(samples) = &samples {
-        report_positions(samples, positions_ms);
+        let kills: Vec<(usize, Instant)> = happened
+            .iter()
+            .filter(|(kind, ..)| kind == "kill")
+            .map(|&(_, node, at)| (node, at))
+            .collect();
+        report_positions(samples, positions_ms, &kills);
     }
     if churn > 0 {
         let closed: f64 = finals
