@@ -10,11 +10,16 @@
 # bound on commit latency: it includes the gateway and apply);
 # records_per_s (log positions per second); apply_lag_p99 and
 # apply_lag_max, the worst node's, in positions (the unit `W` counts);
-# sessions_ended_per_s under churn (DISCONNECTs written).
+# sessions_ended_per_s under churn (DISCONNECTs written); serving_lag_p99
+# and serving_lag_max, the worst node's apply lag over the samples where it
+# served clients (D-154 A: `L_g`), and serving_lag_time_max_ms, the same
+# lag measured in time on the sample clock. After each kill, serving_again: how long
+# until the killed node served again and how far behind it was then, as a
+# distribution like the hold.
 #
-# In the events stage the worst node includes one killed and catching up:
-# it serves no client meanwhile, so it proposes nothing; size `W` from the
-# steady and heavy stages, and the hold from the events stage.
+# apply_lag in the events stage includes a killed node catching up before
+# it serves; serving_lag leaves those samples out. scripts/fence.awk sizes
+# `W` from serving_lag.
 function field(line, key,    n, i, kv) {
     n = split(line, parts, " ")
     for (i = 1; i <= n; i++) {
@@ -58,6 +63,18 @@ function keep(key, value) {
     if (p > lag_p99[round]) lag_p99[round] = p
     if (m > lag_max[round]) lag_max[round] = m
 }
+/^serving_lag / {
+    p = field($0, "p99") + 0; m = field($0, "max") + 0
+    if (p > serving_p99[round]) serving_p99[round] = p
+    if (m > serving_max[round]) serving_max[round] = m
+    tm = field($0, "time_max_ms") + 0
+    if (tm > serving_time[round]) serving_time[round] = tm
+}
+/^serving_again / {
+    again++
+    again_ms[again] = field($0, "after_ms")
+    again_lag[again] = field($0, "lag_at_serving")
+}
 /^churn / {
     ended = field($0, "sessions_ended_per_s")
     keep("sessions_ended_per_s", ended)
@@ -78,6 +95,9 @@ END {
     for (r = 1; r <= round; r++) {
         if (r in lag_p99) keep("apply_lag_p99", lag_p99[r])
         if (r in lag_max) keep("apply_lag_max", lag_max[r])
+        if (r in serving_p99) keep("serving_lag_p99", serving_p99[r])
+        if (r in serving_max) keep("serving_lag_max", serving_max[r])
+        if (r in serving_time) keep("serving_lag_time_max_ms", serving_time[r])
     }
     print "stage=" stage " rounds=" round
     for (k = 1; k <= keys; k++) {
@@ -110,5 +130,17 @@ END {
                 kind, who, n, missing, quantile(v, m, 0.5), quantile(v, m, 0.9), v[m], within / m * 100
         }
         printf "  hold kind=%s its_clients_gave_up=%d\n", kind, gave_up[kind]
+    }
+    # `-`: the samples ended before the node served again.
+    if (again > 0) {
+        m = 0; missing = 0
+        for (i = 1; i <= again; i++) {
+            if (again_ms[i] == "-" || again_ms[i] == "") { missing++; continue }
+            m++; t[m] = again_ms[i] + 0; l[m] = again_lag[i] + 0
+        }
+        sort(t, m); sort(l, m)
+        if (m == 0) printf "  serving_again n=%d missing=%d\n", again, missing
+        else printf "  serving_again n=%d missing=%d p50_ms=%s p90_ms=%s max_ms=%s lag_p50=%s lag_max=%s\n", \
+            again, missing, quantile(t, m, 0.5), quantile(t, m, 0.9), t[m], quantile(l, m, 0.5), l[m]
     }
 }

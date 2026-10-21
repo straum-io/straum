@@ -29,16 +29,25 @@
 #               three real server processes, 5 rounds each:
 #                 steady       positions per second, apply lag, PUBACK latency
 #                 heavy        the same at four times the load
-#                 events       10 planned handoffs and 10 killed sequencers a
-#                              round: the hold across a slot change as a
+#                 events       10 planned handoffs and 10 killed sequencers in
+#                              each 6-minute round, 30 minutes in all (D-154 A):
+#                              the hold across a slot change as a
 #                              distribution (D-130 A, D-134 A)
 #                 churn-100    sessions removed at 100/s under the steady load
 #                 churn-1000   the same at 1 000/s
 #                 saturation   64 unpaced churners: the most the cluster takes
+#   cap-64      node/benches/cap.rs at max_uncommitted 64 (D-155 A): commit
+#               latency, uncommitted work, RSS, failover and catch-up, 5
+#               rounds and 50 failovers, the three logs on the measured disk
+#   cap-64-disks  the same, each node's log on its own disk: only with
+#               STRAUM_HOST_DATA_DIRS=/a,/b,/c on three separate physical
+#               disks; refused when two share one
 #   d124        full only: scripts/linux-run.sh, the D-124 run
 #
 # summary-rates.txt has each quantity's median, min, max and spread across
-# rounds, and the hold's p50, p90, max and share within 1 s (scripts/rates.awk).
+# rounds, and the hold's p50, p90, max and share within 1 s (scripts/rates.awk);
+# fence-size.txt the step 7c W and tombstone queue from it (scripts/fence.awk,
+# D-154 A), preliminary until the host passes D-129.
 # At the end: target/linux-host/straum-linux-<time>.tar.gz and its SHA-256.
 # Send that file back. It holds the host's name (uname -a) and nothing else
 # about the machine beyond what is listed above.
@@ -153,7 +162,7 @@ else
     events=$(printf 'handoff,kill,%.0s' $(seq 1 10))
     run rates-steady rates steady STRAUM_BENCH_SECONDS=60
     run rates-heavy rates heavy STRAUM_BENCH_SECONDS=60 STRAUM_BENCH_PUBLISHERS=24 STRAUM_BENCH_WINDOW=32
-    run rates-events rates events STRAUM_BENCH_SECONDS=300 STRAUM_BENCH_EVENTS="${events%,}"
+    run rates-events rates events STRAUM_BENCH_SECONDS=360 STRAUM_BENCH_EVENTS="${events%,}"
     run rates-churn-100 rates churn STRAUM_BENCH_SECONDS=60 STRAUM_BENCH_CHURN=8 STRAUM_BENCH_CHURN_RATE=100
     run rates-churn-1000 rates churn STRAUM_BENCH_SECONDS=60 STRAUM_BENCH_CHURN=32 STRAUM_BENCH_CHURN_RATE=1000
     run rates-saturation rates saturation STRAUM_BENCH_SECONDS=30 STRAUM_BENCH_CHURN=64
@@ -162,6 +171,45 @@ else
         awk -v stage="${stage%.txt}" -f scripts/rates.awk "$file"
     done > "$OUT/summary-rates.txt" 2>&1
     note "== summary-rates: $OUT/summary-rates.txt"
+    awk -f scripts/fence.awk "$OUT/summary-rates.txt" > "$OUT/fence-size.txt" 2>&1 || true
+    note "== fence-size (preliminary): $OUT/fence-size.txt"
+fi
+
+cap() { env STRAUM_BENCH_CAPS=64 STRAUM_BENCH_ROUNDS=5 STRAUM_BENCH_FAILOVERS=50 "$@" cargo bench -p node --bench cap; }
+run cap-64 cap
+# The physical disks under a directory, one per line: every TYPE=disk
+# device below its mount (through LVM, device mapper or RAID); nothing when
+# that cannot be resolved (tmpfs, a network or overlay mount).
+disks_of() {
+    source=$(findmnt -n -o SOURCE -T "$1" 2>/dev/null) || return 0
+    source=${source%%\[*}
+    lsblk -rs -no NAME,TYPE "$source" 2>/dev/null | awk '$2 == "disk" { print $1 }' | sort -u
+}
+if [ -n "${STRAUM_HOST_DATA_DIRS:-}" ]; then
+    # Refused unless there are three directories, each on a disk that was
+    # resolved, and no disk under two of them.
+    all=""
+    refused=""
+    count=0
+    for d in $(echo "$STRAUM_HOST_DATA_DIRS" | tr ',' ' '); do
+        count=$((count + 1))
+        mkdir -p "$d"
+        found=$(disks_of "$d")
+        note "   data dir $d on disk(s): $(echo ${found:-unresolved} | tr "\n" " ")"
+        if [ -z "$found" ]; then refused="$d on no resolved disk"; fi
+        all="$all
+$found"
+    done
+    if [ "$count" -ne 3 ]; then refused="$count directories, not 3"; fi
+    shared=$(echo "$all" | grep -v '^$' | sort | uniq -d | tr '\n' ' ')
+    if [ -n "$shared" ]; then refused="disk(s) $shared under more than one directory"; fi
+    if [ -n "$refused" ]; then
+        note "   cap-64-disks refused: $refused; the control needs three directories on three separate physical disks"
+    else
+        run cap-64-disks cap STRAUM_BENCH_DATA_DIRS="$STRAUM_HOST_DATA_DIRS"
+    fi
+else
+    note "   cap-64-disks skipped: STRAUM_HOST_DATA_DIRS not set (the separate-disk control, D-155 A)"
 fi
 
 if [ "$MODE" = full ]; then

@@ -25,6 +25,7 @@ jobs:
       - run: cargo test --workspace --all-targets --no-run
       - run: cargo test --workspace --tests
       - run: scripts/check-boundaries.sh
+      - run: scripts/test-fence.sh
 
   # Line, region and function coverage, reported, not gated (ECO-D-7).
   coverage:
