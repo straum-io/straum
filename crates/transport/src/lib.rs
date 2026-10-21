@@ -12,7 +12,7 @@ pub use config::TransportConfig;
 pub use connection::{Accepted, Connection, Reader, Writer, connect};
 pub use listener::Listener;
 pub use sys::KernelLimits;
-pub use tls::{Tls, TlsError};
+pub use tls::{Loaded, Tls, TlsError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {

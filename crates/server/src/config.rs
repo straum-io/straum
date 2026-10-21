@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -85,6 +85,8 @@ pub struct Settings {
     /// Logged at startup: a configuration that starts but may not be what
     /// was meant (D-160 A).
     pub warnings: Vec<&'static str>,
+    /// What a SIGHUP reloads (D-166 A); `None` when nothing is configured.
+    pub access: Option<Access>,
 }
 
 const SWITCH: &str = "STRAUM_EXPERIMENTAL_CLUSTER";
@@ -140,15 +142,20 @@ impl Settings {
         // same loopback rule as every other listener.
         let metrics = parser.optional_value("STRAUM_CLUSTER_METRICS_LISTEN", "a socket address")?;
         let exposed = parser.boolean_flag("STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK")?;
-        let authority = credentials(&mut parser)?;
-        let tls = tls(&mut parser)?;
+        let (passwords, acl, anonymous) = credentials(&mut parser)?;
+        let (certificate, key) = tls_paths(&mut parser)?;
+        let authority = load_authority(passwords.as_deref(), acl.as_deref(), anonymous)?;
+        let tls = match (&certificate, &key) {
+            (Some(certificate), Some(key)) => Some(
+                transport::Tls::from_pem_files(Path::new(certificate), Path::new(key))
+                    .map_err(|error| ConfigError::Tls(error.to_string()))?,
+            ),
+            _ => None,
+        };
         // D-164 A: the MQTT listener alone may leave loopback once every
         // client is encrypted and named, never anonymous. Links, peers and
         // metrics keep the rule until node-to-node TLS (D-138 (6)).
-        let mqtt_secured = tls.is_some()
-            && authority
-                .as_ref()
-                .is_some_and(|a| a.users() > 0 && !a.allows_anonymous());
+        let mqtt_secured = tls.is_some() && authority.as_ref().is_some_and(secures);
         if !exposed {
             for (name, address) in [
                 ("STRAUM_CLUSTER_MQTT_LISTEN", mqtt),
@@ -203,18 +210,16 @@ impl Settings {
             metrics,
         }
         .node_config()?;
-        // D-160 A: a correct ACL file that grants nobody anything starts,
-        // with a warning; it is never read as a permission.
-        let mut warnings = Vec::new();
-        if authority
-            .as_ref()
-            .is_some_and(auth::Authority::grants_no_action)
-        {
-            warnings.push(
-                "STRAUM_AUTH_ACL_FILE grants no user and no anonymous client anything: clients \
-                 can connect, but every PUBLISH and SUBSCRIBE will be refused",
-            );
-        }
+        let warnings = warnings_for(authority.as_ref());
+        // D-166 A: what a SIGHUP reloads, if anything is configured.
+        let access =
+            (passwords.is_some() || acl.is_some() || certificate.is_some()).then_some(Access {
+                passwords,
+                acl,
+                anonymous,
+                certificate,
+                key,
+            });
         if let Some(mqtt) = node.mqtt.as_mut() {
             mqtt.authority = authority.map(std::sync::Arc::new);
             mqtt.tls = tls;
@@ -225,68 +230,135 @@ impl Settings {
             worker_threads,
             effective,
             warnings,
+            access,
         })
     }
 }
 
-/// D-158 A: who may connect. No file: anybody, anything, as before
-/// credentials. A password file: its users, and anonymous clients only if
-/// `STRAUM_AUTH_ALLOW_ANONYMOUS=1`. An ACL file grants only what it lists
-/// (D-159 A): its users their rules, anonymous clients its `anonymous`
-/// section, anyone it does not name nothing. Both files are
-/// read once, at startup; a file that cannot be read or parsed refuses the
-/// start.
-fn credentials(parser: &mut Parser) -> Result<Option<auth::Authority>, ConfigError> {
+/// D-158 A: who may connect, as settings. No file: anybody, anything, as
+/// before credentials. A password file: its users, and anonymous clients
+/// only if `STRAUM_AUTH_ALLOW_ANONYMOUS=1`. An ACL file grants only what it
+/// lists (D-159 A): its users their rules, anonymous clients its
+/// `anonymous` section, anyone it does not name nothing.
+fn credentials(parser: &mut Parser) -> Result<(Option<String>, Option<String>, bool), ConfigError> {
     let passwords: Option<String> = parser.optional_value("STRAUM_AUTH_PASSWORD_FILE", "a path")?;
     let acl: Option<String> = parser.optional_value("STRAUM_AUTH_ACL_FILE", "a path")?;
     let anonymous = parser.switch("STRAUM_AUTH_ALLOW_ANONYMOUS", passwords.is_none())?;
-    if passwords.is_none() && acl.is_none() {
-        return if anonymous {
-            Ok(None)
-        } else {
-            Err(ConfigError::NobodyAllowed)
-        };
+    if passwords.is_none() && acl.is_none() && !anonymous {
+        return Err(ConfigError::NobodyAllowed);
     }
-    let read = |name: &'static str, path: &Option<String>| match path {
-        None => Ok(String::new()),
-        Some(path) => std::fs::read_to_string(path).map_err(|error| ConfigError::Unreadable {
+    Ok((passwords, acl, anonymous))
+}
+
+/// The credential files, read and checked: at startup and on every reload
+/// (D-166 A), by the same rules. A file that cannot be read or parsed is an
+/// error, as is a configuration no client could connect with.
+fn load_authority(
+    passwords: Option<&str>,
+    acl: Option<&str>,
+    anonymous: bool,
+) -> Result<Option<auth::Authority>, ConfigError> {
+    if passwords.is_none() && acl.is_none() {
+        return Ok(None);
+    }
+    let read = |name: &'static str, path: &str| {
+        std::fs::read_to_string(path).map_err(|error| ConfigError::Unreadable {
             name,
-            path: path.clone(),
+            path: path.to_owned(),
             reason: error.to_string(),
-        }),
+        })
     };
-    let rules = match &acl {
-        Some(_) => Some(read("STRAUM_AUTH_ACL_FILE", &acl)?),
-        None => None,
-    };
-    let authority = auth::Authority::parse(
-        &read("STRAUM_AUTH_PASSWORD_FILE", &passwords)?,
-        rules.as_deref(),
-        anonymous,
-    )?;
+    let rules = acl
+        .map(|path| read("STRAUM_AUTH_ACL_FILE", path))
+        .transpose()?;
+    let passwords = passwords
+        .map(|path| read("STRAUM_AUTH_PASSWORD_FILE", path))
+        .transpose()?
+        .unwrap_or_default();
+    let authority = auth::Authority::parse(&passwords, rules.as_deref(), anonymous)?;
     if authority.admits_nobody() {
         return Err(ConfigError::NobodyAllowed);
     }
     Ok(Some(authority))
 }
 
+/// Every client named, none anonymous: with TLS, what lets the MQTT
+/// listener leave loopback (D-164 A).
+fn secures(authority: &auth::Authority) -> bool {
+    authority.users() > 0 && !authority.allows_anonymous()
+}
+
+/// D-160 A: a correct ACL file that grants nobody anything starts, with a
+/// warning; it is never read as a permission.
+fn warnings_for(authority: Option<&auth::Authority>) -> Vec<&'static str> {
+    if authority.is_some_and(auth::Authority::grants_no_action) {
+        vec![
+            "STRAUM_AUTH_ACL_FILE grants no user and no anonymous client anything: clients \
+             can connect, but every PUBLISH and SUBSCRIBE will be refused",
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+/// What a SIGHUP reloads (D-166 A): the files named at startup. The settings
+/// are not read again, so a reload never turns TLS or credentials on or off,
+/// nor lets anonymous clients in. An MQTT listener exposed on the strength
+/// of TLS and credentials (D-164 A) stays secured: TLS stays on, anonymous
+/// clients stay refused, and a password file left without users is refused
+/// as a configuration nobody could connect with.
+#[derive(Debug, Clone)]
+pub struct Access {
+    passwords: Option<String>,
+    acl: Option<String>,
+    anonymous: bool,
+    certificate: Option<String>,
+    key: Option<String>,
+}
+
+/// A reload's files, every one read and checked, none in use yet.
+#[derive(Debug)]
+pub struct Reloaded {
+    pub authority: Option<auth::Authority>,
+    pub tls: Option<transport::Loaded>,
+    pub warnings: Vec<&'static str>,
+}
+
+impl Access {
+    /// Reads and checks every file again by the start's rules; nothing is
+    /// used unless all of them pass (D-166 A).
+    pub fn reload(&self) -> Result<Reloaded, ConfigError> {
+        let authority = load_authority(
+            self.passwords.as_deref(),
+            self.acl.as_deref(),
+            self.anonymous,
+        )?;
+        let tls = match (&self.certificate, &self.key) {
+            (Some(certificate), Some(key)) => Some(
+                transport::Tls::load(Path::new(certificate), Path::new(key))
+                    .map_err(|error| ConfigError::Tls(error.to_string()))?,
+            ),
+            _ => None,
+        };
+        Ok(Reloaded {
+            warnings: warnings_for(authority.as_ref()),
+            authority,
+            tls,
+        })
+    }
+}
+
 /// D-164 A: TLS on the MQTT listener, from a PEM certificate chain and its
-/// key, read once at startup. Both or neither; a file that cannot be read or
-/// holds no certificate or key refuses the start: a node must never come up
-/// in plaintext instead.
-fn tls(parser: &mut Parser) -> Result<Option<transport::Tls>, ConfigError> {
+/// key, read once at startup and again on SIGHUP (D-166 A). Both or
+/// neither; a file that does not load refuses the start: a node must never
+/// come up in plaintext instead.
+fn tls_paths(parser: &mut Parser) -> Result<(Option<String>, Option<String>), ConfigError> {
     let certificate: Option<String> = parser.optional_value("STRAUM_TLS_CERT_PATH", "a path")?;
     let key: Option<String> = parser.optional_value("STRAUM_TLS_KEY_PATH", "a path")?;
-    match (certificate, key) {
-        (None, None) => Ok(None),
-        (Some(certificate), Some(key)) => transport::Tls::from_pem_files(
-            std::path::Path::new(&certificate),
-            std::path::Path::new(&key),
-        )
-        .map(Some)
-        .map_err(|error| ConfigError::Tls(error.to_string())),
-        _ => Err(ConfigError::TlsPair),
+    if certificate.is_some() != key.is_some() {
+        return Err(ConfigError::TlsPair);
     }
+    Ok((certificate, key))
 }
 
 impl Parser {
@@ -942,5 +1014,38 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// D-166 A: a reload reads and checks every file by the start's rules;
+    /// it fails on a file that fails, and on files that would no longer
+    /// secure an MQTT listener beyond loopback.
+    #[test]
+    fn a_reload_applies_the_start_rules_and_refuses_what_would_loosen_them() {
+        let (cert, key) = certificate("reload");
+        let alice = auth::Authority::hash_password(b"pw").unwrap();
+        let passwords = File::new("passwords-reload", &format!("alice:{alice}\n"));
+        let mut pairs = VALID.to_vec();
+        pairs.extend_from_slice(&[
+            ("STRAUM_CLUSTER_MQTT_LISTEN", "0.0.0.0:8883"),
+            ("STRAUM_TLS_CERT_PATH", cert.path()),
+            ("STRAUM_TLS_KEY_PATH", key.path()),
+            ("STRAUM_AUTH_PASSWORD_FILE", passwords.path()),
+        ]);
+        let settings = parse(&pairs).unwrap();
+        let access = settings.access.unwrap();
+        let reloaded = access.reload().unwrap();
+        assert_eq!(reloaded.authority.unwrap().users(), 1);
+        assert!(reloaded.tls.is_some());
+
+        std::fs::write(&passwords.0, "alice\n").unwrap();
+        assert!(matches!(access.reload(), Err(ConfigError::Credentials(_))));
+        std::fs::write(&passwords.0, "# nobody now\n").unwrap();
+        assert_eq!(access.reload().err(), Some(ConfigError::NobodyAllowed));
+        std::fs::write(&key.0, "not a key\n").unwrap();
+        std::fs::write(&passwords.0, format!("alice:{alice}\n")).unwrap();
+        assert!(matches!(access.reload(), Err(ConfigError::Tls(_))));
+
+        // Without TLS settings or credentials there is nothing to reload.
+        assert!(parse(&VALID).unwrap().access.is_none());
     }
 }
