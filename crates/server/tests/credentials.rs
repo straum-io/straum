@@ -304,4 +304,62 @@ fn credentials_decide_who_connects_and_what_each_may_do() {
         std::thread::sleep(Duration::from_millis(200));
     }
     drop(admitted);
+
+    // D-166 A: SIGHUP reloads the files. carol replaces alice; a session
+    // alice opened before keeps what it was admitted with.
+    let hangup = |servers: &Servers, times: usize, what: &str| {
+        for child in &servers.children {
+            Command::new("kill")
+                .args(["-HUP", &child.id().to_string()])
+                .status()
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while log().matches(what).count() < times {
+            assert!(
+                Instant::now() < deadline,
+                "no \"{what}\" in the log: {}",
+                log()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let (mut before, rc) =
+        connect_as(mqtt, "before-reload", Some("alice"), Some("right")).expect("a CONNACK");
+    assert_eq!(rc, 0);
+    std::fs::write(&passwords, format!("carol:{}\n", hash(b"carols"))).unwrap();
+    std::fs::write(&acl, "user carol\nreadwrite open/#\n").unwrap();
+    hangup(&servers, 1, "SIGHUP: TLS and credential files reloaded");
+    assert_eq!(
+        connect(mqtt, Some("alice"), Some("right")).map(|(_, rc)| rc),
+        Some(4)
+    );
+    assert_eq!(
+        connect(mqtt, Some("carol"), Some("carols")).map(|(_, rc)| rc),
+        Some(0)
+    );
+    publish(&mut before, "open/r", 9);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let acked = loop {
+        match read_packet(&mut before, Duration::from_secs(10)) {
+            Some((0x40, ack)) if ack == 9u16.to_be_bytes() => break true,
+            Some(_) => {}
+            None => break false,
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+    };
+    assert!(
+        acked,
+        "a session admitted before the reload keeps its grant"
+    );
+
+    // A broken file is refused, and what is in use stays: carol still gets in.
+    std::fs::write(&passwords, "carol\n").unwrap();
+    hangup(&servers, 1, "SIGHUP: reload refused");
+    assert_eq!(
+        connect(mqtt, Some("carol"), Some("carols")).map(|(_, rc)| rc),
+        Some(0)
+    );
 }

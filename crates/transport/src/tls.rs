@@ -1,15 +1,20 @@
 //! Server-side TLS.
 //!
 //! The certificate is read once at startup: a broker that cannot load its own
-//! key must not come up listening in plaintext instead.
+//! key must not come up listening in plaintext instead. It can be replaced
+//! later (D-166 A): every clone of a [`Tls`] presents the same certificate,
+//! and [`Tls::install`] swaps it for new handshakes, leaving open connections
+//! as they are.
 
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert};
+use tokio_rustls::rustls::sign::CertifiedKey;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
@@ -27,10 +32,31 @@ pub enum TlsError {
     Rustls(#[from] tokio_rustls::rustls::Error),
 }
 
+/// The certificate in use, shared by every clone of a [`Tls`].
+#[derive(Debug)]
+struct Current(RwLock<Arc<CertifiedKey>>);
+
+impl ResolvesServerCert for Current {
+    fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.0.read().ok().map(|key| Arc::clone(&key))
+    }
+}
+
+/// A certificate chain and its key, read and checked (the key matches the
+/// certificate), not yet in use.
+pub struct Loaded(Arc<CertifiedKey>);
+
+impl std::fmt::Debug for Loaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Loaded")
+    }
+}
+
 /// A loaded certificate and key, ready to wrap accepted connections.
 #[derive(Clone)]
 pub struct Tls {
     acceptor: TlsAcceptor,
+    current: Arc<Current>,
 }
 
 impl std::fmt::Debug for Tls {
@@ -42,16 +68,34 @@ impl std::fmt::Debug for Tls {
 impl Tls {
     /// Loads a PEM certificate chain and its private key.
     pub fn from_pem_files(certificate: &Path, key: &Path) -> Result<Self, TlsError> {
-        let chain = certificates(certificate)?;
-        let key = private_key(key)?;
-
+        let Loaded(loaded) = Self::load(certificate, key)?;
+        let current = Arc::new(Current(RwLock::new(loaded)));
         let config = ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(chain, key)?;
-
+            .with_cert_resolver(Arc::clone(&current) as Arc<dyn ResolvesServerCert>);
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),
+            current,
         })
+    }
+
+    /// Reads and checks a certificate chain and key without using them: a
+    /// reload loads every file before it installs anything (D-166 A).
+    pub fn load(certificate: &Path, key: &Path) -> Result<Loaded, TlsError> {
+        let chain = certificates(certificate)?;
+        let key = private_key(key)?;
+        let provider = tokio_rustls::rustls::crypto::ring::default_provider();
+        // `from_der` refuses a key that does not belong to the certificate.
+        Ok(Loaded(Arc::new(CertifiedKey::from_der(
+            chain, key, &provider,
+        )?)))
+    }
+
+    /// From the next handshake on, presents `loaded`.
+    pub fn install(&self, Loaded(loaded): Loaded) {
+        if let Ok(mut current) = self.current.0.write() {
+            *current = loaded;
+        }
     }
 
     pub(crate) fn acceptor(&self) -> &TlsAcceptor {

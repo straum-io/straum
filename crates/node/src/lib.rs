@@ -213,6 +213,8 @@ pub struct Node {
     effects: broadcast::Sender<(u64, u64, Vec<Effect>)>,
     /// Operator handoffs, each with where its answer goes.
     hand_offs: mpsc::Sender<oneshot::Sender<Result<(), cluster::ClusterError>>>,
+    /// New credentials for the next CONNECTs (D-166 A).
+    reloads: mpsc::Sender<Arc<auth::Authority>>,
     metrics: mpsc::Sender<oneshot::Sender<metrics::Snapshot>>,
     trace: mpsc::Sender<TraceRequest>,
     status: watch::Receiver<Status>,
@@ -836,6 +838,7 @@ impl Node {
         let (stop, mut stop_rx) = oneshot::channel::<()>();
         let (hand_offs, mut hand_offs_rx) =
             mpsc::channel::<oneshot::Sender<Result<(), cluster::ClusterError>>>(4);
+        let (reloads, mut reloads_rx) = mpsc::channel::<Arc<auth::Authority>>(4);
         // Snapshots on demand (D-112): nothing is built while nobody asks.
         let (metrics, mut metrics_rx) = mpsc::channel::<oneshot::Sender<metrics::Snapshot>>(4);
         let (trace, mut trace_rx) = mpsc::channel::<TraceRequest>(4);
@@ -952,6 +955,13 @@ impl Node {
                     Some(proposal) = proposals_rx.recv() => node.propose(proposal),
                     Some(reply) = hand_offs_rx.recv() => {
                         let _ = reply.send(node.core.hand_off());
+                    }
+                    // Checks already running keep the credentials they started
+                    // with; open sessions keep their grants (D-166 A).
+                    Some(authority) = reloads_rx.recv() => {
+                        if node.authority.is_some() {
+                            node.authority = Some(authority);
+                        }
                     }
                     Some(reply) = metrics_rx.recv() => {
                         let _ = reply.send(node.snapshot(id, state.applied()));
@@ -1206,6 +1216,7 @@ impl Node {
             mqtt: mqtt_listen,
             proposals,
             hand_offs,
+            reloads,
             metrics,
             metrics_listen,
             trace,
@@ -1222,6 +1233,13 @@ impl Node {
     /// the link to it otherwise.
     pub async fn propose(&self, proposal: Proposal) {
         let _ = self.proposals.send(proposal).await;
+    }
+
+    /// Credentials for the CONNECTs from now on (D-166 A): the caller has
+    /// checked them. Only replaces credentials the node started with, never
+    /// turns them on. `false` once the node stopped.
+    pub async fn reload_authority(&self, authority: Arc<auth::Authority>) -> bool {
+        self.reloads.send(authority).await.is_ok()
     }
 
     /// Asks this node to hand its slot over to the next owner in the

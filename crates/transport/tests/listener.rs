@@ -269,6 +269,61 @@ mod tls {
         }
     }
 
+    /// D-166 A: a new certificate, installed, is what the next handshake
+    /// presents; one loaded with another certificate's key is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_installed_certificate_serves_the_next_handshake() {
+        let (dir, old_cert, old_key, _) = certificate();
+        // A second certificate, under its own names: `certificate()` reuses
+        // one directory per thread.
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let (new_cert, new_key) = (dir.0.join("new-cert.pem"), dir.0.join("new-key.pem"));
+        std::fs::write(&new_cert, issued.cert.pem()).unwrap();
+        std::fs::write(&new_key, issued.signing_key.serialize_pem()).unwrap();
+        let new_der = issued.cert.der().to_vec();
+        assert!(
+            Tls::load(&old_cert, &new_key).is_err(),
+            "a key of another certificate"
+        );
+        let tls = Tls::from_pem_files(&old_cert, &old_key).unwrap();
+        let listener = Listener::bind(config(), budget(), Some(tls.clone())).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let accepted = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    if let Ok(mut connection) = accepted.establish().await {
+                        let _ = connection.writer.write_all(b"ok").await;
+                    }
+                });
+            }
+        });
+        // A client that trusts only the new certificate.
+        let handshake = || {
+            let der = new_der.clone();
+            async move {
+                let mut roots = RootCertStore::empty();
+                roots
+                    .add(tokio_rustls::rustls::pki_types::CertificateDer::from(der))
+                    .unwrap();
+                let config = ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+                let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let name = ServerName::try_from("localhost").unwrap();
+                connector.connect(name, socket).await.is_ok()
+            }
+        };
+        assert!(
+            !handshake().await,
+            "the old certificate is presented before the swap"
+        );
+        tls.install(Tls::load(&new_cert, &new_key).unwrap());
+        assert!(handshake().await, "the new one after it");
+        server.abort();
+    }
+
     #[test]
     fn a_missing_certificate_is_a_startup_error() {
         let missing = std::path::Path::new("/nonexistent/cert.pem");
