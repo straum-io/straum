@@ -1,5 +1,12 @@
 # Straum
 
+[![CI](https://github.com/straum-io/straum/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/straum-io/straum/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/straum-io/straum?include_prereleases&sort=semver)](https://github.com/straum-io/straum/releases)
+[![Docker image](https://img.shields.io/docker/v/straumio/straum?sort=semver&label=docker)](https://hub.docker.com/r/straumio/straum)
+[![PPA](https://img.shields.io/badge/apt-ppa%3Astraum%2Fppa-E95420)](https://launchpad.net/~straum/+archive/ubuntu/ppa)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+![Status: experimental](https://img.shields.io/badge/status-experimental-orange)
+
 A clustered MQTT broker that acknowledges a publish only after a
 majority of its nodes has committed it to one replicated log.
 
