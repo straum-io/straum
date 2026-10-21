@@ -3,7 +3,7 @@
 //! MQTT — the gateway in the node loop does.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -50,13 +50,14 @@ pub enum Event {
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
-/// Connections not yet admitted, per source address (D-165 A): from the
+/// Connections not yet admitted, per source (D-165 A; a source is an IPv4
+/// address or an IPv6 /64, D-168 A): from the
 /// accept until the gateway admits the CONNECT, or the connection goes. At
-/// most `max` per address wait at once; a connection past that is closed at
-/// once, so one address cannot take every slot. The map holds only
-/// addresses with a connection waiting: bounded by the waiting connections
+/// most `max` per source wait at once; a connection past that is closed at
+/// once, so one source cannot take every slot. The map holds only sources
+/// with a connection waiting: bounded by the waiting connections
 /// (handshakes, connections queued for the node loop's `Opened`, and the
-/// gateway's unadmitted ones), at most 16 per address.
+/// gateway's unadmitted ones), at most 16 per source.
 #[derive(Debug)]
 pub struct Waiting {
     max: usize,
@@ -77,7 +78,7 @@ impl Waiting {
             .counts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = counts.entry(source).or_insert(0);
+        let count = counts.entry(unit(source)).or_insert(0);
         if *count >= self.max {
             return false;
         }
@@ -90,10 +91,10 @@ impl Waiting {
             .counts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = counts.get_mut(&source) {
+        if let Some(count) = counts.get_mut(&unit(source)) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                counts.remove(&source);
+                counts.remove(&unit(source));
             }
         }
     }
@@ -101,6 +102,22 @@ impl Waiting {
     #[cfg(test)]
     fn sources(&self) -> usize {
         self.counts.lock().map_or(0, |c| c.len())
+    }
+}
+
+/// What one host controls, the key the cap counts by (D-168 A): an IPv4
+/// address, or an IPv6 /64 (a host commonly holds a whole one); an
+/// IPv4-mapped IPv6 address counts as its IPv4 address.
+fn unit(source: IpAddr) -> IpAddr {
+    match source {
+        IpAddr::V4(_) => source,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let [a, b, c, d, ..] = v6.segments();
+                IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+            }
+        },
     }
 }
 
@@ -232,5 +249,33 @@ mod tests {
         assert_eq!(waiting.sources(), 0);
         waiting.leave(b);
         assert_eq!(waiting.sources(), 0, "leaving twice is harmless");
+    }
+
+    /// D-168 A: an IPv6 /64 is one source; another /64 is another; an
+    /// IPv4-mapped address is its IPv4 address.
+    #[test]
+    fn an_ipv6_prefix_is_one_source() {
+        let waiting = Waiting::new(2);
+        let one: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let same_prefix: IpAddr = "2001:db8:1:2:ffff::7".parse().unwrap();
+        let other_prefix: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(waiting.enter(one));
+        assert!(waiting.enter(same_prefix));
+        assert!(!waiting.enter(one), "two in one /64 fill it");
+        assert!(waiting.enter(other_prefix), "another /64 is served");
+        waiting.leave(same_prefix);
+        assert!(
+            waiting.enter(one),
+            "a slot left under one address frees the /64"
+        );
+
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        assert!(waiting.enter(v4));
+        assert!(waiting.enter(mapped));
+        assert!(
+            !waiting.enter(v4),
+            "a mapped address counts as its IPv4 one"
+        );
     }
 }
