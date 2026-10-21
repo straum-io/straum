@@ -38,13 +38,27 @@ pub enum ConfigError {
     #[error("{0} must be set")]
     Missing(&'static str),
     #[error(
-        "{name} is {address}, reachable beyond this host, with no credentials and no TLS; \
-         set STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1 to accept that on an isolated, trusted network"
+        "{name} is {address}, reachable beyond this host, with no TLS: credentials, if any, \
+         would cross it in clear; set STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1 to accept that \
+         on an isolated, trusted network"
     )]
     Exposed {
         name: &'static str,
         address: SocketAddr,
     },
+    #[error("{name}: {path} cannot be read: {reason}")]
+    Unreadable {
+        name: &'static str,
+        path: String,
+        reason: String,
+    },
+    #[error("credentials: {0}")]
+    Credentials(#[from] auth::AuthError),
+    #[error(
+        "STRAUM_AUTH_ALLOW_ANONYMOUS=0 with no user in STRAUM_AUTH_PASSWORD_FILE: \
+         no client could connect"
+    )]
+    NobodyAllowed,
     #[error("cluster: {0}")]
     Cluster(#[from] node::ConfigError),
 }
@@ -106,8 +120,9 @@ impl Settings {
             Some(own) => parser.parse_value("STRAUM_CLUSTER_LISTEN", own, "a socket address")?,
             None => parser.required("STRAUM_CLUSTER_LISTEN", "a socket address")?,
         };
-        // Loopback unless asked: the path has no credentials and no TLS, and
-        // the experimental switch is no security mechanism (D-107).
+        // Loopback unless asked: the path has no TLS, so credentials would
+        // cross the network in clear (D-158 A), and the experimental switch
+        // is no security mechanism (D-107).
         let mqtt = parser.parse_value(
             "STRAUM_CLUSTER_MQTT_LISTEN",
             SocketAddr::from(([127, 0, 0, 1], 1883)),
@@ -131,6 +146,7 @@ impl Settings {
                 }
             }
         }
+        let authority = credentials(&mut parser)?;
         let data: String = parser.required("STRAUM_CLUSTER_DATA_DIR", "a directory")?;
         let heartbeat = parser.number(
             "STRAUM_CLUSTER_HEARTBEAT_MS",
@@ -157,7 +173,7 @@ impl Settings {
             u64::MAX,
         )?;
         let effective = parser.finish()?;
-        let node = node::Experimental {
+        let mut node = node::Experimental {
             id,
             voters,
             listen,
@@ -170,6 +186,9 @@ impl Settings {
             metrics,
         }
         .node_config()?;
+        if let Some(mqtt) = node.mqtt.as_mut() {
+            mqtt.authority = authority.map(std::sync::Arc::new);
+        }
         Ok(Self {
             node,
             log_level,
@@ -177,6 +196,42 @@ impl Settings {
             effective,
         })
     }
+}
+
+/// D-158 A: who may connect. No file: anybody, anything, as before
+/// credentials. A password file: its users, and anonymous clients only if
+/// `STRAUM_AUTH_ALLOW_ANONYMOUS=1`. An ACL file restricts the users it
+/// names, and anonymous clients by its `anonymous` section. Both files are
+/// read once, at startup; a file that cannot be read or parsed refuses the
+/// start.
+fn credentials(parser: &mut Parser) -> Result<Option<auth::Authority>, ConfigError> {
+    let passwords: Option<String> = parser.optional_value("STRAUM_AUTH_PASSWORD_FILE", "a path")?;
+    let acl: Option<String> = parser.optional_value("STRAUM_AUTH_ACL_FILE", "a path")?;
+    let anonymous = parser.switch("STRAUM_AUTH_ALLOW_ANONYMOUS", passwords.is_none())?;
+    if passwords.is_none() && acl.is_none() {
+        return if anonymous {
+            Ok(None)
+        } else {
+            Err(ConfigError::NobodyAllowed)
+        };
+    }
+    let read = |name: &'static str, path: &Option<String>| match path {
+        None => Ok(String::new()),
+        Some(path) => std::fs::read_to_string(path).map_err(|error| ConfigError::Unreadable {
+            name,
+            path: path.clone(),
+            reason: error.to_string(),
+        }),
+    };
+    let authority = auth::Authority::parse(
+        &read("STRAUM_AUTH_PASSWORD_FILE", &passwords)?,
+        &read("STRAUM_AUTH_ACL_FILE", &acl)?,
+        anonymous,
+    )?;
+    if authority.users() == 0 && !authority.allows_anonymous() {
+        return Err(ConfigError::NobodyAllowed);
+    }
+    Ok(Some(authority))
 }
 
 impl Parser {
@@ -307,6 +362,27 @@ impl Parser {
                 expected: "`0` or `1`",
             }),
         }
+    }
+
+    /// `1` or `0`, with a default that depends on other settings.
+    fn switch(&mut self, name: &'static str, default: bool) -> Result<bool, ConfigError> {
+        let value = match self.raw(name) {
+            None => {
+                self.record(name, u8::from(default), Source::Default);
+                return Ok(default);
+            }
+            Some("0") => false,
+            Some("1") => true,
+            Some(raw) => {
+                return Err(ConfigError::Malformed {
+                    name,
+                    value: raw.to_owned(),
+                    expected: "`0` or `1`",
+                });
+            }
+        };
+        self.record(name, u8::from(value), Source::Env);
+        Ok(value)
     }
 
     /// A value with no default: unset is an error (the node's identity and
@@ -557,5 +633,114 @@ mod tests {
             ),
             Err(ConfigError::Malformed { .. })
         ));
+    }
+
+    /// A file under the system temp directory with `contents`, removed on
+    /// drop.
+    struct File(PathBuf);
+
+    impl File {
+        fn new(name: &str, contents: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("straum-config-{}-{name}", std::process::id()));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for File {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn authority(settings: &Settings) -> Option<&auth::Authority> {
+        settings.node.mqtt.as_ref()?.authority.as_deref()
+    }
+
+    /// D-158 A: no file, everybody as before; a password file, its users
+    /// and no anonymous client unless allowed.
+    #[test]
+    fn credentials_are_off_without_files_and_anonymous_is_off_with_a_password_file() {
+        assert!(authority(&parse(&VALID).unwrap()).is_none());
+        let hash = auth::Authority::hash_password(b"pw").unwrap();
+        let passwords = File::new("passwords-a", &format!("alice:{hash}\n"));
+        let set = [("STRAUM_AUTH_PASSWORD_FILE", passwords.path())];
+        let mut pairs = VALID.to_vec();
+        pairs.extend_from_slice(&set);
+        let settings = parse(&pairs).unwrap();
+        let authority = authority(&settings).unwrap();
+        assert_eq!(authority.users(), 1);
+        assert!(!authority.allows_anonymous());
+        pairs.push(("STRAUM_AUTH_ALLOW_ANONYMOUS", "1"));
+        let settings = parse(&pairs).unwrap();
+        assert!(authority_allows_anonymous(&settings));
+    }
+
+    fn authority_allows_anonymous(settings: &Settings) -> bool {
+        authority(settings).is_some_and(auth::Authority::allows_anonymous)
+    }
+
+    #[test]
+    fn a_configuration_nobody_can_connect_with_is_refused() {
+        assert_eq!(
+            with(&[("STRAUM_AUTH_ALLOW_ANONYMOUS", "0")], "").err(),
+            Some(ConfigError::NobodyAllowed)
+        );
+        let empty = File::new("passwords-empty", "# nobody yet\n");
+        let mut pairs = VALID.to_vec();
+        pairs.push(("STRAUM_AUTH_PASSWORD_FILE", empty.path()));
+        assert_eq!(parse(&pairs).err(), Some(ConfigError::NobodyAllowed));
+    }
+
+    #[test]
+    fn an_unreadable_or_malformed_credentials_file_refuses_the_start() {
+        let mut pairs = VALID.to_vec();
+        pairs.push(("STRAUM_AUTH_PASSWORD_FILE", "/nonexistent/straum-passwords"));
+        assert!(matches!(
+            parse(&pairs),
+            Err(ConfigError::Unreadable {
+                name: "STRAUM_AUTH_PASSWORD_FILE",
+                ..
+            })
+        ));
+        let malformed = File::new("passwords-malformed", "alice\n");
+        let mut pairs = VALID.to_vec();
+        pairs.push(("STRAUM_AUTH_PASSWORD_FILE", malformed.path()));
+        assert_eq!(
+            parse(&pairs).err(),
+            Some(ConfigError::Credentials(
+                auth::AuthError::MalformedCredentials { line: 1 }
+            ))
+        );
+        assert!(matches!(
+            with(&[("STRAUM_AUTH_ALLOW_ANONYMOUS", "yes")], ""),
+            Err(ConfigError::Malformed {
+                name: "STRAUM_AUTH_ALLOW_ANONYMOUS",
+                ..
+            })
+        ));
+    }
+
+    /// An ACL file alone restricts anonymous clients to its `anonymous`
+    /// section.
+    #[test]
+    fn an_acl_file_alone_restricts_anonymous_clients() {
+        let acl = File::new("acl-anonymous", "anonymous\nsubscribe public/#\n");
+        let mut pairs = VALID.to_vec();
+        pairs.push(("STRAUM_AUTH_ACL_FILE", acl.path()));
+        let settings = parse(&pairs).unwrap();
+        let authority = authority(&settings).unwrap();
+        let auth::Authenticated::Allowed(permissions) = authority.authenticate(None, None) else {
+            panic!("anonymous clients are let in");
+        };
+        let filter = |f: &'static str| {
+            domain::TopicFilter::new(bytes::Bytes::from_static(f.as_bytes())).unwrap()
+        };
+        assert!(permissions.may_subscribe(&filter("public/#")));
+        assert!(!permissions.may_subscribe(&filter("private/#")));
     }
 }

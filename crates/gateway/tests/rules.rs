@@ -13,7 +13,7 @@ use codec::{
     ReasonCode, Sender, Subscribe, SubscriptionOptions, Version,
 };
 use domain::{ClientId, Topic, TopicFilter};
-use gateway::{Action, Config, Gateway};
+use gateway::{Action, Config, Gateway, Grant, Verdict};
 use journal::{Chain, Entry, decode};
 
 fn config() -> Config {
@@ -34,6 +34,7 @@ fn config() -> Config {
         max_waiting_bytes: 1 << 16,
         max_total_waiting_bytes: 1 << 20,
         max_retries: 8,
+        authenticate: false,
     }
 }
 
@@ -50,6 +51,8 @@ struct Rig {
     sent: Vec<(u64, Packet)>,
     closed: Vec<u64>,
     versions: std::collections::HashMap<u64, Version>,
+    /// Credentials the gateway asked the driver to check.
+    asked: Vec<(u64, Option<Bytes>, Option<Bytes>)>,
 }
 
 impl Rig {
@@ -62,6 +65,7 @@ impl Rig {
             sent: Vec::new(),
             closed: Vec::new(),
             versions: Default::default(),
+            asked: Vec::new(),
         };
         rig.drain();
         rig
@@ -93,6 +97,11 @@ impl Rig {
                     }
                 }
                 Action::Close { conn } => self.closed.push(conn),
+                Action::Authenticate {
+                    conn,
+                    username,
+                    password,
+                } => self.asked.push((conn, username, password)),
             }
         }
     }
@@ -723,4 +732,246 @@ fn wills_persistent_sessions_and_expiry_are_refused_at_connect() {
             "case {conn}: {version:?}, clean start {clean_start}"
         );
     }
+}
+
+/// D-158 A: refuses publishing and subscribing under `denied`, allows the rest.
+#[derive(Debug)]
+struct Deny(&'static str);
+
+impl Grant for Deny {
+    fn may_publish(&self, topic: &Topic) -> bool {
+        !topic.as_bytes().starts_with(self.0.as_bytes())
+    }
+    fn may_subscribe(&self, filter: &TopicFilter) -> bool {
+        !filter.as_bytes().starts_with(self.0.as_bytes())
+    }
+}
+
+fn connect_packet(id: &'static str, version: Version, user: Option<&'static str>) -> Packet {
+    Packet::Connect(Box::new(Connect {
+        version,
+        client_id: ClientId::new(Bytes::from_static(id.as_bytes())).unwrap(),
+        clean_start: true,
+        keep_alive_secs: 0,
+        will: None,
+        username: user.map(|u| Bytes::from_static(u.as_bytes())),
+        password: user.map(|_| Bytes::from_static(b"secret")),
+        properties: ConnectProperties::default(),
+    }))
+}
+
+impl Rig {
+    fn authenticating() -> Self {
+        let mut rig = Self::new(Config {
+            authenticate: true,
+            ..config()
+        });
+        rig.commit();
+        assert!(rig.gateway.ready());
+        rig
+    }
+
+    /// Connects through the credentials check with what `grant` allows.
+    fn admitted(&mut self, conn: u64, version: Version, grant: Deny) {
+        self.versions.insert(conn, version);
+        assert!(self.gateway.accept(conn, T0));
+        self.client(conn, connect_packet("c", version, Some("alice")), version);
+        self.gateway
+            .authenticated(conn, Verdict::Allowed(Box::new(grant)), T0);
+        self.drain();
+        assert_eq!(
+            connack_reason(&self.take_sent(), conn),
+            Some(ReasonCode::Success)
+        );
+    }
+}
+
+#[test]
+fn a_connect_is_answered_only_once_its_credentials_are_checked() {
+    let mut rig = Rig::authenticating();
+    rig.versions.insert(1, Version::V5);
+    assert!(rig.gateway.accept(1, T0));
+    rig.client(
+        1,
+        connect_packet("c", Version::V5, Some("alice")),
+        Version::V5,
+    );
+    assert_eq!(
+        rig.asked,
+        vec![(
+            1,
+            Some(Bytes::from_static(b"alice")),
+            Some(Bytes::from_static(b"secret"))
+        )]
+    );
+    assert!(rig.take_sent().is_empty(), "no CONNACK before the verdict");
+    assert_eq!(rig.gateway.session(1), None);
+    assert!(!rig.gateway.wants_read(1));
+    rig.gateway
+        .authenticated(1, Verdict::Allowed(Box::new(Deny("none"))), T0);
+    rig.drain();
+    assert_eq!(
+        connack_reason(&rig.take_sent(), 1),
+        Some(ReasonCode::Success)
+    );
+    assert!(rig.gateway.session(1).is_some());
+}
+
+#[test]
+fn bad_credentials_and_a_refused_anonymous_client_are_told_so_and_closed() {
+    for version in [Version::V5, Version::V311] {
+        for (verdict, reason) in [
+            (Verdict::BadCredentials, ReasonCode::BadUserNameOrPassword),
+            (Verdict::NotAuthorized, ReasonCode::NotAuthorized),
+        ] {
+            let mut rig = Rig::authenticating();
+            rig.versions.insert(1, version);
+            assert!(rig.gateway.accept(1, T0));
+            rig.client(1, connect_packet("c", version, None), version);
+            assert_eq!(rig.asked.len(), 1);
+            rig.gateway.authenticated(1, verdict, T0);
+            rig.drain();
+            // 3.1.1's return codes 4 and 5 decode to the same names.
+            assert_eq!(connack_reason(&rig.take_sent(), 1), Some(reason));
+            assert_eq!(rig.closed, vec![1]);
+            assert!(rig.proposed.is_empty(), "a refused CONNECT writes nothing");
+        }
+    }
+}
+
+#[test]
+fn what_follows_a_connect_waits_for_its_verdict() {
+    let mut rig = Rig::authenticating();
+    rig.versions.insert(1, Version::V5);
+    assert!(rig.gateway.accept(1, T0));
+    let mut bytes = BytesMut::new();
+    for packet in [
+        connect_packet("c", Version::V5, Some("alice")),
+        publish("a/b", Qos::AtLeastOnce, 1),
+    ] {
+        codec::encode(&packet, Version::V5, Sender::Client, &mut bytes).unwrap();
+    }
+    rig.gateway.received(1, &bytes, T0);
+    rig.drain();
+    assert!(rig.proposed.is_empty(), "the publish waits for the verdict");
+    rig.gateway
+        .authenticated(1, Verdict::Allowed(Box::new(Deny("none"))), T0);
+    rig.drain();
+    assert!(matches!(&rig.proposed[..], [Proposal::Publish { .. }]));
+}
+
+#[test]
+fn a_verdict_for_a_connection_that_timed_out_is_ignored() {
+    let mut rig = Rig::authenticating();
+    rig.versions.insert(1, Version::V5);
+    assert!(rig.gateway.accept(1, T0));
+    rig.client(
+        1,
+        connect_packet("c", Version::V5, Some("alice")),
+        Version::V5,
+    );
+    rig.gateway.tick(Duration::from_secs(11));
+    rig.drain();
+    assert_eq!(rig.closed, vec![1]);
+    rig.gateway.authenticated(
+        1,
+        Verdict::Allowed(Box::new(Deny("none"))),
+        Duration::from_secs(11),
+    );
+    rig.drain();
+    assert!(rig.take_sent().is_empty());
+    assert_eq!(rig.gateway.session(1), None);
+}
+
+#[test]
+fn a_publish_its_session_may_not_make_writes_nothing() {
+    // MQTT 5: QoS 1 is answered "not authorized", QoS 0 dropped.
+    let mut rig = Rig::authenticating();
+    rig.admitted(1, Version::V5, Deny("secret/"));
+    rig.client(1, publish("secret/x", Qos::AtLeastOnce, 7), Version::V5);
+    rig.client(1, publish("secret/y", Qos::AtMostOnce, 0), Version::V5);
+    assert!(rig.proposed.is_empty());
+    let sent = rig.take_sent();
+    assert!(matches!(
+        &sent[..],
+        [(
+            1,
+            Packet::PubAck(PubAck {
+                reason: ReasonCode::NotAuthorized,
+                ..
+            })
+        )]
+    ));
+    assert!(rig.closed.is_empty());
+    rig.client(1, publish("open/x", Qos::AtLeastOnce, 8), Version::V5);
+    assert!(matches!(&rig.proposed[..], [Proposal::Publish { .. }]));
+
+    // 3.1.1 has no refusal to send: the connection closes.
+    let mut rig = Rig::authenticating();
+    rig.admitted(2, Version::V311, Deny("secret/"));
+    rig.client(2, publish("secret/x", Qos::AtLeastOnce, 7), Version::V311);
+    // The session ends (its `SessionGone`); the publish is never proposed.
+    assert!(matches!(&rig.proposed[..], [Proposal::SessionGone { .. }]));
+    assert_eq!(rig.closed, vec![2]);
+}
+
+#[test]
+fn a_filter_its_session_may_not_subscribe_is_refused_and_the_others_proposed() {
+    let mut rig = Rig::authenticating();
+    rig.admitted(1, Version::V5, Deny("secret/"));
+    rig.client(
+        1,
+        subscribe(&[("open/#", Qos::AtLeastOnce), ("secret/#", Qos::AtLeastOnce)]),
+        Version::V5,
+    );
+    assert_eq!(rig.proposed.len(), 1, "only the allowed filter is proposed");
+    rig.commit();
+    let suback = rig.take_sent().into_iter().find_map(|(_, p)| match p {
+        Packet::SubAck(ack) => Some(ack.reasons),
+        _ => None,
+    });
+    assert_eq!(
+        suback,
+        Some(vec![ReasonCode::GrantedQos1, ReasonCode::NotAuthorized])
+    );
+}
+
+#[test]
+fn without_credentials_a_connect_is_answered_at_once() {
+    let mut rig = Rig::ready();
+    rig.connect_as(1, "c", Version::V5, 0);
+    assert!(rig.asked.is_empty());
+    assert_eq!(
+        connack_reason(&rig.take_sent(), 1),
+        Some(ReasonCode::Success)
+    );
+}
+
+/// MQTT 5 §4.6: PUBACKs go out in the order the publishes came. A refusal
+/// behind an allowed QoS 1 publish still waiting for its commit cannot go
+/// first: the connection closes, telling why, and nothing more is proposed.
+#[test]
+fn a_refusal_behind_a_publish_awaiting_commit_closes_instead_of_overtaking_it() {
+    let mut rig = Rig::authenticating();
+    rig.admitted(1, Version::V5, Deny("secret/"));
+    rig.client(1, publish("open/x", Qos::AtLeastOnce, 1), Version::V5);
+    rig.client(1, publish("secret/x", Qos::AtLeastOnce, 2), Version::V5);
+    let sent = rig.take_sent();
+    assert!(
+        !sent.iter().any(|(_, p)| matches!(p, Packet::PubAck(_))),
+        "no PUBACK ahead of the first publish's: {sent:?}"
+    );
+    assert!(sent.iter().any(|(_, p)| matches!(
+        p,
+        Packet::Disconnect(d) if d.reason == ReasonCode::NotAuthorized
+    )));
+    assert_eq!(rig.closed, vec![1]);
+    assert_eq!(
+        rig.proposed
+            .iter()
+            .filter(|p| matches!(p, Proposal::Publish { .. }))
+            .count(),
+        1,
+        "only the allowed publish"
+    );
 }

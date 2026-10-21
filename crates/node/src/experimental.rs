@@ -183,6 +183,8 @@ impl Experimental {
             max_waiting_bytes: 1 << 20,
             max_total_waiting_bytes: 64 << 20,
             max_retries: 1024,
+            // The node sets it from `MqttConfig::authority`.
+            authenticate: false,
         };
         let config = NodeConfig {
             core: cluster::Config {
@@ -222,6 +224,7 @@ impl Experimental {
                 listen: self.mqtt,
                 gateway,
                 write_queue: 1024,
+                authority: None,
             }),
             retain_bytes: self.retain_bytes,
             snapshot_every: 4096,

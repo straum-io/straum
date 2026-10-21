@@ -545,6 +545,7 @@ name = "node"
 version = "0.0.0"
 dependencies = [
  "apply",
+ "auth",
  "bytes",
  "cluster",
  "codec",
@@ -945,6 +946,9 @@ dependencies = [
 name = "server"
 version = "0.0.0"
 dependencies = [
+ "auth",
+ "bytes",
+ "domain",
  "node",
  "thiserror 2.0.20",
  "tokio",

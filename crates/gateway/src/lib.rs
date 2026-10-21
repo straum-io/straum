@@ -39,6 +39,13 @@
 //! 3.1.1 "server unavailable"), so no client believes this server keeps
 //! them (D-78 A, step 7a). Also not yet: enhanced authentication; message
 //! properties through the log (D-65).
+//!
+//! Credentials (D-110 A, D-158 A): with [`Config::authenticate`] set, a
+//! CONNECT is answered only after the driver has checked its user name and
+//! password off the node loop ([`Action::Authenticate`],
+//! [`Gateway::authenticated`]): a password hash is slow by design. The
+//! [`Grant`] it hands back decides each PUBLISH and SUBSCRIBE filter before
+//! anything is proposed, so a refused one writes nothing to the log.
 
 mod properties;
 
@@ -52,7 +59,7 @@ use codec::{
     AckProperties, ConnAck, ConnAckProperties, Disconnect, DisconnectProperties, Packet, PacketId,
     PubAck, Publish, Qos, ReasonCode, RetainHandling, Sender, SubAck, UnsubAck, Version,
 };
-use domain::{ClientId, DeliveryGuarantee, Topic};
+use domain::{ClientId, DeliveryGuarantee, Topic, TopicFilter};
 
 pub type ConnId = u64;
 
@@ -88,6 +95,28 @@ pub struct Config {
     /// connections are refused: while commits stall, every closed session
     /// would otherwise add one more.
     pub max_retries: usize,
+    /// Check every CONNECT's credentials through the driver before it is
+    /// accepted (D-158 A). Off: every client is let in and may do anything,
+    /// as before credentials existed.
+    pub authenticate: bool,
+}
+
+/// What an authenticated session may do: asked for each PUBLISH and each
+/// SUBSCRIBE filter. The driver builds it from its credentials; the gateway
+/// only asks.
+pub trait Grant: std::fmt::Debug + Send {
+    fn may_publish(&self, topic: &Topic) -> bool;
+    fn may_subscribe(&self, filter: &TopicFilter) -> bool;
+}
+
+/// The driver's answer to [`Action::Authenticate`].
+#[derive(Debug)]
+pub enum Verdict {
+    Allowed(Box<dyn Grant>),
+    /// An unknown user name, or a password that does not match.
+    BadCredentials,
+    /// No user name, and anonymous clients are not let in.
+    NotAuthorized,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +128,13 @@ pub enum Action {
     /// Close the socket. The connection is already gone here.
     Close {
         conn: ConnId,
+    },
+    /// Check a CONNECT's credentials off the node loop, and answer with
+    /// [`Gateway::authenticated`]. Only with [`Config::authenticate`].
+    Authenticate {
+        conn: ConnId,
+        username: Option<Bytes>,
+        password: Option<Bytes>,
     },
     /// Forward to the sequencer, over a link that keeps order: one session's
     /// publishes must reach the log in the order they were sent. A broken link may lose its tail; it may not reorder (found by
@@ -203,11 +239,21 @@ struct Open {
     waiting_bytes: usize,
     next_packet: u16,
     groups: HashMap<u64, Group>,
+    /// What the session may do; `None`: anything (credentials off).
+    grant: Option<Box<dyn Grant>>,
 }
 
 #[derive(Debug)]
 enum Phase {
-    Connecting { deadline: Duration },
+    Connecting {
+        deadline: Duration,
+    },
+    /// The CONNECT waits for the driver's verdict on its credentials;
+    /// nothing more is read from the connection meanwhile.
+    Authenticating {
+        deadline: Duration,
+        connect: Box<codec::Connect>,
+    },
     Open(Box<Open>),
 }
 
@@ -345,7 +391,7 @@ impl Gateway {
     pub fn client_ids(&self) -> impl Iterator<Item = &[u8]> {
         self.conns.values().filter_map(|c| match &c.phase {
             Phase::Open(open) => Some(open.client_id.as_ref()),
-            Phase::Connecting { .. } => None,
+            Phase::Connecting { .. } | Phase::Authenticating { .. } => None,
         })
     }
 
@@ -356,7 +402,7 @@ impl Gateway {
                 node: self.config.node,
                 session: open.session,
             }),
-            Phase::Connecting { .. } => None,
+            Phase::Connecting { .. } | Phase::Authenticating { .. } => None,
         }
     }
 
@@ -401,7 +447,7 @@ impl Gateway {
         match self.conns.get(&conn).map(|c| &c.phase) {
             Some(Phase::Connecting { .. }) => true,
             Some(Phase::Open(open)) => room(&self.config, self.total_pending_bytes, open),
-            None => false,
+            Some(Phase::Authenticating { .. }) | None => false,
         }
     }
 
@@ -427,6 +473,8 @@ impl Gateway {
             };
             let version = match &c.phase {
                 Phase::Connecting { .. } => None,
+                // What follows the CONNECT waits for its verdict.
+                Phase::Authenticating { .. } => return,
                 Phase::Open(open) => {
                     if !room(&config, total, open) {
                         return;
@@ -552,7 +600,6 @@ impl Gateway {
         if connect.properties.authentication_method.is_some() {
             return self.refuse_connect(conn, version, ReasonCode::BadAuthenticationMethod);
         }
-        let session = self.next_session;
         let assigned = connect.client_id.is_empty();
         if assigned && version == Version::V311 && !connect.clean_start {
             // A session nobody can name again cannot be asked for
@@ -571,6 +618,63 @@ impl Gateway {
         if connect.will.is_some() || persistent {
             return self.refuse_connect(conn, version, ReasonCode::ImplementationSpecificError);
         }
+        if !self.config.authenticate {
+            return self.admit(conn, connect, None);
+        }
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        let Phase::Connecting { deadline } = c.phase else {
+            return;
+        };
+        let (username, password) = (connect.username.clone(), connect.password.clone());
+        c.phase = Phase::Authenticating {
+            deadline,
+            connect: Box::new(connect),
+        };
+        self.actions.push(Action::Authenticate {
+            conn,
+            username,
+            password,
+        });
+    }
+
+    /// The driver's verdict on a CONNECT's credentials. Ignored for a
+    /// connection that closed or timed out meanwhile.
+    pub fn authenticated(&mut self, conn: ConnId, verdict: Verdict, now: Duration) {
+        self.now = now;
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        let Phase::Authenticating { deadline, .. } = c.phase else {
+            return;
+        };
+        let Phase::Authenticating { connect, .. } =
+            std::mem::replace(&mut c.phase, Phase::Connecting { deadline })
+        else {
+            return;
+        };
+        let version = connect.version;
+        match verdict {
+            Verdict::Allowed(grant) => {
+                self.admit(conn, *connect, Some(grant));
+                // What the client sent after its CONNECT.
+                self.pump(conn);
+            }
+            Verdict::BadCredentials => {
+                self.refuse_connect(conn, version, ReasonCode::BadUserNameOrPassword);
+            }
+            Verdict::NotAuthorized => {
+                self.refuse_connect(conn, version, ReasonCode::NotAuthorized);
+            }
+        }
+    }
+
+    /// Opens the session of an accepted CONNECT.
+    fn admit(&mut self, conn: ConnId, connect: codec::Connect, grant: Option<Box<dyn Grant>>) {
+        let version = connect.version;
+        let session = self.next_session;
+        let assigned = connect.client_id.is_empty();
         let client_id = if assigned {
             Bytes::from(format!("straum-{}-{session}", self.config.node))
         } else {
@@ -600,6 +704,7 @@ impl Gateway {
             waiting_bytes: 0,
             next_packet: 1,
             groups: HashMap::new(),
+            grant,
         };
         let Some(c) = self.conns.get_mut(&conn) else {
             return;
@@ -637,7 +742,7 @@ impl Gateway {
     fn open(&mut self, conn: ConnId) -> Option<&mut Open> {
         match &mut self.conns.get_mut(&conn)?.phase {
             Phase::Open(open) => Some(open),
-            Phase::Connecting { .. } => None,
+            Phase::Connecting { .. } | Phase::Authenticating { .. } => None,
         }
     }
 
@@ -680,6 +785,29 @@ impl Gateway {
             },
             (None, None) => return self.close(conn, Some(ReasonCode::ProtocolError)),
         };
+        if open.grant.as_ref().is_some_and(|g| !g.may_publish(&topic)) {
+            // Nothing is proposed. MQTT 5 answers a QoS 1 publish with
+            // "not authorized" and drops a QoS 0 one; 3.1.1 has no refusal
+            // to send, and allows a positive acknowledgement or a close
+            // (§3.3.5): a close, so the client knows. PUBACKs go out in the
+            // order the publishes came (MQTT 5 §4.6): while earlier QoS 1
+            // publishes wait for their commit, the refusal cannot go first,
+            // so the connection closes and the client resends them.
+            let pending = open.inbound_qos1 > 0;
+            return match (open.version, publish.id) {
+                (Version::V311, _) => self.close(conn, Some(ReasonCode::NotAuthorized)),
+                (_, Some(_)) if pending => self.close(conn, Some(ReasonCode::NotAuthorized)),
+                (_, Some(id)) => self.send(
+                    conn,
+                    &Packet::PubAck(PubAck {
+                        id,
+                        reason: ReasonCode::NotAuthorized,
+                        properties: AckProperties::default(),
+                    }),
+                ),
+                (_, None) => {}
+            };
+        }
         if publish.qos == Qos::AtLeastOnce {
             if open.version == Version::V5 && usize::from(receive_maximum) <= open.inbound_qos1 {
                 return self.close(conn, Some(ReasonCode::ReceiveMaximumExceeded));
@@ -746,6 +874,8 @@ impl Gateway {
     fn subscribe(&mut self, conn: ConnId, subscribe: codec::Subscribe) {
         let deadline = self.now.saturating_add(self.config.commit_timeout);
         let node = self.config.node;
+        let group = self.next_request;
+        self.next_request = self.next_request.saturating_add(1);
         let Some(open) = self.open(conn) else { return };
         if subscribe.subscription_identifier.is_some() {
             return self.close(conn, Some(ReasonCode::SubscriptionIdentifiersNotSupported));
@@ -754,13 +884,20 @@ impl Gateway {
             node,
             session: open.session,
         };
-        let group = self.next_request;
-        self.next_request = self.next_request.saturating_add(1);
         let mut reasons = Vec::with_capacity(subscribe.filters.len());
         let mut proposals = Vec::new();
         for (index, (filter, options)) in subscribe.filters.into_iter().enumerate() {
             if filter.as_bytes().starts_with(b"$share/") {
                 reasons.push(Some(ReasonCode::SharedSubscriptionsNotSupported));
+                continue;
+            }
+            // Refused before it is proposed: 3.1.1 sends it as 0x80.
+            if open
+                .grant
+                .as_ref()
+                .is_some_and(|g| !g.may_subscribe(&filter))
+            {
+                reasons.push(Some(ReasonCode::NotAuthorized));
                 continue;
             }
             reasons.push(None);
@@ -1088,7 +1225,9 @@ impl Gateway {
         let mut expired = Vec::new();
         for (conn, c) in &self.conns {
             match &c.phase {
-                Phase::Connecting { deadline } if *deadline <= now => {
+                Phase::Connecting { deadline } | Phase::Authenticating { deadline, .. }
+                    if *deadline <= now =>
+                {
                     expired.push((*conn, None));
                 }
                 Phase::Open(open) => {
@@ -1099,7 +1238,7 @@ impl Gateway {
                         expired.push((*conn, Some(ReasonCode::KeepAliveTimeout)));
                     }
                 }
-                Phase::Connecting { .. } => {}
+                Phase::Connecting { .. } | Phase::Authenticating { .. } => {}
             }
         }
         for waiting in self.requests.values() {

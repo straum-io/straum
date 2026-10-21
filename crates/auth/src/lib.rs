@@ -177,7 +177,9 @@ impl Authority {
             let Some((name, hash)) = line.split_once(':') else {
                 return Err(AuthError::MalformedCredentials { line: index + 1 });
             };
-            if name.is_empty() || hash.is_empty() {
+            // A hash that does not parse could never match: refused at
+            // startup, not found out one failed login at a time.
+            if name.is_empty() || PasswordHash::new(hash).is_err() {
                 return Err(AuthError::MalformedCredentials { line: index + 1 });
             }
             users.insert(
@@ -289,28 +291,38 @@ impl Authority {
             };
         };
 
-        let Ok(username) = std::str::from_utf8(username) else {
-            return Authenticated::BadCredentials;
-        };
-        let Some(user) = self.users.get(username) else {
-            // Verify against a throwaway hash anyway: an unknown user that
-            // is rejected in microseconds while a known one costs tens of
-            // milliseconds is a user list, handed out one guess at a time.
-            let _ = self.burn(password);
-            return Authenticated::BadCredentials;
-        };
-        let Some(password) = password else {
-            return Authenticated::BadCredentials;
-        };
-        let Ok(hash) = PasswordHash::new(&user.hash) else {
-            return Authenticated::BadCredentials;
-        };
-
-        match Argon2::default().verify_password(password, &hash) {
-            Ok(()) => Authenticated::Allowed(user.permissions.clone()),
-            Err(_) => Authenticated::BadCredentials,
+        // Every refusal costs one hash, like an accepted login: a refusal
+        // in microseconds where another costs tens of milliseconds tells
+        // which user names exist, one guess at a time. So an unknown user,
+        // a name that is not UTF-8 and a missing password all verify
+        // against a throwaway hash.
+        let user = std::str::from_utf8(username)
+            .ok()
+            .and_then(|name| self.users.get(name));
+        let hash = user.and_then(|u| PasswordHash::new(&u.hash).ok());
+        match (user, hash, password) {
+            (Some(user), Some(hash), Some(password)) => {
+                worked();
+                match Argon2::default().verify_password(password, &hash) {
+                    Ok(()) => Authenticated::Allowed(user.permissions.clone()),
+                    Err(_) => Authenticated::BadCredentials,
+                }
+            }
+            _ => {
+                let _ = self.burn(password);
+                Authenticated::BadCredentials
+            }
         }
     }
+}
+
+/// One password hash computed, for the tests that check every path pays it.
+#[cfg(test)]
+static WORKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn worked() {
+    #[cfg(test)]
+    WORKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl Authority {
@@ -329,6 +341,7 @@ impl Authority {
     /// Spends the same time an unknown user would have cost, so the answer
     /// carries no timing.
     fn burn(&self, password: Option<&[u8]>) -> bool {
+        worked();
         const DECOY: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzb21lc2FsdA$\
                              4xSKQ1Cz5rHEBZH1TkIhNRxrN2hMEa0Wo5Gy5tZ5rRE";
         let Ok(hash) = PasswordHash::new(DECOY) else {
@@ -337,5 +350,46 @@ impl Authority {
         Argon2::default()
             .verify_password(password.unwrap_or(b""), &hash)
             .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    /// Every refusal and every acceptance costs exactly one hash, so none is
+    /// told apart by its time (D-158 A).
+    #[test]
+    fn every_answer_to_a_user_name_costs_one_hash() {
+        let hash = Authority::hash_password(b"right").unwrap();
+        let authority = Authority::parse(&format!("alice:{hash}\n"), "", false).unwrap();
+        for (user, password) in [
+            (Some(&b"alice"[..]), Some(&b"right"[..])),
+            (Some(b"alice"), Some(b"wrong")),
+            (Some(b"alice"), None),
+            (Some(b"mallory"), Some(b"right")),
+            (Some(b"mallory"), None),
+            (Some(&[0xff, 0xfe][..]), Some(b"right")),
+        ] {
+            let before = WORKED.load(Ordering::Relaxed);
+            let _ = authority.authenticate(user, password);
+            assert_eq!(
+                WORKED.load(Ordering::Relaxed) - before,
+                1,
+                "{user:?} / {password:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_hash_that_does_not_parse_refuses_the_file() {
+        assert_eq!(
+            Authority::parse("alice:garbage\n", "", false).err(),
+            Some(AuthError::MalformedCredentials { line: 1 })
+        );
     }
 }
