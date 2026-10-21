@@ -73,6 +73,12 @@ impl Permissions {
         }
     }
 
+    /// Whether no rule allows anything: an ACL file that names this session
+    /// with no rules, or does not name it.
+    pub fn grants_nothing(&self) -> bool {
+        self.rules.as_ref().is_some_and(Vec::is_empty)
+    }
+
     /// Whether this session may publish to `topic`.
     pub fn may_publish(&self, topic: &Topic) -> bool {
         self.allows(topic, Action::Publish)
@@ -164,9 +170,11 @@ impl Authority {
 
     /// Builds from the contents of the password file and the ACL file.
     ///
-    /// `acl` empty means every authenticated user may do anything; a user
-    /// that appears in the ACL is restricted to their rules.
-    pub fn parse(passwords: &str, acl: &str, anonymous: bool) -> Result<Self, AuthError> {
+    /// Without an ACL file (`acl` `None`) every authenticated user, and every
+    /// anonymous client let in, may do anything. With one, it grants only
+    /// what it lists (D-159 A): a user it does not name may do nothing, and
+    /// anonymous clients only what an `anonymous` section lists.
+    pub fn parse(passwords: &str, acl: Option<&str>, anonymous: bool) -> Result<Self, AuthError> {
         let mut users = HashMap::new();
 
         for (index, line) in passwords.lines().enumerate() {
@@ -195,7 +203,7 @@ impl Authority {
         let mut current: Option<String> = None;
         let mut rules: HashMap<String, Vec<(TopicFilter, bool, bool)>> = HashMap::new();
 
-        for (index, line) in acl.lines().enumerate() {
+        for (index, line) in acl.unwrap_or_default().lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -258,19 +266,29 @@ impl Authority {
             }
         }
 
-        for (name, entries) in rules {
-            if let Some(user) = users.get_mut(&name) {
-                user.permissions = Permissions::from_rules(entries);
+        if acl.is_some() {
+            for (name, user) in &mut users {
+                user.permissions = Permissions::from_rules(rules.remove(name).unwrap_or_default());
             }
         }
 
-        let anonymous = match (anonymous, anonymous_rules) {
+        let anonymous = match (anonymous, acl) {
             (false, _) => None,
-            (true, Some(entries)) => Some(Permissions::from_rules(entries)),
+            (true, Some(_)) => Some(Permissions::from_rules(anonymous_rules.unwrap_or_default())),
             (true, None) => Some(Permissions::unrestricted()),
         };
 
         Ok(Self { users, anonymous })
+    }
+
+    /// Whether no client could do anything: no user, and anonymous clients
+    /// refused or granted nothing. A configuration a start refuses.
+    pub fn grants_nothing(&self) -> bool {
+        self.users.is_empty()
+            && self
+                .anonymous
+                .as_ref()
+                .is_none_or(Permissions::grants_nothing)
     }
 
     /// Whether anybody may connect without a user name.
@@ -366,7 +384,7 @@ mod tests {
     #[test]
     fn every_answer_to_a_user_name_costs_one_hash() {
         let hash = Authority::hash_password(b"right").unwrap();
-        let authority = Authority::parse(&format!("alice:{hash}\n"), "", false).unwrap();
+        let authority = Authority::parse(&format!("alice:{hash}\n"), None, false).unwrap();
         for (user, password) in [
             (Some(&b"alice"[..]), Some(&b"right"[..])),
             (Some(b"alice"), Some(b"wrong")),
@@ -388,7 +406,7 @@ mod tests {
     #[test]
     fn a_stored_hash_that_does_not_parse_refuses_the_file() {
         assert_eq!(
-            Authority::parse("alice:garbage\n", "", false).err(),
+            Authority::parse("alice:garbage\n", None, false).err(),
             Some(AuthError::MalformedCredentials { line: 1 })
         );
     }

@@ -23,7 +23,7 @@ fn passwords() -> String {
 
 #[test]
 fn a_correct_password_gets_in_and_a_wrong_one_does_not() {
-    let authority = Authority::parse(&passwords(), "", false).unwrap();
+    let authority = Authority::parse(&passwords(), None, false).unwrap();
     assert_eq!(authority.users(), 2);
 
     assert!(matches!(
@@ -46,14 +46,14 @@ fn a_correct_password_gets_in_and_a_wrong_one_does_not() {
 
 #[test]
 fn anonymous_is_refused_unless_it_is_allowed() {
-    let closed = Authority::parse(&passwords(), "", false).unwrap();
+    let closed = Authority::parse(&passwords(), None, false).unwrap();
     assert_eq!(
         closed.authenticate(None, None),
         Authenticated::NotAuthorized
     );
     assert!(!closed.allows_anonymous());
 
-    let open = Authority::parse(&passwords(), "", true).unwrap();
+    let open = Authority::parse(&passwords(), None, true).unwrap();
     assert!(matches!(
         open.authenticate(None, None),
         Authenticated::Allowed(_)
@@ -65,7 +65,7 @@ fn anonymous_is_refused_unless_it_is_allowed() {
 /// user names exist.
 #[test]
 fn an_unknown_user_costs_what_a_known_one_costs() {
-    let authority = Authority::parse(&passwords(), "", false).unwrap();
+    let authority = Authority::parse(&passwords(), None, false).unwrap();
 
     let started = Instant::now();
     let _ = authority.authenticate(Some(b"alice"), Some(b"wrong-password"));
@@ -85,7 +85,7 @@ fn an_unknown_user_costs_what_a_known_one_costs() {
 
 #[test]
 fn without_rules_a_user_may_do_anything() {
-    let authority = Authority::parse(&passwords(), "", false).unwrap();
+    let authority = Authority::parse(&passwords(), None, false).unwrap();
     let Authenticated::Allowed(permissions) =
         authority.authenticate(Some(b"bob"), Some(b"bob-secret"))
     else {
@@ -107,7 +107,7 @@ subscribe sensors/#
 user bob
 readwrite shared/bus
 ";
-    let authority = Authority::parse(&passwords(), acl, false).unwrap();
+    let authority = Authority::parse(&passwords(), Some(acl), false).unwrap();
 
     let Authenticated::Allowed(alice) =
         authority.authenticate(Some(b"alice"), Some(b"alice-secret"))
@@ -140,7 +140,7 @@ readwrite shared/bus
 #[test]
 fn anonymous_can_be_restricted_too() {
     let acl = "anonymous\nsubscribe public/#\n";
-    let authority = Authority::parse(&passwords(), acl, true).unwrap();
+    let authority = Authority::parse(&passwords(), Some(acl), true).unwrap();
 
     let Authenticated::Allowed(permissions) = authority.authenticate(None, None) else {
         panic!("anonymous should be allowed in");
@@ -152,17 +152,17 @@ fn anonymous_can_be_restricted_too() {
 
 #[test]
 fn a_broken_file_is_an_error_naming_the_line() {
-    assert!(Authority::parse("alice", "", false).is_err());
-    assert!(Authority::parse(":hash", "", false).is_err());
-    assert!(Authority::parse("alice:", "", false).is_err());
+    assert!(Authority::parse("alice", None, false).is_err());
+    assert!(Authority::parse(":hash", None, false).is_err());
+    assert!(Authority::parse("alice:", None, false).is_err());
 
     let good = passwords();
     // A rule for somebody who has no password is a typo, not a permission.
-    assert!(Authority::parse(&good, "user carol\npublish a/b\n", false).is_err());
+    assert!(Authority::parse(&good, Some("user carol\npublish a/b\n"), false).is_err());
     // A rule before any user has been named belongs to nobody.
-    assert!(Authority::parse(&good, "publish a/b\n", false).is_err());
-    assert!(Authority::parse(&good, "user alice\npublish a/#/b\n", false).is_err());
-    assert!(Authority::parse(&good, "user alice\nforbid a/b\n", false).is_err());
+    assert!(Authority::parse(&good, Some("publish a/b\n"), false).is_err());
+    assert!(Authority::parse(&good, Some("user alice\npublish a/#/b\n"), false).is_err());
+    assert!(Authority::parse(&good, Some("user alice\nforbid a/b\n"), false).is_err());
 }
 
 #[test]
@@ -173,4 +173,55 @@ fn an_open_broker_allows_everything() {
     };
     assert!(permissions.may_publish(&topic("$SYS/anything")));
     assert_eq!(permissions, Permissions::unrestricted());
+}
+
+/// D-159 A: an ACL file grants only what it lists. A user it does not name
+/// may do nothing; without an `anonymous` section, neither may anonymous
+/// clients; an empty file grants nothing to anyone.
+#[test]
+fn an_acl_file_grants_only_what_it_lists() {
+    let authority =
+        Authority::parse(&passwords(), Some("user alice\nreadwrite a/#\n"), true).unwrap();
+    let Authenticated::Allowed(bob) = authority.authenticate(Some(b"bob"), Some(b"bob-secret"))
+    else {
+        panic!("bob still gets in");
+    };
+    assert!(bob.grants_nothing());
+    assert!(!bob.may_publish(&topic("a/b")));
+    assert!(!bob.may_subscribe(&filter("a/#")));
+    let Authenticated::Allowed(anonymous) = authority.authenticate(None, None) else {
+        panic!("anonymous clients are let in");
+    };
+    assert!(anonymous.grants_nothing());
+    assert!(!anonymous.may_publish(&topic("a/b")));
+
+    let empty = Authority::parse(&passwords(), Some(""), false).unwrap();
+    let Authenticated::Allowed(alice) = empty.authenticate(Some(b"alice"), Some(b"alice-secret"))
+    else {
+        panic!("alice still gets in");
+    };
+    assert!(!alice.may_publish(&topic("anything")));
+    assert!(!alice.may_subscribe(&filter("#")));
+
+    // Without a file, everybody may do anything, as before.
+    let open = Authority::parse(&passwords(), None, true).unwrap();
+    let Authenticated::Allowed(bob) = open.authenticate(Some(b"bob"), Some(b"bob-secret")) else {
+        panic!("bob gets in");
+    };
+    assert!(bob.may_publish(&topic("a/b")));
+}
+
+#[test]
+fn a_configuration_that_grants_nobody_anything_says_so() {
+    // Anonymous clients let in, granted nothing, and no user.
+    let nobody = Authority::parse("", Some("# no anonymous section\n"), true).unwrap();
+    assert!(nobody.grants_nothing());
+    let someone = Authority::parse("", Some("anonymous\nsubscribe public/#\n"), true).unwrap();
+    assert!(!someone.grants_nothing());
+    assert!(
+        !Authority::parse(&passwords(), Some(""), false)
+            .unwrap()
+            .grants_nothing(),
+        "users with no rules are still users: they may connect"
+    );
 }

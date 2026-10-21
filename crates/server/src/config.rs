@@ -55,8 +55,9 @@ pub enum ConfigError {
     #[error("credentials: {0}")]
     Credentials(#[from] auth::AuthError),
     #[error(
-        "STRAUM_AUTH_ALLOW_ANONYMOUS=0 with no user in STRAUM_AUTH_PASSWORD_FILE: \
-         no client could connect"
+        "no client could connect and do anything: no user in STRAUM_AUTH_PASSWORD_FILE, and anonymous \
+         clients refused (STRAUM_AUTH_ALLOW_ANONYMOUS=0) or granted nothing by \
+         STRAUM_AUTH_ACL_FILE, which grants only what it lists"
     )]
     NobodyAllowed,
     #[error("cluster: {0}")]
@@ -200,8 +201,9 @@ impl Settings {
 
 /// D-158 A: who may connect. No file: anybody, anything, as before
 /// credentials. A password file: its users, and anonymous clients only if
-/// `STRAUM_AUTH_ALLOW_ANONYMOUS=1`. An ACL file restricts the users it
-/// names, and anonymous clients by its `anonymous` section. Both files are
+/// `STRAUM_AUTH_ALLOW_ANONYMOUS=1`. An ACL file grants only what it lists
+/// (D-159 A): its users their rules, anonymous clients its `anonymous`
+/// section, anyone it does not name nothing. Both files are
 /// read once, at startup; a file that cannot be read or parsed refuses the
 /// start.
 fn credentials(parser: &mut Parser) -> Result<Option<auth::Authority>, ConfigError> {
@@ -223,12 +225,16 @@ fn credentials(parser: &mut Parser) -> Result<Option<auth::Authority>, ConfigErr
             reason: error.to_string(),
         }),
     };
+    let rules = match &acl {
+        Some(_) => Some(read("STRAUM_AUTH_ACL_FILE", &acl)?),
+        None => None,
+    };
     let authority = auth::Authority::parse(
         &read("STRAUM_AUTH_PASSWORD_FILE", &passwords)?,
-        &read("STRAUM_AUTH_ACL_FILE", &acl)?,
+        rules.as_deref(),
         anonymous,
     )?;
-    if authority.users() == 0 && !authority.allows_anonymous() {
+    if authority.grants_nothing() {
         return Err(ConfigError::NobodyAllowed);
     }
     Ok(Some(authority))
@@ -693,6 +699,12 @@ mod tests {
         let empty = File::new("passwords-empty", "# nobody yet\n");
         let mut pairs = VALID.to_vec();
         pairs.push(("STRAUM_AUTH_PASSWORD_FILE", empty.path()));
+        assert_eq!(parse(&pairs).err(), Some(ConfigError::NobodyAllowed));
+        // D-159 A: an ACL file alone, with no `anonymous` section, would let
+        // anonymous clients in to do nothing.
+        let acl = File::new("acl-no-anonymous", "# nothing for anonymous clients\n");
+        let mut pairs = VALID.to_vec();
+        pairs.push(("STRAUM_AUTH_ACL_FILE", acl.path()));
         assert_eq!(parse(&pairs).err(), Some(ConfigError::NobodyAllowed));
     }
 
