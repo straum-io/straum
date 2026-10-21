@@ -3,6 +3,8 @@
 A clustered MQTT broker that acknowledges a publish only after a
 majority of its nodes has committed it to one replicated log.
 
+**Website and docs:** [straum-io.github.io](https://straum-io.github.io/)
+
 > **Status: experimental.** Not production-ready: client TLS and credentials
 > only when configured, no encryption between nodes, flow control off, timing defaults are placeholders, and persistent
 > sessions, wills and session expiry are refused at CONNECT for now.
