@@ -34,7 +34,10 @@
 //!   and starve the publishers (their proposals refused at a full outbox);
 //!   `STRAUM_BENCH_CHURN_RATE=<sessions/s>` paces them together to that
 //!   rate, a removal rate under the publishers' load. The count is of
-//!   DISCONNECTs written, not of `SessionGone` records committed.
+//!   DISCONNECTs written, not of `SessionGone` records committed;
+//! * `STRAUM_BENCH_DISK=<disk>` and `STRAUM_BENCH_JOURNAL=<jbd2 name>`
+//!   count the disk's flushes and the ext4 journal's commits over the
+//!   measured window: syncs per second and records per sync (D-157 A).
 //!
 //! `cargo bench -p server --bench puback`; `STRAUM_BENCH_SERVER=<path>`
 //! measures another build's `straum-server` with this client. Refuses an
@@ -551,6 +554,66 @@ fn positions(
     samples
 }
 
+/// Block-layer counters of `device` from `/proc/diskstats` (writes
+/// completed, flush requests completed, ms spent flushing), and the
+/// transactions its ext4 journal `journal` has committed, from
+/// `/proc/fs/jbd2/<journal>/info` (D-157 A). `None` without `/proc`.
+type DiskCounters = (f64, f64, f64, Option<f64>);
+
+fn disk_counters(device: &str, journal: Option<&str>) -> Option<DiskCounters> {
+    let stats = std::fs::read_to_string("/proc/diskstats").ok()?;
+    let line = stats
+        .lines()
+        .find(|l| l.split_whitespace().nth(2) == Some(device))?;
+    // After major, minor and name: field 5 is writes completed, 16 flush
+    // requests completed, 17 ms spent flushing (Linux 5.5 and later).
+    let field = |n: usize| -> Option<f64> { line.split_whitespace().nth(2 + n)?.parse().ok() };
+    let commits = journal
+        .and_then(|j| std::fs::read_to_string(format!("/proc/fs/jbd2/{j}/info")).ok())
+        .and_then(|t| t.split_whitespace().next()?.parse().ok());
+    Some((field(5)?, field(16)?, field(17)?, commits))
+}
+
+/// The largest log end any node reports.
+fn log_end(metrics: &[SocketAddr]) -> f64 {
+    metrics
+        .iter()
+        .filter_map(|&a| fetch(a))
+        .map(|t| value(&t, "straum_log_end"))
+        .fold(0.0, f64::max)
+}
+
+/// Syncs and records over the measured window (D-157 A). Flushes count the
+/// whole device, every node's log and anything else on it;
+/// `record_writes_per_flush` assumes all three logs are on it, each record
+/// written once per node. `-` where a count is missing or zero.
+fn report_disk(device: &str, window: Option<(DiskCounters, DiskCounters, Duration, f64)>) {
+    let Some((before, after, elapsed, records)) = window else {
+        println!("disk device={device} unavailable");
+        return;
+    };
+    let seconds = elapsed.as_secs_f64();
+    let flushes = after.1 - before.1;
+    let ratio = |a: f64, b: f64, digits: usize| {
+        if b > 0.0 {
+            format!("{:.digits$}", a / b)
+        } else {
+            "-".to_owned()
+        }
+    };
+    let commits = after.3.zip(before.3).map(|(a, b)| a - b);
+    println!(
+        "disk device={device} seconds={seconds:.1} writes_per_s={:.0} flushes_per_s={:.0} flush_ms_avg={} records_per_s={:.0} record_writes_per_flush={} journal_commits_per_s={} journal_commits_per_flush={}",
+        (after.0 - before.0) / seconds,
+        flushes / seconds,
+        ratio(after.2 - before.2, flushes, 3),
+        records / seconds,
+        ratio(records * f64::from(NODES), flushes, 1),
+        commits.map_or("-".to_owned(), |c| format!("{:.0}", c / seconds)),
+        commits.map_or("-".to_owned(), |c| ratio(c, flushes, 2)),
+    );
+}
+
 /// The value at quantile `q` of `values`, sorted in place.
 fn percentile(values: &mut [f64], q: f64) -> f64 {
     values.sort_by(f64::total_cmp);
@@ -792,13 +855,23 @@ fn main() {
     let positions_ms: u64 = env("STRAUM_BENCH_POSITIONS_MS", 0);
     let churn: usize = env("STRAUM_BENCH_CHURN", 0);
     let churn_rate: f64 = env("STRAUM_BENCH_CHURN_RATE", 0.0);
+    // D-157 A: the whole disk the logs are on (`sda`: the kernel counts
+    // flushes there, not on a partition), and the ext4 journal of their
+    // filesystem (`sda2-8`), counted over the measured window.
+    let disk = std::env::var("STRAUM_BENCH_DISK")
+        .ok()
+        .filter(|d| !d.is_empty());
+    let journal = std::env::var("STRAUM_BENCH_JOURNAL")
+        .ok()
+        .filter(|j| !j.is_empty());
     // Each churner's share of the rate, as the time between its sessions.
     let churn_every = if churn_rate > 0.0 {
         Duration::from_secs_f64(churn as f64 / churn_rate)
     } else {
         Duration::ZERO
     };
-    let mut servers = Servers::start(scrape_ms > 0 || !events.is_empty() || positions_ms > 0);
+    let mut servers =
+        Servers::start(scrape_ms > 0 || !events.is_empty() || positions_ms > 0 || disk.is_some());
     let measuring = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let delivered = Arc::new(AtomicU64::new(0));
@@ -874,6 +947,10 @@ fn main() {
     std::thread::sleep(warmup);
     let cpu_before = servers.cpu();
     let delivered_before = delivered.load(Ordering::Relaxed);
+    let disk_before = disk
+        .as_deref()
+        .and_then(|d| disk_counters(d, journal.as_deref()));
+    let end_before = log_end(&servers.metrics);
     measuring.store(true, Ordering::Relaxed);
     let started = Instant::now();
     let mut happened: Vec<(String, usize, Instant)> = Vec::new();
@@ -942,6 +1019,15 @@ fn main() {
         }
     }
     measuring.store(false, Ordering::Relaxed);
+    let disk_window = disk_before.and_then(|before| {
+        let after = disk_counters(disk.as_deref()?, journal.as_deref())?;
+        Some((
+            before,
+            after,
+            started.elapsed(),
+            log_end(&servers.metrics) - end_before,
+        ))
+    });
     let cpu = servers.cpu().saturating_sub(cpu_before);
     // After a kill: each node's CPU and disk from the restart to the end of
     // the load (D-133 A); disk only where `/proc/<pid>/io` exists.
@@ -1062,6 +1148,9 @@ fn main() {
             )
         },
     );
+    if let Some(device) = &disk {
+        report_disk(device, disk_window);
+    }
     if let Some(samples) = &samples {
         let kills: Vec<(usize, Instant)> = happened
             .iter()
