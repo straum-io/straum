@@ -489,6 +489,7 @@ impl Loop {
             replica_progress: m.replicas.clone(),
             flights: m.flights.clone(),
             serving: self.gateway.as_ref().is_some_and(Gateway::ready),
+            refused_at_accept: self.waiting.refused(),
         }
     }
 

@@ -62,6 +62,11 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 pub struct Waiting {
     max: usize,
     counts: Mutex<HashMap<IpAddr, usize>>,
+    /// Refusals before the gateway (D-167 A): counted from the accept
+    /// tasks, so atomics, not the node loop's plain counts.
+    no_permit: AtomicU64,
+    source_full: AtomicU64,
+    handshake_failed: AtomicU64,
 }
 
 impl Waiting {
@@ -69,6 +74,9 @@ impl Waiting {
         Self {
             max,
             counts: Mutex::new(HashMap::new()),
+            no_permit: AtomicU64::new(0),
+            source_full: AtomicU64::new(0),
+            handshake_failed: AtomicU64::new(0),
         }
     }
 
@@ -80,10 +88,20 @@ impl Waiting {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = counts.entry(unit(source)).or_insert(0);
         if *count >= self.max {
+            self.source_full.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         *count += 1;
         true
+    }
+
+    /// What was refused before the gateway saw it (D-167 A).
+    pub fn refused(&self) -> crate::metrics::Refused {
+        crate::metrics::Refused {
+            no_permit: self.no_permit.load(Ordering::Relaxed),
+            source_full: self.source_full.load(Ordering::Relaxed),
+            handshake_failed: self.handshake_failed.load(Ordering::Relaxed),
+        }
     }
 
     pub fn leave(&self, source: IpAddr) {
@@ -150,6 +168,7 @@ pub async fn listen(
             continue;
         }
         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            waiting.no_permit.fetch_add(1, Ordering::Relaxed);
             waiting.leave(source);
             drop(accepted);
             continue;
@@ -160,6 +179,7 @@ pub async fn listen(
             let established = tokio::time::timeout(handshakes.within, accepted.establish()).await;
             drop(permit);
             let Ok(Ok(connection)) = established else {
+                waiting.handshake_failed.fetch_add(1, Ordering::Relaxed);
                 waiting.leave(source);
                 return;
             };
@@ -239,6 +259,7 @@ mod tests {
             assert!(waiting.enter(a));
         }
         assert!(!waiting.enter(a), "the 17th from one source");
+        assert_eq!(waiting.refused().source_full, 1, "and counted (D-167 A)");
         assert!(waiting.enter(b), "another source is still served");
         waiting.leave(a);
         assert!(waiting.enter(a), "a slot freed is taken again");
@@ -277,5 +298,81 @@ mod tests {
             !waiting.enter(v4),
             "a mapped address counts as its IPv4 one"
         );
+    }
+}
+
+/// D-167 A: each refusal before the gateway is counted where it happens.
+#[cfg(test)]
+mod refusals {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::io::Read;
+    use std::time::Instant;
+
+    use super::*;
+    use transport::{BufferBudget, Tls, TransportConfig};
+
+    /// A TLS listener with room for one handshake, finished within 300 ms.
+    fn listener() -> (Listener, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "straum-node-refusals-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&cert, issued.cert.pem()).unwrap();
+        std::fs::write(&key, issued.signing_key.serialize_pem()).unwrap();
+        let tls = Tls::from_pem_files(&cert, &key).unwrap();
+        let config = TransportConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..TransportConfig::default()
+        };
+        let budget = Arc::new(BufferBudget::new(1 << 20));
+        (Listener::bind(config, budget, Some(tls)).unwrap(), dir)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_for_no_permit_and_a_handshake_that_times_out_are_counted() {
+        let (listener, dir) = listener();
+        let address = listener.local_addr().unwrap();
+        let waiting = Arc::new(Waiting::new(16));
+        let (events, _keep) = mpsc::channel(16);
+        let accepting = tokio::spawn(listen(
+            listener,
+            16,
+            Handshakes {
+                within: Duration::from_millis(300),
+                at_once: 1,
+            },
+            Arc::clone(&waiting),
+            events,
+        ));
+        // One idle socket holds the only handshake slot.
+        let idle = std::net::TcpStream::connect(address).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The next is closed at once, for want of a permit.
+        let started = Instant::now();
+        let mut second = std::net::TcpStream::connect(address).unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let read = tokio::task::spawn_blocking(move || second.read(&mut [0u8; 1]))
+            .await
+            .unwrap();
+        assert!(matches!(read, Ok(0)), "closed: {read:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "at once, before the timeout"
+        );
+        assert_eq!(waiting.refused().no_permit, 1);
+        // The idle one's handshake times out and is counted.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(waiting.refused().handshake_failed, 1);
+        assert_eq!(waiting.refused().source_full, 0);
+        drop(idle);
+        accepting.abort();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

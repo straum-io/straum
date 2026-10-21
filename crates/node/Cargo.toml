@@ -26,6 +26,8 @@ tracing = "0.1"
 
 [dev-dependencies]
 rumqttc = { version = "0.24", default-features = false }
+# A throwaway certificate per test run (D-167 A tests).
+rcgen = "0.14"
 
 [[bench]]
 name = "cap"

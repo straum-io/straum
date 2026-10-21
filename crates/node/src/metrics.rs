@@ -504,6 +504,16 @@ impl Measured {
     }
 }
 
+/// Connections refused before the gateway saw them, since the node started
+/// (D-167 A): no handshake permit, a source at its cap (D-165 A), a
+/// handshake that failed or did not finish in time (D-164 A).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Refused {
+    pub no_permit: u64,
+    pub source_full: u64,
+    pub handshake_failed: u64,
+}
+
 /// Everything rendered at one scrape: the loop's measurements, the cores'
 /// counts and the node's status, as they were together.
 #[derive(Debug, Clone, Default)]
@@ -536,6 +546,7 @@ pub struct Snapshot {
     pub serving: bool,
     /// D-135 A: what is in flight to each peer.
     pub flights: Vec<(u8, Flight)>,
+    pub refused_at_accept: Refused,
 }
 
 fn gauge(out: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
@@ -961,6 +972,26 @@ impl Snapshot {
                 "straum_mqtt_closed_commit_timeout_total",
                 "Of those, for a proposal not committed in time.",
                 c.closed_commit_timeout,
+            );
+            // D-167 A: never seen by the gateway, so not in its counts.
+            let r = &self.refused_at_accept;
+            counter(
+                o,
+                "straum_mqtt_refused_no_permit_total",
+                "Connections closed at accept: every handshake slot was taken.",
+                r.no_permit,
+            );
+            counter(
+                o,
+                "straum_mqtt_refused_source_full_total",
+                "Connections closed at accept: their source had as many waiting as it may.",
+                r.source_full,
+            );
+            counter(
+                o,
+                "straum_mqtt_handshake_failed_total",
+                "Connections whose setup (read buffers, or the TLS handshake) failed or did not finish within the connect timeout.",
+                r.handshake_failed,
             );
         }
         out
