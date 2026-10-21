@@ -82,6 +82,15 @@ fn read_packet(stream: &mut TcpStream, within: Duration) -> Option<(u8, Vec<u8>)
 /// A clean-session CONNECT with these credentials; the stream and the
 /// CONNACK's return code, or `None` if the node did not answer.
 fn connect(port: u16, user: Option<&str>, password: Option<&str>) -> Option<(TcpStream, u8)> {
+    connect_as(port, "client", user, password)
+}
+
+fn connect_as(
+    port: u16,
+    client: &str,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> Option<(TcpStream, u8)> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     let mut flags = 0x02;
     if user.is_some() {
@@ -92,7 +101,7 @@ fn connect(port: u16, user: Option<&str>, password: Option<&str>) -> Option<(Tcp
     }
     let mut body = string(b"MQTT");
     body.extend_from_slice(&[4, flags, 0, 60]);
-    body.extend(string(b"client"));
+    body.extend(string(client.as_bytes()));
     for field in [user, password].into_iter().flatten() {
         body.extend(string(field.as_bytes()));
     }
@@ -260,4 +269,39 @@ fn credentials_decide_who_connects_and_what_each_may_do() {
         read_packet(&mut bob, Duration::from_secs(10)).is_none(),
         "a publish by bob closes the connection"
     );
+
+    // D-165 A: admitted connections do not count against their source;
+    // 20 from this one address stay open together.
+    let admitted: Vec<TcpStream> = (0..20)
+        .map(|i| {
+            let (stream, rc) = connect_as(mqtt, &format!("held-{i}"), Some("alice"), Some("right"))
+                .expect("a CONNACK");
+            assert_eq!(rc, 0, "admitted {i}");
+            stream
+        })
+        .collect();
+    // 16 sockets that never send a CONNECT take this address's slots: the
+    // 17th is closed at once, long before any timeout.
+    let idle: Vec<TcpStream> = (0..16)
+        .map(|_| TcpStream::connect(("127.0.0.1", mqtt)).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+    let started = Instant::now();
+    let mut extra = TcpStream::connect(("127.0.0.1", mqtt)).unwrap();
+    assert!(
+        read_packet(&mut extra, Duration::from_secs(5)).is_none()
+            && started.elapsed() < Duration::from_secs(3),
+        "the 17th waiting connection from one source is closed at once"
+    );
+    // Once they go, the address is served again.
+    drop(idle);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while connect(mqtt, Some("alice"), Some("right")).map(|(_, rc)| rc) != Some(0) {
+        assert!(
+            Instant::now() < deadline,
+            "the source was never served again"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    drop(admitted);
 }

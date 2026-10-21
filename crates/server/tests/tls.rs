@@ -18,11 +18,13 @@ use tokio_rustls::rustls::{ClientConfig, ClientConnection, RootCertStore, Stream
 
 const NODES: u16 = 3;
 
-/// A block of ports by process id, apart from `cluster.rs`'s and
-/// `credentials.rs`'s (D-108).
+/// A block of ports by process id, apart from `cluster.rs`'s (20 000–31 999)
+/// and `credentials.rs`'s (32 000–32 397), and below Linux's ephemeral range
+/// (from 32 768), where an outgoing connection can take a port first
+/// (D-108): 32 400–32 719, 8 per block.
 fn ports() -> u16 {
     let block = u16::try_from(std::process::id() % 40).unwrap();
-    33_000 + block * 10
+    32_400 + block * 8
 }
 
 struct Servers {

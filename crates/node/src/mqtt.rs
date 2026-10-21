@@ -2,8 +2,10 @@
 //! Each connection is a reader task and a writer task; nothing here knows
 //! MQTT — the gateway in the node loop does.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -29,6 +31,8 @@ pub enum Event {
     Opened {
         conn: u64,
         handle: Conn,
+        /// Counted in [`Waiting`] until admitted or gone.
+        source: IpAddr,
     },
     Bytes {
         conn: u64,
@@ -46,6 +50,60 @@ pub enum Event {
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
+/// Connections not yet admitted, per source address (D-165 A): from the
+/// accept until the gateway admits the CONNECT, or the connection goes. At
+/// most `max` per address wait at once; a connection past that is closed at
+/// once, so one address cannot take every slot. The map holds only
+/// addresses with a connection waiting: bounded by the waiting connections
+/// (handshakes, connections queued for the node loop's `Opened`, and the
+/// gateway's unadmitted ones), at most 16 per address.
+#[derive(Debug)]
+pub struct Waiting {
+    max: usize,
+    counts: Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl Waiting {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            counts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `false`: `source` already has `max` waiting.
+    pub fn enter(&self, source: IpAddr) -> bool {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = counts.entry(source).or_insert(0);
+        if *count >= self.max {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    pub fn leave(&self, source: IpAddr) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = counts.get_mut(&source) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&source);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn sources(&self) -> usize {
+        self.counts.lock().map_or(0, |c| c.len())
+    }
+}
+
 /// Bounds on connections before the gateway sees them (D-164 A). A TLS
 /// handshake happens there, so a client that never finishes one would
 /// otherwise hold a task and a socket for good: each must finish `within`,
@@ -61,6 +119,7 @@ pub async fn listen(
     listener: Listener,
     write_queue: usize,
     handshakes: Handshakes,
+    waiting: Arc<Waiting>,
     events: mpsc::Sender<Event>,
 ) {
     let permits = Arc::new(tokio::sync::Semaphore::new(handshakes.at_once.max(1)));
@@ -68,15 +127,23 @@ pub async fn listen(
         let Ok(accepted) = listener.accept().await else {
             continue;
         };
+        let source = accepted.peer().ip();
+        if !waiting.enter(source) {
+            drop(accepted);
+            continue;
+        }
         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            waiting.leave(source);
             drop(accepted);
             continue;
         };
         let events = events.clone();
+        let waiting = Arc::clone(&waiting);
         tokio::spawn(async move {
             let established = tokio::time::timeout(handshakes.within, accepted.establish()).await;
             drop(permit);
             let Ok(Ok(connection)) = established else {
+                waiting.leave(source);
                 return;
             };
             let conn = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -110,7 +177,16 @@ pub async fn listen(
                 credit: credit_tx,
                 reader: reading.abort_handle(),
             };
-            if events.send(Event::Opened { conn, handle }).await.is_err() {
+            if events
+                .send(Event::Opened {
+                    conn,
+                    handle,
+                    source,
+                })
+                .await
+                .is_err()
+            {
+                waiting.leave(source);
                 return;
             }
             // Writes until the node loop drops the connection.
@@ -128,5 +204,33 @@ pub async fn listen(
             }
             let _ = writer.shutdown().await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D-165 A: one source is capped, another is not affected, and the map
+    /// keeps nothing for a source with nothing waiting.
+    #[test]
+    fn one_source_cannot_take_every_waiting_slot() {
+        let waiting = Waiting::new(16);
+        let a = IpAddr::from([10, 0, 0, 1]);
+        let b = IpAddr::from([10, 0, 0, 2]);
+        for _ in 0..16 {
+            assert!(waiting.enter(a));
+        }
+        assert!(!waiting.enter(a), "the 17th from one source");
+        assert!(waiting.enter(b), "another source is still served");
+        waiting.leave(a);
+        assert!(waiting.enter(a), "a slot freed is taken again");
+        for _ in 0..16 {
+            waiting.leave(a);
+        }
+        waiting.leave(b);
+        assert_eq!(waiting.sources(), 0);
+        waiting.leave(b);
+        assert_eq!(waiting.sources(), 0, "leaving twice is harmless");
     }
 }
