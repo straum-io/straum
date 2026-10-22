@@ -390,7 +390,9 @@ impl Voter {
     /// The proposal gets this node's origin property first (node,
     /// incarnation, sequence; D-188 A): the outbox recognises its own
     /// record by its bytes, and without the property another node's record
-    /// with the same body would pass for it.
+    /// with the same body would pass for it. The property is unique only
+    /// if the driver set this life's incarnation (`Voter::incarnation`),
+    /// as `node` does; without it every restart reuses life 0.
     pub fn submit(&mut self, mut proposal: Proposal) -> Result<(), ClusterError> {
         let origin = &mut proposal.properties;
         origin.push(journal::ORIGIN_PROPERTY);
