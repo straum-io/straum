@@ -4,7 +4,7 @@
 //!
 //! * **throughput** — a closed loop keeps `STRAUM_BENCH_WINDOW` publishes
 //!   in flight at the sequencer (below its proposal queue, so none is
-//!   refused) and counts those it reports committed (`Effect::Accepted`)
+//!   refused) and counts those it reports committed (`Node::records`)
 //!   over `STRAUM_BENCH_SECONDS`;
 //! * **failover** — under that load the sequencer is stopped, and the time
 //!   to a commit in a later slot on the two others is measured;
@@ -23,8 +23,7 @@
 //! sequencer), the largest process RSS sampled (Linux only), the largest uncommitted tail
 //! and outbox; `cap_recovery`, the uncommitted tail at each stop and the
 //! restarted node's time to the survivors' commit point. Uncommitted work
-//! bounds throughput; it is not throughput, and PUBACK latency over MQTT is
-//! `server/benches/puback.rs`'s, not this bench's.
+//! bounds throughput; it is not throughput.
 //!
 //! `cargo bench -p node --bench cap`; `STRAUM_BENCH_CAPS=64,4096` narrows
 //! it, `STRAUM_BENCH_HEARTBEAT_MS` and `STRAUM_BENCH_TAKEOVER_TICKS` set
@@ -42,9 +41,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use apply::{Effect, Limits, Origin};
-use bytes::Bytes;
-use domain::{DeliveryGuarantee, Topic};
 use std::fmt::Write as _;
 
 use node::metrics::{Stage, Stamp, Trace};
@@ -161,7 +157,7 @@ fn config(cap: u64, id: u8, addresses: &[SocketAddr]) -> NodeConfig {
         data: data_dir(cap, id),
         // ADR-0009: `STRAUM_BENCH_PREALLOCATE_BYTES` writes zeros that far
         // ahead of each segment's log; unset, the server's default (8 MiB
-        // since D-178 A), so `cap` and `puback` run alike; 0 does not.
+        // since D-178 A); 0 does not.
         segments: SegmentLimits {
             wal: WalLimits {
                 preallocate_bytes: env(
@@ -172,50 +168,45 @@ fn config(cap: u64, id: u8, addresses: &[SocketAddr]) -> NodeConfig {
             },
             segment_bytes: 64 << 20,
         },
-        limits: Limits::default(),
+        max_record: node::experimental::MAX_RECORD_BYTES,
         heartbeat: Duration::from_millis(match HEARTBEAT_MS.load(Ordering::Relaxed) {
             0 => env("STRAUM_BENCH_HEARTBEAT_MS", 50),
             ms => ms,
         }),
-        // Holds the largest batch: 64 records of the default 1 MiB packet.
+        // Holds the largest batch: 64 records of 1 MiB.
         max_frame: 1 << 27,
         link_queue: 1024,
         transport: TransportConfig {
             listen: addresses[usize::from(id)],
             ..TransportConfig::default()
         },
-        mqtt: None,
         retain_bytes: 256 << 20,
-        // Rare: a snapshot encodes the whole state on the node loop.
         snapshot_every: 1 << 30,
         rotate_every: None,
         read_bytes: 64 * 1024,
         metrics: None,
         tls: tls(id),
-        sessions: None,
     }
 }
 
+/// A record of node `at`: its body names the node and the request, then
+/// 64 bytes, as the bench's MQTT publishes carried before D-188 A.
 fn publish(at: u8, request: u64) -> cluster::Proposal {
-    let proposal = apply::Proposal::Publish {
-        origin: Origin {
-            node: at,
-            session: 1,
-        },
-        request,
-        topic: Topic::new(Bytes::from_static(b"bench")).unwrap(),
-        payload: Bytes::from_static(&[7; 64]),
-        properties: Bytes::new(),
-        guarantee: DeliveryGuarantee::AtMostOnce,
-        retain: false,
-    };
-    let mut body = Vec::new();
-    proposal.encode(&mut body).unwrap();
+    let mut body = vec![at];
+    body.extend_from_slice(&request.to_be_bytes());
+    body.extend_from_slice(&[7; 64]);
     cluster::Proposal {
-        kind: proposal.kind(),
+        kind: journal::Kind::Data,
         properties: Vec::new(),
         body,
     }
+}
+
+/// The node and request a committed `publish` names.
+fn origin(record: &node::Committed) -> Option<(u8, u64)> {
+    let node = *record.body.first()?;
+    let request = u64::from_be_bytes(record.body.get(1..9)?.try_into().ok()?);
+    (record.kind == journal::Kind::Data).then_some((node, request))
 }
 
 struct Cluster {
@@ -274,7 +265,7 @@ fn load(
     window: u64,
     stop: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<(u64, Vec<u32>)> {
-    let mut effects = node.effects();
+    let mut records = node.records();
     let proposals: Vec<cluster::Proposal> = (0..window).map(|r| publish(at, r)).collect();
     let sender = node.proposer();
     tokio::spawn(async move {
@@ -290,23 +281,20 @@ fn load(
             if *stop.borrow() {
                 return (committed, latencies);
             }
-            let received = tokio::time::timeout(Duration::from_millis(50), effects.recv()).await;
-            let Ok(Ok((_, _, out))) = received else {
+            let received = tokio::time::timeout(Duration::from_millis(50), records.recv()).await;
+            let Ok(Ok(record)) = received else {
                 continue;
             };
-            for effect in out {
-                if let Effect::Accepted { to, request, .. } = effect {
-                    if to.node == at {
-                        committed += 1;
-                        if let Some(at_sent) = sent.remove(&request) {
-                            latencies.push(
-                                u32::try_from(at_sent.elapsed().as_micros()).unwrap_or(u32::MAX),
-                            );
-                        }
-                        sent.insert(next, Instant::now());
-                        let _ = sender.send(publish(at, next)).await;
-                        next += 1;
+            if let Some((node, request)) = origin(&record) {
+                if node == at {
+                    committed += 1;
+                    if let Some(at_sent) = sent.remove(&request) {
+                        latencies
+                            .push(u32::try_from(at_sent.elapsed().as_micros()).unwrap_or(u32::MAX));
                     }
+                    sent.insert(next, Instant::now());
+                    let _ = sender.send(publish(at, next)).await;
+                    next += 1;
                 }
             }
         }
@@ -538,7 +526,7 @@ fn load_timed(
     stop: tokio::sync::watch::Receiver<bool>,
     measuring: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<Vec<u32>> {
-    let mut effects = node.effects();
+    let mut records = node.records();
     let sender = node.proposer();
     tokio::spawn(async move {
         let mut sent: std::collections::HashMap<u64, Instant> = std::collections::HashMap::new();
@@ -552,25 +540,22 @@ fn load_timed(
             if *stop.borrow() {
                 return samples;
             }
-            let received = tokio::time::timeout(Duration::from_millis(50), effects.recv()).await;
-            let Ok(Ok((_, _, out))) = received else {
+            let received = tokio::time::timeout(Duration::from_millis(50), records.recv()).await;
+            let Ok(Ok(record)) = received else {
                 continue;
             };
-            for effect in out {
-                if let Effect::Accepted { to, request, .. } = effect {
-                    if to.node != at {
-                        continue;
-                    }
-                    if let Some(t) = sent.remove(&request) {
-                        if *measuring.borrow() {
-                            samples
-                                .push(u32::try_from(t.elapsed().as_micros()).unwrap_or(u32::MAX));
-                        }
-                    }
-                    sent.insert(next, Instant::now());
-                    let _ = sender.send(publish(at, next)).await;
-                    next += 1;
+            if let Some((node, request)) = origin(&record) {
+                if node != at {
+                    continue;
                 }
+                if let Some(t) = sent.remove(&request) {
+                    if *measuring.borrow() {
+                        samples.push(u32::try_from(t.elapsed().as_micros()).unwrap_or(u32::MAX));
+                    }
+                }
+                sent.insert(next, Instant::now());
+                let _ = sender.send(publish(at, next)).await;
+                next += 1;
             }
         }
     })
@@ -795,7 +780,7 @@ fn quantiles(v: &mut [f64]) -> String {
 /// The `cap_stats` and `cap_recovery` lines of one cap (D-155 A), after
 /// the table: the rate is the median round's, commit latency over every
 /// round's publishes, the rest the largest any round saw. Read blocks are
-/// not measured here (`n/a`): this bench has no MQTT clients.
+/// not measured here (`n/a`): this bench has no clients.
 fn report(cap: u64, rounds: &[Round], trials: &[Failover]) {
     let mut rates: Vec<f64> = rounds.iter().map(|r| r.records_per_s).collect();
     rates.sort_by(f64::total_cmp);
@@ -989,9 +974,8 @@ fn evict(cluster: &Cluster) {
 /// after the load stops: its own lag (D-132); per heartbeat, the positions
 /// it moved and the heartbeats it did not; the bytes and positions in
 /// flight to it, as the sequencer counts them; and the sequencer's commit
-/// latency from raw samples over the same 20 s. A different harness from
-/// `server/benches/puback.rs`: node handles, no MQTT, so no PUBACK; a stop
-/// is `shutdown`, not a kill. Flow control stays off.
+/// latency from raw samples over the same 20 s, through node handles; a
+/// stop is `shutdown`, not a kill. Flow control stays off.
 async fn catch_up(window: u64, heartbeat_ms: u64, restart: bool) -> Option<(String, String)> {
     WINDOW.store(window, Ordering::Relaxed);
     HEARTBEAT_MS.store(heartbeat_ms, Ordering::Relaxed);

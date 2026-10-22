@@ -68,7 +68,7 @@ pub enum Event {
         started: Instant,
         done: Instant,
     },
-    /// Committed records read back for apply; when this thread took the
+    /// Committed records read back for the node loop to hand out; when this thread took the
     /// read up and finished it (D-139 A).
     Range {
         records: Vec<Vec<u8>>,
@@ -93,7 +93,7 @@ pub struct Recovered {
     pub chain: Chain,
     /// The lowest lsn still in the log; `None` if it is empty.
     pub first: Option<u64>,
-    /// The snapshot's body, checksum verified; decoding it is `apply`'s.
+    /// The snapshot's body, checksum verified; decoding it is the node loop's.
     pub snapshot: Option<Vec<u8>>,
     /// The log's slot table: (slot, first lsn), ascending.
     pub slots: Vec<(u64, u64)>,
@@ -300,7 +300,7 @@ fn run(
     inbox: mpsc::Receiver<Command>,
     events: tokio_mpsc::Sender<Event>,
 ) {
-    // One per replica being caught up, one for apply's read-back: at most
+    // One per replica being caught up, one for the node loop's read-back: at most
     // the voters plus one (D-142 A).
     let mut cursors: BTreeMap<u8, Cursor> = BTreeMap::new();
     let mut applying: Option<Cursor> = None;
@@ -493,7 +493,7 @@ fn read_batches_at(
 }
 
 /// Committed records from `from`, contiguous, none past `upto`, at most
-/// `MAX_RANGE`: the read-back for apply. Started at `cursor` when it
+/// `MAX_RANGE`: the read-back for the node loop. Started at `cursor` when it
 /// continues there, stopped once it has what it needs; with where it left
 /// off.
 fn read_range(
@@ -550,7 +550,7 @@ mod tests {
 
     use super::*;
 
-    /// D-142 A: reads continued through a cursor — catch-up and apply's
+    /// D-142 A: reads continued through a cursor — catch-up and the node loop's
     /// read-back — return exactly what reads from the segment's start
     /// return, across segment rolls; a cursor gone stale by a truncation
     /// still gives the right answer, by falling back to the scan.
@@ -569,7 +569,7 @@ mod tests {
         for batch in 0..60u8 {
             let entries: Vec<Entry> = (0..3u8)
                 .map(|i| Entry {
-                    kind: Kind::Publish,
+                    kind: Kind::Data,
                     properties: &[],
                     body: if i == 0 { &[1; 40] } else { &[2; 40] },
                 })
@@ -600,7 +600,7 @@ mod tests {
             cursor = left;
         }
 
-        // Apply's read-back, 7 at a time.
+        // The node loop's read-back, 7 at a time.
         let (mut from, mut cursor) = (1u64, None);
         while from <= end {
             let upto = (from + 6).min(end);
@@ -621,7 +621,7 @@ mod tests {
         let mut chain = truncate(&mut log, 30).unwrap();
         while chain.next_lsn() <= end {
             let entries = [Entry {
-                kind: Kind::Publish,
+                kind: Kind::Data,
                 properties: &[],
                 body: &[3; 97],
             }];
@@ -660,12 +660,12 @@ mod tests {
         for batch in 0..3u8 {
             let entries = [
                 Entry {
-                    kind: Kind::Publish,
+                    kind: Kind::Data,
                     properties: &[],
                     body: &[batch, 1],
                 },
                 Entry {
-                    kind: Kind::Publish,
+                    kind: Kind::Data,
                     properties: &[],
                     body: &[batch, 2],
                 },
@@ -717,7 +717,7 @@ mod tests {
                 body: &[0; 8],
             },
             Entry {
-                kind: Kind::Publish,
+                kind: Kind::Data,
                 properties: &[],
                 body: &[1],
             },

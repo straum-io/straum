@@ -61,7 +61,7 @@ jobs:
             type=raw,value=latest,enable=${{ env.PUBLISH == 'true' && !contains(github.ref_name, '-') }}
           labels: |
             org.opencontainers.image.title=straum-server
-            org.opencontainers.image.description=Clustered MQTT broker (experimental, not production-ready)
+            org.opencontainers.image.description=Replicated log (experimental, not production-ready)
             org.opencontainers.image.licenses=Apache-2.0
 
       # ponytail: arm64 builds under QEMU, slow for a Rust workspace; move to

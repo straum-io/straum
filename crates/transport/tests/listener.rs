@@ -251,21 +251,21 @@ mod tls {
 
         let client = tokio::spawn(async move {
             let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
-            // A CONNECT packet, sent in the clear.
+            // Protocol bytes, sent in the clear.
             socket.write_all(&[0x10, 0x0c, 0x00, 0x04]).await.unwrap();
             let mut answer = [0u8; 1];
             socket.read_exact(&mut answer).await.map(|_| answer[0])
         });
 
         let accepted = listener.accept().await.unwrap();
-        // The handshake fails; the connection never becomes a session.
+        // The handshake fails; the connection is never established.
         assert!(accepted.establish().await.is_err());
 
-        // What the client gets back is a TLS alert record (0x15), not a
-        // CONNACK (0x20): the broker never spoke MQTT to it.
+        // What the client gets back is a TLS alert record (0x15): the
+        // server never speaks plaintext to it.
         let answer = client.await.unwrap();
         if let Ok(first) = answer {
-            assert_eq!(first, 0x15, "a plaintext client was answered in MQTT");
+            assert_eq!(first, 0x15, "a plaintext client was answered in plaintext");
         }
     }
 

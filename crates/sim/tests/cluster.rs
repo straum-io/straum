@@ -1028,7 +1028,7 @@ impl World {
             let body = format!("message {}", self.next_body).into_bytes();
             if core
                 .propose(Proposal {
-                    kind: Kind::Publish,
+                    kind: Kind::Data,
                     properties: Vec::new(),
                     body,
                 })

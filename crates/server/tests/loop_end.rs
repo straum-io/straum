@@ -20,14 +20,13 @@ fn free_port() -> u16 {
     20_000 + block * 300 + n
 }
 
-fn spawn(dir: &Path, peers: &str, mqtt: u16, log: &Path) -> Child {
+fn spawn(dir: &Path, peers: &str, log: &Path) -> Child {
     let file = std::fs::File::create(log).unwrap();
     Command::new(env!("CARGO_BIN_EXE_straum-server"))
         .env_clear()
         .env("STRAUM_EXPERIMENTAL_CLUSTER", "1")
         .env("STRAUM_CLUSTER_NODE_ID", "0")
         .env("STRAUM_CLUSTER_PEERS", peers)
-        .env("STRAUM_CLUSTER_MQTT_LISTEN", format!("127.0.0.1:{mqtt}"))
         .env("STRAUM_CLUSTER_DATA_DIR", dir)
         .env("STRAUM_LOG_LEVEL", "info")
         .env("NO_COLOR", "1")
@@ -74,11 +73,10 @@ fn a_server_whose_node_loop_ends_exits_non_zero() {
         .map(|id| format!("{id}=127.0.0.1:{}", free_port()))
         .collect::<Vec<_>>()
         .join(",");
-    let mqtt = free_port();
 
     // First life: node 0 takes the first slot at once and promises it.
     let first = root.join("log-1");
-    let mut child = spawn(&data, &peers, mqtt, &first);
+    let mut child = spawn(&data, &peers, &first);
     wait_for_log(&first, "node started");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !data.join("promise").exists() {
@@ -98,7 +96,7 @@ fn a_server_whose_node_loop_ends_exits_non_zero() {
     // silence, and the directory in the way fails that promise.
     std::fs::create_dir(data.join("promise.next")).unwrap();
     let second = root.join("log-2");
-    let mut child = spawn(&data, &peers, mqtt, &second);
+    let mut child = spawn(&data, &peers, &second);
     wait_for_log(&second, "node started");
     let status = exited(&mut child, Duration::from_secs(10));
     if status.is_none() {

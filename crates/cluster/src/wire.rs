@@ -44,8 +44,10 @@ use crate::{Message, NodeId, Proposal};
 /// at its HELLO (ADR-0008 step 7a, D-78 A): ACK and FETCHED changed shape
 /// in steps 5 and 6, and a node of another build would misread them.
 /// Version 2: FORWARD carries the slot it is sent for (D-117 B). Version 3:
-/// HELLO carries the incarnation (D-151 A).
-pub const WIRE_VERSION: u16 = 3;
+/// HELLO carries the incarnation (D-151 A). Version 4: FORWARD and APPEND
+/// carry journal format 5, whose kind 1 is `Data`, no longer an MQTT
+/// publish (D-188 A).
+pub const WIRE_VERSION: u16 = 4;
 
 const HELLO: u8 = 1;
 const APPEND: u8 = 2;

@@ -12,7 +12,6 @@ name = "straum-server"
 path = "src/main.rs"
 
 [dependencies]
-auth = { path = "../auth" }
 node = { path = "../node" }
 transport = { path = "../transport" }
 thiserror = "2"
@@ -21,17 +20,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-bytes = "1"
-domain = { path = "../domain" }
-# A throwaway certificate per test run, and a client to speak TLS to it.
+# A throwaway certificate per test run.
 rcgen = "0.14"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-
-# Built, not run, by `cargo test --all-targets` (D-4): it refuses a debug
-# build. `cargo bench -p server --bench puback` (D-124).
-[[bench]]
-name = "puback"
-harness = false
 
 # Debian package, built by .github/workflows/release.yml with cargo-deb.
 [package.metadata.deb]
@@ -39,7 +29,7 @@ name = "straum"
 maintainer = "straum-io <https://github.com/straum-io/straum/issues>"
 copyright = "straum-io"
 license-file = ["../../LICENSE", "0"]
-extended-description = "A clustered MQTT 3.1.1 and 5 broker that acknowledges a publish only after a majority of its nodes has committed it to one replicated log. Experimental, not production-ready."
+extended-description = "A replicated log: nodes commit records by majority under a scheduled sequencer. Its client protocol is not built yet (D-188 A). Experimental, not production-ready."
 section = "net"
 priority = "optional"
 depends = "$auto"

@@ -40,7 +40,7 @@ fn frames() -> Vec<Frame> {
         Frame::Message(Message::Forward {
             slot: 9,
             proposal: Proposal {
-                kind: Kind::Publish,
+                kind: Kind::Data,
                 properties: vec![1, 0, 1, 1],
                 body: b"body".to_vec(),
             },

@@ -13,7 +13,7 @@ Rules-Requires-Root: no
 Package: straum
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
-Description: clustered MQTT broker (experimental)
- A clustered MQTT 3.1.1 and 5 broker that acknowledges a publish only after
- a majority of its nodes has committed it to one replicated log.
+Description: replicated log (experimental)
+ A replicated log: nodes commit records by majority under a scheduled
+ sequencer. Its client protocol is not built yet.
  Experimental, not production-ready.

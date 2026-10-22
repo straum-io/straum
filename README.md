@@ -7,244 +7,104 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![Status: experimental](https://img.shields.io/badge/status-experimental-orange)
 
-A clustered MQTT broker that acknowledges a publish only after a
-majority of its nodes has committed it to one replicated log.
+A replicated log: a scheduled sequencer orders records, and a record is
+committed once a majority of the nodes holds it on disk.
 
 **Website and docs:** [straum-io.github.io](https://straum-io.github.io/)
 
-> **Status: experimental.** Not production-ready: flow control is off,
-> failover and performance are not yet confirmed by Linux measurements,
-> timing defaults are placeholders, and persistent sessions, wills and
-> session expiry are refused at CONNECT for now.
+> **Status: experimental.** Straum has no client protocol right now. It was
+> an MQTT broker until MQTT was removed, and its own protocol is being
+> designed. What runs today is the cluster: nodes, links, the log,
+> failover and handoff, metrics. Not production-ready: flow control is off
+> and timing defaults are placeholders.
 
 ## Why
 
-A PUBACK from a single-node broker means one machine has your message. In
-Straum it means the message is in the log of a majority of the cluster, so
-a three-node cluster keeps every acknowledged message when one node dies.
-
-## The idea
-
-A Straum cluster is one mechanism, not a set of nodes that happen to talk
-to each other.
-
-- **One log decides.** Everything a client can observe, from a PUBACK to a
-  delivery, a retained message or a change of sequencer, is the result of
-  applying a committed record. No node changes shared state any other way.
-- **Nodes are deterministic.** A node is a function of the committed log
-  and its input events: two nodes with the same log prefix hold the same
-  state.
-- **Predictable over fast.** Who takes over next is known in advance,
-  handing the sequencer role over is routine, and each failure has one
-  defined reaction.
-- **Clocks don't decide.** Timeouts only start a transition; the log and
-  the majority decide how it ends.
-- **Proof before claims.** Correctness is shown by deterministic
-  simulation, performance only by measurements on Linux. No "faster"
-  without numbers.
-
-The goal it has to prove: a replicated MQTT 3.1.1 and 5 broker where a
-PUBACK means a majority committed the message, a planned leader change
-keeps client connections open, simulation checks correctness, and any
-`unsafe` code is isolated, justified and verified.
-
-Under the hood the protocol is a variant of Viewstamped Replication and
-Multi-Paxos with a deterministic owner per epoch, plus a few ideas from
-Solana's leader schedule. It is not a new consensus algorithm, and
-consensus only comes in when an owner fails.
-
-**Who it's for:** telemetry and industrial systems where a lost message
-costs money (metering, billing, SCADA events, audit trails), edge-to-cloud
-gateways that want a small, predictable binary, and teams that need a
-replicated broker under a permissive license without a JVM or BEAM
-runtime.
-
-**When goals conflict, this order wins:** an acknowledged message is
-committed; memory stays bounded; operations stay predictable (explicit
-backpressure and failure modes, configuration errors at startup);
-performance per CPU cycle, measured; then protocol coverage.
-
-**What it won't become:** a benchmark winner at the cost of those
-guarantees, a rule engine or integration hub, a broker with a management
-UI built in (that is [straum-console](https://github.com/straum-io/straum-console),
-outside the broker process), or a server for protocols other than MQTT.
+Most replicated systems pick a leader by election and find out who leads
+after the fact. In Straum the order of sequencers is a schedule known in
+advance: handing the role over is a routine, planned step, and a failed
+sequencer is replaced by the next one in line. The committed log is the
+only thing that decides; clocks only start a transition.
 
 ## What it does
 
-- **MQTT 3.1.1 and MQTT 5** over TCP, from one packet model with
-  properties and reason codes. QoS 0 and 1, retained messages, MQTT 5
-  subscription options. QoS 2 and shared subscriptions are not supported
-  yet.
-- **Majority commit.** A gateway forwards each publish to the sequencer,
-  which orders it in the log; the PUBACK goes out once a majority holds
-  the record.
-- **Failover and handoff.** A silent sequencer is taken over by another
-  node; an operator can hand the role over on purpose with `SIGUSR1`.
-- **Bounded memory.** Every queue and buffer has a limit and a stated
-  behavior when it is full, so a slow client cannot grow the broker
-  without bound.
-- **Deterministic simulation.** Three-node clusters run under a simulated
-  network and disk with the safety invariants checked throughout,
+- **Majority commit.** The sequencer of the current slot orders proposals
+  into the log; a record is committed once a majority has it durably.
+- **Scheduled leadership.** A silent sequencer is taken over by the next
+  node in the schedule, fenced by durable promises; an operator hands the
+  role over with `SIGUSR1`.
+- **A segmented log on disk** with group commit, snapshots and compaction,
+  and a chain hash over every batch, so two diverged logs disagree from the
+  next batch on.
+- **Bounded memory.** Every queue has a limit and a stated behavior when
+  it is full.
+- **Deterministic simulation.** Three-node clusters under a simulated
+  network and disk, with the safety invariants checked after every step,
   next to real three-node tests on loopback.
-- **TLS and access control.** TLS for clients and between nodes, where
-  each node's certificate proves which node it is; a password file and
-  topic rules for clients. All off by default; files reload on `SIGHUP`.
-- **Metrics.** Each node can serve Prometheus text; the stable metric and
-  setting names are pinned by tests.
+- **TLS between nodes**, each node's certificate proving which node it is,
+  and **Prometheus metrics** whose stable names are pinned by tests.
 
 ## Quick start
 
-You need Rust 1.85 or newer. Build the server:
+You need Rust 1.85 or newer. Build the server and start three nodes on one
+machine:
 
 ```sh
 cargo build --release -p server --bin straum-server
-```
-
-Start three nodes on one machine (there is no single-node mode):
-
-```sh
 export STRAUM_EXPERIMENTAL_CLUSTER=1
 export STRAUM_CLUSTER_PEERS=0=127.0.0.1:7000,1=127.0.0.1:7001,2=127.0.0.1:7002
 for i in 0 1 2; do
   STRAUM_CLUSTER_NODE_ID=$i \
   STRAUM_CLUSTER_DATA_DIR=/tmp/straum/n$i \
-  STRAUM_CLUSTER_MQTT_LISTEN=127.0.0.1:188$((3 + i)) \
   STRAUM_CLUSTER_METRICS_LISTEN=127.0.0.1:910$i \
   target/release/straum-server &
 done
 ```
 
-Subscribe on one node, publish to another. Any MQTT client works; with
-[straum-cli](https://github.com/straum-io/straum-cli):
+Watch them commit and hand over:
 
 ```sh
-straum-cli sub --broker 127.0.0.1:1884 -t 'sensors/+' -v &
-straum-cli pub --broker 127.0.0.1:1883 -t sensors/a -m 21.5
-# sensors/a 21.5
-
-straum-cli status --node 127.0.0.1:9100,127.0.0.1:9101,127.0.0.1:9102
+curl -s 127.0.0.1:9100 | grep -E '^straum_(slot|leading|commit) '
+kill -USR1 %1        # node 0 hands its slot to node 1
+curl -s 127.0.0.1:9101 | grep -E '^straum_(slot|leading|commit) '
 ```
 
 Everything binds to loopback. Any other address is refused unless you set
-`STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1`, and then only on a network you
-trust. Without that setting, the links between nodes may face a network once
-TLS between nodes is configured (`STRAUM_CLUSTER_TLS_*`, each node's
-certificate naming it), and the MQTT listener once TLS (`STRAUM_TLS_*`) and a
-password file (`STRAUM_AUTH_*`, anonymous clients refused) are; the metrics
-endpoint never does (`docs/configuration.md`).
+`STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1`, on a network you trust, or, for
+the links between nodes, configure TLS between nodes
+(`STRAUM_CLUSTER_TLS_*`). The metrics endpoint never leaves loopback without
+the first. Every setting is in [docs/configuration.md](docs/configuration.md).
 
-## Run with Docker
+## Run it elsewhere
 
-Build the image (about 40 MB, a distroless base, runs as a non-root user):
-
-```sh
-docker build -t straum .
-```
-
-Three nodes on their own network. Containers need addresses beyond
-loopback, so this sets `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1`: keep that
-network private, since this example sets no TLS or credentials.
-
-```sh
-docker network create --subnet 10.89.42.0/24 straum
-PEERS=0=10.89.42.10:7000,1=10.89.42.11:7000,2=10.89.42.12:7000
-for i in 0 1 2; do
-  docker run -d --name straum-$i --network straum --ip 10.89.42.1$i \
-    -v straum-$i:/var/lib/straum \
-    -p 188$((3 + i)):1883 -p 910$i:9100 \
-    -e STRAUM_EXPERIMENTAL_CLUSTER=1 \
-    -e STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1 \
-    -e STRAUM_CLUSTER_NODE_ID=$i \
-    -e STRAUM_CLUSTER_PEERS=$PEERS \
-    -e STRAUM_CLUSTER_LISTEN=0.0.0.0:7000 \
-    -e STRAUM_CLUSTER_MQTT_LISTEN=0.0.0.0:1883 \
-    -e STRAUM_CLUSTER_METRICS_LISTEN=0.0.0.0:9100 \
-    straum
-done
-```
-
-The ports map as in the quick start (MQTT on 1883–1885, metrics on
-9100–9102), so the same `straum-cli` commands work. Each node keeps its log
-in its volume and picks up where it left off after a restart. Peers are
-given as IP addresses: the node does not resolve host names.
-
-Release versions are published to Docker Hub by
-[`.github/workflows/release.yml`](.github/workflows/release.yml) for
-`linux/amd64` and `linux/arm64`, with provenance and an SBOM attached.
-
-## Install the Debian package
-
-On Ubuntu 22.04, 24.04 and 26.04, add the PPA and let apt keep Straum up
-to date (amd64 and arm64):
-
-```sh
-sudo add-apt-repository ppa:straum/ppa
-sudo apt install straum
-```
-
-Otherwise, each release on [GitHub](https://github.com/straum-io/straum/releases) has
-`.deb` packages for amd64 and arm64 (Debian 12, Ubuntu 22.04 and newer),
-with `SHA256SUMS` and build provenance. The package installs
-`/usr/bin/straum-server`, a `straum` systemd service and its settings file;
-it does not start anything, and neither does the PPA package. Then:
-
-```sh
-sudo apt install ./straum_<version>_<arch>.deb
-sudoedit /etc/default/straum          # node id, peers, listen addresses
-sudo systemctl enable --now straum
-```
-
-The service runs as a dynamic user with its data in `/var/lib/straum` and
-a tight sandbox (`systemd-analyze security` rates it 1.4). Run it on hosts
-or VMs; in containers use the Docker image, since the sandbox needs
-namespaces a container usually cannot create.
-
-## Run on Kubernetes
-
-[`deploy/kubernetes`](deploy/kubernetes) is a Kustomize package: a
-three-replica StatefulSet with a volume per node, one Service per node for
-the links, a `straum-mqtt` Service for clients, a headless Service for
-per-pod metrics, and a NetworkPolicy that keeps the links to Straum pods.
-It needs Kubernetes 1.28 or newer (each pod takes its node id from the
-`apps.kubernetes.io/pod-index` label).
-
-```sh
-kubectl apply -k deploy/kubernetes
-kubectl rollout status statefulset/straum
-kubectl port-forward svc/straum-mqtt 1883:1883
-```
-
-Before applying, set two things:
-
-- **The image**, in `kustomization.yaml` (`images:`).
-- **Three free ClusterIPs** in `peers.yaml`, inside your service CIDR, and
-  the same three in `STRAUM_CLUSTER_PEERS` in `statefulset.yaml`. The node
-  takes socket addresses, not host names, so each peer gets a Service with a
-  fixed IP that survives pod restarts. The defaults fit the common
-  `10.96.0.0/12`.
-
-The pods run as a non-root user with a read-only root filesystem.
-Kubernetes service links are off, because the server refuses unknown
-`STRAUM_*` variables.
-
-One limitation to know before you rely on it: a pod that restarts can stay
-behind and not serve clients
-([#13](https://github.com/straum-io/straum/issues/13)); the other two keep
-the cluster available.
+- **Docker:** `docker build -t straum .` gives a distroless image that runs
+  as a non-root user. Containers need addresses beyond loopback, so set
+  `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1` on a private network or
+  configure node TLS. Releases are published to Docker Hub for
+  `linux/amd64` and `linux/arm64`.
+- **Debian and Ubuntu:** `sudo add-apt-repository ppa:straum/ppa && sudo apt
+  install straum`, or a `.deb` from the
+  [releases](https://github.com/straum-io/straum/releases). The package
+  installs a `straum` systemd service and `/etc/default/straum`; it starts
+  nothing until you set the node id and peers there.
+- **Kubernetes:** [`deploy/kubernetes`](deploy/kubernetes) is a Kustomize
+  package for a three-replica StatefulSet. Set the image and three free
+  ClusterIPs (`peers.yaml`) first; the node takes socket addresses, not host
+  names.
 
 ## Compared with others
 
-Need a broker in production today? Use Mosquitto on a single node, or a
-clustered broker such as EMQX, VerneMQ or HiveMQ. Straum is for people who
-want an MQTT cluster whose behavior follows from one log, and want to
-follow or help with getting there.
+Need a replicated log in production today? Use Kafka, Redpanda or an etcd
+cluster. Straum is for people who want to follow, or help with, a log
+whose leadership is a schedule rather than an election, checked by
+deterministic simulation.
 
 ## More
 
 - [docs/configuration.md](docs/configuration.md): every setting, the
-  metrics, and the names clients may rely on.
-- [straum-cli](https://github.com/straum-io/straum-cli): a terminal client
-  for publish, subscribe and cluster status.
+  metrics, and the names other tools may rely on.
+- [straum-cli](https://github.com/straum-io/straum-cli): `status` reads
+  every node's metrics.
 - [Issues](https://github.com/straum-io/straum/issues): what is being
   worked on.
 - The architecture, ADRs and decision log live in the private

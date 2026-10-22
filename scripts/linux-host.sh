@@ -11,8 +11,7 @@
 # cargo to fetch crates. No root; nothing is changed on the system and
 # nothing is sent anywhere.
 #
-#   cd straum && scripts/linux-host.sh           # quick: a few hours
-#   scripts/linux-host.sh full                   # quick, then the D-124 run
+#   cd straum && scripts/linux-host.sh           # a few hours
 #
 # Stages, each written to target/linux-host/<time>/<stage>.txt, with its
 # outcome, duration and load average in run.log. A failure is recorded and
@@ -25,36 +24,20 @@
 #               and the crate boundaries
 #   sim-*       the simulation sweeps of docs/testing.md, in release
 #   bench-*     the micro benchmarks (divan) and the group-commit benchmark
-#   rates-*     what sizes the step 7c fence (straum#23, D-153 A), through
-#               three real server processes, 5 rounds each:
-#                 steady       positions per second, apply lag, PUBACK latency
-#                 heavy        the same at four times the load
-#                 events       10 planned handoffs and 10 killed sequencers in
-#                              each 6-minute round, 30 minutes in all (D-154 A):
-#                              the hold across a slot change as a
-#                              distribution (D-130 A, D-134 A)
-#                 churn-100    sessions removed at 100/s under the steady load
-#                 churn-1000   the same at 1 000/s
-#                 saturation   64 unpaced churners: the most the cluster takes
 #   cap-64      node/benches/cap.rs at max_uncommitted 64 (D-155 A): commit
 #               latency, uncommitted work, RSS, failover and catch-up, 5
 #               rounds and 50 failovers, the three logs on the measured disk
 #   cap-64-disks  the same, each node's log on its own disk: only with
 #               STRAUM_HOST_DATA_DIRS=/a,/b,/c on three separate physical
 #               disks; refused when two share one
-#   d124        full only: scripts/linux-run.sh, the D-124 run
 #
-# summary-rates.txt has each quantity's median, min, max and spread across
-# rounds, and the hold's p50, p90, max and share within 1 s (scripts/rates.awk);
-# fence-size.txt the step 7c W and tombstone queue from it (scripts/fence.awk,
-# D-154 A), preliminary until the host passes D-129.
+# The MQTT stages (the `puback` rates, the step 7c fence sizing and the
+# D-124 run) went with MQTT (D-188 A).
 # At the end: target/linux-host/straum-linux-<time>.tar.gz and its SHA-256.
 # Send that file back. It holds the host's name (uname -a) and nothing else
 # about the machine beyond what is listed above.
 set -eu
 
-MODE=${1:-quick}
-case $MODE in quick | full) ;; *) echo "usage: $0 [quick|full]" >&2; exit 2 ;; esac
 cd "$(dirname "$0")/.."
 if [ "$(uname -s)" != Linux ]; then
     echo "$0: this is for a Linux host; on macOS use scripts/linux.sh for tests only" >&2
@@ -64,7 +47,6 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 OUT=target/linux-host/$STAMP
 mkdir -p "$OUT"
 LOG=$OUT/run.log
-ROUNDS=5
 
 # The benchmarks write their logs under the system temp directory: here,
 # on the disk being measured, never tmpfs, where a sync costs nothing.
@@ -90,14 +72,13 @@ run() {
     note "   $status in $(($(date +%s) - started)) s"
 }
 
-note "straum linux-host run, mode $MODE, into $OUT"
+note "straum linux-host run into $OUT"
 
 # D-157 A: the physical disk under TMPDIR, as /proc/diskstats names it (the
 # kernel counts flushes on the whole disk, never on a partition), and the
 # ext4 journal of the filesystem there, under /proc/fs/jbd2 (named after
-# the partition or dm volume), for puback to count flushes and journal
-# commits over each measured window. A volume over several disks counts
-# the first.
+# the partition or dm volume), recorded with the run. A volume over several
+# disks counts the first.
 LOGDEV=$(lsblk -no KNAME "$(findmnt -n -o SOURCE -T "$TMPDIR" 2>/dev/null | sed 's/\[.*//')" 2>/dev/null | head -1 || true)
 DISK=$(lsblk -rs -no NAME,TYPE "/dev/${LOGDEV:-none}" 2>/dev/null | awk '$2 == "disk" { print $1; exit }' || true)
 JOURNAL=$(ls /proc/fs/jbd2 2>/dev/null | grep "^${LOGDEV:-none}-" | head -1 || true)
@@ -147,49 +128,14 @@ fi
 
 run tests sh -c 'cargo test --workspace --tests && scripts/check-boundaries.sh'
 
-for sim in takeover:20000 cluster:1000 apply:1000 gateway:1000 connect:1000 journal:1000; do
+for sim in takeover:20000 cluster:1000 journal:1000; do
     name=${sim%%:*}
     run "sim-$name" env STRAUM_SIM_SEEDS="${sim#*:}" cargo test --release -p sim --test "$name" -- --nocapture
 done
 
-for bench in apply:apply auth:verify codec:codec domain:topic gateway:gateway \
-    storage:record storage:scan transport:read_buffer storage:commit; do
+for bench in storage:record storage:scan transport:read_buffer storage:commit; do
     run "bench-${bench#*:}" cargo bench -p "${bench%%:*}" --bench "${bench#*:}"
 done
-
-PUBACK=$(cargo bench -p server --bench puback --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\))$/\1/p' | tail -1)
-if [ -z "$PUBACK" ] || [ ! -x "$PUBACK" ]; then
-    note "the puback benchmark did not build: the rates are skipped"
-else
-    # rates <label> <settings...>: ROUNDS runs of puback with the positions
-    # sampled every 100 ms; fails if any round did.
-    rates() {
-        shift
-        failed=0
-        for round in $(seq 1 "$ROUNDS"); do
-            echo "--- round $round"
-            if ! env STRAUM_BENCH_POSITIONS_MS=100 STRAUM_BENCH_DISK="$DISK" STRAUM_BENCH_JOURNAL="$JOURNAL" "$@" "$PUBACK"; then
-                echo "round $round FAILED"
-                failed=1
-            fi
-        done
-        return "$failed"
-    }
-    events=$(printf 'handoff,kill,%.0s' $(seq 1 10))
-    run rates-steady rates steady STRAUM_BENCH_SECONDS=60
-    run rates-heavy rates heavy STRAUM_BENCH_SECONDS=60 STRAUM_BENCH_PUBLISHERS=24 STRAUM_BENCH_WINDOW=32
-    run rates-events rates events STRAUM_BENCH_SECONDS=360 STRAUM_BENCH_EVENTS="${events%,}"
-    run rates-churn-100 rates churn STRAUM_BENCH_SECONDS=60 STRAUM_BENCH_CHURN=8 STRAUM_BENCH_CHURN_RATE=100
-    run rates-churn-1000 rates churn STRAUM_BENCH_SECONDS=60 STRAUM_BENCH_CHURN=32 STRAUM_BENCH_CHURN_RATE=1000
-    run rates-saturation rates saturation STRAUM_BENCH_SECONDS=30 STRAUM_BENCH_CHURN=64
-    for file in "$OUT"/rates-*.txt; do
-        stage=${file##*/rates-}
-        awk -v stage="${stage%.txt}" -f scripts/rates.awk "$file"
-    done > "$OUT/summary-rates.txt" 2>&1
-    note "== summary-rates: $OUT/summary-rates.txt"
-    awk -f scripts/fence.awk "$OUT/summary-rates.txt" > "$OUT/fence-size.txt" 2>&1 || true
-    note "== fence-size (preliminary): $OUT/fence-size.txt"
-fi
 
 cap() { env STRAUM_BENCH_CAPS=64 STRAUM_BENCH_ROUNDS=5 STRAUM_BENCH_FAILOVERS=50 "$@" cargo bench -p node --bench cap; }
 run cap-64 cap
@@ -226,15 +172,6 @@ $found"
     fi
 else
     note "   cap-64-disks skipped: STRAUM_HOST_DATA_DIRS not set (the separate-disk control, D-155 A)"
-fi
-
-if [ "$MODE" = full ]; then
-    before=$(ls -d target/linux-run/* 2>/dev/null | tail -1 || true)
-    run d124 scripts/linux-run.sh 5
-    after=$(ls -d target/linux-run/* 2>/dev/null | tail -1 || true)
-    if [ -n "$after" ] && [ "$after" != "$before" ]; then
-        cp -r "$after" "$OUT/d124-run"
-    fi
 fi
 
 rm -rf "$TMPDIR"

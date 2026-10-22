@@ -1,8 +1,8 @@
 //! The experimental cluster path end to end (ADR-0008 step 7a, D-106 A):
-//! three real `straum-server` processes on loopback, spoken to over MQTT
-//! 3.1.1 by a minimal hand-written client. One test, its steps in order, so
-//! no other test in this file competes for the ports it picks. Unix only:
-//! signals drive the handoff and the stops.
+//! three real `straum-server` processes on loopback, watched through their
+//! metrics (no client protocol since D-188 A). One test, its steps in
+//! order, so no other test in this file competes for the ports it picks.
+//! Unix only: signals drive the handoff and the stops.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
@@ -36,7 +36,7 @@ struct Server {
 struct Cluster {
     dir: PathBuf,
     links: Vec<u16>,
-    mqtt: Vec<u16>,
+    metrics: Vec<u16>,
     servers: Vec<Option<Server>>,
 }
 
@@ -47,11 +47,11 @@ impl Cluster {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let links = (0..NODES).map(|_| free_port()).collect();
-        let mqtt = (0..NODES).map(|_| free_port()).collect();
+        let metrics = (0..NODES).map(|_| free_port()).collect();
         Self {
             dir,
             links,
-            mqtt,
+            metrics,
             servers: (0..NODES).map(|_| None).collect(),
         }
     }
@@ -78,8 +78,8 @@ impl Cluster {
             .env("STRAUM_CLUSTER_NODE_ID", id.to_string())
             .env("STRAUM_CLUSTER_PEERS", self.peers())
             .env(
-                "STRAUM_CLUSTER_MQTT_LISTEN",
-                format!("127.0.0.1:{}", self.mqtt[usize::from(id)]),
+                "STRAUM_CLUSTER_METRICS_LISTEN",
+                format!("127.0.0.1:{}", self.metrics[usize::from(id)]),
             )
             .env("STRAUM_CLUSTER_DATA_DIR", &data)
             .env("STRAUM_LOG_LEVEL", "info")
@@ -138,8 +138,34 @@ impl Cluster {
         log(&self.servers[usize::from(id)].as_ref().unwrap().log)
     }
 
-    fn mqtt(&self, id: u8) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], self.mqtt[usize::from(id)]))
+    /// One stable gauge of node `id`, scraped now; `None` if the node did
+    /// not answer.
+    fn gauge(&self, id: u8, name: &str) -> Option<u64> {
+        let address = SocketAddr::from(([127, 0, 0, 1], self.metrics[usize::from(id)]));
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        stream.write_all(b"GET / HTTP/1.1\r\n\r\n").ok()?;
+        let mut text = String::new();
+        stream.read_to_string(&mut text).ok()?;
+        text.lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+    }
+
+    /// Until `holds` is true of node `id`'s gauge `name`, or the deadline.
+    fn wait_gauge(&self, id: u8, name: &str, holds: impl Fn(u64) -> bool) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(value) = self.gauge(id, name).filter(|&v| holds(v)) {
+                return value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "node {id}: {name} never held ({:?}): {}",
+                self.gauge(id, name),
+                self.log(id)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -214,229 +240,32 @@ fn wait_for_log(cluster: &Cluster, id: u8, what: &str) {
     }
 }
 
-// A minimal MQTT 3.1.1 client: what this test sends and reads, nothing more.
-
-fn remaining(mut n: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        let byte = (n % 128) as u8;
-        n /= 128;
-        out.push(if n > 0 { byte | 0x80 } else { byte });
-        if n == 0 {
-            return out;
-        }
-    }
-}
-
-fn string(s: &[u8]) -> Vec<u8> {
-    let mut out = u16::try_from(s.len()).unwrap().to_be_bytes().to_vec();
-    out.extend_from_slice(s);
-    out
-}
-
-fn packet(header: u8, body: &[u8]) -> Vec<u8> {
-    let mut out = vec![header];
-    out.extend(remaining(body.len()));
-    out.extend_from_slice(body);
-    out
-}
-
-/// One whole packet, or `None` at the deadline or the end of the stream.
-fn read_packet(stream: &mut TcpStream, within: Duration) -> Option<(u8, Vec<u8>)> {
-    stream.set_read_timeout(Some(within)).unwrap();
-    let mut header = [0u8; 1];
-    stream.read_exact(&mut header).ok()?;
-    let (mut length, mut shift) = (0usize, 0);
-    loop {
-        let mut byte = [0u8; 1];
-        stream.read_exact(&mut byte).ok()?;
-        length |= usize::from(byte[0] & 0x7f) << shift;
-        shift += 7;
-        if byte[0] & 0x80 == 0 {
-            break;
-        }
-    }
-    let mut body = vec![0u8; length];
-    stream.read_exact(&mut body).ok()?;
-    Some((header[0], body))
-}
-
-/// CONNECT and its CONNACK's return code; `None` if the node did not answer.
-fn connect_with(
-    address: SocketAddr,
-    client: &str,
-    flags: u8,
-    will: Option<(&str, &str)>,
-) -> Option<(TcpStream, u8)> {
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).ok()?;
-    let mut body = string(b"MQTT");
-    body.extend_from_slice(&[4, flags, 0, 60]);
-    body.extend(string(client.as_bytes()));
-    if let Some((topic, message)) = will {
-        body.extend(string(topic.as_bytes()));
-        body.extend(string(message.as_bytes()));
-    }
-    stream.write_all(&packet(0x10, &body)).ok()?;
-    match read_packet(&mut stream, Duration::from_secs(5))? {
-        (0x20, ack) if ack.len() == 2 => Some((stream, ack[1])),
-        _ => None,
-    }
-}
-
-/// A clean session, once the node takes clients (it refuses them until its
-/// gateway's reset is committed).
-fn connect(address: SocketAddr, client: &str) -> TcpStream {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some((stream, 0)) = connect_with(address, client, 0x02, None) {
-            return stream;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{client}: never connected to {address}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-fn subscribe(stream: &mut TcpStream, topic: &str) {
-    let mut body = 1u16.to_be_bytes().to_vec();
-    body.extend(string(topic.as_bytes()));
-    body.push(1);
-    stream.write_all(&packet(0x82, &body)).unwrap();
-    let (kind, ack) = read_packet(stream, Duration::from_secs(10)).expect("no SUBACK");
-    assert_eq!((kind, ack.last().copied()), (0x90, Some(1)), "SUBACK");
-}
-
-fn publish(stream: &mut TcpStream, topic: &str, payload: &str, id: u16) {
-    let mut body = string(topic.as_bytes());
-    body.extend_from_slice(&id.to_be_bytes());
-    body.extend_from_slice(payload.as_bytes());
-    stream.write_all(&packet(0x32, &body)).unwrap();
-}
-
-/// Whether the PUBACK for `id` comes within `within`.
-fn acknowledged(stream: &mut TcpStream, id: u16, within: Duration) -> bool {
-    let deadline = Instant::now() + within;
-    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-        match read_packet(stream, left.max(Duration::from_millis(1))) {
-            Some((0x40, ack)) if ack == id.to_be_bytes() => return true,
-            Some(_) => {}
-            None => return false,
-        }
-    }
-    false
-}
-
-/// Whether a PUBLISH carrying `payload` arrives within `within`; each
-/// QoS 1 delivery is acknowledged.
-fn delivered(stream: &mut TcpStream, payload: &str, within: Duration) -> bool {
-    let deadline = Instant::now() + within;
-    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-        let Some((kind, body)) = read_packet(stream, left.max(Duration::from_millis(1))) else {
-            return false;
-        };
-        if kind >> 4 != 3 {
-            continue;
-        }
-        let topic = usize::from(u16::from_be_bytes([body[0], body[1]]));
-        let mut at = 2 + topic;
-        if kind & 0x06 != 0 {
-            let id = [body[at], body[at + 1]];
-            at += 2;
-            stream.write_all(&packet(0x40, &id)).unwrap();
-        }
-        if body[at..] == *payload.as_bytes() {
-            return true;
-        }
-    }
-    false
-}
-
 #[test]
-fn three_server_processes_acknowledge_only_committed_publishes_and_hand_over() {
+fn three_server_processes_commit_hand_over_and_refuse_another_cluster() {
     let mut cluster = Cluster::new();
     for id in 0..NODES {
         cluster.start(id);
     }
-    let long = Duration::from_secs(15);
 
-    // A QoS 1 publish on node 2, acknowledged and delivered on node 0.
-    let mut on0 = connect(cluster.mqtt(0), "sub-0");
-    subscribe(&mut on0, "t/x");
-    let mut pub2 = connect(cluster.mqtt(2), "pub-2");
-    publish(&mut pub2, "t/x", "one", 1);
-    assert!(
-        acknowledged(&mut pub2, 1, long),
-        "no PUBACK for the first publish"
-    );
-    assert!(
-        delivered(&mut on0, "one", long),
-        "the first publish was not delivered"
-    );
-
-    // What the path cannot keep yet is refused at CONNECT (code 3).
-    assert_eq!(
-        connect_with(cluster.mqtt(1), "will", 0x06, Some(("w/t", "bye"))).map(|(_, code)| code),
-        Some(3),
-        "a will was accepted"
-    );
-    assert_eq!(
-        connect_with(cluster.mqtt(1), "keep", 0x00, None).map(|(_, code)| code),
-        Some(3),
-        "a persistent session was accepted"
-    );
-
-    // PUBACK waits for the commit. Node 0 sequences the first slot; with
-    // its two replicas stopped it can append but not commit — two of three
-    // logs are needed — so a publish on it is neither acknowledged nor
-    // delivered. The sequencer is alive throughout: what is missing is the
-    // majority, nothing else.
-    cluster.stop(1);
-    cluster.stop(2);
-    let mut pub0 = connect(cluster.mqtt(0), "pub-0");
-    publish(&mut pub0, "t/x", "three", 3);
-    assert!(
-        !acknowledged(&mut pub0, 3, Duration::from_secs(3)),
-        "acknowledged without a majority"
-    );
-    assert!(
-        !delivered(&mut on0, "three", Duration::from_secs(1)),
-        "delivered without a majority"
-    );
-    // A replica restarted over its own data brings the majority back: the
-    // same publish, on the same connection, commits and is acknowledged.
-    cluster.start(1);
-    assert!(
-        acknowledged(&mut pub0, 3, Duration::from_secs(20)),
-        "the publish waiting for a majority was not acknowledged once it had one"
-    );
-    assert!(
-        delivered(&mut on0, "three", long),
-        "not delivered once the majority was back"
-    );
+    // Node 0 sequences the first slot, and its start commits on all three.
+    cluster.wait_gauge(0, "straum_leading", |v| v == 1);
+    let first = cluster.wait_gauge(0, "straum_commit", |v| v >= 2);
+    for id in 1..NODES {
+        cluster.wait_gauge(id, "straum_applied", |v| v >= first);
+    }
 
     // The operator's handoff: the first slot's owner, node 0, hands it
-    // over; node 1 says it does not sequence. Publishing goes on: the first
-    // publish after the handoff is held by its node while the slot changes
-    // hands and acknowledged on its first sending, with no resend (D-109 B).
+    // over; node 1 says it does not sequence. The next slot commits.
     cluster.signal(0, "-USR1");
     cluster.signal(1, "-USR1");
     wait_for_log(&cluster, 0, "handing the slot over");
     wait_for_log(&cluster, 1, "no handoff");
-    let mut pub1 = connect(cluster.mqtt(1), "pub-1");
-    publish(&mut pub1, "t/x", "four", 4);
-    assert!(
-        acknowledged(&mut pub1, 4, long),
-        "the first publish after the handoff was not acknowledged without a resend"
-    );
-    assert!(
-        delivered(&mut on0, "four", long),
-        "not delivered after the handoff"
-    );
+    cluster.wait_gauge(1, "straum_leading", |v| v == 1);
+    let handed = cluster.wait_gauge(1, "straum_commit", |v| v > first);
 
     // An incompatible configuration is refused: over node 2's data, with
     // another takeover setting, the process refuses to start…
+    cluster.stop(2);
     let mut other = cluster.spawn(2, None, &[("STRAUM_CLUSTER_TAKEOVER_TICKS", "4")]);
     let status = wait(&mut other.child, Duration::from_secs(20));
     assert!(!status.success(), "started over another cluster's data");
@@ -465,18 +294,10 @@ fn three_server_processes_acknowledge_only_committed_publishes_and_hand_over() {
     wait_for_log(&cluster, 2, "node started");
     cluster.stop(2);
 
-    // Node 2 as it was configured rejoins, and everyone stops cleanly.
+    // Node 2 as it was configured rejoins and reaches the log, and
+    // everyone stops cleanly.
     cluster.start(2);
-    let mut pub2 = connect(cluster.mqtt(2), "pub-2b");
-    publish(&mut pub2, "t/x", "five", 5);
-    assert!(
-        acknowledged(&mut pub2, 5, long),
-        "no PUBACK after node 2 rejoined"
-    );
-    assert!(
-        delivered(&mut on0, "five", long),
-        "not delivered after node 2 rejoined"
-    );
+    cluster.wait_gauge(2, "straum_applied", |v| v >= handed);
     for id in 0..NODES {
         cluster.stop(id);
     }

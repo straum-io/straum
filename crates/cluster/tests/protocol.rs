@@ -22,7 +22,7 @@ fn config(id: u8) -> Config {
 
 fn publish(body: &[u8]) -> Proposal {
     Proposal {
-        kind: Kind::Publish,
+        kind: Kind::Data,
         properties: Vec::new(),
         body: body.to_vec(),
     }
@@ -291,7 +291,7 @@ fn a_replica_behind_memory_is_caught_up_from_the_log_and_lost_below_it() {
         .batch(
             1,
             &[journal::Entry {
-                kind: Kind::Publish,
+                kind: Kind::Data,
                 properties: &[],
                 body: b"a",
             }],
@@ -366,7 +366,7 @@ fn a_restarted_sequencer_ships_nothing_until_a_replica_reports() {
         .batch(
             1,
             &[journal::Entry {
-                kind: Kind::Publish,
+                kind: Kind::Data,
                 properties: &[],
                 body: b"a",
             }],
@@ -627,12 +627,12 @@ fn a_read_hands_back_whole_batches_within_its_bounds() {
     for body in [b"a", b"b", b"c"] {
         let entries = [
             Entry {
-                kind: Kind::Publish,
+                kind: Kind::Data,
                 properties: &[],
                 body,
             },
             Entry {
-                kind: Kind::Publish,
+                kind: Kind::Data,
                 properties: &[],
                 body,
             },
@@ -705,7 +705,7 @@ fn a_stale_read_answer_neither_clears_the_read_nor_asks_again() {
             .batch(
                 1,
                 &[journal::Entry {
-                    kind: Kind::Publish,
+                    kind: Kind::Data,
                     properties: &[],
                     body,
                 }],

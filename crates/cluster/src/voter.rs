@@ -157,6 +157,10 @@ pub struct Voter {
     cut: bool,
     /// The next report's number: the incarnation in the high bits.
     report: u64,
+    /// This node's incarnation and the next sequence number: the origin
+    /// property each own proposal gets (`journal::ORIGIN_PROPERTY`).
+    life: u64,
+    sequence: u64,
     /// Fetches waiting for a read of the local log: (asker, slot, the
     /// asker's last slot and end).
     serving: Vec<(NodeId, u64, (u64, u64))>,
@@ -203,6 +207,8 @@ impl Voter {
             truncating: false,
             cut: false,
             report: 1,
+            life: 0,
+            sequence: 0,
             serving: Vec::new(),
             refused: 0,
             effects: Vec::new(),
@@ -229,6 +235,7 @@ impl Voter {
     /// reports would look older than its previous life's.
     pub fn incarnation(mut self, incarnation: u64) -> Self {
         self.report = (incarnation << 40) | 1;
+        self.life = incarnation;
         self
     }
 
@@ -374,12 +381,26 @@ impl Voter {
         }
     }
 
-    /// Takes one of this node's own proposals (a gateway's): held until its
+    /// Takes one of this node's own proposals: held until its
     /// record is applied from the committed log, sent to the sequencer of
     /// the promised slot, and sent again only once that slot is closed in
     /// the committed log (`outbox`, D-109 B). `Full` at `max_queue` held:
     /// refused, never acknowledged.
-    pub fn submit(&mut self, proposal: Proposal) -> Result<(), ClusterError> {
+    ///
+    /// The proposal gets this node's origin property first (node,
+    /// incarnation, sequence; D-188 A): the outbox recognises its own
+    /// record by its bytes, and without the property another node's record
+    /// with the same body would pass for it. The property is unique only
+    /// if the driver set this life's incarnation (`Voter::incarnation`),
+    /// as `node` does; without it every restart reuses life 0.
+    pub fn submit(&mut self, mut proposal: Proposal) -> Result<(), ClusterError> {
+        let origin = &mut proposal.properties;
+        origin.push(journal::ORIGIN_PROPERTY);
+        origin.extend_from_slice(&journal::ORIGIN_BYTES.to_be_bytes());
+        origin.push(self.config.id);
+        origin.extend_from_slice(&self.life.to_be_bytes());
+        origin.extend_from_slice(&self.sequence.to_be_bytes());
+        self.sequence = self.sequence.wrapping_add(1);
         if !self.outbox.push(proposal) {
             return Err(ClusterError::Full);
         }

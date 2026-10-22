@@ -36,7 +36,7 @@ fn sends(effects: &[Effect]) -> Vec<(u8, Message)> {
 fn batch(chain: &mut Chain, slot: u64, body: &[u8]) -> Vec<Vec<u8>> {
     let mut records = Vec::new();
     let entry = Entry {
-        kind: Kind::Publish,
+        kind: Kind::Data,
         properties: &[],
         body,
     };
@@ -284,7 +284,7 @@ fn cluster() -> Vec<Voter> {
 
 fn publish(body: &[u8]) -> cluster::Proposal {
     cluster::Proposal {
-        kind: Kind::Publish,
+        kind: Kind::Data,
         properties: Vec::new(),
         body: body.to_vec(),
     }

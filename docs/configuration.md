@@ -27,8 +27,8 @@ measurements, not intuition, and none is measured yet.
 Without `STRAUM_EXPERIMENTAL_CLUSTER=1` the server refuses to start: the
 only path is experimental and **not production-ready** — flow control off,
 timing defaults placeholders, failover and performance not confirmed by a
-Linux measurement (D-102 A, D-111). TLS and credentials are not among the
-reasons: they work, off by default (below). Only the variables below, `STRAUM_LOG_LEVEL`
+Linux measurement (D-102 A, D-111). It serves no clients: MQTT was removed
+(D-188 A) and Straum's own protocol is not built yet. Only the variables below, `STRAUM_LOG_LEVEL`
 (default `info`) and `STRAUM_WORKER_THREADS` (`auto`: the CPUs) are read;
 any other `STRAUM_*` variable is refused at startup (D-104 A).
 
@@ -38,45 +38,36 @@ any other `STRAUM_*` variable is refused at startup (D-104 A).
 | `STRAUM_CLUSTER_NODE_ID` | required | This node's id, 0–255. |
 | `STRAUM_CLUSTER_PEERS` | required | Every voter, this node included: `id=address,…` (socket addresses). Odd, at least three; no id twice. |
 | `STRAUM_CLUSTER_LISTEN` | this node's address in the peers | Where its links listen. It and the peers may be beyond loopback without the unauthenticated-network setting when the three `STRAUM_CLUSTER_TLS_*` are set (ADR-0010). |
-| `STRAUM_CLUSTER_MQTT_LISTEN` | `127.0.0.1:1883` | Where MQTT clients connect. Loopback by default (D-107). It may bind beyond loopback without the next-but-one setting only when `STRAUM_TLS_*` and a password file are set and anonymous clients are not let in (D-164 A); otherwise credentials, if any, would cross the network in clear. |
 | `STRAUM_CLUSTER_METRICS_LISTEN` | off | Where the node serves its metrics over plain HTTP, in the Prometheus text format (D-112): every request gets the current snapshot. No credentials; loopback unless the next setting is `1`. A diagnostic interface, not a monitoring system (D-126 A): at most 4 scrapes at once — more wait unaccepted — and each read and write bounded by 2 s. |
-| `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK` | `0` | `1` lets the MQTT listener, the link listener, the peers and the metrics listener use addresses beyond loopback — metrics always unencrypted and unauthenticated, links and peers so unless `STRAUM_CLUSTER_TLS_*` are set; MQTT clients encrypted only under `STRAUM_TLS_*`, and without it their passwords cross the network in clear: for an isolated, trusted network only. Without it any such address is refused at startup, except the MQTT listener when TLS and a password file with no anonymous clients secure it (D-164 A), and the link listener and the peers when node TLS is set (ADR-0010). The experimental switch is no security mechanism (D-107). |
+| `STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK` | `0` | `1` lets the link listener, the peers and the metrics listener use addresses beyond loopback — metrics always unencrypted and unauthenticated, links and peers so unless `STRAUM_CLUSTER_TLS_*` are set: for an isolated, trusted network only. Without it any such address is refused at startup, except the link listener and the peers when node TLS is set (ADR-0010). The experimental switch is no security mechanism (D-107). |
 | `STRAUM_CLUSTER_DATA_DIR` | required | The log, the promise, snapshots, and the `cluster` file that pins the directory to its cluster's configuration digest: a node started over another cluster's data is refused. |
 | `STRAUM_CLUSTER_HEARTBEAT_MS` | `50` | 1–10 000. A placeholder, not a recommendation (D-104 A). |
 | `STRAUM_CLUSTER_TAKEOVER_TICKS` | `3` | Heartbeats of silence before a takeover, 1–1 000. A placeholder; the simulation shows 3 churns under random delivery (D-99). With node TLS at least 4, or the start is refused (D-173 A): a stalled handshake to a restarted peer can take a heartbeat on top of a backoff, the handshake and the wait for the next heartbeat. |
 | `STRAUM_CLUSTER_RETAIN_BYTES` | `67108864` | The log kept behind a slow replica (D-57 A, D-91 A); a starting value, not a measured optimum. |
 | `STRAUM_READ_BYTES` | `65536` | One catch-up or fetch read (D-83 A); at most half the 8 MiB frame — 4 MiB — refused above. |
-| `STRAUM_WAL_PREALLOCATE_BYTES` | `8388608` (8 MiB) | Zeros written this far ahead of each log segment's end (ADR-0009, D-170 A, D-178 A), 0–1 GiB, so a sync flushes data only and does not also commit the file's new length through the filesystem's journal. Measured on one host that passes D-129 (an i5-10600, ext4 on a SATA disk, 2026-10-22): steady PUBACKs/s from about 1 800 to about 4 500 with it, journal commits per flush from 0.5 to 0.01. The pre-zeroed rounds of that run varied 1–7 %, and it is one host and one filesystem: no precise gain is claimed for others. Not measured on XFS, Btrfs or ZFS. On a copy-on-write filesystem (Btrfs, ZFS) no benefit is expected (not measured), only the cost of writing the zeros: set `0` there, which turns it off. Recovery is unchanged (a zero frame ends the log, as any torn tail); a sealed segment is trimmed to its log; readers stop at the written end. At most this much disk per open segment beyond its log; one extension costs one write of this size. |
-| `STRAUM_AUTH_PASSWORD_FILE` | off | MQTT credentials (D-110 A, D-158 A): one `user:<hash>` line per user, `#` comments and blank lines ignored; the hash is argon2, as `straum-server hash-password` prints it for a password given on stdin. Set: every CONNECT is checked, off the node loop, before its CONNACK; a wrong or unknown user gets "bad user name or password" (3.1.1: return code 4), an anonymous client "not authorized" (5) unless `STRAUM_AUTH_ALLOW_ANONYMOUS` lets it in. Read at startup, where unreadable or malformed refuses the start, and again on SIGHUP (below). |
-| `STRAUM_AUTH_ACL_FILE` | off | Topic rules: `user <name>` or `anonymous`, then lines `publish <filter>`, `subscribe <filter>` or `readwrite <filter>`. Read at startup and again on SIGHUP (below). The file grants only what it lists (D-159 A): a user it names may do what its rules allow, one it does not name nothing, and anonymous clients only what an `anonymous` section lists. Without the file every user, and every anonymous client let in, may do anything. A correct file under which clients can connect but nobody, anonymous clients included, may do anything starts, with a warning in the log (D-160 A, D-161 A; an ACL file alone that grants anonymous clients nothing included); a file that cannot be read or parsed refuses the start, never falling back to a looser policy. A refused SUBSCRIBE filter gets "not authorized" (3.1.1: 0x80) and is not proposed; a refused PUBLISH is never proposed: MQTT 5 answers a QoS 1 one "not authorized" (or closes the connection, "not authorized", while earlier QoS 1 publishes still wait for their PUBACKs, which a refusal may not overtake) and drops a QoS 0 one; 3.1.1 closes the connection. A subscription is allowed only where a rule covers all it can match. |
-| `STRAUM_AUTH_ALLOW_ANONYMOUS` | `1` without a password file, `0` with one | Whether a client without a user name is let in (restricted by the ACL file's `anonymous` section). A configuration under which no client could connect is refused at startup: no user, and anonymous clients refused. One where clients connect but may do nothing starts with a warning. |
-| `STRAUM_TLS_CERT_PATH` | off | A PEM certificate chain for the MQTT listener (D-164 A). With it and the next one, the listener speaks TLS only, never plaintext beside it. Both or neither; read at startup, where a file that cannot be read, holds no certificate or a key of another certificate refuses the start, and again on SIGHUP (below). A TLS handshake must finish within the gateway's connect timeout (10 s), and at most 1 024 run at once: a connection past that is closed at once. TLS state per connection (rustls's buffers and session) is not charged to the read-buffer budget; it is bounded by count, at most 1 024 handshakes and 1 024 open connections, not measured in bytes. At most 16 connections from one source address wait at once, for a handshake or a CONNECT (D-165 A); past that the source's next one is closed at once, so one address or one IPv6 /64 cannot take every slot: a source is an IPv4 address, or an IPv6 /64, since a host commonly holds a whole one (D-168 A); an IPv4-mapped address counts as its IPv4 address. Hosts sharing one /64 share the 16: so do every link-local client (fe80::/64, whatever its interface), and, behind a NAT64 that shows IPv4 clients as 64:ff9b::/96, every IPv4 client. Clients behind one NAT share those 16; many sources together, or a host routed a wider prefix, still can fill the 1 024, which is a firewall's job. Each refusal before the gateway is counted, with or without TLS, outside the stable metrics (D-167 A): `straum_mqtt_refused_no_permit_total`, `straum_mqtt_refused_source_full_total`, and `straum_mqtt_handshake_failed_total` (a connection whose setup, read buffers or the TLS handshake, failed or did not finish in time). Clients only: links between nodes have their own settings, `STRAUM_CLUSTER_TLS_*` (below). |
-| `STRAUM_TLS_KEY_PATH` | off | The certificate's private key, PEM. As above. |
+| `STRAUM_WAL_PREALLOCATE_BYTES` | `8388608` (8 MiB) | Zeros written this far ahead of each log segment's end (ADR-0009, D-170 A, D-178 A), 0–1 GiB, so a sync flushes data only and does not also commit the file's new length through the filesystem's journal. Measured on one host that passes D-129 (an i5-10600, ext4 on a SATA disk, 2026-10-22), through the MQTT path since removed: steady PUBACKs/s from about 1 800 to about 4 500 with it, journal commits per flush from 0.5 to 0.01. The pre-zeroed rounds of that run varied 1–7 %, and it is one host and one filesystem: no precise gain is claimed for others. Not measured on XFS, Btrfs or ZFS. On a copy-on-write filesystem (Btrfs, ZFS) no benefit is expected (not measured), only the cost of writing the zeros: set `0` there, which turns it off. Recovery is unchanged (a zero frame ends the log, as any torn tail); a sealed segment is trimmed to its log; readers stop at the written end. At most this much disk per open segment beyond its log; one extension costs one write of this size. |
 | `STRAUM_CLUSTER_TLS_CERT_PATH` | off | This node's certificate chain for its links, PEM (ADR-0010, D-171 A). With the next two, every link is TLS 1.3, with no session resumption and no early data, and both ends present a certificate the cluster CA signed. All three or none. The certificate must name this node exactly once (below), or the start is refused. A node with them and one without cannot link: turning node TLS on or off means stopping every node, then starting every node with the new settings. |
 | `STRAUM_CLUSTER_TLS_KEY_PATH` | off | Its private key, PEM. As above. |
 | `STRAUM_CLUSTER_TLS_CA_PATH` | off | The cluster CA, PEM: the only certificates a peer's chain may lead to. Use a CA for this cluster alone: its key is the root of every node's identity. As above. |
 
-Credentials checks (D-158 A) run off the node loop, at most one per CPU at once, each argon2 check taking about 19 MiB while it runs; a check waiting for its turn holds one CONNECT's user name and password and is cancelled when its connection goes, so the waiting ones are at most the gateway's 1 024 connections: at worst 1 024 × the 256 KiB packet bound, 256 MiB. Hashes must use `straum-server hash-password`'s parameters (argon2id, m=19456, t=2, p=1): a refusal costs one hash with them, so a stored hash made with others would let a known user name be told from an unknown one by its time.
-
 Fixed in 7a, not settings: `max_uncommitted` 64 (D-82 A), batches of 16
-records, MQTT packets up to 256 KiB, link frames up to 8 MiB, window 256,
+records, records (body and properties) up to 256 KiB, link frames up to 8 MiB, window 256,
 snapshots every 4 096 applied records, segments of 64 MiB, a queue of
 1 024 proposals (`max_queue`) at the sequencer; each node's outbox of its own
 proposals awaiting commit holds its share, `max_queue / voters` rounded
 down and never 0 — 341 with three voters (D-109 B, D-120 A): up to 341
-times a packet of 256 KiB, about 85 MiB, per node at worst, a count without
-a byte budget of its own (D-119 A); while it is full the node reads none
-of its MQTT clients. A queue below one proposal per voter is refused at startup
+times a record of 256 KiB, about 85 MiB, per node at worst, a count without
+a byte budget of its own (D-119 A); while it is full the node refuses new
+proposals and counts them. A queue below one proposal per voter is refused at startup
 (`ConfigError::Queue`), so the shares always fit it. A link to a down peer is redialled at least once per
 heartbeat (D-122 A), and at once when the peer comes back as a new process:
-its HELLO carries its incarnation (D-151 A). And the gateway's and `apply`'s limits at the values in `node::experimental`. Every node of one
+its HELLO carries its incarnation (D-151 A). Every node of one
 cluster must agree on the voters, the first slot, the timing and these
 bounds: they go into the configuration digest each link's HELLO carries, and
-a link from a node that differs is refused. Wills, persistent sessions and
-session expiry are refused at CONNECT until step 7c. SIGHUP reads the TLS and credential files again (D-166 A), the ones named at startup: every file is read and checked by the start's rules first, and only if all pass are they used, for new connections; open connections keep what they were admitted with, and a credentials check already started (running, or waiting for its turn) finishes with the old files. If any fails, the log says why and the files in use stay, never a looser policy. The node TLS files are in the same set: after they are installed, every open link, dialled or accepted, is checked again with the new CA, its peer's node name and the current time, and one that fails, or cannot be checked, is closed (D-172 C); a renewal under the same CA closes none. A reload never turns TLS or credentials on or off (the settings are not read again); `systemctl reload straum` sends it. SIGUSR1 asks the node to
+a link from a node that differs is refused. SIGHUP reads the node TLS files again (D-166 A), the ones named at startup: every file is read and checked by the start's rules first, and only if all pass are they used. If any fails, the log says why and the files in use stay. After they are installed, every open link, dialled or accepted, is checked again with the new CA, its peer's node name and the current time, and one that fails, or cannot be checked, is closed (D-172 C); a renewal under the same CA closes none. A reload never turns TLS on or off (the settings are not read again); `systemctl reload straum` sends it. SIGUSR1 asks the node to
 hand its slot over (a protocol handoff, D-105 A); SIGTERM or Ctrl-C stops it,
 with exit code 0. A node that stops by itself — its log fails, a committed
-record does not apply, a panic — logs why, and the process exits non-zero so
+record does not decode, a panic — logs why, and the process exits non-zero so
 a supervisor restarts it (D-152 A).
 
 ### Stable metrics (D-141 A)
@@ -95,7 +86,6 @@ the catch-up series of D-132–D-139 among them.
 straum_node
 straum_slot
 straum_leading
-straum_serving
 straum_commit
 straum_applied
 straum_log_end
@@ -108,14 +98,15 @@ straum_outbox_capacity
 
 What they mean, as rendered: `straum_node` this node's id; `straum_slot`
 the highest slot it promised; `straum_leading` 1 while it sequences its
-slot; `straum_serving` 1 once its gateway takes clients; `straum_commit`
+slot; `straum_commit`
 the commit point it knows; `straum_applied` the last position applied
 here; `straum_log_end` and `straum_log_durable` its log's last position
 and the position durable through; `straum_lag` positions its log is
 behind the commit point it heard; `straum_outbox_entries` and
 `straum_outbox_capacity` its own proposals awaiting commit and their
-bound. A value is this node's view at the scrape — not the cluster's, and
-not a health verdict.
+bound. `straum_serving` was removed with the gateway (D-188 A). A value
+is this node's view at the scrape — not the cluster's, and not a health
+verdict.
 
 ### Stable names (D-141 A)
 
@@ -137,7 +128,6 @@ STRAUM_CLUSTER_NODE_ID
 STRAUM_CLUSTER_PEERS
 STRAUM_CLUSTER_DATA_DIR
 STRAUM_CLUSTER_LISTEN
-STRAUM_CLUSTER_MQTT_LISTEN
 STRAUM_CLUSTER_METRICS_LISTEN
 STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK
 STRAUM_CLUSTER_HEARTBEAT_MS
@@ -145,137 +135,44 @@ STRAUM_CLUSTER_TAKEOVER_TICKS
 STRAUM_CLUSTER_RETAIN_BYTES
 STRAUM_READ_BYTES
 STRAUM_WAL_PREALLOCATE_BYTES
-STRAUM_AUTH_PASSWORD_FILE
-STRAUM_AUTH_ACL_FILE
-STRAUM_AUTH_ALLOW_ANONYMOUS
-STRAUM_TLS_CERT_PATH
-STRAUM_TLS_KEY_PATH
 STRAUM_CLUSTER_TLS_CERT_PATH
 STRAUM_CLUSTER_TLS_KEY_PATH
 STRAUM_CLUSTER_TLS_CA_PATH
 ```
 <!-- stable-settings:end -->
 
-The journal's record kinds that are written and applied today, and their
-numbers (`journal`'s `the_stable_kinds_are_the_ones_decoded`, and
-`apply`'s `the_stable_kinds_are_written_and_applied_and_the_reserved_are_refused`,
-which fails if a stable kind is not written or a reserved one is applied):
+The journal's record kinds, version 5, and their numbers (`journal`'s
+`the_stable_kinds_are_the_ones_decoded`). Version 5 (D-188 A) dropped the
+MQTT kinds; a record of version 4 is refused by its version byte.
 
 <!-- stable-kinds:begin -->
 ```text
 BatchHeader = 0
-Publish = 1
-SessionGone = 3
-Subscribe = 4
-Unsubscribe = 5
-Ack = 6
-NodeReset = 9
+Data = 1
 SlotStart = 24
 SlotEnd = 25
 ```
 <!-- stable-kinds:end -->
 
-Reserved kinds (unified-stream §2.7): their numbers are held — no other
-kind will take them — but nothing writes them yet, `apply` refuses each,
-and their names and meaning stay free until 7c or phase 6 builds them. Not
-stable. `Session`, `Connect` and `Disconnect` were listed as stable by
-mistake until D-145 A moved them here.
+Reserved kinds: none since D-188 A. The block stays so the readers of these
+blocks keep finding it.
 
 <!-- reserved-kinds:begin -->
 ```text
-Session = 2
-Connect = 7
-Disconnect = 8
-SessionExpired = 16
-MessageExpired = 17
-WillPublished = 18
-QosTwoState = 32
-SharedAssignment = 33
 ```
 <!-- reserved-kinds:end -->
 
-The MQTT reason codes the gateway sends by name — in CONNACK, SUBACK and
-DISCONNECT, refusals among them (`gateway`'s
-`the_stable_reason_codes_are_the_ones_sent`). That check is textual: the
-`ReasonCode::` names in `gateway/src/lib.rs`, which today is where the
-gateway names every reason it sends. A malformed packet closes the
-connection with the reason `codec` gives it; those are not in this list.
+Reason codes: none since D-188 A removed the MQTT gateway that sent them.
+The block stays empty for the same reason.
 
 <!-- stable-reasons:begin -->
 ```text
-Success
-GrantedQos1
-BadAuthenticationMethod
-BadUserNameOrPassword
-ClientIdentifierNotValid
-ImplementationSpecificError
-KeepAliveTimeout
-NotAuthorized
-ProtocolError
-QosNotSupported
-QuotaExceeded
-ReceiveMaximumExceeded
-ServerBusy
-ServerUnavailable
-SessionTakenOver
-SharedSubscriptionsNotSupported
-SubscriptionIdentifiersNotSupported
-TopicAliasInvalid
 ```
 <!-- stable-reasons:end -->
 
 ## Internal settings
 
 Not read from the environment: fixed in 7a (`node::experimental`), or set by tests and simulations.
-
-### `codec` (ADR-0008 step 3a)
-
-`codec::Limits`; the experimental profile lowers `max_packet_bytes` to 256 KiB,
-so a batch of the largest packets fits one link frame.
-
-| Limit | Default | Notes |
-|---|---|---|
-| `max_packet_bytes` | `1048576` | Whole packet, fixed header included; checked against Remaining Length before any allocation. |
-| `max_topic_bytes` | `1024` | |
-| `max_topic_levels` | `32` | |
-| `max_client_id_bytes` | `256` | 3.1.1 requires accepting 1–23 bytes; more is allowed. |
-| `max_filters_per_subscribe` | `64` | Per SUBSCRIBE/UNSUBSCRIBE packet. |
-| `payload_copy_threshold_bytes` | `512` | Payloads up to this size are copied at ingress instead of sliced: one copy per publish, not per subscriber, so a small payload does not pin a read-buffer chunk. |
-| `max_user_properties` | `32` | User Properties in one MQTT 5 property section; more is refused before the next is kept (Implementation specific error, 0x83). |
-
-### `apply` and `gateway` (ADR-0008 step 3b-2)
-
-Bounds the apply function decides from the log. Every node must run with the
-same values: they are part of what the log means. None is read from the
-environment until the server runs the new path (step 7, D-68 A).
-
-| Limit | Default | Notes |
-|---|---|---|
-| `max_subscriptions_per_session` | `1024` | Beyond: SUBACK failure (Quota exceeded in MQTT 5). |
-| `max_subscriptions` | `1000000` | All sessions together. |
-| `max_retained` | `10000` | Beyond: delivered, not kept. |
-| `max_retained_bytes` | `67108864` | Retained payload bytes. |
-| `max_inflight` | `256` | At-least-once deliveries unacknowledged per session. |
-| `max_backlog` | `16384` | Waiting behind a full window, per session. |
-| `max_backlog_bytes` | `8388608` | Per session. Beyond: at-most-once dropped, at-least-once closes the session as a slow consumer. |
-| `max_total_queued_bytes` | `1073741824` | Inflight and backlog payload bytes of all sessions together. At-least-once beyond: backlog, then a slow-consumer close. |
-
-Gateway settings, per node:
-
-| Setting | Notes |
-|---|---|
-| `first_session` | Kept durable and growing across restarts by the driver: sessions are never renumbered. |
-| `max_connections` | Beyond: the socket is closed at accept. |
-| `node::MAX_WAITING_PER_SOURCE` (16, fixed) | Connections from one source (an IPv4 address, or an IPv6 /64, D-168 A) waiting at once for a TLS handshake or a CONNECT, plaintext and TLS alike (D-165 A); beyond: the next one is closed at accept. |
-| `connect_timeout` | Time from accept to a valid CONNECT. |
-| `max_pending`, `max_pending_bytes` | Proposals of one connection awaiting commit; at the bound the connection is not read. |
-| `max_total_pending_bytes` | All connections. |
-| `commit_timeout` | A proposal not committed within it closes its connection. |
-| `retry_interval` | First interval for `Ack`, `SessionGone`, `NodeReset`; doubles to 32×. |
-| `receive_maximum`, `topic_alias_maximum` | Advertised to MQTT 5 clients. |
-| `max_waiting`, `max_waiting_bytes`, `max_total_waiting_bytes` | At-most-once deliveries held behind a QoS 1 delivery waiting for the client's receive maximum; beyond, dropped and counted. |
-| `max_retries` | Lifecycle proposals awaiting their effect; at the bound new connections are refused. |
-| `connect_through_log` | Off unless the node's `sessions` is set (step 7c stage 3, below). On: a CONNECT is answered only from its committed `Connect` and nothing more is read until then, a closed connection proposes `Disconnect` until it is applied (instead of `SessionGone`), the log decides takeovers across gateways, and a QoS 1 delivery's packet identifier follows from its delivery id, so a resend carries its original. |
 
 ### `node` (ADR-0008 step 4)
 
@@ -287,20 +184,16 @@ in the experimental cluster mode (step 7a); tests build it directly.
 | `core` | `cluster::Config`: id, voters, the first slot's owner, replication window, queue, batch, `max_uncommitted` (lsns appended past the commit point; it also bounds how long a takeover takes, since a new sequencer moves that tail first — `cluster::DEFAULT_MAX_UNCOMMITTED` = 64, measured in simulation, used once step 7a reads configuration, throughput cost unmeasured, D-82 A, D-84), `takeover_ticks` (heartbeats of silence before the next node in the schedule takes the slot over; step 5), `lag_bound` (`Option<LagBound>`, default `None`: flow control on replica lag, ADR-0008 R1–R4 — while an attached replica is more than `records` behind the commit point no new batch is made, for at most `ticks` heartbeats, after which that replica is detached; `records` is raised to `max_uncommitted + max_batch`; never holds commit; values come from the Linux measurement, D-89). |
 | `data` (step 5) | Also holds `promise`: the highest slot promised, synced before any answer. |
 | `listen`, `peers` | Where other nodes connect to this one; where to reach each of them. One TCP connection per direction. |
-| `data` | The segmented log, the `snapshot` file (the committed slot table, pruned by compaction, and the applied state at one lsn: `[version=2][slots]{…}[state]`; D-67 B, D-73 A, D-79 A) and the `incarnation` file (the gateway's `first_session`, made durable before use). |
+| `data` | The segmented log, the `snapshot` file (the committed slot table, pruned by compaction, the applied position and its digest: `[version=3][slots]{…}[applied][digest]`; D-67 B, D-73 A, D-79 A, D-188 A) and the `incarnation` file (this process's life, made durable before use; it is in every HELLO and in the origin property of each own proposal). |
 | `retain_bytes` | D-57 A: the log keeps no more than this behind a replica that is only slow; one further behind is lost until state copy (step 7b). `node::DEFAULT_RETAIN_BYTES` = 64 MiB, the removed broker's default; read from `STRAUM_CLUSTER_RETAIN_BYTES`; a starting value, not a measured optimum (D-91 A). |
 | `snapshot_every` | Applied records between snapshots; segments wholly below the last durable snapshot and the retention floor are removed after it is written. |
 | `read_bytes` | `usize`, no default: bytes one read of the log hands back at most (or one batch, if that alone is larger) — what a sequencer's catch-up or a candidate's fetch moves per round trip, within the replication window and the sequencer's durable log (D-81 A). Clamped to half of `max_frame`, which carries it. The node tests use 64 KiB. |
 | `rotate_every` | `Option<u32>`, default `None`: leading, hand the slot over to the next owner by `SlotEnd` every this many heartbeats (ADR-0008 step 6; unified-stream §2.4 planned rotation). Off by default: a sequencer is stable. |
 | `segments` | `storage::SegmentLimits`. |
-| `limits` | `apply::Limits`, the table above. A link whose HELLO carries another digest of them is refused. |
-| `heartbeat` | Sequencer tick and gateway tick. |
+| `max_record` | The largest body and properties of one record, the node's origin property included (`journal::ORIGIN_PROPERTY`: node, incarnation, sequence, on every own proposal so the outbox tells its records from another node's); a larger proposal is refused and counted. In the configuration digest. A batch of `max_batch` such records must fit `max_frame`, or the start is refused. |
+| `heartbeat` | Sequencer tick. |
 | `max_frame` | Largest link frame read; beyond, the link closes. |
 | `link_queue` | Frames queued per peer; beyond, dropped (the protocol resends). |
-| `mqtt.listen`, `mqtt.gateway` | MQTT listener and the gateway settings above. |
-| `mqtt.write_queue` | Packets queued per client; a client that lets it fill is closed. |
-| `sessions` | `Option<apply::ConnectLimits>`, default `None`, and the server always leaves it there: step 7c stage 3 (D-176 A). With it, every CONNECT goes through the committed log (`apply::State::with_connect`, the gateway's `connect_through_log`), sessions may persist across connections and nodes (3.1.1 CleanSession = 0, an MQTT 5 Session Expiry Interval above 0 answered with 0xFFFFFFFF, D-177 A), a resumed session gets its unacknowledged QoS 1 messages again with their packet identifiers and DUP set before its backlog, and the log decides a takeover across gateways. Its four bounds: `connect_window` and `max_connect_tombstones` (the fence, still placeholders: 4 096 and 10 000, sized by the 30-minute run on a D-129 host, D-153 A, D-154 A), `max_persisted_sessions` (10 000; a new persisted session past it is refused, 0x97, a resumption never), `max_detached_queued_bytes` (256 MiB, inside `max_total_queued_bytes`; a detached session without room for an at-least-once message is deleted). In the configuration digest when set, so a cluster must agree; refused at start together with credentials until a session is bound to its user. Turning it on is a decision of its own. |
-
 ## Node certificates (ADR-0010, D-171 A, D-172 C)
 
 Each node's certificate names it with a subjectAltName dNSName
@@ -327,8 +220,7 @@ heartbeat; a stalled attempt is tried again at once. With or without TLS, a
 connection to a link port that has not sent a HELLO it may send within two
 heartbeats of its accept is closed, and at most twice as many as there are
 peers wait at once; one more is closed at once. Without TLS a waiting
-connection holds its read and write buffers from the budget the MQTT
-listener shares, so at most twice the peers times those buffers; with TLS
+connection holds its read and write buffers from the transport's budget, so at most twice the peers times those buffers; with TLS
 it holds none until its handshake is done. Refusals before a HELLO names a
 node (a handshake that fails or stalls) are logged at debug level with
 the source address, since anyone who reaches the port can cause them; too
@@ -366,36 +258,3 @@ CA that never signed the removed node), then SIGHUP each: its links to the
 removed node, both ways, close and stay closed. There is no revocation list.
 A peer certificate that expires keeps its link until the next reload checks
 it.
-
-## Access rules (D-110 A, D-158 A, D-159 A)
-
-The formats of `STRAUM_AUTH_PASSWORD_FILE` and `STRAUM_AUTH_ACL_FILE`, read by the `auth` crate. What the settings do is in the table above.
-
-The password file is one `user:hash` per line; `#` starts a comment. The
-hash is an argon2 PHC string, as `straum-server hash-password` prints it. A
-PHC string carries its own cost parameters, but use that command's: a
-refusal costs one hash with them, so a stored hash made with others lets a
-known user name be told from an unknown one by its time (D-158 A).
-
-The ACL file names a user, then what that user may do:
-
-```text
-user alice
-publish   sensors/+/temp
-subscribe sensors/#
-
-user bob
-readwrite shared/bus
-
-anonymous
-subscribe public/#
-```
-
-A user that appears in the file may do only what its rules allow; a user
-that does not appear may do nothing (D-159 A), and anonymous clients only
-what an `anonymous` section allows. A rule for a user with no password
-is a startup error, because it is a typo, not a permission.
-
-A subscription is allowed when a rule covers everything the filter could
-match: `subscribe sensors/#` does not grant `#`, because the wider filter
-would deliver topics no rule mentions.

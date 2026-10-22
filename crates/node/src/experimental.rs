@@ -5,14 +5,13 @@
 //! measured on Linux (D-102 A).
 
 use std::net::SocketAddr;
-use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use storage::{SegmentLimits, WalLimits};
 use transport::TransportConfig;
 
-use crate::{MqttConfig, NodeConfig};
+use crate::NodeConfig;
 
 /// Heartbeat placeholder: the tests' value, not a recommendation (D-104 A).
 pub const DEFAULT_HEARTBEAT: Duration = Duration::from_millis(50);
@@ -28,9 +27,11 @@ pub const DEFAULT_READ_BYTES: usize = 64 * 1024;
 pub const DEFAULT_WAL_PREALLOCATE_BYTES: u64 = 8 << 20;
 
 /// The fixed sizes of 7a: not settings, and not tuned. A batch of
-/// `MAX_BATCH` records of the largest packet fits one frame.
+/// `MAX_BATCH` records of the largest size fits one frame.
 const MAX_BATCH: usize = 16;
-const MAX_PACKET_BYTES: usize = 256 * 1024;
+/// The largest record body and properties together (the node's origin
+/// property included): the packet bound of the removed MQTT path.
+pub const MAX_RECORD_BYTES: usize = 256 * 1024;
 const MAX_FRAME: usize = 8 << 20;
 
 /// What an operator sets for the experimental cluster path.
@@ -41,8 +42,6 @@ pub struct Experimental {
     pub voters: Vec<(u8, SocketAddr)>,
     /// Where this node listens for links.
     pub listen: SocketAddr,
-    /// Where it listens for MQTT clients.
-    pub mqtt: SocketAddr,
     pub data: PathBuf,
     pub heartbeat: Duration,
     pub takeover_ticks: u32,
@@ -90,11 +89,6 @@ pub enum ConfigError {
     TlsTakeoverTicks(u32),
     #[error("the node TLS files are node {tls}'s, and this is node {id}")]
     TlsNode { tls: u8, id: u8 },
-    #[error(
-        "sessions through the log with credentials: a session is not yet bound to the user who \
-         made it, so a CONNECT could resume another user's (step 7c stage 3)"
-    )]
-    SessionsWithCredentials,
 }
 
 impl NodeConfig {
@@ -128,12 +122,6 @@ impl NodeConfig {
         if self.core.takeover_ticks == 0 {
             return Err(ConfigError::TakeoverTicks(self.core.takeover_ticks));
         }
-        // Until a `Connect` names the user, a Clean Start 0 CONNECT could
-        // resume another user's session with its subscriptions and queue,
-        // which no grant was asked about.
-        if self.sessions.is_some() && self.mqtt.as_ref().is_some_and(|m| m.authority.is_some()) {
-            return Err(ConfigError::SessionsWithCredentials);
-        }
         if let Some(tls) = &self.tls {
             // A backoff, a stalled attempt, the handshake that succeeds,
             // then up to a heartbeat until the sequencer's next frame:
@@ -157,15 +145,9 @@ impl NodeConfig {
             });
         }
         // An APPEND of the largest batch: its header record and `max_batch`
-        // records of the largest packet, each with its record header and its
-        // length prefix in the frame, plus the frame's own fields. A body
-        // carries a packet's topic and payload and less than 256 bytes of
-        // encoding around them.
-        let packet = self
-            .mqtt
-            .as_ref()
-            .map_or(0, |m| m.gateway.codec.max_packet_bytes);
-        let record = journal::RECORD_HEADER_BYTES + 4 + packet + 256;
+        // records of the largest size, each with its record header and its
+        // length prefix in the frame, plus the frame's own fields.
+        let record = journal::RECORD_HEADER_BYTES + 4 + self.max_record;
         let batch = self
             .core
             .max_batch
@@ -204,30 +186,6 @@ impl Experimental {
     /// What [`NodeConfig::check`] refuses.
     pub fn node_config(&self) -> Result<NodeConfig, ConfigError> {
         let nodes: Vec<u8> = self.voters.iter().map(|&(id, _)| id).collect();
-        let gateway = gateway::Config {
-            node: self.id,
-            first_session: 0,
-            codec: codec::Limits {
-                max_packet_bytes: MAX_PACKET_BYTES,
-                ..codec::Limits::default()
-            },
-            max_connections: 1024,
-            connect_timeout: Duration::from_secs(10),
-            max_pending: 64,
-            max_pending_bytes: 1 << 20,
-            max_total_pending_bytes: 64 << 20,
-            commit_timeout: Duration::from_secs(30),
-            retry_interval: Duration::from_millis(200),
-            receive_maximum: NonZeroU16::MIN.saturating_add(63),
-            topic_alias_maximum: 16,
-            max_waiting: 1024,
-            max_waiting_bytes: 1 << 20,
-            max_total_waiting_bytes: 64 << 20,
-            max_retries: 1024,
-            // The node sets it from `MqttConfig::authority`.
-            authenticate: false,
-            connect_through_log: false,
-        };
         let config = NodeConfig {
             core: cluster::Config {
                 id: self.id,
@@ -257,7 +215,7 @@ impl Experimental {
                 },
                 segment_bytes: 64 << 20,
             },
-            limits: apply::Limits::default(),
+            max_record: MAX_RECORD_BYTES,
             heartbeat: self.heartbeat,
             max_frame: MAX_FRAME,
             link_queue: 1024,
@@ -265,20 +223,12 @@ impl Experimental {
                 listen: self.listen,
                 ..TransportConfig::default()
             },
-            mqtt: Some(MqttConfig {
-                listen: self.mqtt,
-                gateway,
-                write_queue: 1024,
-                authority: None,
-                tls: None,
-            }),
             retain_bytes: self.retain_bytes,
             snapshot_every: 4096,
             rotate_every: None,
             read_bytes: self.read_bytes,
             metrics: self.metrics,
             tls: None,
-            sessions: None,
         };
         config.check()?;
         Ok(config)

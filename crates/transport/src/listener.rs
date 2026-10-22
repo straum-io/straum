@@ -121,8 +121,8 @@ impl Listener {
         }
 
         if let Some(idle) = self.config.keepalive {
-            // Detects peers that vanished without closing, which MQTT
-            // keep-alive 0 leaves us blind to.
+            // Detects peers that vanished without closing, which no
+            // protocol-level keep-alive may catch.
             socket.set_tcp_keepalive(&TcpKeepalive::new().with_time(idle))?;
         }
         Ok(())

@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 4cafe03d1ab3c7ea21ea43f68bbe7721f653b5c41bee32a08dd80bd0c3705554 # shrinks to proposals = [Publish { origin: Origin { node: 0, session: 0 }, request: 0, topic: Topic("a"), payload: b"\0", properties: b"\0", guarantee: AtMostOnce, retain: true }, Publish { origin: Origin { node: 0, session: 0 }, request: 0, topic: Topic("a"), payload: b"", properties: b"", guarantee: AtMostOnce, retain: false }], cut = Index(7378697629483820647)

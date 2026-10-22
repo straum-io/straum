@@ -38,7 +38,7 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
-            listen: SocketAddr::from(([0, 0, 0, 0], 1883)),
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             backlog: 1024,
             nodelay: true,
             keepalive: Some(Duration::from_secs(300)),

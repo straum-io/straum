@@ -783,7 +783,7 @@ impl World {
             body.extend_from_slice(&self.next_proposal.to_be_bytes());
             let slot = voter.slot();
             let fate = match voter.submit(Proposal {
-                kind: Kind::Publish,
+                kind: Kind::Data,
                 properties: Vec::new(),
                 body,
             }) {

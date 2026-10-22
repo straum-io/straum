@@ -10,7 +10,7 @@
 //! whatever the sequencer did with it — given that a sequencer takes a
 //! forward only into the slot it was sent for (`Message::Forward`), and
 //! that one link delivers in order, losing at most whole forwards.
-//! Sends go strictly in order, and none while an earlier entry waits for its slot to be decided: one session's
+//! Sends go strictly in order, and none while an earlier entry waits for its slot to be decided: one node's
 //! proposals reach the log in the order they were made.
 
 use std::collections::VecDeque;
@@ -58,14 +58,14 @@ impl Outbox {
         self.max
     }
 
-    /// Whether a proposal would be refused now: the driver stops reading
-    /// its clients while it is (D-120 A, backpressure).
+    /// Whether a proposal would be refused now (D-120 A; with no client
+    /// protocol since D-188 A, the node refuses and counts).
     pub(crate) fn full(&self) -> bool {
         self.entries.len() >= self.max
     }
 
     /// Takes a proposal; refused when full, as a full sequencer queue
-    /// refuses: the gateway's `commit_timeout` closes its publisher.
+    /// refuses: the proposer learns it from the refusal count.
     pub(crate) fn push(&mut self, proposal: Proposal) -> bool {
         if self.entries.len() >= self.max {
             return false;
@@ -150,9 +150,9 @@ fn size(proposal: &Proposal) -> usize {
         .saturating_add(proposal.properties.len())
 }
 
-/// The record this proposal became. Every gateway proposal names its node
-/// and session, and a publish or a filter its request, so another node's
-/// record never equals one of these.
+/// The record this proposal became. Every node's proposal carries its
+/// origin property (`journal::ORIGIN_PROPERTY`: node, incarnation,
+/// sequence), so another node's record never equals one of these.
 fn same(proposal: &Proposal, record: &Record<'_>) -> bool {
     proposal.kind == record.kind
         && proposal.body == record.body
@@ -166,7 +166,7 @@ mod tests {
 
     fn proposal(n: u8) -> Proposal {
         Proposal {
-            kind: Kind::Publish,
+            kind: Kind::Data,
             properties: Vec::new(),
             body: vec![n],
         }
@@ -174,13 +174,44 @@ mod tests {
 
     fn record(slot: u64, body: &[u8]) -> Record<'_> {
         Record {
-            kind: Kind::Publish,
+            kind: Kind::Data,
             slot,
             lsn: 0,
             prev_hash: 0,
             properties: Properties::new(&[]),
             body,
         }
+    }
+
+    /// D-188 A: the same body from another node, told apart by its origin
+    /// property, never confirms this node's entry.
+    #[test]
+    fn another_nodes_record_with_the_same_body_confirms_nothing() {
+        let origin = |node: u8| {
+            let mut bytes = Vec::new();
+            let mut value = vec![node];
+            value.extend_from_slice(&[0; 16]);
+            journal::encode_property(journal::ORIGIN_PROPERTY, &value, &mut bytes).unwrap();
+            bytes
+        };
+        let mut outbox = Outbox::new(8);
+        assert!(outbox.push(Proposal {
+            kind: Kind::Data,
+            properties: origin(1),
+            body: b"same".to_vec(),
+        }));
+        outbox.next(3).unwrap();
+        outbox.sent(3);
+        let theirs = origin(2);
+        let mut other = record(3, b"same");
+        other.properties = Properties::new(&theirs);
+        assert!(outbox.committed(&other).is_empty());
+        assert_eq!(outbox.len(), 1, "another node's record taken for ours");
+        let ours = origin(1);
+        let mut own = record(3, b"same");
+        own.properties = Properties::new(&ours);
+        assert!(outbox.committed(&own).is_empty());
+        assert_eq!(outbox.len(), 0);
     }
 
     #[test]
