@@ -44,8 +44,25 @@ CAP_B=$(cd "$B" && pwd)/$(build "$B")
 PUBACK=$HERE/$(cd "$HERE" && cargo bench -p server --bench puback --no-run 2>&1 | executable)
 SERVER_A=$(cd "$A" && pwd)/target/release/straum-server
 SERVER_B=$(cd "$B" && pwd)/target/release/straum-server
+# D-178 A made zeros ahead of each segment the default. Both trees run
+# without them, so the comparison measures what it is for: a tree that
+# knows the setting is given 0, an older one has none and would refuse
+# the unknown variable (D-104 A).
+zeros() {
+    if grep -q STRAUM_WAL_PREALLOCATE_BYTES "$1/crates/server/src/config.rs" 2>/dev/null; then
+        echo 0
+    fi
+}
+ZEROS_A=$(zeros "$A")
+ZEROS_B=$(zeros "$B")
 
-run() { # label cap-binary server-binary round
+run() { # label cap-binary server-binary round zeros
+    if [ -n "$5" ]; then
+        STRAUM_BENCH_PREALLOCATE_BYTES=$5
+        export STRAUM_BENCH_PREALLOCATE_BYTES
+    else
+        unset STRAUM_BENCH_PREALLOCATE_BYTES
+    fi
     # 50 failovers: failover is a distribution (D-130) — its share within
     # 1 s, p50 and p90 (p90 only from builds that print it), and the slow
     # mode's diagnosis lines.
@@ -62,11 +79,11 @@ run() { # label cap-binary server-binary round
 : > "$OUT/rounds"
 for round in $(seq 1 "$ROUNDS"); do
     if [ $((round % 2)) -eq 1 ]; then
-        run base "$CAP_A" "$SERVER_A" "$round" | tee -a "$OUT/rounds"
-        run head "$CAP_B" "$SERVER_B" "$round" | tee -a "$OUT/rounds"
+        run base "$CAP_A" "$SERVER_A" "$round" "$ZEROS_A" | tee -a "$OUT/rounds"
+        run head "$CAP_B" "$SERVER_B" "$round" "$ZEROS_B" | tee -a "$OUT/rounds"
     else
-        run head "$CAP_B" "$SERVER_B" "$round" | tee -a "$OUT/rounds"
-        run base "$CAP_A" "$SERVER_A" "$round" | tee -a "$OUT/rounds"
+        run head "$CAP_B" "$SERVER_B" "$round" "$ZEROS_B" | tee -a "$OUT/rounds"
+        run base "$CAP_A" "$SERVER_A" "$round" "$ZEROS_A" | tee -a "$OUT/rounds"
     fi
 done
 

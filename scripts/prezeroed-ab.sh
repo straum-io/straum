@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
 # ADR-0009 (D-162 A, D-170 A): today's WAL (A) against zeros written ahead of
 # each segment's log (B, `STRAUM_WAL_PREALLOCATE_BYTES`), on the disk being
-# measured. Run it on a host that passes D-129 to decide the default.
+# measured. Run on a host that passes D-129 (2026-10-22: it confirmed the gain,
+# and the default became 8 MiB, D-178 A); side A sets 0 explicitly.
 # Rounds alternate A B B A, so a disk that is faster in its first minutes (2026-10-21: round 1's
 # flushes took 0.76 ms, the rest 2.7 ms) does not favour either side.
 #

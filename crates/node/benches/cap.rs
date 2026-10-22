@@ -160,10 +160,14 @@ fn config(cap: u64, id: u8, addresses: &[SocketAddr]) -> NodeConfig {
             .collect(),
         data: data_dir(cap, id),
         // ADR-0009: `STRAUM_BENCH_PREALLOCATE_BYTES` writes zeros that far
-        // ahead of each segment's log; 0, the default, does not.
+        // ahead of each segment's log; unset, the server's default (8 MiB
+        // since D-178 A), so `cap` and `puback` run alike; 0 does not.
         segments: SegmentLimits {
             wal: WalLimits {
-                preallocate_bytes: env("STRAUM_BENCH_PREALLOCATE_BYTES", 0),
+                preallocate_bytes: env(
+                    "STRAUM_BENCH_PREALLOCATE_BYTES",
+                    node::experimental::DEFAULT_WAL_PREALLOCATE_BYTES,
+                ),
                 ..WalLimits::default()
             },
             segment_bytes: 64 << 20,
