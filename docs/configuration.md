@@ -275,6 +275,7 @@ Gateway settings, per node:
 | `receive_maximum`, `topic_alias_maximum` | Advertised to MQTT 5 clients. |
 | `max_waiting`, `max_waiting_bytes`, `max_total_waiting_bytes` | At-most-once deliveries held behind a QoS 1 delivery waiting for the client's receive maximum; beyond, dropped and counted. |
 | `max_retries` | Lifecycle proposals awaiting their effect; at the bound new connections are refused. |
+| `connect_through_log` | Off unless the node's `sessions` is set (step 7c stage 3, below). On: a CONNECT is answered only from its committed `Connect` and nothing more is read until then, a closed connection proposes `Disconnect` until it is applied (instead of `SessionGone`), the log decides takeovers across gateways, and a QoS 1 delivery's packet identifier follows from its delivery id, so a resend carries its original. |
 
 ### `node` (ADR-0008 step 4)
 
@@ -298,6 +299,7 @@ in the experimental cluster mode (step 7a); tests build it directly.
 | `link_queue` | Frames queued per peer; beyond, dropped (the protocol resends). |
 | `mqtt.listen`, `mqtt.gateway` | MQTT listener and the gateway settings above. |
 | `mqtt.write_queue` | Packets queued per client; a client that lets it fill is closed. |
+| `sessions` | `Option<apply::ConnectLimits>`, default `None`, and the server always leaves it there: step 7c stage 3 (D-176 A). With it, every CONNECT goes through the committed log (`apply::State::with_connect`, the gateway's `connect_through_log`), sessions may persist across connections and nodes (3.1.1 CleanSession = 0, an MQTT 5 Session Expiry Interval above 0 answered with 0xFFFFFFFF, D-177 A), a resumed session gets its unacknowledged QoS 1 messages again with their packet identifiers and DUP set before its backlog, and the log decides a takeover across gateways. Its four bounds: `connect_window` and `max_connect_tombstones` (the fence, still placeholders: 4 096 and 10 000, sized by the 30-minute run on a D-129 host, D-153 A, D-154 A), `max_persisted_sessions` (10 000; a new persisted session past it is refused, 0x97, a resumption never), `max_detached_queued_bytes` (256 MiB, inside `max_total_queued_bytes`; a detached session without room for an at-least-once message is deleted). In the configuration digest when set, so a cluster must agree; refused at start together with credentials until a session is bound to its user. Turning it on is a decision of its own. |
 
 ## Node certificates (ADR-0010, D-171 A, D-172 C)
 

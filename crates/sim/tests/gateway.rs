@@ -19,6 +19,18 @@
 //! client has gone no node's state holds a session and no gateway is
 //! retrying anything.
 //!
+//! With step 7c stage 3 on (`mqtt_clients_with_sessions_through_the_log`,
+//! D-176 A), every CONNECT goes through the log, clients ask for persisted
+//! sessions at random (3.1.1 CleanSession, MQTT 5 Clean Start and expiry
+//! apart, D-177 A) and come back through any node; checked on every node
+//! after every record it applies: invariant A (a client id is attached to
+//! the origin of the last `Connect` for it that passed, unless detached
+//! since; `origins` its inverse) and invariant B (no `Connect` changed a
+//! client id that changed after its `seen`). A redelivered PUBLISH (DUP)
+//! must be one `apply` delivered at least once to that client id's session
+//! before: the session, not one connection, holds it — a takeover moves it,
+//! and a delivery may have gone to a connection that closed unsent.
+//!
 //! The log is in memory and never compacted (state copy: step 7b).
 //!
 //! `STRAUM_SIM_SEEDS=<n>` sweeps more seeds; `STRAUM_SIM_SEED=<n>` runs one.
@@ -34,7 +46,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU16;
 use std::time::Duration;
 
-use apply::{Limits, Proposal, State};
+use apply::{ClientEffect, ConnectLimits, Effect, Limits, Origin, Proposal, State};
 use bytes::{Bytes, BytesMut};
 use cluster::{Config, Effect as Step, Message, Voter};
 use codec::{
@@ -65,7 +77,7 @@ const LIMITS: Limits = Limits {
     max_total_queued_bytes: 2048,
 };
 
-fn seeds() -> std::ops::Range<u64> {
+fn seeds(default: u64) -> std::ops::Range<u64> {
     match std::env::var("STRAUM_SIM_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -75,7 +87,7 @@ fn seeds() -> std::ops::Range<u64> {
             0..std::env::var("STRAUM_SIM_SEEDS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(30)
+                .unwrap_or(default)
         }
     }
 }
@@ -117,7 +129,16 @@ fn cluster_config(id: u8) -> Config {
     }
 }
 
-fn gateway_config(node: u8, first_session: u64) -> gateway::Config {
+/// Step 7c's bounds in this simulation: a tombstone queue small enough to
+/// overflow, and a detached budget small enough to delete sessions.
+const CONNECT_LIMITS: ConnectLimits = ConnectLimits {
+    connect_window: 4096,
+    max_connect_tombstones: 4,
+    max_persisted_sessions: 4,
+    max_detached_queued_bytes: 256,
+};
+
+fn gateway_config(node: u8, first_session: u64, sessions: bool) -> gateway::Config {
     gateway::Config {
         node,
         first_session,
@@ -136,6 +157,7 @@ fn gateway_config(node: u8, first_session: u64) -> gateway::Config {
         max_total_waiting_bytes: 16_384,
         max_retries: 64,
         authenticate: false,
+        connect_through_log: sessions,
     }
 }
 
@@ -157,6 +179,20 @@ struct Node {
     durable: usize,
     state: State,
     incarnation: u64,
+    /// Step 7c: what invariants A and B expect of this node's state.
+    oracle: Oracle,
+}
+
+/// Invariants A and B as the committed records say they must hold, per
+/// node: rebuilt with its state when it restarts.
+#[derive(Default)]
+struct Oracle {
+    /// Client id → the origin its last passing `Connect` attached, while
+    /// not detached since.
+    expected: BTreeMap<Bytes, Origin>,
+    /// Client id → the lsn of its last fence event: an applied `Connect`
+    /// or the removal of its entry.
+    fenced: BTreeMap<Bytes, u64>,
 }
 
 struct Client {
@@ -191,10 +227,21 @@ struct Stats {
     v311: u64,
     cuts: u64,
     slot_takeovers: u64,
+    /// Step 7c: CONNACKs with a session present, PUBLISHes sent again with
+    /// DUP, sessions taken over by the log, CONNECTs refused as stale or at
+    /// the limit, detached sessions deleted, records checked for A and B.
+    resumed: u64,
+    redelivered: u64,
+    taken_over: u64,
+    refused: u64,
+    deleted: u64,
+    checked: u64,
 }
 
 struct World {
     seed: u64,
+    /// Step 7c stage 3 on (D-176 A).
+    sessions: bool,
     step: usize,
     now: Duration,
     rng: Rng,
@@ -217,6 +264,9 @@ struct World {
     clients: Vec<Client>,
     /// Connection → client.
     owners: HashMap<u64, usize>,
+    /// Step 7c: client id → the payloads `apply` delivered at least once to
+    /// its session, so a DUP one can be checked against them.
+    delivered: BTreeMap<Bytes, std::collections::HashSet<Bytes>>,
     next_conn: u64,
     stats: Stats,
 }
@@ -237,6 +287,11 @@ fn properties_for(version: Version, payload: &str) -> Option<Box<codec::PublishP
     })
 }
 
+/// Client `c`'s id: two clients share one, so they take each other over.
+fn name(c: usize) -> &'static [u8] {
+    [b"c0".as_slice(), b"c1", b"c2", b"c3", b"dup", b"dup"][c]
+}
+
 fn committed_only(packet: &Packet) -> bool {
     matches!(
         packet,
@@ -252,9 +307,10 @@ impl World {
         )
     }
 
-    fn new(seed: u64) -> Self {
+    fn new(seed: u64, sessions: bool) -> Self {
         let mut world = World {
             seed,
+            sessions,
             step: 0,
             now: Duration::ZERO,
             rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
@@ -270,6 +326,7 @@ impl World {
                     durable: 0,
                     state: State::new(LIMITS),
                     incarnation: 0,
+                    oracle: Oracle::default(),
                 })
                 .collect(),
             network: Vec::new(),
@@ -294,6 +351,7 @@ impl World {
                     unacked: Vec::new(),
                 })
                 .collect(),
+            delivered: BTreeMap::new(),
             owners: HashMap::new(),
             next_conn: 0,
             stats: Stats::default(),
@@ -316,7 +374,12 @@ impl World {
             .truncate(usize::try_from(tail.chain.next_lsn() - 1).unwrap());
         node.written = node.records.len();
         node.durable = node.records.len();
-        node.state = State::new(LIMITS);
+        node.state = if self.sessions {
+            State::with_connect(LIMITS, CONNECT_LIMITS)
+        } else {
+            State::new(LIMITS)
+        };
+        node.oracle = Oracle::default();
         node.incarnation += 1;
         let mut slots: Vec<(u64, u64)> = Vec::new();
         for record in &node.records {
@@ -332,7 +395,7 @@ impl World {
                 .incarnation(node.incarnation),
         );
         node.gateway = Some(Gateway::new(
-            gateway_config(id, node.incarnation * 1_000_000),
+            gateway_config(id, node.incarnation * 1_000_000, self.sessions),
             self.now,
         ));
         self.gateway_actions(id, None);
@@ -462,9 +525,53 @@ impl World {
             }
             let bytes = node.records[usize::try_from(next - 1).unwrap()].clone();
             let mut effects = Vec::new();
+            let mut clients = Vec::new();
             let node = &mut self.nodes[usize::from(id)];
-            if let Err(e) = node.state.apply(&decode(&bytes).unwrap(), &mut effects) {
+            let record = decode(&bytes).unwrap();
+            let before: Vec<bool> = (0..CLIENTS)
+                .map(|c| node.state.client(name(c)).is_some())
+                .collect();
+            let applied = if self.sessions {
+                node.state
+                    .apply_connect(&record, &mut effects, &mut clients)
+            } else {
+                node.state.apply(&record, &mut effects)
+            };
+            if let Err(e) = applied {
                 self.fail(&format!("node {id}: lsn {next} did not apply: {e}"));
+            }
+            if self.sessions {
+                self.check_a_and_b(id, &record, &before, &effects, &clients);
+                let state = &self.nodes[usize::from(id)].state;
+                for effect in &effects {
+                    if let Effect::Deliver {
+                        to,
+                        id: Some(_),
+                        payload,
+                        ..
+                    } = effect
+                    {
+                        if let Some(client) = state.attached_to(*to) {
+                            self.delivered
+                                .entry(Bytes::copy_from_slice(client))
+                                .or_default()
+                                .insert(payload.clone());
+                        }
+                    }
+                }
+            }
+            for effect in &clients {
+                match effect {
+                    ClientEffect::TakenOver { .. } => self.stats.taken_over += 1,
+                    ClientEffect::ConnectRefused { .. } => self.stats.refused += 1,
+                    ClientEffect::SessionDeleted { .. } => self.stats.deleted += 1,
+                    _ => {}
+                }
+                let now = self.now;
+                if let Some(g) = self.nodes[usize::from(id)].gateway.as_mut() {
+                    g.client_effect(effect, now);
+                }
+                self.gateway_actions(id, Some((next, bytes.clone())));
             }
             for effect in effects {
                 let now = self.now;
@@ -472,6 +579,9 @@ impl World {
                     g.effect(&effect, now);
                 }
                 self.gateway_actions(id, Some((next, bytes.clone())));
+            }
+            if let Some(g) = self.nodes[usize::from(id)].gateway.as_mut() {
+                g.applied(next);
             }
         }
     }
@@ -518,6 +628,86 @@ impl World {
             }
         }
         self.check_one_session_per_client_id(id);
+    }
+
+    /// Step 7c: invariants A and B on node `id` after the record it just
+    /// applied (ADR-0008 "Step 7c design").
+    fn check_a_and_b(
+        &mut self,
+        id: u8,
+        record: &journal::Record<'_>,
+        before: &[bool],
+        effects: &[Effect],
+        clients: &[ClientEffect],
+    ) {
+        self.stats.checked += 1;
+        let lsn = record.lsn;
+        let proposal = match record.kind {
+            journal::Kind::BatchHeader | journal::Kind::SlotStart | journal::Kind::SlotEnd => None,
+            _ => Some(Proposal::decode(record).unwrap()),
+        };
+        let node = &mut self.nodes[usize::from(id)];
+        let mut failure = None;
+        for effect in clients {
+            if let ClientEffect::Connected { to, .. } = effect {
+                let Some(Proposal::Connect {
+                    client_id, seen, ..
+                }) = &proposal
+                else {
+                    failure = Some(format!("node {id}: Connected from {proposal:?}"));
+                    break;
+                };
+                let client = Bytes::copy_from_slice(client_id.as_bytes());
+                let last = node.oracle.fenced.get(&client).copied().unwrap_or(0);
+                if last > *seen {
+                    failure = Some(format!(
+                        "node {id}: invariant B: {client:?} changed at lsn {last}, after its Connect's seen {seen} (lsn {lsn})"
+                    ));
+                }
+                node.oracle.fenced.insert(client.clone(), lsn);
+                node.oracle.expected.insert(client, *to);
+            }
+        }
+        for effect in effects {
+            if let Effect::Close { to, .. } = effect {
+                node.oracle.expected.retain(|_, o| o != to);
+            }
+        }
+        let detached = |o: &Origin| match &proposal {
+            Some(Proposal::Disconnect { origin, .. } | Proposal::SessionGone { origin }) => {
+                origin == o
+            }
+            Some(Proposal::NodeReset { node, below }) => o.node == *node && o.session < *below,
+            _ => false,
+        };
+        node.oracle.expected.retain(|_, o| !detached(o));
+        for (c, was) in before.iter().enumerate() {
+            let client = Bytes::from_static(name(c));
+            if node.state.client(name(c)).is_none() {
+                node.oracle.expected.remove(&client);
+                if *was {
+                    node.oracle.fenced.insert(client, lsn);
+                }
+            }
+        }
+        for c in 0..CLIENTS {
+            let actual = node.state.client(name(c)).and_then(|v| v.attached);
+            let expected = node.oracle.expected.get(name(c)).copied();
+            if actual != expected {
+                failure = Some(format!(
+                    "node {id}: invariant A for {:?} at lsn {lsn}: attached {actual:?}, expected {expected:?}",
+                    String::from_utf8_lossy(name(c))
+                ));
+            }
+            if let Some(o) = actual {
+                if node.state.attached_to(o) != Some(name(c)) {
+                    failure = Some(format!("node {id}: origins is not the inverse at {o:?}"));
+                }
+            }
+        }
+        if let Some(failure) = failure {
+            self.fail(&failure);
+        }
     }
 
     /// Invariant 4 at the wire.
@@ -734,6 +924,9 @@ impl World {
             match packet {
                 Packet::ConnAck(ack) => {
                     client.connected = ack.reason == ReasonCode::Success;
+                    if ack.session_present {
+                        self.stats.resumed += 1;
+                    }
                 }
                 Packet::PubAck(ack) => {
                     client.unacked.retain(|id| *id != ack.id.get());
@@ -743,6 +936,19 @@ impl World {
                     self.stats.deliveries += 1;
                     if let Some(id) = p.id {
                         client.to_ack.push(id);
+                        if p.duplicate {
+                            self.stats.redelivered += 1;
+                            let before = self
+                                .delivered
+                                .get(name(c))
+                                .is_some_and(|d| d.contains(&p.payload));
+                            if !before {
+                                let text = String::from_utf8_lossy(&p.payload).to_string();
+                                self.fail(&format!(
+                                    "client {c} was sent {text} again (DUP), never delivered to its session"
+                                ));
+                            }
+                        }
                     }
                     // D-65: what an MQTT 5 publisher attached arrives at an MQTT 5
                     // subscriber unchanged; a 3.1.1 publisher attached none.
@@ -804,6 +1010,18 @@ impl World {
             Version::V5 => self.stats.v5 += 1,
             Version::V311 => self.stats.v311 += 1,
         }
+        // Step 7c: a session that persists, or not, and Clean Start apart
+        // from the expiry in MQTT 5 (D-177 A).
+        let (clean_start, expiry) = if self.sessions {
+            let clean_start = self.rng.chance(40);
+            let expiry = match version {
+                Version::V5 => self.rng.pick(&[0, 0, 60, u32::MAX]),
+                Version::V311 => 0,
+            };
+            (clean_start, expiry)
+        } else {
+            (true, 0)
+        };
         let client = &mut self.clients[c];
         client.conn = Some((node, conn));
         client.version = version;
@@ -816,12 +1034,15 @@ impl World {
         let connect = Packet::Connect(Box::new(Connect {
             version,
             client_id: ClientId::new(Bytes::from_static(client.client_id.as_bytes())).unwrap(),
-            clean_start: true,
+            clean_start,
             keep_alive_secs: 0,
             will: None,
             username: None,
             password: None,
-            properties: ConnectProperties::default(),
+            properties: ConnectProperties {
+                session_expiry_secs: expiry,
+                ..ConnectProperties::default()
+            },
         }));
         // Another client with this id, open at this gateway: the CONNECT
         // must take its session over (invariant 7 within one gateway).
@@ -836,6 +1057,11 @@ impl World {
             .as_ref()
             .is_some_and(Gateway::ready);
         self.client_send(c, &[connect]);
+        // Through the log, the takeover comes with the commit, and across
+        // gateways too (counted as `taken_over`).
+        if self.sessions {
+            return;
+        }
         if let (Some(rival), true) = (rival, ready) {
             if self.clients[rival].conn.is_some() {
                 self.fail(&format!(
@@ -950,10 +1176,16 @@ impl World {
             }
             46..=47 => self.client_send(c, &[Packet::PingReq]),
             48 => {
-                // Clean goodbye.
+                // Clean goodbye. Through the log, an MQTT 5 client sometimes
+                // ends its session there: expiry 0 (D-177 A).
+                let end =
+                    self.sessions && self.clients[c].version == Version::V5 && self.rng.chance(30);
                 let goodbye = Packet::Disconnect(codec::Disconnect {
                     reason: ReasonCode::Success,
-                    properties: Default::default(),
+                    properties: codec::DisconnectProperties {
+                        session_expiry_secs: end.then_some(0),
+                        ..Default::default()
+                    },
                 });
                 self.client_send(c, &[goodbye]);
             }
@@ -1180,8 +1412,8 @@ impl World {
     }
 }
 
-fn run(seed: u64) -> Stats {
-    let mut world = World::new(seed);
+fn run(seed: u64, sessions: bool) -> Stats {
+    let mut world = World::new(seed, sessions);
     for step in 0..STEPS {
         world.step = step;
         // Mostly calm: 50 steps of chaos in every 200. The disk and
@@ -1204,8 +1436,8 @@ fn run(seed: u64) -> Stats {
 #[test]
 fn mqtt_clients_see_only_what_is_committed() {
     let mut total = Stats::default();
-    for seed in seeds() {
-        let s = run(seed);
+    for seed in seeds(30) {
+        let s = run(seed, false);
         total.committed += s.committed;
         total.packets_checked += s.packets_checked;
         total.deliveries += s.deliveries;
@@ -1239,5 +1471,49 @@ fn mqtt_clients_see_only_what_is_committed() {
         assert!(total.slot_takeovers > 0 && total.cuts > 0);
         assert!(total.properties_checked > 0);
         assert!(total.restarts > 0 && total.v5 > 0 && total.v311 > 0);
+    }
+}
+
+/// Step 7c stage 3 on (D-176 A): the same faults, CONNECT through the log,
+/// persisted sessions resumed through any node, invariants A and B on every
+/// node after every record.
+#[test]
+fn mqtt_clients_with_sessions_through_the_log() {
+    let mut total = Stats::default();
+    // More than the other mode: a redelivery needs a persisted session
+    // with an unacknowledged delivery to come back, which is rare.
+    for seed in seeds(300) {
+        let s = run(seed, true);
+        total.committed += s.committed;
+        total.deliveries += s.deliveries;
+        total.pubacks += s.pubacks;
+        total.restarts += s.restarts;
+        total.slot_takeovers += s.slot_takeovers;
+        total.resumed += s.resumed;
+        total.redelivered += s.redelivered;
+        total.taken_over += s.taken_over;
+        total.refused += s.refused;
+        total.deleted += s.deleted;
+        total.checked += s.checked;
+    }
+    println!(
+        "committed {} deliveries {} pubacks {} restarts {} slot takeovers {} records checked for A and B {} resumed {} redelivered {} taken over {} connects refused {} sessions deleted {}",
+        total.committed,
+        total.deliveries,
+        total.pubacks,
+        total.restarts,
+        total.slot_takeovers,
+        total.checked,
+        total.resumed,
+        total.redelivered,
+        total.taken_over,
+        total.refused,
+        total.deleted
+    );
+    if std::env::var("STRAUM_SIM_SEED").is_err() {
+        assert!(total.deliveries > 0 && total.pubacks > 0 && total.checked > 0);
+        assert!(total.resumed > 0 && total.redelivered > 0 && total.taken_over > 0);
+        assert!(total.refused > 0 && total.deleted > 0);
+        assert!(total.restarts > 0 && total.slot_takeovers > 0);
     }
 }

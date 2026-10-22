@@ -188,6 +188,7 @@ fn config(cap: u64, id: u8, addresses: &[SocketAddr]) -> NodeConfig {
         read_bytes: 64 * 1024,
         metrics: None,
         tls: tls(id),
+        sessions: None,
     }
 }
 

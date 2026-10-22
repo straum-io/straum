@@ -96,6 +96,22 @@ fn a_queue_below_one_proposal_per_voter_is_refused() {
     assert_eq!(config.check(), Ok(()));
 }
 
+/// Step 7c stage 3 (D-176 A): sessions through the log are refused with
+/// credentials until a session is bound to its user; a Clean Start 0
+/// CONNECT could otherwise resume another user's session.
+#[test]
+fn sessions_with_credentials_are_refused() {
+    let mut config = experimental().node_config().unwrap();
+    config.sessions = Some(apply::ConnectLimits::default());
+    assert_eq!(config.check(), Ok(()), "sessions alone");
+    config.mqtt.as_mut().unwrap().authority = Some(std::sync::Arc::new(
+        auth::Authority::parse("", None, true).unwrap(),
+    ));
+    assert_eq!(config.check(), Err(ConfigError::SessionsWithCredentials));
+    config.sessions = None;
+    assert_eq!(config.check(), Ok(()), "credentials alone");
+}
+
 #[tokio::test]
 async fn a_node_refuses_to_start_on_a_broken_configuration() {
     let mut config = experimental().node_config().unwrap();

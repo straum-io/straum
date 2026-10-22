@@ -48,6 +48,8 @@ struct Cluster {
     via: Vec<(u8, u8, SocketAddr)>,
     /// Each node's link TLS (ADR-0010), or none: plaintext links.
     tls: Vec<transport::NodeTls>,
+    /// Step 7c stage 3's switch and bounds (D-176 A), or off.
+    sessions: Option<apply::ConnectLimits>,
 }
 
 /// A cluster CA for TLS between nodes (ADR-0010), issuing node files into a
@@ -120,6 +122,7 @@ fn gateway() -> gateway::Config {
         max_total_waiting_bytes: 16 << 20,
         max_retries: 1024,
         authenticate: false,
+        connect_through_log: false,
     }
 }
 
@@ -188,6 +191,7 @@ fn config(
         read_bytes: 64 * 1024,
         metrics: None,
         tls: None,
+        sessions: None,
     }
 }
 
@@ -238,20 +242,27 @@ impl Cluster {
     /// As `start`, with each listed link from node `from` to node `to`
     /// dialled through `address` instead (a proxy, D-122, D-151).
     async fn start_via(test: &'static str, via: Vec<(u8, u8, SocketAddr)>) -> Self {
-        Self::start_with(test, via, Vec::new()).await
+        Self::start_with(test, via, Vec::new(), None).await
+    }
+
+    /// With step 7c stage 3 on (D-176 A): CONNECT through the log, sessions
+    /// that persist, within `connect`.
+    async fn start_sessions(test: &'static str, connect: apply::ConnectLimits) -> Self {
+        Self::start_with(test, Vec::new(), Vec::new(), Some(connect)).await
     }
 
     /// As `start_via`, with TLS on every link and each node's files from
     /// `ca` (ADR-0010).
     async fn start_tls(test: &'static str, ca: &Ca, via: Vec<(u8, u8, SocketAddr)>) -> Self {
         let tls = (0..NODES).map(|id| ca.node(test, id)).collect();
-        Self::start_with(test, via, tls).await
+        Self::start_with(test, via, tls, None).await
     }
 
     async fn start_with(
         test: &'static str,
         via: Vec<(u8, u8, SocketAddr)>,
         tls: Vec<transport::NodeTls>,
+        sessions: Option<apply::ConnectLimits>,
     ) -> Self {
         for id in 0..NODES {
             let _ = std::fs::remove_dir_all(data_dir(test, id));
@@ -265,6 +276,7 @@ impl Cluster {
             nodes: Vec::new(),
             via,
             tls,
+            sessions,
         };
         for id in 0..NODES {
             let node = Node::start(cluster.config(id, Limits::default()))
@@ -277,6 +289,7 @@ impl Cluster {
 
     fn config(&self, id: u8, limits: Limits) -> NodeConfig {
         let mut config = config(self.test, id, &self.addresses, &self.mqtt, limits);
+        config.sessions = self.sessions;
         if let Some(tls) = self.tls.get(usize::from(id)) {
             config.tls = Some(tls.clone());
             // Room for a handshake of a debug build on a busy test host
@@ -1720,5 +1733,275 @@ async fn tls_links_bound_connections_that_never_finish_a_handshake() {
     let cluster = Cluster::start_tls("tls-bounded", &ca, Vec::new()).await;
     cluster.converged(2).await;
     strangers_are_bounded(&cluster, 4).await;
+    cluster.shutdown().await;
+}
+
+/// An MQTT client over one TCP connection, packet by packet through
+/// `codec`: what the server sends, flags and properties included, exactly
+/// (step 7c stage 3).
+struct Raw {
+    stream: tokio::net::TcpStream,
+    buf: bytes::BytesMut,
+    version: codec::Version,
+}
+
+impl Raw {
+    /// Connects and returns the CONNACK. `expiry` is MQTT 5's Session
+    /// Expiry Interval; 3.1.1's CleanSession is `clean_start`. Tried again,
+    /// as a client would, while the gateway is not ready yet ("server
+    /// unavailable" until its `NodeReset` is committed).
+    async fn connect(
+        address: SocketAddr,
+        version: codec::Version,
+        id: &'static str,
+        clean_start: bool,
+        expiry: u32,
+    ) -> (Self, codec::ConnAck) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let (raw, ack) = Self::connect_once(address, version, id, clean_start, expiry).await;
+            if ack.reason != codec::ReasonCode::ServerUnavailable
+                || tokio::time::Instant::now() >= deadline
+            {
+                return (raw, ack);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn connect_once(
+        address: SocketAddr,
+        version: codec::Version,
+        id: &'static str,
+        clean_start: bool,
+        expiry: u32,
+    ) -> (Self, codec::ConnAck) {
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut raw = Raw {
+            stream,
+            buf: bytes::BytesMut::new(),
+            version,
+        };
+        raw.send(codec::Packet::Connect(Box::new(codec::Connect {
+            version,
+            client_id: domain::ClientId::new(Bytes::from_static(id.as_bytes())).unwrap(),
+            clean_start,
+            keep_alive_secs: 0,
+            will: None,
+            username: None,
+            password: None,
+            properties: codec::ConnectProperties {
+                session_expiry_secs: expiry,
+                ..codec::ConnectProperties::default()
+            },
+        })))
+        .await;
+        let codec::Packet::ConnAck(ack) = raw.recv().await.expect("a CONNACK") else {
+            panic!("not a CONNACK");
+        };
+        (raw, *ack)
+    }
+
+    async fn send(&mut self, packet: codec::Packet) {
+        use tokio::io::AsyncWriteExt;
+        let mut out = bytes::BytesMut::new();
+        codec::encode(&packet, self.version, codec::Sender::Client, &mut out).unwrap();
+        self.stream.write_all(&out).await.unwrap();
+    }
+
+    /// The next packet, or `None` once the server closed the connection.
+    async fn recv(&mut self) -> Option<codec::Packet> {
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(packet) = codec::decode(
+                    &mut self.buf,
+                    Some(self.version),
+                    codec::Sender::Server,
+                    &codec::Limits::default(),
+                )
+                .unwrap()
+                {
+                    return Some(packet);
+                }
+                if self.stream.read_buf(&mut self.buf).await.unwrap_or(0) == 0 {
+                    return None;
+                }
+            }
+        })
+        .await
+        .expect("nothing from the server within 20 s")
+    }
+
+    async fn subscribe(&mut self, filter: &'static str) {
+        self.send(codec::Packet::Subscribe(codec::Subscribe {
+            id: codec::PacketId::new(1).unwrap(),
+            subscription_identifier: None,
+            user: Vec::new(),
+            filters: vec![(
+                domain::TopicFilter::new(Bytes::from_static(filter.as_bytes())).unwrap(),
+                codec::SubscriptionOptions::qos(codec::Qos::AtLeastOnce),
+            )],
+        }))
+        .await;
+        assert!(matches!(self.recv().await, Some(codec::Packet::SubAck(_))));
+    }
+
+    /// Publishes on `t`; a QoS 1 one waits for its PUBACK.
+    async fn publish(&mut self, payload: &'static str, qos: codec::Qos) {
+        let id = (qos == codec::Qos::AtLeastOnce).then(|| codec::PacketId::new(7).unwrap());
+        self.send(codec::Packet::Publish(codec::Publish {
+            topic: Some(Topic::new(Bytes::from_static(b"t")).unwrap()),
+            id,
+            qos,
+            duplicate: false,
+            retain: false,
+            payload: Bytes::from_static(payload.as_bytes()),
+            properties: None,
+        }))
+        .await;
+        if id.is_some() {
+            assert!(matches!(self.recv().await, Some(codec::Packet::PubAck(_))));
+        }
+    }
+
+    /// The next PUBLISH: its payload and DUP flag. Not acknowledged.
+    async fn delivered(&mut self) -> (String, bool) {
+        loop {
+            match self.recv().await {
+                Some(codec::Packet::Publish(p)) => {
+                    return (String::from_utf8_lossy(&p.payload).to_string(), p.duplicate);
+                }
+                Some(_) => {}
+                None => panic!("closed before a delivery"),
+            }
+        }
+    }
+}
+
+fn connect_limits() -> apply::ConnectLimits {
+    apply::ConnectLimits::default()
+}
+
+/// Long enough for a closed connection's `Disconnect` to commit on
+/// loopback, so what is published next waits in the detached session.
+async fn detached() {
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+/// Step 7c stage 3 (D-176 A, D-177 A) end to end: a persisted session
+/// resumes on another node. What it had not acknowledged comes again with
+/// DUP set, then what was published while it was away, QoS 1 and QoS 0, in
+/// order. CONNACK says the session is present and never expires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_persisted_session_resumes_on_another_node_with_redelivery_and_its_backlog() {
+    use codec::{Qos, Version};
+    let cluster = Cluster::start_sessions("sessions-resume", connect_limits()).await;
+    cluster.converged(2).await;
+    let (mut sub, ack) = Raw::connect(cluster.mqtt[0], Version::V5, "s", true, 60).await;
+    assert_eq!(ack.reason, codec::ReasonCode::Success);
+    assert!(!ack.session_present);
+    assert_eq!(ack.properties.session_expiry_secs, Some(u32::MAX));
+    sub.subscribe("t").await;
+    let (mut publisher, _) = Raw::connect(cluster.mqtt[1], Version::V311, "p", true, 0).await;
+    publisher.publish("one", Qos::AtLeastOnce).await;
+    assert_eq!(sub.delivered().await, ("one".into(), false));
+    drop(sub);
+    detached().await;
+    publisher.publish("two", Qos::AtLeastOnce).await;
+    publisher.publish("three", Qos::AtMostOnce).await;
+    let (mut sub, ack) = Raw::connect(cluster.mqtt[2], Version::V5, "s", false, 60).await;
+    assert!(ack.session_present);
+    assert_eq!(sub.delivered().await, ("one".into(), true));
+    assert_eq!(sub.delivered().await, ("two".into(), false));
+    assert_eq!(sub.delivered().await, ("three".into(), false));
+    cluster.shutdown().await;
+}
+
+/// A CONNECT on another node takes a persisted session over: the old
+/// connection is told (MQTT 5: SessionTakenOver) and closed, and the new one
+/// finds the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connect_on_another_node_takes_the_session_over() {
+    use codec::Version;
+    let cluster = Cluster::start_sessions("sessions-takeover", connect_limits()).await;
+    cluster.converged(2).await;
+    let (mut old, _) = Raw::connect(cluster.mqtt[0], Version::V5, "s", true, 60).await;
+    old.subscribe("t").await;
+    let (_new, ack) = Raw::connect(cluster.mqtt[1], Version::V5, "s", false, 60).await;
+    assert!(ack.session_present);
+    let told = old.recv().await;
+    assert!(
+        matches!(&told, Some(codec::Packet::Disconnect(d)) if d.reason == codec::ReasonCode::SessionTakenOver),
+        "{told:?}"
+    );
+    assert!(old.recv().await.is_none(), "the old connection stayed open");
+    cluster.shutdown().await;
+}
+
+/// A persisted session outlives the restart of the node its client comes
+/// back to: the node rebuilds it from its log, and it gets what was
+/// published meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_persisted_session_outlives_a_restart_while_detached() {
+    use codec::{Qos, Version};
+    let mut cluster = Cluster::start_sessions("sessions-restart", connect_limits()).await;
+    cluster.converged(2).await;
+    let (mut sub, _) = Raw::connect(cluster.mqtt[2], Version::V311, "s", false, 0).await;
+    sub.subscribe("t").await;
+    drop(sub);
+    detached().await;
+    let (mut publisher, _) = Raw::connect(cluster.mqtt[0], Version::V311, "p", true, 0).await;
+    publisher.publish("kept", Qos::AtLeastOnce).await;
+    cluster.restart(2, Limits::default()).await;
+    let before = *cluster.node(0).status().borrow();
+    cluster.converged(before.applied).await;
+    let (mut sub, ack) = Raw::connect(cluster.mqtt[2], Version::V311, "s", false, 0).await;
+    assert!(ack.session_present);
+    assert_eq!(sub.delivered().await, ("kept".into(), false));
+    cluster.shutdown().await;
+}
+
+/// A detached session with no room for an at-least-once message is
+/// deleted whole; the next CONNACK finds none (D-144 (3)).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detached_session_that_overflows_is_gone_at_the_next_connect() {
+    use codec::{Qos, Version};
+    let cluster = Cluster::start_sessions(
+        "sessions-overflow",
+        apply::ConnectLimits {
+            max_detached_queued_bytes: 4,
+            ..connect_limits()
+        },
+    )
+    .await;
+    cluster.converged(2).await;
+    let (mut sub, _) = Raw::connect(cluster.mqtt[0], Version::V5, "s", true, 60).await;
+    sub.subscribe("t").await;
+    drop(sub);
+    detached().await;
+    let (mut publisher, _) = Raw::connect(cluster.mqtt[1], Version::V5, "p", true, 0).await;
+    publisher.publish("more than four", Qos::AtLeastOnce).await;
+    let (_sub, ack) = Raw::connect(cluster.mqtt[0], Version::V5, "s", false, 60).await;
+    assert_eq!(ack.reason, codec::ReasonCode::Success);
+    assert!(!ack.session_present);
+    cluster.shutdown().await;
+}
+
+/// The switch off, as every node runs by default (D-176 A): a CONNECT
+/// asking for a persisted session is refused, as before step 7c.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_the_switch_a_persisted_session_is_refused() {
+    use codec::Version;
+    let cluster = Cluster::start("sessions-off").await;
+    cluster.converged(2).await;
+    let (_, ack) = Raw::connect(cluster.mqtt[0], Version::V5, "s", true, 60).await;
+    assert_eq!(ack.reason, codec::ReasonCode::ImplementationSpecificError);
+    // 3.1.1 has only 0x03 for it, which a retry would take for "not ready".
+    let (_, ack) = Raw::connect_once(cluster.mqtt[0], Version::V311, "t", false, 0).await;
+    assert_ne!(ack.reason, codec::ReasonCode::Success);
+    let (_, ack) = Raw::connect(cluster.mqtt[0], Version::V5, "u", true, 0).await;
+    assert_eq!(ack.reason, codec::ReasonCode::Success);
+    assert_eq!(ack.properties.session_expiry_secs, None);
     cluster.shutdown().await;
 }

@@ -85,6 +85,11 @@ pub enum ConfigError {
     TlsTakeoverTicks(u32),
     #[error("the node TLS files are node {tls}'s, and this is node {id}")]
     TlsNode { tls: u8, id: u8 },
+    #[error(
+        "sessions through the log with credentials: a session is not yet bound to the user who \
+         made it, so a CONNECT could resume another user's (step 7c stage 3)"
+    )]
+    SessionsWithCredentials,
 }
 
 impl NodeConfig {
@@ -117,6 +122,12 @@ impl NodeConfig {
         // longer, so that only a handoff changes the sequencer.
         if self.core.takeover_ticks == 0 {
             return Err(ConfigError::TakeoverTicks(self.core.takeover_ticks));
+        }
+        // Until a `Connect` names the user, a Clean Start 0 CONNECT could
+        // resume another user's session with its subscriptions and queue,
+        // which no grant was asked about.
+        if self.sessions.is_some() && self.mqtt.as_ref().is_some_and(|m| m.authority.is_some()) {
+            return Err(ConfigError::SessionsWithCredentials);
         }
         if let Some(tls) = &self.tls {
             // A backoff, a stalled attempt, the handshake that succeeds,
@@ -210,6 +221,7 @@ impl Experimental {
             max_retries: 1024,
             // The node sets it from `MqttConfig::authority`.
             authenticate: false,
+            connect_through_log: false,
         };
         let config = NodeConfig {
             core: cluster::Config {
@@ -261,6 +273,7 @@ impl Experimental {
             read_bytes: self.read_bytes,
             metrics: self.metrics,
             tls: None,
+            sessions: None,
         };
         config.check()?;
         Ok(config)

@@ -220,7 +220,9 @@ impl State {
             return;
         }
         let mut kept = None;
+        let mut previous_persisted = false;
         if let Some(previous) = clients.by_id.remove(&id) {
+            previous_persisted = previous.persist;
             if previous.persist {
                 clients.persisted = clients.persisted.saturating_sub(1);
             }
@@ -239,8 +241,13 @@ impl State {
                 }
             });
         }
-        let session_present = kept.is_some() && !clean_start;
-        if clean_start {
+        // A session is kept for this connection only if the client asks for
+        // it (no clean start) and it was one that outlives its connection: a
+        // clean session ends with the connection a takeover ends (MQTT 5
+        // §3.1.2.4, 3.1.1 §3.1.2.4).
+        let resumable = previous_persisted && !clean_start;
+        let session_present = kept.is_some() && resumable;
+        if !resumable {
             if let Some(session) = kept.take() {
                 self.release(&session);
             }
@@ -248,6 +255,21 @@ impl State {
         // A new origin holds nothing yet; whatever it held is not this
         // client's.
         self.drop_session(origin);
+        // What the resumed session had sent and not seen acknowledged goes
+        // again, after `Connected` and before the backlog.
+        let redeliver: Vec<ClientEffect> = kept
+            .iter()
+            .flat_map(|s| s.inflight.iter())
+            .map(|(&id, m)| ClientEffect::Redeliver {
+                to: origin,
+                id,
+                topic: m.topic.clone(),
+                payload: m.payload.clone(),
+                properties: m.properties.clone(),
+                retain: m.retain,
+                lsn,
+            })
+            .collect();
         if let Some(session) = kept {
             self.sessions.insert(origin, session);
         }
@@ -270,15 +292,17 @@ impl State {
             session_present,
             lsn,
         });
+        self.client_out.extend(redeliver);
         // What waited while it was detached goes out as the window allows.
         self.drain(origin, lsn, out);
         self.forget_if_empty(origin);
     }
 
     /// Detaches `origin`, if attached: its session is kept detached if it
-    /// persists and the detached budget has room, and deleted whole
-    /// otherwise, leaving a tombstone. Returns whether it was attached.
-    pub(crate) fn detach(&mut self, origin: Origin, lsn: u64) -> bool {
+    /// persists, `end` is not set, and the detached budget has room, and
+    /// deleted whole otherwise, leaving a tombstone. Returns whether it was
+    /// attached.
+    pub(crate) fn detach(&mut self, origin: Origin, lsn: u64, end: bool) -> bool {
         let Some(mut clients) = self.clients.take() else {
             return false;
         };
@@ -289,7 +313,7 @@ impl State {
                 let session = self.sessions.remove(&origin).unwrap_or_default();
                 let persist = clients.by_id.get(&id).is_some_and(|c| c.persist);
                 let detached = clients.detached_bytes.saturating_add(queued(&session));
-                if persist && detached <= limits.max_detached_queued_bytes {
+                if persist && !end && detached <= limits.max_detached_queued_bytes {
                     clients.detached_bytes = detached;
                     if let Some(client) = clients.by_id.get_mut(&id) {
                         client.attached = None;
@@ -298,7 +322,8 @@ impl State {
                 } else {
                     self.release(&session);
                     clients.remove(&id, lsn, limits.max_connect_tombstones);
-                    if persist {
+                    // Ended at the client's request is no overflow.
+                    if persist && !end {
                         self.client_out.push(ClientEffect::SessionDeleted { lsn });
                     }
                 }
