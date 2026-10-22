@@ -216,9 +216,14 @@ impl Settings {
             0,
             u64::MAX,
         )?;
-        // ADR-0009 (D-170 A): off until a host that passes D-129 confirms it.
-        let wal_preallocate_bytes =
-            parser.number("STRAUM_WAL_PREALLOCATE_BYTES", 0u64, 0, 1 << 30)?;
+        // ADR-0009: on by default since the D-129 run confirmed the gain
+        // (D-178 A); 0 turns it off, as on a copy-on-write filesystem.
+        let wal_preallocate_bytes = parser.number(
+            "STRAUM_WAL_PREALLOCATE_BYTES",
+            node::experimental::DEFAULT_WAL_PREALLOCATE_BYTES,
+            0,
+            1 << 30,
+        )?;
         let effective = parser.finish()?;
         let mut node = node::Experimental {
             id,
@@ -1253,5 +1258,15 @@ mod tests {
         assert!(access.reload().unwrap().node.is_some());
         std::fs::write(&ca.0, "not a certificate\n").unwrap();
         assert!(matches!(access.reload(), Err(ConfigError::NodeTls(_))));
+    }
+
+    /// D-178 A: zeros 8 MiB ahead by default; 0 still turns them off.
+    #[test]
+    fn pre_zeroed_segments_are_on_by_default_and_0_turns_them_off() {
+        let preallocate = |s: &Settings| s.node.segments.wal.preallocate_bytes;
+        assert_eq!(preallocate(&parse(&VALID).unwrap()), 8 << 20);
+        let mut pairs = VALID.to_vec();
+        pairs.push(("STRAUM_WAL_PREALLOCATE_BYTES", "0"));
+        assert_eq!(preallocate(&parse(&pairs).unwrap()), 0);
     }
 }

@@ -22,6 +22,10 @@ pub const DEFAULT_HEARTBEAT: Duration = Duration::from_millis(50);
 pub const DEFAULT_TAKEOVER_TICKS: u32 = 3;
 /// One catch-up or fetch read (D-83 A).
 pub const DEFAULT_READ_BYTES: usize = 64 * 1024;
+/// Zeros written ahead of each log segment (ADR-0009, D-178 A): the value
+/// the D-129 run measured on ext4. 0 is off, as on a copy-on-write
+/// filesystem.
+pub const DEFAULT_WAL_PREALLOCATE_BYTES: u64 = 8 << 20;
 
 /// The fixed sizes of 7a: not settings, and not tuned. A batch of
 /// `MAX_BATCH` records of the largest packet fits one frame.
@@ -47,7 +51,8 @@ pub struct Experimental {
     /// Where the metrics are served (D-112); `None` serves none.
     pub metrics: Option<SocketAddr>,
     /// Zeros written this far ahead of each segment's log
-    /// (`WalLimits::preallocate_bytes`, ADR-0009); 0, the default, is off.
+    /// (`WalLimits::preallocate_bytes`, ADR-0009); 0 is off. The server's
+    /// default is [`DEFAULT_WAL_PREALLOCATE_BYTES`].
     pub wal_preallocate_bytes: u64,
 }
 
