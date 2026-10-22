@@ -32,12 +32,18 @@
 //! `retry_interval` until their effect is seen; applying one twice changes
 //! nothing.
 //!
-//! Not yet (ADR-0008 step 7c): sessions that outlive their connection,
-//! wills, session expiry, takeover across gateways. A CONNECT asking for
-//! any of the first three — a will, a 3.1.1 CleanSession=0, an MQTT 5
-//! session expiry above zero — is refused (`ImplementationSpecificError`,
-//! 3.1.1 "server unavailable"), so no client believes this server keeps
-//! them (D-78 A, step 7a). Also not yet: enhanced authentication; message
+//! Sessions across connections (ADR-0008 step 7c stage 3, D-176 A), with
+//! [`Config::connect_through_log`]: every CONNECT is proposed as a
+//! `Connect` and answered from its committed effect ([`ClientEffect`]), a
+//! closed connection proposes `Disconnect`, a resumed session gets what it
+//! had not acknowledged again (DUP set) before its backlog, and a
+//! connection the log detached is closed. A 3.1.1 CleanSession=0 or an
+//! MQTT 5 session expiry above zero asks for a session that persists; MQTT
+//! 5 is told 0xFFFFFFFF, since no expiry is run (D-177 A). Without it, as
+//! before 7c: a CONNECT asking for a session that outlives its connection
+//! is refused (`ImplementationSpecificError`, 3.1.1 "server unavailable"),
+//! so no client believes this server keeps it (D-78 A, step 7a). Wills
+//! are refused either way. Not yet: enhanced authentication; message
 //! properties through the log (D-65).
 //!
 //! Credentials (D-110 A, D-158 A): with [`Config::authenticate`] set, a
@@ -53,7 +59,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::time::Duration;
 
-use apply::{Effect, Options, Origin, Proposal, RetainHandling as Handling};
+use apply::{ClientEffect, Effect, Options, Origin, Proposal, Refusal, RetainHandling as Handling};
 use bytes::{Bytes, BytesMut};
 use codec::{
     AckProperties, ConnAck, ConnAckProperties, Disconnect, DisconnectProperties, Packet, PacketId,
@@ -99,6 +105,11 @@ pub struct Config {
     /// accepted (D-158 A). Off: every client is let in and may do anything,
     /// as before credentials existed.
     pub authenticate: bool,
+    /// Step 7c stage 3 (D-176 A): every CONNECT goes through the committed
+    /// log, and sessions may persist. The node's `apply` must run
+    /// `State::with_connect` with it, and every gateway of the cluster
+    /// must have it or none. Off: as before 7c.
+    pub connect_through_log: bool,
 }
 
 /// What an authenticated session may do: asked for each PUBLISH and each
@@ -147,6 +158,8 @@ enum RetryKey {
     Reset,
     Gone(u64),
     Ack(u64, u64),
+    /// Step 7c: a closed connection's `Disconnect`, until it is applied.
+    Disconnect(u64),
 }
 
 #[derive(Debug)]
@@ -206,6 +219,8 @@ struct Group {
 #[derive(Debug)]
 struct Delivery {
     id: Option<u64>,
+    /// Sent before on the session's last connection (step 7c).
+    duplicate: bool,
     topic: Topic,
     payload: Bytes,
     properties: Bytes,
@@ -241,6 +256,11 @@ struct Open {
     groups: HashMap<u64, Group>,
     /// What the session may do; `None`: anything (credentials off).
     grant: Option<Box<dyn Grant>>,
+    /// Step 7c: the session outlives the connection.
+    persist: bool,
+    /// Step 7c, MQTT 5: the client set the expiry to 0 at DISCONNECT, so the
+    /// session ends with this connection.
+    end: bool,
 }
 
 #[derive(Debug)]
@@ -253,6 +273,14 @@ enum Phase {
     Authenticating {
         deadline: Duration,
         connect: Box<codec::Connect>,
+    },
+    /// Step 7c: the `Connect` is proposed, and nothing is answered or read
+    /// until its effect comes back.
+    Attaching {
+        deadline: Duration,
+        open: Box<Open>,
+        /// MQTT 5: the server assigned the client id.
+        assigned: bool,
     },
     Open(Box<Open>),
 }
@@ -270,6 +298,8 @@ pub struct Gateway {
     /// The `NodeReset` of this incarnation is committed: what earlier
     /// incarnations left is gone, and connections are accepted.
     ready: bool,
+    /// The last lsn this node applied: a `Connect`'s `seen` (step 7c).
+    applied: u64,
     next_session: u64,
     next_request: u64,
     conns: BTreeMap<ConnId, Conn>,
@@ -299,6 +329,12 @@ pub struct Counted {
     pub closed: u64,
     pub closed_keep_alive: u64,
     pub closed_commit_timeout: u64,
+    /// Step 7c: CONNECTs refused as stale by the fence, and at the
+    /// persisted-session limit.
+    pub connects_stale: u64,
+    pub connects_quota: u64,
+    /// Step 7c: detached sessions deleted for lack of room, cluster-wide.
+    pub sessions_deleted: u64,
 }
 
 /// What the gateway holds, for assertions and metrics.
@@ -344,6 +380,7 @@ impl Gateway {
             config,
             now,
             ready: false,
+            applied: 0,
             next_session: config.first_session,
             next_request: 0,
             conns: BTreeMap::new(),
@@ -391,7 +428,9 @@ impl Gateway {
     pub fn client_ids(&self) -> impl Iterator<Item = &[u8]> {
         self.conns.values().filter_map(|c| match &c.phase {
             Phase::Open(open) => Some(open.client_id.as_ref()),
-            Phase::Connecting { .. } | Phase::Authenticating { .. } => None,
+            Phase::Connecting { .. } | Phase::Authenticating { .. } | Phase::Attaching { .. } => {
+                None
+            }
         })
     }
 
@@ -402,8 +441,16 @@ impl Gateway {
                 node: self.config.node,
                 session: open.session,
             }),
-            Phase::Connecting { .. } | Phase::Authenticating { .. } => None,
+            Phase::Connecting { .. } | Phase::Authenticating { .. } | Phase::Attaching { .. } => {
+                None
+            }
         }
+    }
+
+    /// Step 7c: the last lsn the node applied, given after every record:
+    /// what a `Connect` proposed from now on has seen.
+    pub fn applied(&mut self, lsn: u64) {
+        self.applied = self.applied.max(lsn);
     }
 
     fn retry(&mut self, key: RetryKey, proposal: Proposal) {
@@ -447,7 +494,7 @@ impl Gateway {
         match self.conns.get(&conn).map(|c| &c.phase) {
             Some(Phase::Connecting { .. }) => true,
             Some(Phase::Open(open)) => room(&self.config, self.total_pending_bytes, open),
-            Some(Phase::Authenticating { .. }) | None => false,
+            Some(Phase::Authenticating { .. } | Phase::Attaching { .. }) | None => false,
         }
     }
 
@@ -473,8 +520,9 @@ impl Gateway {
             };
             let version = match &c.phase {
                 Phase::Connecting { .. } => None,
-                // What follows the CONNECT waits for its verdict.
-                Phase::Authenticating { .. } => return,
+                // What follows the CONNECT waits for its verdict, or for
+                // its `Connect` to commit.
+                Phase::Authenticating { .. } | Phase::Attaching { .. } => return,
                 Phase::Open(open) => {
                     if !room(&config, total, open) {
                         return;
@@ -507,6 +555,13 @@ impl Gateway {
     /// Ends a connection: an MQTT 5 client is told why, the socket closes,
     /// and the session's end goes to the log.
     fn close(&mut self, conn: ConnId, reason: Option<ReasonCode>) {
+        self.end(conn, reason, true);
+    }
+
+    /// As [`Gateway::close`]; `propose` false for a connection the log has
+    /// already detached (step 7c: taken over, or refused as not attached),
+    /// whose `Disconnect` would change nothing.
+    fn end(&mut self, conn: ConnId, reason: Option<ReasonCode>, propose: bool) {
         if let (Some(reason), Some(Phase::Open(open))) =
             (reason, self.conns.get(&conn).map(|c| &c.phase))
         {
@@ -534,24 +589,43 @@ impl Gateway {
                 self.total_pending_bytes = self.total_pending_bytes.saturating_sub(w.bytes());
             }
         }
-        if let Phase::Open(open) = c.phase {
-            self.total_waiting_bytes = self.total_waiting_bytes.saturating_sub(open.waiting_bytes);
-            if self.by_client.get(&open.client_id) == Some(&conn) {
-                self.by_client.remove(&open.client_id);
-            }
-            self.by_session.remove(&open.session);
-            // Its acknowledgements no longer matter: the session goes.
-            self.retries
-                .retain(|key, _| !matches!(key, RetryKey::Ack(s, _) if *s == open.session));
-            let origin = Origin {
-                node: self.config.node,
-                session: open.session,
-            };
-            self.retry(
-                RetryKey::Gone(open.session),
-                Proposal::SessionGone { origin },
-            );
+        let open = match c.phase {
+            Phase::Open(open) => open,
+            // Its `Connect` may still commit: the `Disconnect` after it
+            // detaches it again.
+            Phase::Attaching { open, .. } => open,
+            Phase::Connecting { .. } | Phase::Authenticating { .. } => return,
+        };
+        self.total_waiting_bytes = self.total_waiting_bytes.saturating_sub(open.waiting_bytes);
+        if self.by_client.get(&open.client_id) == Some(&conn) {
+            self.by_client.remove(&open.client_id);
         }
+        self.by_session.remove(&open.session);
+        let origin = Origin {
+            node: self.config.node,
+            session: open.session,
+        };
+        // Its acknowledgements no longer matter. Through the log, a detached
+        // origin's would be refused; an unacknowledged delivery of a
+        // persisted session goes again when it resumes.
+        self.retries
+            .retain(|key, _| !matches!(key, RetryKey::Ack(s, _) if *s == open.session));
+        if self.config.connect_through_log {
+            if propose {
+                self.retry(
+                    RetryKey::Disconnect(open.session),
+                    Proposal::Disconnect {
+                        origin,
+                        end: open.end,
+                    },
+                );
+            }
+            return;
+        }
+        self.retry(
+            RetryKey::Gone(open.session),
+            Proposal::SessionGone { origin },
+        );
     }
 
     /// The socket closed under the connection.
@@ -570,7 +644,7 @@ impl Gateway {
             Packet::Subscribe(subscribe) => self.subscribe(conn, subscribe),
             Packet::Unsubscribe(unsubscribe) => self.unsubscribe(conn, unsubscribe),
             Packet::PingReq => self.send(conn, &Packet::PingResp),
-            Packet::Disconnect(_) => self.close(conn, None),
+            Packet::Disconnect(disconnect) => self.disconnect(conn, &disconnect),
             // Enhanced authentication is not offered (no method is
             // accepted at CONNECT), so an AUTH is out of turn.
             Packet::Auth(_) => self.close(conn, Some(ReasonCode::ProtocolError)),
@@ -615,8 +689,15 @@ impl Gateway {
             Version::V311 => !connect.clean_start,
             _ => connect.properties.session_expiry_secs != 0,
         };
-        if connect.will.is_some() || persistent {
+        if connect.will.is_some() || (persistent && !self.config.connect_through_log) {
             return self.refuse_connect(conn, version, ReasonCode::ImplementationSpecificError);
+        }
+        // `apply`'s bound, part of the record format; the codec's may be
+        // set wider (D-153 precisions 4 and 8).
+        if self.config.connect_through_log
+            && connect.client_id.as_bytes().len() > apply::MAX_CLIENT_ID_BYTES
+        {
+            return self.refuse_connect(conn, version, ReasonCode::ClientIdentifierNotValid);
         }
         if !self.config.authenticate {
             return self.admit(conn, connect, None);
@@ -682,10 +763,24 @@ impl Gateway {
         };
         self.next_session = self.next_session.saturating_add(1);
         // One live session per client id within this gateway: the newer
-        // takes over (invariant 7, within one gateway until step 7).
-        if let Some(&old) = self.by_client.get(&client_id) {
-            self.close(old, Some(ReasonCode::SessionTakenOver));
+        // takes over (invariant 7, within one gateway). Through the log,
+        // the log decides across gateways (`ClientEffect::TakenOver`).
+        if !self.config.connect_through_log {
+            if let Some(&old) = self.by_client.get(&client_id) {
+                self.close(old, Some(ReasonCode::SessionTakenOver));
+            }
         }
+        // 3.1.1's CleanSession is both: a new session, and one that ends
+        // with the connection. MQTT 5 keeps them apart: Clean Start alone
+        // decides whether a kept session is resumed, the expiry alone
+        // whether this one is kept (D-177 A).
+        let (clean_start, persist) = match version {
+            Version::V311 => (connect.clean_start, !connect.clean_start),
+            _ => (
+                connect.clean_start,
+                connect.properties.session_expiry_secs != 0,
+            ),
+        };
         let keep_alive = (connect.keep_alive_secs != 0)
             .then(|| Duration::from_millis(u64::from(connect.keep_alive_secs) * 1500));
         let open = Open {
@@ -705,13 +800,54 @@ impl Gateway {
             next_packet: 1,
             groups: HashMap::new(),
             grant,
+            persist,
+            end: false,
         };
         let Some(c) = self.conns.get_mut(&conn) else {
             return;
         };
+        if self.config.connect_through_log {
+            let deadline = match c.phase {
+                Phase::Connecting { deadline } => deadline,
+                _ => self.now.saturating_add(self.config.connect_timeout),
+            };
+            let Ok(id) = ClientId::new(client_id.clone()) else {
+                return self.refuse_connect(conn, version, ReasonCode::ClientIdentifierNotValid);
+            };
+            c.phase = Phase::Attaching {
+                deadline,
+                open: Box::new(open),
+                assigned,
+            };
+            self.by_session.insert(session, conn);
+            // Never proposed again: a `Connect` that does not commit leaves
+            // the CONNECT unanswered until its deadline (D-144 (2)).
+            self.actions.push(Action::Propose(Proposal::Connect {
+                origin: Origin {
+                    node: self.config.node,
+                    session,
+                },
+                client_id: id,
+                seen: self.applied,
+                clean_start,
+                persist,
+            }));
+            return;
+        }
         c.phase = Phase::Open(Box::new(open));
         self.by_client.insert(client_id.clone(), conn);
         self.by_session.insert(session, conn);
+        self.connack(conn, false, assigned);
+    }
+
+    /// The CONNACK of an open session. MQTT 5 is told a persisted session's
+    /// expiry is 0xFFFFFFFF: none is run (D-177 A).
+    fn connack(&mut self, conn: ConnId, session_present: bool, assigned: bool) {
+        let Some(open) = self.open(conn) else { return };
+        let assigned_client_id = assigned
+            .then(|| ClientId::new(open.client_id.clone()).ok())
+            .flatten();
+        let session_expiry_secs = open.persist.then_some(u32::MAX);
         let max_packet = u32::try_from(self.config.codec.max_packet_bytes)
             .ok()
             .and_then(NonZeroU32::new);
@@ -720,29 +856,51 @@ impl Gateway {
             maximum_qos: Some(Qos::AtLeastOnce),
             retain_available: Some(true),
             maximum_packet_size: max_packet,
-            assigned_client_id: assigned
-                .then(|| ClientId::new(client_id.clone()).ok())
-                .flatten(),
+            assigned_client_id,
             topic_alias_maximum: Some(self.config.topic_alias_maximum),
             wildcard_subscription_available: Some(true),
             subscription_identifiers_available: Some(false),
             shared_subscription_available: Some(false),
+            session_expiry_secs,
             ..ConnAckProperties::default()
         };
         self.send(
             conn,
             &Packet::ConnAck(Box::new(ConnAck {
-                session_present: false,
+                session_present,
                 reason: ReasonCode::Success,
                 properties,
             })),
         );
     }
 
+    /// A DISCONNECT from the client. MQTT 5 may change the session's expiry
+    /// there: to 0 ends a persisted session with the connection; from 0 to
+    /// anything else is a protocol error (§3.14.2.2.2).
+    /// Without step 7c a DISCONNECT only closes, as before it.
+    fn disconnect(&mut self, conn: ConnId, disconnect: &Disconnect) {
+        if !self.config.connect_through_log {
+            return self.close(conn, None);
+        }
+        let Some(open) = self.open(conn) else {
+            return self.close(conn, None);
+        };
+        match disconnect.properties.session_expiry_secs {
+            Some(0) => open.end = true,
+            Some(_) if !open.persist => {
+                return self.close(conn, Some(ReasonCode::ProtocolError));
+            }
+            _ => {}
+        }
+        self.close(conn, None);
+    }
+
     fn open(&mut self, conn: ConnId) -> Option<&mut Open> {
         match &mut self.conns.get_mut(&conn)?.phase {
             Phase::Open(open) => Some(open),
-            Phase::Connecting { .. } | Phase::Authenticating { .. } => None,
+            Phase::Connecting { .. } | Phase::Authenticating { .. } | Phase::Attaching { .. } => {
+                None
+            }
         }
     }
 
@@ -1124,6 +1282,7 @@ impl Gateway {
                         open.waiting_bytes = open.waiting_bytes.saturating_add(size);
                         open.waiting.push_back(Delivery {
                             id: *id,
+                            duplicate: false,
                             topic: topic.clone(),
                             payload: payload.clone(),
                             properties: properties.clone(),
@@ -1146,6 +1305,109 @@ impl Gateway {
         self.pump(conn);
     }
 
+    /// A committed record's step 7c effect (D-176 A). The driver hands every
+    /// one over, before that record's [`Effect`]s; those for other gateways'
+    /// sessions are ignored.
+    pub fn client_effect(&mut self, effect: &ClientEffect, now: Duration) {
+        self.now = now;
+        let node = self.config.node;
+        if let ClientEffect::SessionDeleted { .. } = effect {
+            self.counted.sessions_deleted = self.counted.sessions_deleted.saturating_add(1);
+            return;
+        }
+        let Some(to) = effect.to().filter(|to| to.node == node) else {
+            return;
+        };
+        if let ClientEffect::Disconnected { .. } = effect {
+            self.retries.remove(&RetryKey::Disconnect(to.session));
+            return;
+        }
+        let Some(&conn) = self.by_session.get(&to.session) else {
+            return;
+        };
+        match effect {
+            ClientEffect::Connected {
+                session_present, ..
+            } => self.attached(conn, *session_present),
+            ClientEffect::ConnectRefused { reason, .. } => {
+                let reason = match reason {
+                    Refusal::Stale => {
+                        self.counted.connects_stale = self.counted.connects_stale.saturating_add(1);
+                        ReasonCode::ServerUnavailable
+                    }
+                    Refusal::Quota => {
+                        self.counted.connects_quota = self.counted.connects_quota.saturating_add(1);
+                        ReasonCode::QuotaExceeded
+                    }
+                };
+                self.refused(conn, reason);
+            }
+            // Detached by the log: nothing more is committed in its name,
+            // and no `Disconnect` is needed.
+            ClientEffect::TakenOver { .. } | ClientEffect::Refused { .. } => {
+                self.end(conn, Some(ReasonCode::SessionTakenOver), false);
+            }
+            ClientEffect::Redeliver {
+                id,
+                topic,
+                payload,
+                properties,
+                retain,
+                ..
+            } => {
+                let size = payload.len().saturating_add(properties.len());
+                if let Some(open) = self.open(conn) {
+                    open.waiting_bytes = open.waiting_bytes.saturating_add(size);
+                    open.waiting.push_back(Delivery {
+                        id: Some(*id),
+                        duplicate: true,
+                        topic: topic.clone(),
+                        payload: payload.clone(),
+                        properties: properties.clone(),
+                        retain: *retain,
+                    });
+                    self.total_waiting_bytes = self.total_waiting_bytes.saturating_add(size);
+                }
+                self.flush_waiting(conn);
+            }
+            ClientEffect::Disconnected { .. } | ClientEffect::SessionDeleted { .. } => {}
+        }
+        self.pump(conn);
+    }
+
+    /// The `Connect` of an attaching connection applied: it is open.
+    fn attached(&mut self, conn: ConnId, session_present: bool) {
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        let Phase::Attaching { deadline, .. } = c.phase else {
+            return;
+        };
+        let Phase::Attaching { open, assigned, .. } =
+            std::mem::replace(&mut c.phase, Phase::Connecting { deadline })
+        else {
+            return;
+        };
+        let client_id = open.client_id.clone();
+        c.phase = Phase::Open(open);
+        self.by_client.insert(client_id, conn);
+        self.connack(conn, session_present, assigned);
+    }
+
+    /// The `Connect` of an attaching connection was refused: it changed
+    /// nothing, so no `Disconnect` follows.
+    fn refused(&mut self, conn: ConnId, reason: ReasonCode) {
+        let Some(c) = self.conns.get(&conn) else {
+            return;
+        };
+        let Phase::Attaching { open, .. } = &c.phase else {
+            return;
+        };
+        let (version, session) = (open.version, open.session);
+        self.by_session.remove(&session);
+        self.refuse_connect(conn, version, reason);
+    }
+
     fn answer(&mut self, conn: ConnId, request: u64, reason: ReasonCode) {
         if let Some(Waiting::Filter { group, index, .. }) = self.release(request) {
             if let Some(open) = self.open(conn) {
@@ -1164,6 +1426,7 @@ impl Gateway {
     /// Sends deliveries in order while the client's receive maximum has
     /// room for the QoS 1 ones.
     fn flush_waiting(&mut self, conn: ConnId) {
+        let through_log = self.config.connect_through_log;
         loop {
             let Some(open) = self.open(conn) else { return };
             let room = open.outbound.len() < usize::from(open.client_receive_maximum);
@@ -1180,6 +1443,22 @@ impl Gateway {
             let v5 = open.version == Version::V5;
             open.waiting_bytes = open.waiting_bytes.saturating_sub(size);
             let packet = match delivery.id {
+                // Step 7c: the identifier follows from the delivery, so a
+                // resend on any later connection, through any gateway,
+                // carries the one first sent ([MQTT-4.4.0-1]). Two collide
+                // only if the oldest unacknowledged delivery is 65 535 or
+                // more behind the newest: such a client is closed.
+                Some(delivery_id) if through_log => {
+                    let id = u16::try_from(delivery_id % 65_535)
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    if open.outbound.contains_key(&id) {
+                        self.total_waiting_bytes = self.total_waiting_bytes.saturating_sub(size);
+                        return self.close(conn, Some(ReasonCode::ImplementationSpecificError));
+                    }
+                    open.outbound.insert(id, delivery_id);
+                    PacketId::new(id)
+                }
                 Some(delivery_id) => {
                     // A free 16-bit identifier: at most the receive
                     // maximum are in use.
@@ -1203,7 +1482,7 @@ impl Gateway {
                 topic: Some(delivery.topic),
                 id: packet,
                 qos,
-                duplicate: false,
+                duplicate: delivery.duplicate,
                 retain: delivery.retain,
                 payload: delivery.payload,
                 // 3.1.1 has no properties; the encoder would drop them.
@@ -1225,7 +1504,9 @@ impl Gateway {
         let mut expired = Vec::new();
         for (conn, c) in &self.conns {
             match &c.phase {
-                Phase::Connecting { deadline } | Phase::Authenticating { deadline, .. }
+                Phase::Connecting { deadline }
+                | Phase::Authenticating { deadline, .. }
+                | Phase::Attaching { deadline, .. }
                     if *deadline <= now =>
                 {
                     expired.push((*conn, None));
@@ -1238,7 +1519,9 @@ impl Gateway {
                         expired.push((*conn, Some(ReasonCode::KeepAliveTimeout)));
                     }
                 }
-                Phase::Connecting { .. } | Phase::Authenticating { .. } => {}
+                Phase::Connecting { .. }
+                | Phase::Authenticating { .. }
+                | Phase::Attaching { .. } => {}
             }
         }
         for waiting in self.requests.values() {

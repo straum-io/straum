@@ -129,8 +129,10 @@ pub enum Proposal {
         persist: bool,
     },
     /// The connection of `origin` ended: it is detached, and its session
-    /// kept if it persists. Applied only by a [`State::with_connect`].
-    Disconnect { origin: Origin },
+    /// kept if it persists, unless `end`: the client asked at DISCONNECT
+    /// for its session to end with the connection (MQTT 5, D-177 A).
+    /// Applied only by a [`State::with_connect`].
+    Disconnect { origin: Origin, end: bool },
 }
 
 /// Why a `Connect` was refused (step 7c).
@@ -241,6 +243,19 @@ pub enum ClientEffect {
     },
     /// a detached session was deleted whole, its budget full.
     SessionDeleted { lsn: u64 },
+    /// An at-least-once delivery `to` had not acknowledged when the session
+    /// it resumes was last connected: sent again, marked as a duplicate
+    /// (D-153 precision 5, step 7c stage 3). Handed out right after
+    /// `Connected`, in delivery order, before what drains from the backlog.
+    Redeliver {
+        to: Origin,
+        id: u64,
+        topic: Topic,
+        payload: Bytes,
+        properties: Bytes,
+        retain: bool,
+        lsn: u64,
+    },
 }
 
 impl ClientEffect {
@@ -248,6 +263,7 @@ impl ClientEffect {
     pub fn to(&self) -> Option<Origin> {
         match self {
             Self::Connected { to, .. }
+            | Self::Redeliver { to, .. }
             | Self::ConnectRefused { to, .. }
             | Self::TakenOver { to, .. }
             | Self::Disconnected { to, .. }
@@ -259,6 +275,7 @@ impl ClientEffect {
     pub fn lsn(&self) -> u64 {
         match self {
             Self::Connected { lsn, .. }
+            | Self::Redeliver { lsn, .. }
             | Self::ConnectRefused { lsn, .. }
             | Self::TakenOver { lsn, .. }
             | Self::Disconnected { lsn, .. }
@@ -387,7 +404,7 @@ impl Proposal {
     /// [delivery u64]`. SessionGone: `[node][session]`. NodeReset:
     /// `[node u8][below u64]`. Connect: `[node][session][seen u64]
     /// [flags u8: clean_start 1, persist 2][client_id_len u16][client_id]`.
-    /// Disconnect: `[node][session]`.
+    /// Disconnect: `[node][session][flags u8: end 1]`.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), TooLong> {
         match self {
             Self::Publish {
@@ -432,7 +449,11 @@ impl Proposal {
                 put_origin(*origin, out);
                 out.put_u64(*delivery);
             }
-            Self::SessionGone { origin } | Self::Disconnect { origin } => put_origin(*origin, out),
+            Self::SessionGone { origin } => put_origin(*origin, out),
+            Self::Disconnect { origin, end } => {
+                put_origin(*origin, out);
+                out.put_u8(u8::from(*end));
+            }
             Self::NodeReset { node, below } => {
                 out.put_u8(*node);
                 out.put_u64(*below);
@@ -544,8 +565,9 @@ impl Proposal {
             }
             Kind::Disconnect => {
                 let origin = body.origin()?;
+                let end = body.flag()?;
                 body.finish()?;
-                Self::Disconnect { origin }
+                Self::Disconnect { origin, end }
             }
             other => return Err(ApplyError::NotYet(other)),
         };
@@ -962,7 +984,7 @@ impl State {
             Proposal::Ack { origin, delivery } => self.ack(origin, delivery, lsn, out),
             Proposal::SessionGone { origin } => {
                 // A persisted session is detached and kept; clean state goes.
-                self.detach(origin, lsn);
+                self.detach(origin, lsn, false);
                 self.drop_session(origin);
                 out.push(Effect::Gone { to: origin, lsn });
             }
@@ -977,7 +999,7 @@ impl State {
                 gone.sort_unstable();
                 gone.dedup();
                 for origin in gone {
-                    self.detach(origin, lsn);
+                    self.detach(origin, lsn, false);
                     self.drop_session(origin);
                 }
                 out.push(Effect::Reset { node, below, lsn });
@@ -989,8 +1011,8 @@ impl State {
                 clean_start,
                 persist,
             } => self.connect(origin, &client_id, seen, clean_start, persist, lsn, out),
-            Proposal::Disconnect { origin } => {
-                let attached = self.detach(origin, lsn);
+            Proposal::Disconnect { origin, end } => {
+                let attached = self.detach(origin, lsn, end);
                 self.client_out.push(ClientEffect::Disconnected {
                     to: origin,
                     attached,

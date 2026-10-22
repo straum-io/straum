@@ -170,6 +170,13 @@ pub struct NodeConfig {
     /// TLS on every link, each end proving its node id (ADR-0010). `None`:
     /// plaintext links.
     pub tls: Option<transport::NodeTls>,
+    /// Step 7c stage 3 (D-176 A): with bounds, every CONNECT goes through
+    /// the committed log (`State::with_connect`) and sessions may persist.
+    /// The same on every node: in the configuration digest. `None`, the
+    /// default and the only value the server sets: as before 7c. Turning
+    /// it on is a decision of its own, once `connect_window` and
+    /// `max_connect_tombstones` are sized (D-153 A, D-154 A).
+    pub sessions: Option<apply::ConnectLimits>,
 }
 
 /// The starting `retain_bytes` (D-91 A): 64 MiB, the old path's
@@ -344,6 +351,17 @@ pub fn cluster_digest(config: &NodeConfig) -> u64 {
         lag_ticks,
         limits_digest(&config.limits),
     ]);
+    // Nothing for a cluster without step 7c, so its digest, and every data
+    // directory pinned to it, stays as it was.
+    let fields = fields.chain(config.sessions.into_iter().flat_map(|c| {
+        [
+            u64::MAX - 1,
+            c.connect_window,
+            c.max_connect_tombstones as u64,
+            c.max_persisted_sessions as u64,
+            c.max_detached_queued_bytes as u64,
+        ]
+    }));
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for field in fields {
         for byte in field.to_be_bytes() {
@@ -720,12 +738,17 @@ impl Node {
         let chain = recovered.chain;
         // The snapshot, then the log after it, with nothing between them.
         let end = chain.next_lsn().saturating_sub(1);
-        let (snapshot_slots, state) = match &recovered.snapshot {
-            Some(bytes) => {
+        let (snapshot_slots, state) = match (&recovered.snapshot, config.sessions) {
+            (Some(bytes), None) => {
                 let (slots, state) = decode_snapshot(bytes)?;
                 (slots, State::decode(config.limits, state)?)
             }
-            None => (Vec::new(), State::new(config.limits)),
+            (Some(bytes), Some(connect)) => {
+                let (slots, state) = decode_snapshot(bytes)?;
+                (slots, State::decode_connect(config.limits, connect, state)?)
+            }
+            (None, None) => (Vec::new(), State::new(config.limits)),
+            (None, Some(connect)) => (Vec::new(), State::with_connect(config.limits, connect)),
         };
         let first = recovered.first.unwrap_or(end.saturating_add(1));
         if state.applied().saturating_add(1) < first || state.applied() > end {
@@ -840,6 +863,7 @@ impl Node {
                         node: id,
                         first_session,
                         authenticate: m.authority.is_some(),
+                        connect_through_log: config.sessions.is_some(),
                         ..m.gateway
                     },
                     started.elapsed(),
@@ -905,6 +929,7 @@ impl Node {
         let effects_tx = effects.clone();
         let heartbeat = config.heartbeat;
         let snapshot_every = config.snapshot_every.max(1);
+        let sessions = config.sessions.is_some();
         // At most half a frame (`NodeConfig::check`): the batches read go
         // out in one.
         let read_bytes = config.read_bytes;
@@ -1164,11 +1189,21 @@ impl Node {
                         tracing::warn!(lost, "proposals lost before a later one of this node committed; their publishers time out");
                     }
                     let mut out = Vec::new();
-                    if let Err(error) = state.apply(&decoded, &mut out) {
+                    let mut clients = Vec::new();
+                    let applied = if sessions {
+                        state.apply_connect(&decoded, &mut out, &mut clients)
+                    } else {
+                        state.apply(&decoded, &mut out)
+                    };
+                    if let Err(error) = applied {
                         tracing::error!(%error, "a committed record does not apply; the node stops");
                         return;
                     }
-                    if out.is_empty() {
+                    if let Some(g) = node.gateway.as_mut() {
+                        // What a `Connect` proposed from now on has seen.
+                        g.applied(next);
+                    }
+                    if out.is_empty() && clients.is_empty() {
                         continue;
                     }
                     // Observers see an effect before any client does: a test
@@ -1179,6 +1214,11 @@ impl Node {
                     }
                     let now = node.now();
                     if let Some(g) = node.gateway.as_mut() {
+                        // Step 7c's first: a resumed session is open before
+                        // what drains to it arrives.
+                        for effect in &clients {
+                            g.client_effect(effect, now);
+                        }
                         for effect in &out {
                             g.effect(effect, now);
                         }

@@ -125,6 +125,11 @@ fn a_connect_and_a_disconnect_round_trip_as_records() {
         connect(origin(3, 9), "client-1", 41, false, true),
         Proposal::Disconnect {
             origin: origin(3, 9),
+            end: false,
+        },
+        Proposal::Disconnect {
+            origin: origin(3, 9),
+            end: true,
         },
     ];
     for (proposal, record) in proposals
@@ -266,10 +271,10 @@ fn nothing_is_committed_for_an_origin_that_is_not_attached() {
 fn a_newer_connect_takes_the_session_over_and_the_old_origin_is_refused() {
     let (a, b) = (origin(1, 1), origin(2, 1));
     let (state, _, clients) = run(&[
-        connect(a, "c", 0, true, false),
+        connect(a, "c", 0, true, true),
         subscribe(a, "t", G::AtMostOnce),
         // Node 2 had applied both before it proposed.
-        connect(b, "c", at(1), false, false),
+        connect(b, "c", at(1), false, true),
         publish(a, "t", b"late", G::AtMostOnce),
     ]);
     assert!(clients.contains(&ClientEffect::TakenOver { to: a, lsn: at(2) }));
@@ -285,6 +290,30 @@ fn a_newer_connect_takes_the_session_over_and_the_old_origin_is_refused() {
     }));
     assert_eq!(attached(&state, "c"), Some(b));
     assert_eq!(state.attached_to(a), None);
+}
+
+/// A clean session ends with its connection, and a takeover ends that
+/// connection: Clean Start 0 then finds no session to resume (MQTT 5
+/// §3.1.2.4, 3.1.1 §3.1.2.4).
+#[test]
+fn a_takeover_of_a_clean_session_starts_a_new_one() {
+    let (a, b) = (origin(1, 1), origin(2, 1));
+    let (state, _, clients) = run(&[
+        connect(a, "c", 0, true, false),
+        subscribe(a, "t", G::AtMostOnce),
+        connect(b, "c", at(1), false, true),
+    ]);
+    assert!(clients.contains(&ClientEffect::TakenOver { to: a, lsn: at(2) }));
+    assert!(clients.contains(&ClientEffect::Connected {
+        to: b,
+        session_present: false,
+        lsn: at(2)
+    }));
+    assert_eq!(
+        state.sessions(),
+        0,
+        "the clean session's subscription stayed"
+    );
 }
 
 #[test]
@@ -382,7 +411,10 @@ fn a_disconnect_removes_a_clean_entry_and_fences_a_connect_that_had_not_seen_it(
     let (a, b, c) = (origin(1, 1), origin(2, 1), origin(2, 2));
     let (state, _, clients) = run(&[
         connect(a, "c", 0, true, false),
-        Proposal::Disconnect { origin: a },
+        Proposal::Disconnect {
+            origin: a,
+            end: false,
+        },
         // Seen the Connect, not the removal.
         connect(b, "c", at(0), true, false),
         connect(c, "c", at(1), true, false),
@@ -408,7 +440,10 @@ fn a_disconnect_removes_a_clean_entry_and_fences_a_connect_that_had_not_seen_it(
 #[test]
 fn a_disconnect_of_an_origin_not_attached_changes_nothing() {
     let a = origin(1, 1);
-    let (state, _, clients) = run(&[Proposal::Disconnect { origin: a }]);
+    let (state, _, clients) = run(&[Proposal::Disconnect {
+        origin: a,
+        end: false,
+    }]);
     assert_eq!(
         clients,
         vec![ClientEffect::Disconnected {
@@ -426,7 +461,10 @@ fn a_persisted_session_waits_detached_and_resumes_with_what_arrived() {
     let (state, effects, clients) = run(&[
         connect(a, "c", 0, true, true),
         subscribe(a, "t", G::AtLeastOnce),
-        Proposal::Disconnect { origin: a },
+        Proposal::Disconnect {
+            origin: a,
+            end: false,
+        },
         connect(p, "p", at(2), true, false),
         publish(p, "t", b"1", G::AtLeastOnce),
         publish(p, "t", b"2", G::AtMostOnce),
@@ -457,6 +495,111 @@ fn a_persisted_session_waits_detached_and_resumes_with_what_arrived() {
     assert_eq!(state.persisted(), (1, 0));
 }
 
+/// What a resumed session had delivered and not seen acknowledged goes
+/// again, right after `Connected` and in delivery order, before what drains
+/// from the backlog (step 7c stage 3). A takeover of an attached session
+/// resumes the same way; a clean start sends nothing again.
+#[test]
+fn unacknowledged_deliveries_go_again_on_resume_before_the_backlog() {
+    let (a, b, p) = (origin(1, 1), origin(2, 1), origin(3, 1));
+    let (_, effects, clients) = run(&[
+        connect(a, "c", 0, true, true),
+        subscribe(a, "t", G::AtLeastOnce),
+        connect(p, "p", at(1), true, false),
+        publish(p, "t", b"1", G::AtLeastOnce),
+        publish(p, "t", b"2", G::AtLeastOnce),
+        Proposal::Disconnect {
+            origin: a,
+            end: false,
+        },
+        publish(p, "t", b"3", G::AtLeastOnce),
+        connect(b, "c", at(6), false, true),
+    ]);
+    let resumed: Vec<&ClientEffect> = clients.iter().filter(|e| e.to() == Some(b)).collect();
+    let redelivered: Vec<(u64, &[u8])> = resumed
+        .iter()
+        .filter_map(|e| match e {
+            ClientEffect::Redeliver { id, payload, .. } => Some((*id, payload.as_ref())),
+            _ => None,
+        })
+        .collect();
+    assert!(matches!(
+        resumed.first(),
+        Some(ClientEffect::Connected {
+            session_present: true,
+            ..
+        })
+    ));
+    assert_eq!(redelivered, vec![(0, &b"1"[..]), (1, &b"2"[..])]);
+    let drained: Vec<(Option<u64>, &[u8])> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Deliver {
+                to, id, payload, ..
+            } if *to == b => Some((*id, payload.as_ref())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(drained, vec![(Some(2), &b"3"[..])]);
+
+    // Taken over while attached: the same.
+    let (_, _, clients) = run(&[
+        connect(a, "c", 0, true, true),
+        subscribe(a, "t", G::AtLeastOnce),
+        connect(p, "p", at(1), true, false),
+        publish(p, "t", b"1", G::AtLeastOnce),
+        connect(b, "c", at(3), false, true),
+    ]);
+    assert!(clients.contains(&ClientEffect::TakenOver { to: a, lsn: at(4) }));
+    assert!(
+        clients
+            .iter()
+            .any(|e| matches!(e, ClientEffect::Redeliver { to, id: 0, .. } if *to == b))
+    );
+
+    // A clean start sends nothing again.
+    let (_, _, clients) = run(&[
+        connect(a, "c", 0, true, true),
+        subscribe(a, "t", G::AtLeastOnce),
+        connect(p, "p", at(1), true, false),
+        publish(p, "t", b"1", G::AtLeastOnce),
+        connect(b, "c", at(3), true, true),
+    ]);
+    assert!(
+        !clients
+            .iter()
+            .any(|e| matches!(e, ClientEffect::Redeliver { .. }))
+    );
+}
+
+/// D-177 A: a `Disconnect` with `end` deletes a persisted session as the
+/// client asked, leaving a tombstone; it is not counted as an overflow, and
+/// the next CONNACK finds no session.
+#[test]
+fn a_disconnect_that_ends_the_session_deletes_it() {
+    let (a, b) = (origin(1, 1), origin(2, 1));
+    let (state, _, clients) = run(&[
+        connect(a, "c", 0, true, true),
+        subscribe(a, "t", G::AtLeastOnce),
+        Proposal::Disconnect {
+            origin: a,
+            end: true,
+        },
+        connect(b, "c", at(2), false, true),
+    ]);
+    assert!(
+        !clients
+            .iter()
+            .any(|e| matches!(e, ClientEffect::SessionDeleted { .. }))
+    );
+    assert!(clients.contains(&ClientEffect::Connected {
+        to: b,
+        session_present: false,
+        lsn: at(3)
+    }));
+    assert_eq!(state.persisted(), (1, 0));
+}
+
 #[test]
 fn a_detached_session_drops_an_at_most_once_message_it_has_no_room_for() {
     let limits = (
@@ -472,7 +615,10 @@ fn a_detached_session_drops_an_at_most_once_message_it_has_no_room_for() {
         &[
             connect(a, "c", 0, true, true),
             subscribe(a, "t", G::AtMostOnce),
-            Proposal::Disconnect { origin: a },
+            Proposal::Disconnect {
+                origin: a,
+                end: false,
+            },
             connect(p, "p", at(2), true, false),
             publish(p, "t", b"1", G::AtMostOnce),
             publish(p, "t", b"22", G::AtMostOnce),
@@ -505,7 +651,10 @@ fn a_detached_session_with_no_room_for_an_at_least_once_message_is_deleted() {
         &[
             connect(a, "c", 0, true, true),
             subscribe(a, "t", G::AtLeastOnce),
-            Proposal::Disconnect { origin: a },
+            Proposal::Disconnect {
+                origin: a,
+                end: false,
+            },
             connect(p, "p", at(2), true, false),
             publish(p, "t", b"22", G::AtLeastOnce),
             connect(b, "c", at(4), false, true),
@@ -540,7 +689,10 @@ fn a_detachment_the_detached_budget_cannot_take_deletes_the_session() {
             subscribe(a, "t", G::AtLeastOnce),
             connect(p, "p", at(1), true, false),
             publish(p, "t", b"x", G::AtLeastOnce),
-            Proposal::Disconnect { origin: a },
+            Proposal::Disconnect {
+                origin: a,
+                end: false,
+            },
         ],
     );
     assert!(clients.contains(&ClientEffect::SessionDeleted { lsn: at(4) }));
@@ -563,7 +715,10 @@ fn a_new_persisted_session_at_the_limit_is_refused_and_a_resumption_never_is() {
         &[
             connect(a, "c", 0, true, true),
             connect(b, "d", at(0), true, true),
-            Proposal::Disconnect { origin: a },
+            Proposal::Disconnect {
+                origin: a,
+                end: false,
+            },
             connect(c, "c", at(2), false, true),
         ],
     );
@@ -614,8 +769,14 @@ fn a_disconnect_applied_twice_acts_once() {
     let a = origin(1, 1);
     let (_, _, clients) = run(&[
         connect(a, "c", 0, true, false),
-        Proposal::Disconnect { origin: a },
-        Proposal::Disconnect { origin: a },
+        Proposal::Disconnect {
+            origin: a,
+            end: false,
+        },
+        Proposal::Disconnect {
+            origin: a,
+            end: false,
+        },
     ]);
     assert!(clients.contains(&ClientEffect::Disconnected {
         to: a,
@@ -643,9 +804,15 @@ fn a_full_tombstone_queue_raises_the_floor_and_the_floor_fences() {
         limits,
         &[
             connect(a, "x", 0, true, false),
-            Proposal::Disconnect { origin: a },
+            Proposal::Disconnect {
+                origin: a,
+                end: false,
+            },
             connect(b, "y", at(1), true, false),
-            Proposal::Disconnect { origin: b },
+            Proposal::Disconnect {
+                origin: b,
+                end: false,
+            },
             // Seen x's Connect, not its removal at lsn 4, which only the
             // floor now remembers.
             connect(c, "x", at(0), true, false),
@@ -673,7 +840,10 @@ fn tombstones_older_than_the_window_are_pruned_without_raising_the_floor() {
         limits,
         &[
             connect(a, "x", 0, true, false),
-            Proposal::Disconnect { origin: a },
+            Proposal::Disconnect {
+                origin: a,
+                end: false,
+            },
             connect(b, "y", at(1), true, false),
             connect(c, "z", at(2), true, false),
             // At lsn 10 the horizon is 6: the tombstone at 4 goes.
@@ -732,9 +902,15 @@ fn a_snapshot_round_trips_client_ids_tombstones_and_detached_sessions() {
     let proposals = [
         connect(a, "c", 0, true, true),
         subscribe(a, "t", G::AtLeastOnce),
-        Proposal::Disconnect { origin: a },
+        Proposal::Disconnect {
+            origin: a,
+            end: false,
+        },
         connect(b, "d", at(2), true, false),
-        Proposal::Disconnect { origin: b },
+        Proposal::Disconnect {
+            origin: b,
+            end: false,
+        },
         connect(p, "p", at(4), true, false),
         publish(p, "t", b"1", G::AtLeastOnce),
     ];
@@ -771,7 +947,8 @@ enum Op {
         clean_start: bool,
         persist: bool,
     },
-    Disconnect(Origin),
+    /// With `end`: the session ends with the connection (D-177 A).
+    Disconnect(Origin, bool),
     Gone(Origin),
     Reset(u8),
     Subscribe(Origin, bool),
@@ -791,7 +968,7 @@ fn op() -> impl Strategy<Value = Op> {
                 persist
             }
         ),
-        2 => o.clone().prop_map(Op::Disconnect),
+        2 => (o.clone(), any::<bool>()).prop_map(|(o, end)| Op::Disconnect(o, end)),
         1 => o.clone().prop_map(Op::Gone),
         1 => (1u8..=2).prop_map(Op::Reset),
         2 => (o.clone(), any::<bool>()).prop_map(|(o, q)| Op::Subscribe(o, q)),
@@ -827,7 +1004,10 @@ fn proposals(ops: &[Op]) -> Vec<Proposal> {
                 *clean_start,
                 *persist,
             ),
-            Op::Disconnect(o) => Proposal::Disconnect { origin: *o },
+            Op::Disconnect(o, end) => Proposal::Disconnect {
+                origin: *o,
+                end: *end,
+            },
             Op::Gone(o) => Proposal::SessionGone { origin: *o },
             // Every session of the node: the simulated gateways restart.
             Op::Reset(node) => Proposal::NodeReset {
@@ -915,7 +1095,7 @@ impl Oracle {
             }
         }
         let detached = |o: &Origin| match proposal {
-            Proposal::Disconnect { origin } | Proposal::SessionGone { origin } => origin == o,
+            Proposal::Disconnect { origin, .. } | Proposal::SessionGone { origin } => origin == o,
             Proposal::NodeReset { node, below } => o.node == *node && o.session < *below,
             _ => false,
         };

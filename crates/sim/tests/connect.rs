@@ -300,7 +300,10 @@ impl World {
                         self.stats.disconnect_racing += 1;
                     }
                     self.conns.get_mut(&origin).unwrap().closed = true;
-                    self.propose(step, origin, Proposal::Disconnect { origin });
+                    // Now and then the client ends its session at DISCONNECT
+                    // (MQTT 5 expiry 0, D-177 A): a removal, a fence event.
+                    let end = self.rng.chance(20);
+                    self.propose(step, origin, Proposal::Disconnect { origin, end });
                 }
             }
             45..=49 => {
@@ -532,7 +535,7 @@ impl World {
             }
         }
         let detached = |o: &Origin| match proposal {
-            Proposal::Disconnect { origin } | Proposal::SessionGone { origin } => origin == o,
+            Proposal::Disconnect { origin, .. } | Proposal::SessionGone { origin } => origin == o,
             Proposal::NodeReset { node, below } => o.node == *node && o.session < *below,
             _ => false,
         };
