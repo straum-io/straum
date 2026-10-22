@@ -81,22 +81,4 @@ archive=$(sed -n 's/^send back: //p' "$OUT/prezeroed-ab.txt" | tail -1)
 cp "$archive" "$OUT/"
 
 echo "== 3. cap, TLS between nodes off and on (ADR-0010)"
-BENCH=$(cargo bench -p node --bench cap --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\))$/\1/p' | tail -1)
-[ -n "$BENCH" ] && [ -x "$BENCH" ] || tool_failed "building the cap bench"
-# Four rounds a side, the order flipped each round. TLS needs 4 takeover
-# ticks (D-173 A), so both sides run with 4.
-for round in 1 2 3 4; do
-    if [ $((round % 2)) -eq 1 ]; then order="0 1"; else order="1 0"; fi
-    for tls in $order; do
-        echo "--- round $round" >> "$OUT/cap-tls-$tls.txt"
-        env STRAUM_BENCH_CAPS=64 STRAUM_BENCH_SECONDS=60 STRAUM_BENCH_FAILOVERS=10 \
-            STRAUM_BENCH_ROUNDS=1 STRAUM_BENCH_TAKEOVER_TICKS=4 STRAUM_BENCH_TLS="$tls" \
-            "$BENCH" >> "$OUT/cap-tls-$tls.txt" 2>&1 || echo "round $round FAILED" >> "$OUT/cap-tls-$tls.txt"
-    done
-    echo "cap round $round done (load $(cut -d' ' -f1-3 /proc/loadavg))"
-done
-for tls in 0 1; do
-    echo "tls=$tls"
-    grep -E "^64 |FAILED" "$OUT/cap-tls-$tls.txt" || echo "no result"
-done > "$OUT/cap-tls-summary.txt"
-cat "$OUT/cap-tls-summary.txt"
+scripts/cap-tls-ab.sh 4 "$OUT" || tool_failed "scripts/cap-tls-ab.sh"
