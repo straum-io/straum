@@ -1,0 +1,70 @@
+name: ci
+
+# The validation of rules.md §17 on every PR and on main. The Linux container
+# run of scripts/linux.sh is not needed here: the runner is Linux.
+# While crates/ holds no crate, cargo refuses a workspace without members, so
+# the cargo steps are skipped and the jobs pass.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: ws
+        run: |
+          if ls crates/*/Cargo.toml >/dev/null 2>&1; then
+            echo "crates=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "crates=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.ws.outputs.crates == 'true'
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        if: steps.ws.outputs.crates == 'true'
+      - if: steps.ws.outputs.crates == 'true'
+        run: cargo fmt --check
+      - if: steps.ws.outputs.crates == 'true'
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Benches are built, not run (D-4).
+      - if: steps.ws.outputs.crates == 'true'
+        run: cargo test --workspace --all-targets --no-run
+      - if: steps.ws.outputs.crates == 'true'
+        run: cargo test --workspace --tests
+
+  # Line, region and function coverage, reported, not gated (ECO-D-7).
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: ws
+        run: |
+          if ls crates/*/Cargo.toml >/dev/null 2>&1; then
+            echo "crates=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "crates=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.ws.outputs.crates == 'true'
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        if: steps.ws.outputs.crates == 'true'
+      - uses: taiki-e/install-action@cargo-llvm-cov
+        if: steps.ws.outputs.crates == 'true'
+      - name: Coverage
+        if: steps.ws.outputs.crates == 'true'
+        run: |
+          {
+            echo '```text'
+            cargo llvm-cov --workspace --tests --summary-only | tail -1
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

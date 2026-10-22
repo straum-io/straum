@@ -1,0 +1,15 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: straum
+Source: https://github.com/straum-io/straum
+
+Files: *
+Copyright: straum-io
+License: Apache-2.0
+
+Files: vendor/*
+Copyright: the authors of each crate, named in its Cargo.toml
+License: the license named in each crate's Cargo.toml and license files
+
+License: Apache-2.0
+ On Debian and Ubuntu systems the full text is in
+ /usr/share/common-licenses/Apache-2.0.
