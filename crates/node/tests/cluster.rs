@@ -4,15 +4,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use apply::{Effect, Limits, Origin};
-use bytes::Bytes;
-use domain::{DeliveryGuarantee, Topic};
-use node::{MqttConfig, Node, NodeConfig, Status};
+use node::{Committed, Node, NodeConfig, Status};
 use storage::{SegmentLimits, WalLimits};
 use transport::TransportConfig;
 
@@ -42,14 +38,11 @@ fn data_dir(test: &str, id: u8) -> PathBuf {
 struct Cluster {
     test: &'static str,
     addresses: Vec<SocketAddr>,
-    mqtt: Vec<SocketAddr>,
     nodes: Vec<Option<Node>>,
     /// Links dialled through a proxy: (from, to, the proxy's address).
     via: Vec<(u8, u8, SocketAddr)>,
     /// Each node's link TLS (ADR-0010), or none: plaintext links.
     tls: Vec<transport::NodeTls>,
-    /// Step 7c stage 3's switch and bounds (D-176 A), or off.
-    sessions: Option<apply::ConnectLimits>,
 }
 
 /// A cluster CA for TLS between nodes (ADR-0010), issuing node files into a
@@ -103,29 +96,6 @@ impl Ca {
     }
 }
 
-fn gateway() -> gateway::Config {
-    gateway::Config {
-        node: 0,
-        first_session: 0,
-        codec: codec::Limits::default(),
-        max_connections: 64,
-        connect_timeout: Duration::from_secs(10),
-        max_pending: 64,
-        max_pending_bytes: 1 << 20,
-        max_total_pending_bytes: 16 << 20,
-        commit_timeout: Duration::from_secs(30),
-        retry_interval: Duration::from_millis(200),
-        receive_maximum: NonZeroU16::new(64).unwrap(),
-        topic_alias_maximum: 16,
-        max_waiting: 1024,
-        max_waiting_bytes: 1 << 20,
-        max_total_waiting_bytes: 16 << 20,
-        max_retries: 1024,
-        authenticate: false,
-        connect_through_log: false,
-    }
-}
-
 /// Segment size, retention bytes and snapshot interval: small for the
 /// compaction test, so its log spans many segments; roomy elsewhere, with
 /// snapshots still taken.
@@ -137,13 +107,10 @@ fn disk(test: &str) -> (u64, u64, u64) {
     }
 }
 
-fn config(
-    test: &str,
-    id: u8,
-    addresses: &[SocketAddr],
-    mqtt: &[SocketAddr],
-    limits: Limits,
-) -> NodeConfig {
+/// The record bound every test node shares, unless a test sets another.
+const MAX_RECORD: usize = 1 << 20;
+
+fn config(test: &str, id: u8, addresses: &[SocketAddr], max_record: usize) -> NodeConfig {
     NodeConfig {
         core: cluster::Config {
             id,
@@ -169,29 +136,21 @@ fn config(
             wal: WalLimits::default(),
             segment_bytes: disk(test).0,
         },
-        limits,
+        max_record,
         heartbeat: Duration::from_millis(50),
-        // Holds the largest batch: 64 records of the default 1 MiB packet.
+        // Holds the largest batch: 64 records of 1 MiB.
         max_frame: 1 << 27,
         link_queue: 1024,
         transport: TransportConfig {
             listen: addresses[usize::from(id)],
             ..TransportConfig::default()
         },
-        mqtt: Some(MqttConfig {
-            listen: mqtt[usize::from(id)],
-            gateway: gateway(),
-            write_queue: 1024,
-            authority: None,
-            tls: None,
-        }),
         retain_bytes: disk(test).1,
         snapshot_every: disk(test).2,
         rotate_every: test.starts_with("rotation").then_some(6),
         read_bytes: 64 * 1024,
         metrics: None,
         tls: None,
-        sessions: None,
     }
 }
 
@@ -210,28 +169,27 @@ fn on_disk(test: &str, id: u8) -> (u64, bool) {
     (lowest, dir.join("snapshot").exists())
 }
 
-/// A publish proposed at node `id`, as its gateway would make it: one
-/// session, one request id.
+/// A record proposed at node `id`: its body names the node and the
+/// request, then a payload.
 fn publish(id: u8, request: u64) -> cluster::Proposal {
-    let proposal = apply::Proposal::Publish {
-        origin: Origin {
-            node: id,
-            session: 1,
-        },
-        request,
-        topic: Topic::new(Bytes::from_static(b"t")).unwrap(),
-        payload: Bytes::from(format!("m{request}")),
-        properties: Bytes::new(),
-        guarantee: DeliveryGuarantee::AtMostOnce,
-        retain: false,
-    };
-    let mut body = Vec::new();
-    proposal.encode(&mut body).unwrap();
+    let mut body = vec![id];
+    body.extend_from_slice(&request.to_be_bytes());
+    body.extend_from_slice(format!("m{request}").as_bytes());
     cluster::Proposal {
-        kind: proposal.kind(),
+        kind: journal::Kind::Data,
         properties: Vec::new(),
         body,
     }
+}
+
+/// The node and request a committed `publish` names.
+fn origin(record: &Committed) -> Option<(u8, u64)> {
+    if record.kind != journal::Kind::Data {
+        return None;
+    }
+    let node = *record.body.first()?;
+    let request = u64::from_be_bytes(record.body.get(1..9)?.try_into().ok()?);
+    Some((node, request))
 }
 
 impl Cluster {
@@ -242,44 +200,34 @@ impl Cluster {
     /// As `start`, with each listed link from node `from` to node `to`
     /// dialled through `address` instead (a proxy, D-122, D-151).
     async fn start_via(test: &'static str, via: Vec<(u8, u8, SocketAddr)>) -> Self {
-        Self::start_with(test, via, Vec::new(), None).await
-    }
-
-    /// With step 7c stage 3 on (D-176 A): CONNECT through the log, sessions
-    /// that persist, within `connect`.
-    async fn start_sessions(test: &'static str, connect: apply::ConnectLimits) -> Self {
-        Self::start_with(test, Vec::new(), Vec::new(), Some(connect)).await
+        Self::start_with(test, via, Vec::new()).await
     }
 
     /// As `start_via`, with TLS on every link and each node's files from
     /// `ca` (ADR-0010).
     async fn start_tls(test: &'static str, ca: &Ca, via: Vec<(u8, u8, SocketAddr)>) -> Self {
         let tls = (0..NODES).map(|id| ca.node(test, id)).collect();
-        Self::start_with(test, via, tls, None).await
+        Self::start_with(test, via, tls).await
     }
 
     async fn start_with(
         test: &'static str,
         via: Vec<(u8, u8, SocketAddr)>,
         tls: Vec<transport::NodeTls>,
-        sessions: Option<apply::ConnectLimits>,
     ) -> Self {
         for id in 0..NODES {
             let _ = std::fs::remove_dir_all(data_dir(test, id));
         }
         let addresses: Vec<SocketAddr> = (0..NODES).map(|_| free_port()).collect();
-        let mqtt: Vec<SocketAddr> = (0..NODES).map(|_| free_port()).collect();
         let mut cluster = Cluster {
             test,
             addresses,
-            mqtt,
             nodes: Vec::new(),
             via,
             tls,
-            sessions,
         };
         for id in 0..NODES {
-            let node = Node::start(cluster.config(id, Limits::default()))
+            let node = Node::start(cluster.config(id, MAX_RECORD))
                 .await
                 .unwrap_or_else(|e| panic!("{test}: node {id} did not start: {e}"));
             cluster.nodes.push(Some(node));
@@ -287,9 +235,8 @@ impl Cluster {
         cluster
     }
 
-    fn config(&self, id: u8, limits: Limits) -> NodeConfig {
-        let mut config = config(self.test, id, &self.addresses, &self.mqtt, limits);
-        config.sessions = self.sessions;
+    fn config(&self, id: u8, max_record: usize) -> NodeConfig {
+        let mut config = config(self.test, id, &self.addresses, max_record);
         if let Some(tls) = self.tls.get(usize::from(id)) {
             config.tls = Some(tls.clone());
             // Room for a handshake of a debug build on a busy test host
@@ -308,11 +255,15 @@ impl Cluster {
         config
     }
 
-    async fn restart(&mut self, id: u8, limits: Limits) {
+    async fn restart(&mut self, id: u8) {
+        self.restart_with(id, MAX_RECORD).await;
+    }
+
+    async fn restart_with(&mut self, id: u8, max_record: usize) {
         if let Some(node) = self.nodes[usize::from(id)].take() {
             node.shutdown().await;
         }
-        let node = Node::start(self.config(id, limits))
+        let node = Node::start(self.config(id, max_record))
             .await
             .unwrap_or_else(|e| panic!("{}: node {id} did not restart: {e}", self.test));
         self.nodes[usize::from(id)] = Some(node);
@@ -328,11 +279,11 @@ impl Cluster {
         self.nodes[usize::from(id)].as_ref().unwrap()
     }
 
-    /// Proposes a publish at `id` until its acceptance is applied there:
-    /// what a gateway does with a proposal that does not commit.
+    /// Proposes a record at `id` until it is committed there: what a
+    /// client does with a proposal that does not commit.
     async fn publish(&self, id: u8, request: u64) {
         let node = self.node(id);
-        let mut effects = node.effects();
+        let mut records = node.records();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
             node.propose(publish(id, request)).await;
@@ -341,15 +292,9 @@ impl Cluster {
             loop {
                 tokio::select! {
                     _ = &mut retry => break,
-                    received = effects.recv() => {
-                        if let Ok((_, _, out)) = received {
-                            let accepted = out.iter().any(|e| matches!(
-                                e,
-                                Effect::Accepted { to, request: r, .. } if to.node == id && *r == request
-                            ));
-                            if accepted {
-                                return;
-                            }
+                    received = records.recv() => {
+                        if received.ok().and_then(|r| origin(&r)) == Some((id, request)) {
+                            return;
                         }
                     }
                 }
@@ -362,7 +307,7 @@ impl Cluster {
     }
 
     /// Waits until every running node has applied the same log as far as
-    /// `at_least`, and they agree on the state.
+    /// `at_least`, and they agree on its digest.
     async fn converged(&self, at_least: u64) -> Status {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
@@ -432,7 +377,7 @@ async fn a_restarted_replica_catches_up_from_its_log_and_the_sequencers() {
     for request in 10..20 {
         cluster.publish(1, request).await;
     }
-    cluster.restart(2, Limits::default()).await;
+    cluster.restart(2).await;
     cluster.converged(40).await;
     cluster.shutdown().await;
 }
@@ -444,7 +389,7 @@ async fn a_restarted_sequencer_resumes_where_its_log_ends() {
         cluster.publish(1, request).await;
     }
     let before = cluster.converged(20).await;
-    cluster.restart(0, Limits::default()).await;
+    cluster.restart(0).await;
     for request in 10..20 {
         cluster.publish(2, request).await;
     }
@@ -454,17 +399,14 @@ async fn a_restarted_sequencer_resumes_where_its_log_ends() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_node_with_other_limits_is_refused_and_the_others_go_on() {
+async fn a_node_with_another_record_bound_is_refused_and_the_others_go_on() {
     let mut cluster = Cluster::start("other-limits").await;
-    let other = Limits {
-        max_inflight: 7,
-        ..Limits::default()
-    };
+    let other = MAX_RECORD / 2;
     // A node configured differently from the start: over its old data
     // directory it would not start at all (`a_data_directory_of_another_cluster_is_refused`).
     cluster.stop(2).await;
     let _ = std::fs::remove_dir_all(data_dir("other-limits", 2));
-    cluster.restart(2, other).await;
+    cluster.restart_with(2, other).await;
     for request in 0..5 {
         cluster.publish(0, request).await;
     }
@@ -483,121 +425,10 @@ async fn a_node_with_other_limits_is_refused_and_the_others_go_on() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let s2 = *cluster.node(2).status().borrow();
-    assert_eq!(s2.applied, 0, "a node with other limits took part: {s2:?}");
-    cluster.shutdown().await;
-}
-
-/// An MQTT client of one node; its event loop runs on a task of its own and
-/// hands over every incoming packet.
-fn client(
-    address: SocketAddr,
-    id: &str,
-) -> (
-    rumqttc::AsyncClient,
-    tokio::sync::mpsc::UnboundedReceiver<rumqttc::Packet>,
-) {
-    let mut options = rumqttc::MqttOptions::new(id, address.ip().to_string(), address.port());
-    options.set_keep_alive(Duration::from_secs(30));
-    let (client, mut eventloop) = rumqttc::AsyncClient::new(options, 16);
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        loop {
-            match eventloop.poll().await {
-                Ok(rumqttc::Event::Incoming(packet)) => {
-                    if tx.send(packet).is_err() {
-                        return;
-                    }
-                }
-                Ok(_) => {}
-                // Refused until the gateway's NodeReset is committed: the
-                // event loop dials again on the next poll.
-                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-            }
-        }
-    });
-    (client, rx)
-}
-
-async fn next(
-    packets: &mut tokio::sync::mpsc::UnboundedReceiver<rumqttc::Packet>,
-    wanted: impl Fn(&rumqttc::Packet) -> bool,
-) -> rumqttc::Packet {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let packet = packets.recv().await.expect("event loop ended");
-            if wanted(&packet) {
-                return packet;
-            }
-        }
-    })
-    .await
-    .expect("the packet never came")
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_mqtt_publish_on_one_node_reaches_a_subscriber_on_another() {
-    let cluster = Cluster::start("mqtt").await;
-    let (subscriber, mut sub_packets) = client(cluster.mqtt[1], "subscriber");
-    next(&mut sub_packets, |p| {
-        matches!(p, rumqttc::Packet::ConnAck(_))
-    })
-    .await;
-    subscriber
-        .subscribe("sensors/+/t", rumqttc::QoS::AtLeastOnce)
-        .await
-        .unwrap();
-    next(&mut sub_packets, |p| {
-        matches!(p, rumqttc::Packet::SubAck(_))
-    })
-    .await;
-
-    // Through the sequencer's gateway, then through a replica's.
-    for (node, name) in [(0usize, "pub-0"), (2, "pub-2")] {
-        let (publisher, mut pub_packets) = client(cluster.mqtt[node], name);
-        next(&mut pub_packets, |p| {
-            matches!(p, rumqttc::Packet::ConnAck(_))
-        })
-        .await;
-        // The node publishes each applied record's effects before its
-        // gateway sees them, so an acceptance is here before its PUBACK.
-        let mut effects = cluster.node(node as u8).effects();
-        let mut accepted = 0;
-        for i in 0..10u8 {
-            publisher
-                .publish("sensors/a/t", rumqttc::QoS::AtLeastOnce, false, vec![i; 8])
-                .await
-                .unwrap();
-            next(&mut pub_packets, |p| {
-                matches!(p, rumqttc::Packet::PubAck(_))
-            })
-            .await;
-            // PUBACK only once the publish is committed (invariant 4).
-            while let Ok((_, _, out)) = effects.try_recv() {
-                accepted += out
-                    .iter()
-                    .filter(|e| matches!(e, Effect::Accepted { to, .. } if usize::from(to.node) == node))
-                    .count();
-            }
-            assert!(
-                accepted > usize::from(i),
-                "PUBACK {i} from {name} before its publish was committed"
-            );
-        }
-        // In publish order.
-        for i in 0..10u8 {
-            let rumqttc::Packet::Publish(publish) = next(&mut sub_packets, |p| {
-                matches!(p, rumqttc::Packet::Publish(_))
-            })
-            .await
-            else {
-                unreachable!()
-            };
-            assert_eq!(publish.topic, "sensors/a/t");
-            assert_eq!(&publish.payload[..], &[i; 8][..], "from {name}");
-        }
-    }
-    // Every node applied the same log, client sessions included.
-    cluster.converged(1).await;
+    assert_eq!(
+        s2.applied, 0,
+        "a node with another record bound took part: {s2:?}"
+    );
     cluster.shutdown().await;
 }
 
@@ -624,12 +455,11 @@ async fn compacted_nodes_restart_from_their_snapshots() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // A replica and the sequencer restart from snapshot and log; each
-    // restart commits its gateway's NodeReset, and the state they then
-    // reach must equal that of node 1, which never stopped.
-    cluster.restart(2, Limits::default()).await;
-    cluster.restart(0, Limits::default()).await;
-    cluster.converged(before.applied + 2).await;
+    // A replica and the sequencer restart from snapshot and log, and
+    // reach the log of node 1, which never stopped.
+    cluster.restart(2).await;
+    cluster.restart(0).await;
+    cluster.converged(before.applied).await;
     for request in 150..160u64 {
         cluster.publish((request % 3) as u8, request).await;
     }
@@ -674,7 +504,7 @@ async fn another_node_takes_the_slot_over_when_the_sequencer_stops() {
     assert_eq!(now.len(), 1, "one sequencer: {now:?}");
     assert_ne!(now[0], old);
 
-    cluster.restart(old, Limits::default()).await;
+    cluster.restart(old).await;
     for request in 20..25 {
         cluster.publish(old, request).await;
     }
@@ -748,8 +578,8 @@ async fn nodes_compacted_past_slot_changes_restart_from_their_snapshots() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    cluster.restart(2, Limits::default()).await;
-    cluster.restart(0, Limits::default()).await;
+    cluster.restart(2).await;
+    cluster.restart(0).await;
     for request in 150..160u64 {
         cluster.publish((request % 3) as u8, request).await;
     }
@@ -778,8 +608,7 @@ async fn a_link_from_another_frame_version_is_refused() {
                     "other-version",
                     2,
                     &cluster.addresses,
-                    &cluster.mqtt,
-                    Limits::default(),
+                    MAX_RECORD,
                 )),
                 incarnation: 1,
             },
@@ -817,21 +646,16 @@ async fn a_link_from_another_frame_version_is_refused() {
 
 /// A data directory keeps the configuration digest of the cluster it was
 /// first used with (D-104 A): a node started over it with other cluster
-/// parameters or limits is refused before it opens its log or listens.
+/// parameters is refused before it opens its log or listens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_data_directory_of_another_cluster_is_refused() {
     let mut cluster = Cluster::start("other-cluster").await;
     cluster.stop(2).await;
-    let other = Limits {
-        max_inflight: 7,
-        ..Limits::default()
-    };
     let refused = Node::start(config(
         "other-cluster",
         2,
         &cluster.addresses,
-        &cluster.mqtt,
-        other,
+        MAX_RECORD / 2,
     ))
     .await;
     assert!(
@@ -840,7 +664,7 @@ async fn a_data_directory_of_another_cluster_is_refused() {
         refused.err()
     );
     // The same configuration starts again.
-    cluster.restart(2, Limits::default()).await;
+    cluster.restart(2).await;
     cluster.shutdown().await;
 }
 
@@ -923,14 +747,14 @@ async fn halfway_wait(barrier: &tokio::sync::Barrier) {
         .expect("a sender never reached halfway");
 }
 
-/// The acceptances `effects` sees from `origins`, in commit order, until
+/// The records `records` sees from `origins`, in commit order, until
 /// each origin has `count` and then for a further half second — a
 /// duplicate would come after. Checks the committed log never goes back to
 /// an older slot: no record of a fenced owner's slot commits after the
 /// first of its successor's. Returns the requests per origin and the slots
 /// they committed in.
 async fn acceptances(
-    effects: &mut tokio::sync::broadcast::Receiver<(u64, u64, Vec<Effect>)>,
+    records: &mut tokio::sync::broadcast::Receiver<Committed>,
     origins: &[u8],
     count: usize,
 ) -> (BTreeMap<u8, Vec<u64>>, BTreeSet<u64>) {
@@ -941,23 +765,22 @@ async fn acceptances(
     let mut quiet: Option<tokio::time::Instant> = None;
     loop {
         let until = quiet.unwrap_or(deadline);
-        let Ok(received) = tokio::time::timeout_at(until, effects.recv()).await else {
+        let Ok(received) = tokio::time::timeout_at(until, records.recv()).await else {
             assert!(quiet.is_some(), "not all committed: {seen:?}");
             return (seen, slots);
         };
-        let (lsn, slot, out) = received.expect("the observer kept up");
+        let record = received.expect("the observer kept up");
+        let (lsn, slot) = (record.lsn, record.slot);
         assert!(lsn > last_lsn, "lsn {lsn} after {last_lsn}");
         assert!(
             slot >= last_slot,
             "slot {slot} committed after slot {last_slot}"
         );
         (last_lsn, last_slot) = (lsn, slot);
-        for effect in out {
-            if let Effect::Accepted { to, request, .. } = effect {
-                if let Some(requests) = seen.get_mut(&to.node) {
-                    requests.push(request);
-                    slots.insert(slot);
-                }
+        if let Some((node, request)) = origin(&record) {
+            if let Some(requests) = seen.get_mut(&node) {
+                requests.push(request);
+                slots.insert(slot);
             }
         }
         if quiet.is_none() && seen.values().all(|r| r.len() >= count) {
@@ -979,13 +802,13 @@ async fn a_handoff_loses_no_proposal_and_commits_each_once() {
         .find(|&id| cluster.node(id).status().borrow().leading)
         .expect("a sequencer");
     let observer = (leader + 1) % NODES;
-    let mut effects = cluster.node(observer).effects();
+    let mut records = cluster.node(observer).records();
     let all: Vec<u8> = (0..NODES).collect();
     let (senders, halfway) = propose_once(&cluster, &all, 200);
     halfway_wait(&halfway).await;
     cluster.node(leader).hand_off().await.unwrap();
     halfway_wait(&halfway).await;
-    let (seen, slots) = acceptances(&mut effects, &all, 200).await;
+    let (seen, slots) = acceptances(&mut records, &all, 200).await;
     for sender in senders {
         sender.await.unwrap();
     }
@@ -1014,7 +837,7 @@ async fn a_sequencer_failure_loses_no_proposal_the_others_hold() {
         .find(|&id| cluster.node(id).status().borrow().leading)
         .expect("a sequencer");
     let others: Vec<u8> = (0..NODES).filter(|&id| id != leader).collect();
-    let mut effects = cluster.node(others[0]).effects();
+    let mut records = cluster.node(others[0]).records();
     let (senders, halfway) = propose_once(&cluster, &others, 200);
     halfway_wait(&halfway).await;
     // What the sequencer held uncommitted as it stopped, for the report:
@@ -1026,7 +849,7 @@ async fn a_sequencer_failure_loses_no_proposal_the_others_hold() {
     );
     cluster.stop(leader).await;
     halfway_wait(&halfway).await;
-    let (seen, slots) = acceptances(&mut effects, &others, 200).await;
+    let (seen, slots) = acceptances(&mut records, &others, 200).await;
     for sender in senders {
         sender.await.unwrap();
     }
@@ -1037,7 +860,7 @@ async fn a_sequencer_failure_loses_no_proposal_the_others_hold() {
         slots.iter().any(|&s| s > first.slot),
         "nothing committed in a later slot: {slots:?}"
     );
-    cluster.restart(leader, Limits::default()).await;
+    cluster.restart(leader).await;
     cluster.converged(first.applied + 400).await;
     cluster.shutdown().await;
 }
@@ -1058,7 +881,7 @@ async fn a_restarted_replica_leaves_the_slot_with_its_live_owner() {
     cluster.stop(replica).await;
     // Longer than the old backoff's cap, so its redial waited up to 1 s.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    cluster.restart(replica, Limits::default()).await;
+    cluster.restart(replica).await;
     let watch = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < watch {
         for id in 0..NODES {
@@ -1126,7 +949,7 @@ async fn restart_behind_a_slow_link(test: &'static str, delay_ms: u64) -> (Clust
     cluster.stop(1).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     delay.store(delay_ms, std::sync::atomic::Ordering::Relaxed);
-    cluster.restart(1, Limits::default()).await;
+    cluster.restart(1).await;
     (cluster, first)
 }
 
@@ -1165,7 +988,7 @@ async fn a_link_a_heartbeat_late_leaves_the_slot_with_its_live_owner() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_link_slower_than_the_takeover_window_fences_the_live_owner() {
     let (cluster, first) = restart_behind_a_slow_link("slow-link", 1_000).await;
-    let mut effects = cluster.node(2).effects();
+    let mut records = cluster.node(2).records();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let moved = (1..NODES).any(|id| {
@@ -1184,18 +1007,15 @@ async fn a_link_slower_than_the_takeover_window_fences_the_live_owner() {
     // Proposed once, never again: only node 0's outbox may send it again,
     // and it must reach the log once (`Cluster::publish` resends, as a
     // client would, and could commit it twice).
-    let mut accepted = cluster.node(0).effects();
+    let mut accepted = cluster.node(0).records();
     cluster.node(0).propose(publish(0, 7)).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        let (_, _, out) = tokio::time::timeout_at(deadline, accepted.recv())
+        let record = tokio::time::timeout_at(deadline, accepted.recv())
             .await
             .expect("node 0's request 7 never committed")
             .unwrap();
-        if out
-            .iter()
-            .any(|e| matches!(e, Effect::Accepted { to, request: 7, .. } if to.node == 0))
-        {
+        if origin(&record) == Some((0, 7)) {
             break;
         }
     }
@@ -1213,16 +1033,14 @@ async fn a_link_slower_than_the_takeover_window_fences_the_live_owner() {
     // What node 2 applied: slots never go back, and request 7 of node 0
     // commits once.
     let (mut last_slot, mut sevens) = (0, 0);
-    while let Ok((lsn, slot, out)) = effects.try_recv() {
+    while let Ok(record) = records.try_recv() {
+        let (lsn, slot) = (record.lsn, record.slot);
         assert!(
             slot >= last_slot,
             "lsn {lsn} of slot {slot} after slot {last_slot}"
         );
         last_slot = slot;
-        sevens += out
-            .iter()
-            .filter(|e| matches!(e, Effect::Accepted { to, request: 7, .. } if to.node == 0))
-            .count();
+        sevens += usize::from(origin(&record) == Some((0, 7)));
     }
     assert_eq!(sevens, 1, "node 0's request 7 committed {sevens} times");
     cluster.shutdown().await;
@@ -1293,9 +1111,11 @@ async fn a_restarted_node_behind_stale_links_is_redialled_and_catches_up() {
     let first = cluster.converged(2).await;
     cluster.stop(0).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    cluster.restart(0, Limits::default()).await;
-    // A slot change commits a `SlotStart`: past `first` on every node, node
-    // 0 included, only if node 0 hears the others.
+    cluster.restart(0).await;
+    // A record committed after the restart: past `first` on every node,
+    // node 0 included, only if node 0 hears the others. (A slot change may
+    // already have happened before `first`, so it cannot be counted on.)
+    cluster.publish(1, 1).await;
     let caught = cluster.converged(first.applied + 1).await;
     let links = accepted.load(std::sync::atomic::Ordering::Relaxed);
     let slots: Vec<u64> = (0..NODES)
@@ -1354,14 +1174,13 @@ async fn metrics_follow_proposals_from_accepted_to_committed() {
     cluster.converged(2).await;
     // Node 0 again, now serving its metrics.
     cluster.stop(0).await;
-    let mut config = cluster.config(0, Limits::default());
+    let mut config = cluster.config(0, MAX_RECORD);
     config.metrics = Some(free_port());
     let served = Node::start(config).await.unwrap();
     let address = served.metrics_listen.unwrap();
     cluster.nodes[0] = Some(served);
     cluster.converged(2).await;
-    // The gateway's own lifecycle proposals go through the outbox too: what
-    // they add is counted against a first snapshot once they settle.
+    // Counted against a first snapshot once the start has settled.
     let base = metrics_until(&cluster, 0, "settled", |s| {
         s.accepted == s.committed && s.voter.outbox_entries == 0
     })
@@ -1407,8 +1226,7 @@ async fn metrics_follow_proposals_from_accepted_to_committed() {
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| panic!("no {name}: {text}"))
     };
-    // The count moves on with the gateway's own proposals: at least as far
-    // as it was, and the histogram counts every commit.
+    // At least as far as it was, and the histogram counts every commit.
     let committed = scraped("straum_proposals_committed_total");
     assert!(committed >= s.committed, "{committed} < {}", s.committed);
     assert_eq!(scraped("straum_proposal_commit_seconds_count"), committed);
@@ -1458,13 +1276,13 @@ async fn metrics_show_an_outbox_overflow_and_where_the_delay_is() {
         before.append_commit.count(),
         "a batch committed without a majority"
     );
-    cluster.restart(others[0], Limits::default()).await;
+    cluster.restart(others[0]).await;
     let drained = metrics_until(&cluster, leader, "the outbox drained", |s| {
         s.voter.outbox_entries == 0 && s.spells.count >= 1
     })
     .await;
     // Every accepted proposal committed; the refused ones were never
-    // accepted (the gateway's retries can add refusals while it stalls).
+    // accepted.
     assert_eq!(drained.accepted, drained.committed);
     assert!(drained.refused >= 10);
     assert_eq!(drained.given_up, 0);
@@ -1497,9 +1315,9 @@ async fn a_lagging_replica_is_visible_from_both_sides() {
     })
     .await;
     assert!(seen.replica_progress.len() <= 2);
-    cluster.restart(replica, Limits::default()).await;
-    let caught_up = metrics_until(&cluster, replica, "the replica caught up and serves", |s| {
-        s.own.lag == 0 && s.heard_commit > 0 && s.serving
+    cluster.restart(replica).await;
+    let caught_up = metrics_until(&cluster, replica, "the replica caught up", |s| {
+        s.own.lag == 0 && s.heard_commit > 0
     })
     .await;
     assert!(caught_up.heard_commit >= caught_up.status.commit);
@@ -1516,8 +1334,7 @@ async fn a_node_whose_loop_ends_reports_it_stopped() {
     let test = "loop-end";
     let _ = std::fs::remove_dir_all(data_dir(test, 0));
     let addresses: Vec<SocketAddr> = (0..NODES).map(|_| free_port()).collect();
-    let mqtt: Vec<SocketAddr> = (0..NODES).map(|_| free_port()).collect();
-    let start = || Node::start(config(test, 0, &addresses, &mqtt, Limits::default()));
+    let start = || Node::start(config(test, 0, &addresses, MAX_RECORD));
     let node = start().await.unwrap();
     let mut status = node.status();
     tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.slot == 1))
@@ -1659,7 +1476,7 @@ async fn a_stalled_tls_handshake_leaves_the_slot_with_its_live_owner() {
     cluster.stop(1).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     stall.store(true, std::sync::atomic::Ordering::Relaxed);
-    cluster.restart(1, Limits::default()).await;
+    cluster.restart(1).await;
     let watch = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < watch {
         for id in 0..NODES {
@@ -1736,272 +1553,53 @@ async fn tls_links_bound_connections_that_never_finish_a_handshake() {
     cluster.shutdown().await;
 }
 
-/// An MQTT client over one TCP connection, packet by packet through
-/// `codec`: what the server sends, flags and properties included, exactly
-/// (step 7c stage 3).
-struct Raw {
-    stream: tokio::net::TcpStream,
-    buf: bytes::BytesMut,
-    version: codec::Version,
-}
-
-impl Raw {
-    /// Connects and returns the CONNACK. `expiry` is MQTT 5's Session
-    /// Expiry Interval; 3.1.1's CleanSession is `clean_start`. Tried again,
-    /// as a client would, while the gateway is not ready yet ("server
-    /// unavailable" until its `NodeReset` is committed).
-    async fn connect(
-        address: SocketAddr,
-        version: codec::Version,
-        id: &'static str,
-        clean_start: bool,
-        expiry: u32,
-    ) -> (Self, codec::ConnAck) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            let (raw, ack) = Self::connect_once(address, version, id, clean_start, expiry).await;
-            if ack.reason != codec::ReasonCode::ServerUnavailable
-                || tokio::time::Instant::now() >= deadline
-            {
-                return (raw, ack);
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+/// D-188 A: two nodes proposing the same bytes each get a record of their
+/// own, told apart by the origin property (`journal::ORIGIN_PROPERTY`), so
+/// neither node's outbox can take the other's commit for its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identical_proposals_from_two_nodes_commit_as_records_of_their_own() {
+    let cluster = Cluster::start("identical").await;
+    cluster.converged(2).await;
+    let mut records = cluster.node(2).records();
+    let same = || cluster::Proposal {
+        kind: journal::Kind::Data,
+        properties: Vec::new(),
+        body: b"same".to_vec(),
+    };
+    for _ in 0..20 {
+        cluster.node(0).propose(same()).await;
+        cluster.node(1).propose(same()).await;
+    }
+    let mut origins: BTreeMap<u8, BTreeSet<u64>> = BTreeMap::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while origins.values().map(BTreeSet::len).sum::<usize>() < 40 {
+        let record = tokio::time::timeout_at(deadline, records.recv())
+            .await
+            .expect("not every proposal committed")
+            .unwrap();
+        if record.body != b"same" {
+            continue;
         }
+        let (id, value) = journal::Properties::new(&record.properties)
+            .iter()
+            .map(Result::unwrap)
+            .find(|&(id, _)| id == journal::ORIGIN_PROPERTY)
+            .expect("an origin property");
+        assert_eq!((id, value.len()), (journal::ORIGIN_PROPERTY, 17));
+        let sequence = u64::from_be_bytes(value[9..17].try_into().unwrap());
+        assert!(
+            origins.entry(value[0]).or_default().insert(sequence),
+            "node {} sequence {sequence} committed twice",
+            value[0]
+        );
     }
-
-    async fn connect_once(
-        address: SocketAddr,
-        version: codec::Version,
-        id: &'static str,
-        clean_start: bool,
-        expiry: u32,
-    ) -> (Self, codec::ConnAck) {
-        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
-        let mut raw = Raw {
-            stream,
-            buf: bytes::BytesMut::new(),
-            version,
-        };
-        raw.send(codec::Packet::Connect(Box::new(codec::Connect {
-            version,
-            client_id: domain::ClientId::new(Bytes::from_static(id.as_bytes())).unwrap(),
-            clean_start,
-            keep_alive_secs: 0,
-            will: None,
-            username: None,
-            password: None,
-            properties: codec::ConnectProperties {
-                session_expiry_secs: expiry,
-                ..codec::ConnectProperties::default()
-            },
-        })))
-        .await;
-        let codec::Packet::ConnAck(ack) = raw.recv().await.expect("a CONNACK") else {
-            panic!("not a CONNACK");
-        };
-        (raw, *ack)
-    }
-
-    async fn send(&mut self, packet: codec::Packet) {
-        use tokio::io::AsyncWriteExt;
-        let mut out = bytes::BytesMut::new();
-        codec::encode(&packet, self.version, codec::Sender::Client, &mut out).unwrap();
-        self.stream.write_all(&out).await.unwrap();
-    }
-
-    /// The next packet, or `None` once the server closed the connection.
-    async fn recv(&mut self) -> Option<codec::Packet> {
-        use tokio::io::AsyncReadExt;
-        tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                if let Some(packet) = codec::decode(
-                    &mut self.buf,
-                    Some(self.version),
-                    codec::Sender::Server,
-                    &codec::Limits::default(),
-                )
-                .unwrap()
-                {
-                    return Some(packet);
-                }
-                if self.stream.read_buf(&mut self.buf).await.unwrap_or(0) == 0 {
-                    return None;
-                }
-            }
+    assert_eq!(origins.keys().copied().collect::<Vec<_>>(), vec![0, 1]);
+    for id in 0..2 {
+        let m = metrics_until(&cluster, id, "the outbox drained", |s| {
+            s.voter.outbox_entries == 0
         })
-        .await
-        .expect("nothing from the server within 20 s")
-    }
-
-    async fn subscribe(&mut self, filter: &'static str) {
-        self.send(codec::Packet::Subscribe(codec::Subscribe {
-            id: codec::PacketId::new(1).unwrap(),
-            subscription_identifier: None,
-            user: Vec::new(),
-            filters: vec![(
-                domain::TopicFilter::new(Bytes::from_static(filter.as_bytes())).unwrap(),
-                codec::SubscriptionOptions::qos(codec::Qos::AtLeastOnce),
-            )],
-        }))
         .await;
-        assert!(matches!(self.recv().await, Some(codec::Packet::SubAck(_))));
+        assert_eq!((m.refused, m.given_up), (0, 0), "node {id}");
     }
-
-    /// Publishes on `t`; a QoS 1 one waits for its PUBACK.
-    async fn publish(&mut self, payload: &'static str, qos: codec::Qos) {
-        let id = (qos == codec::Qos::AtLeastOnce).then(|| codec::PacketId::new(7).unwrap());
-        self.send(codec::Packet::Publish(codec::Publish {
-            topic: Some(Topic::new(Bytes::from_static(b"t")).unwrap()),
-            id,
-            qos,
-            duplicate: false,
-            retain: false,
-            payload: Bytes::from_static(payload.as_bytes()),
-            properties: None,
-        }))
-        .await;
-        if id.is_some() {
-            assert!(matches!(self.recv().await, Some(codec::Packet::PubAck(_))));
-        }
-    }
-
-    /// The next PUBLISH: its payload and DUP flag. Not acknowledged.
-    async fn delivered(&mut self) -> (String, bool) {
-        loop {
-            match self.recv().await {
-                Some(codec::Packet::Publish(p)) => {
-                    return (String::from_utf8_lossy(&p.payload).to_string(), p.duplicate);
-                }
-                Some(_) => {}
-                None => panic!("closed before a delivery"),
-            }
-        }
-    }
-}
-
-fn connect_limits() -> apply::ConnectLimits {
-    apply::ConnectLimits::default()
-}
-
-/// Long enough for a closed connection's `Disconnect` to commit on
-/// loopback, so what is published next waits in the detached session.
-async fn detached() {
-    tokio::time::sleep(Duration::from_millis(500)).await;
-}
-
-/// Step 7c stage 3 (D-176 A, D-177 A) end to end: a persisted session
-/// resumes on another node. What it had not acknowledged comes again with
-/// DUP set, then what was published while it was away, QoS 1 and QoS 0, in
-/// order. CONNACK says the session is present and never expires.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_persisted_session_resumes_on_another_node_with_redelivery_and_its_backlog() {
-    use codec::{Qos, Version};
-    let cluster = Cluster::start_sessions("sessions-resume", connect_limits()).await;
-    cluster.converged(2).await;
-    let (mut sub, ack) = Raw::connect(cluster.mqtt[0], Version::V5, "s", true, 60).await;
-    assert_eq!(ack.reason, codec::ReasonCode::Success);
-    assert!(!ack.session_present);
-    assert_eq!(ack.properties.session_expiry_secs, Some(u32::MAX));
-    sub.subscribe("t").await;
-    let (mut publisher, _) = Raw::connect(cluster.mqtt[1], Version::V311, "p", true, 0).await;
-    publisher.publish("one", Qos::AtLeastOnce).await;
-    assert_eq!(sub.delivered().await, ("one".into(), false));
-    drop(sub);
-    detached().await;
-    publisher.publish("two", Qos::AtLeastOnce).await;
-    publisher.publish("three", Qos::AtMostOnce).await;
-    let (mut sub, ack) = Raw::connect(cluster.mqtt[2], Version::V5, "s", false, 60).await;
-    assert!(ack.session_present);
-    assert_eq!(sub.delivered().await, ("one".into(), true));
-    assert_eq!(sub.delivered().await, ("two".into(), false));
-    assert_eq!(sub.delivered().await, ("three".into(), false));
-    cluster.shutdown().await;
-}
-
-/// A CONNECT on another node takes a persisted session over: the old
-/// connection is told (MQTT 5: SessionTakenOver) and closed, and the new one
-/// finds the session.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_connect_on_another_node_takes_the_session_over() {
-    use codec::Version;
-    let cluster = Cluster::start_sessions("sessions-takeover", connect_limits()).await;
-    cluster.converged(2).await;
-    let (mut old, _) = Raw::connect(cluster.mqtt[0], Version::V5, "s", true, 60).await;
-    old.subscribe("t").await;
-    let (_new, ack) = Raw::connect(cluster.mqtt[1], Version::V5, "s", false, 60).await;
-    assert!(ack.session_present);
-    let told = old.recv().await;
-    assert!(
-        matches!(&told, Some(codec::Packet::Disconnect(d)) if d.reason == codec::ReasonCode::SessionTakenOver),
-        "{told:?}"
-    );
-    assert!(old.recv().await.is_none(), "the old connection stayed open");
-    cluster.shutdown().await;
-}
-
-/// A persisted session outlives the restart of the node its client comes
-/// back to: the node rebuilds it from its log, and it gets what was
-/// published meanwhile.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_persisted_session_outlives_a_restart_while_detached() {
-    use codec::{Qos, Version};
-    let mut cluster = Cluster::start_sessions("sessions-restart", connect_limits()).await;
-    cluster.converged(2).await;
-    let (mut sub, _) = Raw::connect(cluster.mqtt[2], Version::V311, "s", false, 0).await;
-    sub.subscribe("t").await;
-    drop(sub);
-    detached().await;
-    let (mut publisher, _) = Raw::connect(cluster.mqtt[0], Version::V311, "p", true, 0).await;
-    publisher.publish("kept", Qos::AtLeastOnce).await;
-    cluster.restart(2, Limits::default()).await;
-    let before = *cluster.node(0).status().borrow();
-    cluster.converged(before.applied).await;
-    let (mut sub, ack) = Raw::connect(cluster.mqtt[2], Version::V311, "s", false, 0).await;
-    assert!(ack.session_present);
-    assert_eq!(sub.delivered().await, ("kept".into(), false));
-    cluster.shutdown().await;
-}
-
-/// A detached session with no room for an at-least-once message is
-/// deleted whole; the next CONNACK finds none (D-144 (3)).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_detached_session_that_overflows_is_gone_at_the_next_connect() {
-    use codec::{Qos, Version};
-    let cluster = Cluster::start_sessions(
-        "sessions-overflow",
-        apply::ConnectLimits {
-            max_detached_queued_bytes: 4,
-            ..connect_limits()
-        },
-    )
-    .await;
-    cluster.converged(2).await;
-    let (mut sub, _) = Raw::connect(cluster.mqtt[0], Version::V5, "s", true, 60).await;
-    sub.subscribe("t").await;
-    drop(sub);
-    detached().await;
-    let (mut publisher, _) = Raw::connect(cluster.mqtt[1], Version::V5, "p", true, 0).await;
-    publisher.publish("more than four", Qos::AtLeastOnce).await;
-    let (_sub, ack) = Raw::connect(cluster.mqtt[0], Version::V5, "s", false, 60).await;
-    assert_eq!(ack.reason, codec::ReasonCode::Success);
-    assert!(!ack.session_present);
-    cluster.shutdown().await;
-}
-
-/// The switch off, as every node runs by default (D-176 A): a CONNECT
-/// asking for a persisted session is refused, as before step 7c.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn without_the_switch_a_persisted_session_is_refused() {
-    use codec::Version;
-    let cluster = Cluster::start("sessions-off").await;
-    cluster.converged(2).await;
-    let (_, ack) = Raw::connect(cluster.mqtt[0], Version::V5, "s", true, 60).await;
-    assert_eq!(ack.reason, codec::ReasonCode::ImplementationSpecificError);
-    // 3.1.1 has only 0x03 for it, which a retry would take for "not ready".
-    let (_, ack) = Raw::connect_once(cluster.mqtt[0], Version::V311, "t", false, 0).await;
-    assert_ne!(ack.reason, codec::ReasonCode::Success);
-    let (_, ack) = Raw::connect(cluster.mqtt[0], Version::V5, "u", true, 0).await;
-    assert_eq!(ack.reason, codec::ReasonCode::Success);
-    assert_eq!(ack.properties.session_expiry_secs, None);
     cluster.shutdown().await;
 }

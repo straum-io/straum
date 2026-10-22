@@ -240,8 +240,7 @@ impl Writer {
         Ok(())
     }
 
-    /// Closes the write side. The broker has no DISCONNECT to send (§6), so
-    /// this is how a session ends.
+    /// Closes the write side: how a connection ends from this end.
     pub async fn shutdown(&mut self) -> Result<(), TransportError> {
         match &mut self.half {
             WriteSide::Plain(half) => half.shutdown().await?,

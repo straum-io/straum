@@ -1,13 +1,13 @@
-//! The log's record format, version 4 (ADR-0008 step 1; unified-stream §2.2,
-//! §2.7).
+//! The log's record format, version 5 (ADR-0008 step 1; unified-stream §2.2;
+//! D-188 A).
 //!
 //! `storage` frames records on disk (length, checksum) and recovers the
 //! durable prefix; this crate says what a record *is*:
 //!
 //! ```text
-//! record    [ version u8 = 4 ][ kind u8 ][ slot u64 ][ lsn u64 ]
+//! record    [ version u8 = 5 ][ kind u8 ][ slot u64 ][ lsn u64 ]
 //!           [ prev_hash u128 ][ properties_len u32 ][ properties ][ body ]
-//! property  [ id u8 ][ len u16 ][ value ]          MQTT 5 property ids
+//! property  [ id u8 ][ len u16 ][ value ]
 //! header    a record of kind BatchHeader whose body is [ records u32 ]
 //! ```
 //!
@@ -22,8 +22,7 @@
 //! `lsn` is global and monotonic and never restarts in a new slot.
 //!
 //! Integers are big-endian. Lengths read from a file or a socket are
-//! untrusted: this module refuses indexing and unchecked arithmetic, as the
-//! MQTT decoder does.
+//! untrusted: this module refuses indexing and unchecked arithmetic.
 #![deny(
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
@@ -32,7 +31,7 @@
 
 use xxhash_rust::xxh3::Xxh3;
 
-pub const VERSION: u8 = 4;
+pub const VERSION: u8 = 5;
 
 /// Version, kind, slot, lsn, prev_hash, properties length.
 pub const RECORD_HEADER_BYTES: usize = 1 + 1 + 8 + 8 + 16 + 4;
@@ -43,56 +42,26 @@ pub const BATCH_HEADER_BODY_BYTES: usize = 4;
 /// not know is refused, not skipped, because skipping would apply a log
 /// differently from a node that knows it.
 ///
-/// Several kinds are reserved now so the log model allows them from the
-/// start (unified-stream §2.7, ADR-0003) and nothing has to be renumbered
-/// when they are built.
+/// Version 5 (D-188 A) dropped the MQTT kinds of version 4: a version 4
+/// record is refused by its version byte, never read as `Data`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Kind {
     BatchHeader = 0,
-    Publish = 1,
-    Session = 2,
-    SessionGone = 3,
-    Subscribe = 4,
-    Unsubscribe = 5,
-    Ack = 6,
-    Connect = 7,
-    Disconnect = 8,
-    /// A gateway restarted: every session it numbered below a bound is gone
-    /// (ADR-0008 step 3b-2). `Disconnect` stays the per-session event.
-    NodeReset = 9,
-    /// Written by the sequencer: time decided through the log (§2.7).
-    SessionExpired = 16,
-    MessageExpired = 17,
-    WillPublished = 18,
+    /// A client's record. Its body is opaque to the log.
+    Data = 1,
     /// Handoff between sequencers (§2.4).
     SlotStart = 24,
     SlotEnd = 25,
-    /// Reserved for QoS 2 state (PUBREC/PUBREL) and shared subscriptions.
-    QosTwoState = 32,
-    SharedAssignment = 33,
 }
 
 impl Kind {
     pub fn from_u8(value: u8) -> Option<Self> {
         Some(match value {
             0 => Self::BatchHeader,
-            1 => Self::Publish,
-            2 => Self::Session,
-            3 => Self::SessionGone,
-            4 => Self::Subscribe,
-            5 => Self::Unsubscribe,
-            6 => Self::Ack,
-            7 => Self::Connect,
-            8 => Self::Disconnect,
-            9 => Self::NodeReset,
-            16 => Self::SessionExpired,
-            17 => Self::MessageExpired,
-            18 => Self::WillPublished,
+            1 => Self::Data,
             24 => Self::SlotStart,
             25 => Self::SlotEnd,
-            32 => Self::QosTwoState,
-            33 => Self::SharedAssignment,
             _ => return None,
         })
     }
@@ -122,6 +91,13 @@ pub struct Record<'a> {
     pub properties: Properties<'a>,
     pub body: &'a [u8],
 }
+
+/// The property every node puts on its own proposals (D-188 A): `[node
+/// u8][incarnation u64][sequence u64]`, unique per proposal, so a node tells
+/// its own record from another node's with the same body.
+pub const ORIGIN_PROPERTY: u8 = 1;
+/// The origin property's value length.
+pub const ORIGIN_BYTES: u16 = 17;
 
 /// The properties section, as stored: `[id][len u16][value]` repeated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -185,8 +185,8 @@ impl Flight {
     }
 }
 
-/// Spells of withheld reads: the node read none of its MQTT clients while
-/// its outbox was full (D-120 A, D-123).
+/// Spells in which the node's outbox was full and its new proposals were
+/// refused (D-120 A, D-123).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Spells {
     pub count: u64,
@@ -225,7 +225,7 @@ pub enum Stage {
     ReportSent,
     /// Sequencer: a durable report read from the link, from `peer`.
     ReportReceived,
-    /// A read-back of committed records for apply: taken up, and done
+    /// A read-back of committed records for the node loop: taken up, and done
     /// (`first` the records it brought).
     RangeStarted,
     RangeDone,
@@ -504,16 +504,6 @@ impl Measured {
     }
 }
 
-/// Connections refused before the gateway saw them, since the node started
-/// (D-167 A): no handshake permit, a source at its cap (D-165 A), a
-/// handshake that failed or did not finish in time (D-164 A).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Refused {
-    pub no_permit: u64,
-    pub source_full: u64,
-    pub handshake_failed: u64,
-}
-
 /// Everything rendered at one scrape: the loop's measurements, the cores'
 /// counts and the node's status, as they were together.
 #[derive(Debug, Clone, Default)]
@@ -524,7 +514,6 @@ pub struct Snapshot {
     pub voter: cluster::VoterStats,
     /// Sequencing: each replica's durable position, if known.
     pub replicas: Vec<(u8, Option<u64>)>,
-    pub gateway: Option<gateway::Load>,
     pub accepted: u64,
     pub refused: u64,
     pub committed: u64,
@@ -539,14 +528,12 @@ pub struct Snapshot {
     pub takeover: Histogram,
     pub spells: Spells,
     /// D-132: the commit point heard, this node's own progress against
-    /// it, each replica's (sequencing), and whether the gateway serves.
+    /// it, and each replica's (sequencing).
     pub heard_commit: u64,
     pub own: Progress,
     pub replica_progress: Vec<(u8, Progress)>,
-    pub serving: bool,
     /// D-135 A: what is in flight to each peer.
     pub flights: Vec<(u8, Flight)>,
-    pub refused_at_accept: Refused,
 }
 
 fn gauge(out: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
@@ -691,23 +678,23 @@ impl Snapshot {
             "Frames dropped at a full link queue, forwards included; the protocol resends the rest.",
             self.link_drops,
         );
-        // D-123: reads withheld while the outbox is full.
+        // D-123: spells of a full outbox.
         let spells = self.spells;
         counter(
             o,
-            "straum_read_block_spells_total",
-            "Spells in which no MQTT client was read: the outbox was full.",
+            "straum_outbox_full_spells_total",
+            "Spells in which the outbox was full: new proposals were refused.",
             spells.count,
         );
         gauge(
             o,
-            "straum_read_block_seconds_total",
+            "straum_outbox_full_seconds_total",
             "Time spent in such spells.",
             spells.total.as_secs_f64(),
         );
         gauge(
             o,
-            "straum_read_block_longest_seconds",
+            "straum_outbox_full_longest_seconds",
             "The longest such spell, the open one included.",
             spells.longest.as_secs_f64(),
         );
@@ -771,12 +758,6 @@ impl Snapshot {
             "straum_catching_up",
             "1 while lag is above 0. An indicator only: a healthy replica under load is a few positions behind too; telling catch-up from normal replication takes lag, rate and age together.",
             u8::from(own.lag > 0),
-        );
-        gauge(
-            o,
-            "straum_serving",
-            "1 once this node's gateway takes clients: its own reset is applied.",
-            u8::from(self.serving),
         );
         let _ = writeln!(
             o,
@@ -904,96 +885,6 @@ impl Snapshot {
             "Times this node stopped sequencing: handed over, or fenced by a newer slot.",
             v.stepped_down,
         );
-        // 5. MQTT.
-        if let Some(g) = &self.gateway {
-            let c = &g.counted;
-            gauge(
-                o,
-                "straum_mqtt_connections",
-                "Open MQTT connections.",
-                g.connections,
-            );
-            gauge(
-                o,
-                "straum_mqtt_pending",
-                "Client requests proposed and awaiting commit.",
-                g.pending,
-            );
-            gauge(
-                o,
-                "straum_mqtt_pending_bytes",
-                "Their bytes.",
-                g.pending_bytes,
-            );
-            gauge(
-                o,
-                "straum_mqtt_waiting_bytes",
-                "Deliveries held for clients' receive maximum.",
-                g.waiting_bytes,
-            );
-            counter(
-                o,
-                "straum_mqtt_publishes_total",
-                "PUBLISH packets proposed to the log.",
-                c.publishes,
-            );
-            counter(
-                o,
-                "straum_mqtt_pubacks_total",
-                "PUBACKs sent, each after its commit.",
-                c.pubacks,
-            );
-            counter(
-                o,
-                "straum_mqtt_deliveries_total",
-                "PUBLISH packets sent to subscribers.",
-                c.deliveries,
-            );
-            counter(
-                o,
-                "straum_mqtt_dropped_total",
-                "At-most-once deliveries dropped at the waiting bounds.",
-                g.dropped,
-            );
-            counter(
-                o,
-                "straum_mqtt_closed_total",
-                "Connections closed.",
-                c.closed,
-            );
-            counter(
-                o,
-                "straum_mqtt_closed_keep_alive_total",
-                "Of those, for keep-alive silence.",
-                c.closed_keep_alive,
-            );
-            counter(
-                o,
-                "straum_mqtt_closed_commit_timeout_total",
-                "Of those, for a proposal not committed in time.",
-                c.closed_commit_timeout,
-            );
-            // D-167 A: never seen by the gateway, so not in its counts.
-            let r = &self.refused_at_accept;
-            counter(
-                o,
-                "straum_mqtt_refused_no_permit_total",
-                "Connections closed at accept: every handshake slot was taken.",
-                r.no_permit,
-            );
-            counter(
-                o,
-                "straum_mqtt_refused_source_full_total",
-                "Connections closed at accept: their source had as many waiting as it may.",
-                r.source_full,
-            );
-            counter(
-                o,
-                "straum_mqtt_handshake_failed_total",
-                "Connections whose setup (read buffers, or the TLS handshake) failed or did not finish within the connect timeout.",
-                r.handshake_failed,
-            );
-        }
         out
     }
 }
@@ -1285,7 +1176,7 @@ mod stable {
             .map(str::trim)
             .filter(|l| l.starts_with("straum_"))
             .collect();
-        assert_eq!(names.len(), 11, "the stable set changed: {names:?}");
+        assert_eq!(names.len(), 10, "the stable set changed: {names:?}");
         let text = Snapshot::default().render();
         for name in names {
             assert_eq!(

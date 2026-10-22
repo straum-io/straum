@@ -8,10 +8,10 @@
 #
 #   scripts/prezeroed-ab.sh [rounds]     # 4 by default; about 1 h 20 min
 #
-# Each round runs puback's steady and heavy loads and cap at 64, with the
-# disk's flushes and journal commits counted. Writes target/prezeroed-ab/
-# <time>/ with one file per side and stage, a summary from scripts/rates.awk,
-# and run.log. Preliminary unless the host passes D-129.
+# Each round runs cap at 64 (the MQTT `puback` loads went with MQTT,
+# D-188 A). Writes target/prezeroed-ab/<time>/ with one file per side, a
+# summary of the `cap_stats` lines, and run.log. Preliminary unless the host
+# passes D-129.
 set -eu
 cd "$(dirname "$0")/.."
 if [ "$(uname -s)" != Linux ]; then
@@ -39,9 +39,9 @@ JOURNAL=$(ls /proc/fs/jbd2 2>/dev/null | grep "^${LOGDEV:-none}-" | head -1 || t
     echo "governors: $(sort /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | uniq -c | tr -s ' ' | tr '\n' ';')"
     echo "loadavg: $(cat /proc/loadavg)"
 } | tee "$OUT/run.log"
-# D-170 A turns the default on only after a run on a host that passes D-129
-# (scripts/linux-run.sh, its noise stage, is the only test of that). These
-# warnings catch the usual misses; no warning does not mean the host passes.
+# A result counts only from a host that passes D-129 (scripts/gated-run.sh
+# runs the gate first). These warnings catch the usual misses; no warning
+# does not mean the host passes.
 if grep -qv '^performance$' /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null; then
     echo "warning: not every CPU uses the performance governor; this run cannot settle D-170 (D-129)" | tee -a "$OUT/run.log"
 fi
@@ -49,23 +49,12 @@ if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || pgrep -x 'gnome-shell|kwin_wayla
     echo "warning: a desktop session is running; this run cannot settle D-170 (D-129)" | tee -a "$OUT/run.log"
 fi
 
-cargo build --release -p server --bin straum-server >/dev/null 2>&1
-PUBACK=$(cargo bench -p server --bench puback --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\))$/\1/p' | tail -1)
 CAP=$(cargo bench -p node --bench cap --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\))$/\1/p' | tail -1)
 
 # side <A|B> <round>: one round of every stage on one side.
 side() {
     ahead=0
     if [ "$1" = B ]; then ahead=$AHEAD; fi
-    for stage in steady heavy; do
-        extra=""
-        if [ "$stage" = heavy ]; then extra="STRAUM_BENCH_PUBLISHERS=24 STRAUM_BENCH_WINDOW=32"; fi
-        echo "--- round $2" >> "$OUT/rates-$stage-$1.txt"
-        # shellcheck disable=SC2086
-        env STRAUM_BENCH_SECONDS=60 STRAUM_BENCH_POSITIONS_MS=100 STRAUM_BENCH_DISK="$DISK" \
-            STRAUM_BENCH_JOURNAL="$JOURNAL" STRAUM_BENCH_PREALLOCATE_BYTES=$ahead $extra \
-            "$PUBACK" >> "$OUT/rates-$stage-$1.txt" 2>&1 || echo "round $2 FAILED" >> "$OUT/rates-$stage-$1.txt"
-    done
     echo "--- round $2" >> "$OUT/cap-$1.txt"
     env STRAUM_BENCH_CAPS=64 STRAUM_BENCH_ROUNDS=3 STRAUM_BENCH_FAILOVERS=10 \
         STRAUM_BENCH_PREALLOCATE_BYTES=$ahead "$CAP" >> "$OUT/cap-$1.txt" 2>&1 \
@@ -80,9 +69,6 @@ while [ "$round" -le "$ROUNDS" ]; do
 done
 
 for side in A B; do
-    for stage in steady heavy; do
-        awk -v stage="$stage-$side" -f scripts/rates.awk "$OUT/rates-$stage-$side.txt"
-    done
     grep -h "^cap_stats" "$OUT/cap-$side.txt" | sed "s/^/  $side /"
 done > "$OUT/summary.txt" 2>&1
 rm -rf "$TMPDIR"

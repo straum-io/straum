@@ -7,9 +7,9 @@ use journal::{
 };
 use proptest::prelude::*;
 
-fn publish(body: &[u8]) -> Entry<'_> {
+fn data(body: &[u8]) -> Entry<'_> {
     Entry {
-        kind: Kind::Publish,
+        kind: Kind::Data,
         properties: &[],
         body,
     }
@@ -23,7 +23,7 @@ fn log(count: usize, per: usize) -> (Vec<Vec<u8>>, Chain) {
         let bodies: Vec<Vec<u8>> = (0..per)
             .map(|i| format!("b{batch}r{i}").into_bytes())
             .collect();
-        let entries: Vec<Entry<'_>> = bodies.iter().map(|b| publish(b)).collect();
+        let entries: Vec<Entry<'_>> = bodies.iter().map(|b| data(b)).collect();
         chain.batch(1, &entries, &mut out).unwrap();
     }
     (out, chain)
@@ -51,9 +51,9 @@ proptest! {
             encode_property(*id, value, &mut properties).unwrap();
         }
         let mut bytes = Vec::new();
-        encode(Kind::Publish, Position { slot, lsn, prev_hash }, &properties, &body, &mut bytes).unwrap();
+        encode(Kind::Data, Position { slot, lsn, prev_hash }, &properties, &body, &mut bytes).unwrap();
         let record = decode(&bytes).unwrap();
-        prop_assert_eq!(record.kind, Kind::Publish);
+        prop_assert_eq!(record.kind, Kind::Data);
         prop_assert_eq!(record.slot, slot);
         prop_assert_eq!(record.lsn, lsn);
         prop_assert_eq!(record.prev_hash, prev_hash);
@@ -75,7 +75,7 @@ proptest! {
         // A change shows in the record itself or in the next batch's prev_hash;
         // the last batch has no next one, so add a batch after it.
         let mut chain = verify(&records).unwrap().chain;
-        chain.batch(1, &[publish(b"after")], &mut records).unwrap();
+        chain.batch(1, &[data(b"after")], &mut records).unwrap();
         let target = &mut records[record];
         let position = at % target.len();
         target[position] ^= flip;
@@ -116,16 +116,12 @@ fn a_foreign_history_is_refused_at_the_next_batch() {
     let mut theirs = Chain::genesis();
     let mut log_ours = Vec::new();
     let mut log_theirs = Vec::new();
-    ours.batch(1, &[publish(b"same")], &mut log_ours).unwrap();
-    theirs
-        .batch(1, &[publish(b"same")], &mut log_theirs)
-        .unwrap();
-    ours.batch(1, &[publish(b"a")], &mut log_ours).unwrap();
-    theirs.batch(1, &[publish(b"b")], &mut log_theirs).unwrap();
-    ours.batch(1, &[publish(b"next")], &mut log_ours).unwrap();
-    theirs
-        .batch(1, &[publish(b"next")], &mut log_theirs)
-        .unwrap();
+    ours.batch(1, &[data(b"same")], &mut log_ours).unwrap();
+    theirs.batch(1, &[data(b"same")], &mut log_theirs).unwrap();
+    ours.batch(1, &[data(b"a")], &mut log_ours).unwrap();
+    theirs.batch(1, &[data(b"b")], &mut log_theirs).unwrap();
+    ours.batch(1, &[data(b"next")], &mut log_ours).unwrap();
+    theirs.batch(1, &[data(b"next")], &mut log_theirs).unwrap();
     assert_ne!(ours.hash(), theirs.hash());
 
     // Their third batch after our first two.
@@ -149,7 +145,7 @@ fn a_torn_batch_is_a_tail_and_writing_resumes_before_it() {
     let mut resumed = records[..10].to_vec();
     let mut chain = complete;
     chain
-        .batch(1, &[publish(b"after the cut")], &mut resumed)
+        .batch(1, &[data(b"after the cut")], &mut resumed)
         .unwrap();
     assert_eq!(verify(&resumed).unwrap().partial, 0);
 }
@@ -158,15 +154,15 @@ fn a_torn_batch_is_a_tail_and_writing_resumes_before_it() {
 fn lsn_continues_across_slots_and_never_goes_back() {
     let mut chain = Chain::genesis();
     let mut records = Vec::new();
-    chain.batch(1, &[publish(b"x")], &mut records).unwrap();
-    chain.batch(2, &[publish(b"y")], &mut records).unwrap();
+    chain.batch(1, &[data(b"x")], &mut records).unwrap();
+    chain.batch(2, &[data(b"y")], &mut records).unwrap();
     assert!(verify(&records).is_ok());
     assert_eq!(chain.next_lsn(), 5);
 
     // The writer refuses to go back by itself.
     let mut refused = Vec::new();
     assert!(matches!(
-        chain.batch(1, &[publish(b"z")], &mut refused),
+        chain.batch(1, &[data(b"z")], &mut refused),
         Err(ChainError::SlotBack { .. })
     ));
     assert!(refused.is_empty());
@@ -175,7 +171,7 @@ fn lsn_continues_across_slots_and_never_goes_back() {
     // resumed from the middle of the log rather than from genesis.
     let mut forgetful = Chain::resume(chain.hash(), chain.next_lsn() - 1, 0);
     let mut back = Vec::new();
-    forgetful.batch(1, &[publish(b"z")], &mut back).unwrap();
+    forgetful.batch(1, &[data(b"z")], &mut back).unwrap();
     let mut whole = records.clone();
     whole.extend_from_slice(&back);
     assert!(matches!(verify(&whole), Err(ChainError::SlotBack { .. })));
@@ -189,7 +185,7 @@ fn lsn_continues_across_slots_and_never_goes_back() {
 #[test]
 fn malformed_records_are_refused() {
     let mut bytes = Vec::new();
-    encode(Kind::Publish, AT, &[], b"x", &mut bytes).unwrap();
+    encode(Kind::Data, AT, &[], b"x", &mut bytes).unwrap();
     assert_eq!(decode(&bytes[..10]), Err(JournalError::Truncated));
     let mut wrong_version = bytes.clone();
     wrong_version[0] = 3;
@@ -207,7 +203,7 @@ fn malformed_records_are_refused() {
 #[test]
 fn a_record_outside_a_batch_is_refused() {
     let mut bytes = Vec::new();
-    encode(Kind::Publish, AT, &[], b"x", &mut bytes).unwrap();
+    encode(Kind::Data, AT, &[], b"x", &mut bytes).unwrap();
     assert!(matches!(
         verify(&[bytes]),
         Err(ChainError::OutsideBatch { .. })
@@ -225,11 +221,12 @@ fn the_hash_is_xxh3_128_and_the_format_is_pinned() {
         0x99aa_06d3_0147_98d8_6001_c324_468d_497f
     );
     let mut chain = Chain::genesis();
-    chain.batch(1, &[publish(b"x")], &mut Vec::new()).unwrap();
+    chain.batch(1, &[data(b"x")], &mut Vec::new()).unwrap();
     assert_eq!(chain.hash(), PINNED);
 }
-/// Recorded from this implementation on 2026-10-05 (batch hash on every record, D-56 A); not an external vector.
-const PINNED: u128 = 0x54b8_079d_c207_a33a_eeb2_d76c_c3ff_6ee6;
+/// Recorded from this implementation on 2026-10-22, format version 5
+/// (D-188 A; batch hash on every record, D-56 A); not an external vector.
+const PINNED: u128 = 0x0ede_3705_a282_7658_6918_0186_784d_0ea0;
 
 const AT: Position = Position {
     slot: 1,
@@ -244,11 +241,11 @@ fn every_record_of_a_batch_names_the_batch_before() {
     let mut chain = Chain::genesis();
     let mut records = Vec::new();
     chain
-        .batch(1, &[publish(b"a"), publish(b"b")], &mut records)
+        .batch(1, &[data(b"a"), data(b"b")], &mut records)
         .unwrap();
     let first = chain.hash();
     chain
-        .batch(1, &[publish(b"c"), publish(b"d")], &mut records)
+        .batch(1, &[data(b"c"), data(b"d")], &mut records)
         .unwrap();
     let names: Vec<u128> = records
         .iter()

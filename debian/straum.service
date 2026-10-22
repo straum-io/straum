@@ -1,5 +1,5 @@
 [Unit]
-Description=Straum MQTT broker node (experimental)
+Description=Straum node (experimental)
 Documentation=https://github.com/straum-io/straum
 After=network-online.target
 Wants=network-online.target

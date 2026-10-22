@@ -18,7 +18,6 @@ fn experimental() -> Experimental {
             .map(|id| (id, address(7000 + u16::from(id))))
             .collect(),
         listen: address(7001),
-        mqtt: address(1884),
         data: std::env::temp_dir().join("straum-config-test"),
         heartbeat: node::experimental::DEFAULT_HEARTBEAT,
         takeover_ticks: node::experimental::DEFAULT_TAKEOVER_TICKS,
@@ -96,20 +95,16 @@ fn a_queue_below_one_proposal_per_voter_is_refused() {
     assert_eq!(config.check(), Ok(()));
 }
 
-/// Step 7c stage 3 (D-176 A): sessions through the log are refused with
-/// credentials until a session is bound to its user; a Clean Start 0
-/// CONNECT could otherwise resume another user's session.
+/// A batch of the largest records must fit one frame: a record bound
+/// that breaks it is refused, not trimmed.
 #[test]
-fn sessions_with_credentials_are_refused() {
+fn a_record_bound_whose_batch_overflows_a_frame_is_refused() {
     let mut config = experimental().node_config().unwrap();
-    config.sessions = Some(apply::ConnectLimits::default());
-    assert_eq!(config.check(), Ok(()), "sessions alone");
-    config.mqtt.as_mut().unwrap().authority = Some(std::sync::Arc::new(
-        auth::Authority::parse("", None, true).unwrap(),
+    config.max_record = config.max_frame;
+    assert!(matches!(
+        config.check(),
+        Err(ConfigError::BatchOverFrame { .. })
     ));
-    assert_eq!(config.check(), Err(ConfigError::SessionsWithCredentials));
-    config.sessions = None;
-    assert_eq!(config.check(), Ok(()), "credentials alone");
 }
 
 #[tokio::test]

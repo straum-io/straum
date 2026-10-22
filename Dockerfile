@@ -20,6 +20,6 @@ COPY --from=build /straum-server /usr/local/bin/straum-server
 # STRAUM_CLUSTER_UNAUTHENTICATED_NETWORK=1 (D-107); the image does not set it.
 ENV STRAUM_CLUSTER_DATA_DIR=/var/lib/straum
 VOLUME ["/var/lib/straum"]
-# MQTT, node links, metrics (when configured to listen on them).
-EXPOSE 1883 7000 9100
+# Node links, metrics (when configured to listen on them).
+EXPOSE 7000 9100
 ENTRYPOINT ["/usr/local/bin/straum-server"]

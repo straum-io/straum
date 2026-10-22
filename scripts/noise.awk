@@ -29,7 +29,7 @@ function median(arr, n,    i, j, t) {
         split($f, kv, "=")
         if (kv[2] == "" || kv[2] == "-") continue
         k = kv[1]
-        if (k !~ /^(publishes_per_s|failover_within_1s|failover_p50_ms|failover_p90_ms|pubacks_per_s|p50_ms|p99_ms|cpu_ms_per_1k)$/) continue
+        if (k !~ /^(publishes_per_s|failover_within_1s|failover_p50_ms|failover_p90_ms)$/) continue
         keys[k] = 1
         c = ++count[$1, k]
         v[$1, k, c] = kv[2] + 0

@@ -40,18 +40,15 @@ spec:
               value: "0=10.96.100.10:7000,1=10.96.100.11:7000,2=10.96.100.12:7000"
             - name: STRAUM_CLUSTER_LISTEN
               value: "0.0.0.0:7000"
-            - name: STRAUM_CLUSTER_MQTT_LISTEN
-              value: "0.0.0.0:1883"
             - name: STRAUM_CLUSTER_METRICS_LISTEN
               value: "0.0.0.0:9100"
             - name: STRAUM_CLUSTER_DATA_DIR
               value: /var/lib/straum
           ports:
-            - { name: mqtt, containerPort: 1883 }
             - { name: link, containerPort: 7000 }
             - { name: metrics, containerPort: 9100 }
           readinessProbe:
-            tcpSocket: { port: mqtt }
+            tcpSocket: { port: metrics }
             periodSeconds: 5
           securityContext:
             allowPrivilegeEscalation: false

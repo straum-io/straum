@@ -2,31 +2,26 @@
 //! cluster, running the sans-IO cores against sockets, a disk and a clock.
 //!
 //! * The **node loop** — one tokio task — owns the sequencer or replica
-//!   core, the applied state and the gateway. It carries out the core's
-//!   effects, applies committed records in order, hands their effects to
-//!   the gateway, and carries out the gateway's actions. It never touches a
+//!   core. It carries out the core's effects and hands committed records,
+//!   in order, to whoever listens (`Node::records`). It never touches a
 //!   file and never awaits one connection.
 //! * The **WAL thread** owns the segmented log on disk: recovery and its
 //!   chain check, appends with group commit, and reads for catch-up and for
 //!   applying records older than this process (`wal`).
 //! * **Links** carry `cluster::wire` frames, one TCP connection per
-//!   direction, opened by a HELLO naming the sender and the digest of its
-//!   `apply` limits; a mismatch refuses the link (`link`).
-//! * **MQTT connections** (`mqtt`): a reader that reads only on a credit
-//!   from the node loop, so the gateway's backpressure reaches TCP, and a
-//!   writer behind a bounded queue; a client that lets it fill is closed.
+//!   direction, opened by a HELLO naming the sender and the digest of the
+//!   cluster's configuration; a mismatch refuses the link (`link`).
 //!
-//! Cluster mode stays refused by the server's configuration until step 7
-//! (ADR-0008): this crate is reached from tests.
+//! No client protocol reaches the node since D-188 A removed MQTT: records
+//! are proposed through `Node::propose` until Straum's own protocol exists.
 
 mod link;
 pub mod metrics;
-mod mqtt;
 mod wal;
 
 pub mod experimental;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -35,10 +30,8 @@ use std::time::Duration;
 
 pub use experimental::{ConfigError, Experimental};
 
-use apply::{Effect, Limits, State};
 use cluster::wire::Frame;
 use cluster::{Config as CoreConfig, Effect as Step, Proposal, Voter};
-use gateway::{Action, Gateway};
 use metrics::Stage;
 use storage::SegmentLimits;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -50,8 +43,6 @@ pub enum NodeError {
     Storage(#[from] storage::StorageError),
     #[error("the log does not recover as one chain: {0}")]
     Recovery(#[from] journal::ChainError),
-    #[error("the snapshot is refused: {0}")]
-    Snapshot(#[from] apply::SnapshotError),
     #[error("the snapshot file is torn or damaged")]
     SnapshotDamaged,
     /// The log was compacted past a snapshot, or the snapshot is ahead of
@@ -75,60 +66,6 @@ pub enum NodeError {
 }
 
 #[derive(Debug, Clone)]
-pub struct MqttConfig {
-    pub listen: SocketAddr,
-    /// `node` and `first_session` are the node's to set and are overwritten.
-    pub gateway: gateway::Config,
-    /// Packets queued per connection; a client that lets the queue fill is
-    /// closed (a writer that makes no progress).
-    pub write_queue: usize,
-    /// Who may connect and what each may do (D-158 A). `None`: anybody,
-    /// anything, as before credentials. Set, the gateway's `authenticate`
-    /// is on and every CONNECT is checked off the node loop.
-    pub authority: Option<Arc<auth::Authority>>,
-    /// TLS on the MQTT listener (D-164 A): with it, the listener speaks
-    /// TLS only. `None`: plaintext.
-    pub tls: Option<transport::Tls>,
-}
-
-/// Credentials checks in flight, at most one per connection (D-158 A). A
-/// connection that goes cancels its check, so what waits for a permit is
-/// bounded by the connections, never by how many have come and gone.
-#[derive(Debug, Default)]
-struct Checks(HashMap<u64, tokio::task::AbortHandle>);
-
-impl Checks {
-    fn start(&mut self, conn: u64, check: tokio::task::AbortHandle) {
-        if let Some(old) = self.0.insert(conn, check) {
-            old.abort();
-        }
-    }
-
-    fn finished(&mut self, conn: u64) {
-        self.0.remove(&conn);
-    }
-
-    fn cancel(&mut self, conn: u64) {
-        if let Some(check) = self.0.remove(&conn) {
-            check.abort();
-        }
-    }
-}
-
-/// What a session may do, from the credential files (D-158 A).
-#[derive(Debug)]
-struct Rules(auth::Permissions);
-
-impl gateway::Grant for Rules {
-    fn may_publish(&self, topic: &domain::Topic) -> bool {
-        self.0.may_publish(topic)
-    }
-    fn may_subscribe(&self, filter: &domain::TopicFilter) -> bool {
-        self.0.may_subscribe(filter)
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct NodeConfig {
     /// This node's core configuration: its id, the voters, the slot owner.
     pub core: CoreConfig,
@@ -138,21 +75,20 @@ pub struct NodeConfig {
     pub peers: Vec<(u8, SocketAddr)>,
     pub data: PathBuf,
     pub segments: SegmentLimits,
-    /// The same on every node: refused otherwise.
-    pub limits: Limits,
+    /// The largest body and properties of one record, together; a larger
+    /// proposal is refused. In the configuration digest.
+    pub max_record: usize,
     pub heartbeat: Duration,
     pub max_frame: usize,
     /// Frames queued per peer link; beyond, dropped (the protocol resends).
     pub link_queue: usize,
     pub transport: TransportConfig,
-    pub mqtt: Option<MqttConfig>,
     /// The retention bound of D-57 A: the log keeps no more than this many
     /// bytes behind a replica that is only slow; a replica further behind
     /// is lost (it needs a state copy, step 7b).
     pub retain_bytes: u64,
     /// Applied records between two snapshots. The log below the last
-    /// durable snapshot may go (D-67 B); a snapshot encodes the whole
-    /// state on the node loop, so this trades disk for that pause.
+    /// durable snapshot may go (D-67 B).
     pub snapshot_every: u64,
     /// Leading, hand the slot over to the next owner every this many
     /// heartbeats (§2.4 planned rotation, ADR-0008 step 6). `None`, the
@@ -170,13 +106,6 @@ pub struct NodeConfig {
     /// TLS on every link, each end proving its node id (ADR-0010). `None`:
     /// plaintext links.
     pub tls: Option<transport::NodeTls>,
-    /// Step 7c stage 3 (D-176 A): with bounds, every CONNECT goes through
-    /// the committed log (`State::with_connect`) and sessions may persist.
-    /// The same on every node: in the configuration digest. `None`, the
-    /// default and the only value the server sets: as before 7c. Turning
-    /// it on is a decision of its own, once `connect_window` and
-    /// `max_connect_tombstones` are sized (D-153 A, D-154 A).
-    pub sessions: Option<apply::ConnectLimits>,
 }
 
 /// The starting `retain_bytes` (D-91 A): 64 MiB, the old path's
@@ -187,19 +116,15 @@ pub struct NodeConfig {
 /// configuration.
 pub const DEFAULT_RETAIN_BYTES: u64 = 64 * 1024 * 1024;
 
-/// MQTT connections one source (an IPv4 address or an IPv6 /64, D-168 A)
-/// may have waiting at once, for a handshake or a CONNECT (D-165 A): fixed,
-/// not a setting. Clients behind one NAT share it; past it a connection is
-/// closed at once and the client retries.
-pub const MAX_WAITING_PER_SOURCE: usize = 16;
-
 /// What a node reports about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Status {
     pub end: u64,
     pub commit: u64,
     pub applied: u64,
-    /// `apply::State::digest` at `applied`.
+    /// The committed history through `applied`, as one number: a running
+    /// hash over every record applied (`fold_digest`). Two nodes at one
+    /// `applied` with one `digest` applied the same records.
     pub digest: u64,
     /// The highest slot this node has promised, and whether it sequences it.
     pub slot: u64,
@@ -210,21 +135,28 @@ pub struct Status {
     pub given_up: u64,
 }
 
+/// A committed record as the node hands it out (`Node::records`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Committed {
+    pub lsn: u64,
+    pub slot: u64,
+    pub kind: journal::Kind,
+    pub properties: Vec<u8>,
+    pub body: Vec<u8>,
+}
+
 /// A running node. `shutdown` stops it and waits for every part. Dropping
-/// it only ends the node loop (its stop channel closes); its link and MQTT
+/// it only ends the node loop (its stop channel closes); its link
 /// tasks run until the runtime ends, and the log thread until its queue
 /// closes — nothing waits for them.
 pub struct Node {
     pub listen: SocketAddr,
-    pub mqtt: Option<SocketAddr>,
     /// Where the metrics are served, if they are (`NodeConfig::metrics`).
     pub metrics_listen: Option<SocketAddr>,
     proposals: mpsc::Sender<Proposal>,
-    effects: broadcast::Sender<(u64, u64, Vec<Effect>)>,
+    records: broadcast::Sender<Committed>,
     /// Operator handoffs, each with where its answer goes.
     hand_offs: mpsc::Sender<oneshot::Sender<Result<(), cluster::ClusterError>>>,
-    /// New credentials for the next CONNECTs (D-166 A).
-    reloads: mpsc::Sender<Arc<auth::Authority>>,
     metrics: mpsc::Sender<oneshot::Sender<metrics::Snapshot>>,
     trace: mpsc::Sender<TraceRequest>,
     status: watch::Receiver<Status>,
@@ -235,34 +167,33 @@ pub struct Node {
     wal: Option<std::thread::JoinHandle<()>>,
 }
 
-/// The snapshot file's body, this node's format (D-79 A):
-/// `[version=2][slots u32] { [slot u64][first lsn u64] } [apply::State]`.
+/// The snapshot file's body, this node's format (D-79 A, D-188 A):
+/// `[version=3][slots u32] { [slot u64][first lsn u64] } [applied u64][digest u64]`.
 /// The slot table is the committed log's, through the snapshot's lsn and
-/// pruned by compaction; the state is `apply`'s own encoding. Version 2:
-/// before D-79 the body was `apply`'s alone, which starts with its own
-/// version 1, so an old body is refused here rather than misread. The
-/// table goes first because `apply`'s body carries no length of its own.
-const SNAPSHOT_VERSION: u8 = 2;
+/// pruned by compaction. Version 3: the state machine of version 2 went
+/// with MQTT, so a version 2 body is refused, not misread.
+const SNAPSHOT_VERSION: u8 = 3;
 
-fn encode_snapshot(slots: &[(u64, u64)], state: &State) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(5 + slots.len() * 16);
+/// A slot table: (slot, first lsn), ascending.
+type Slots = Vec<(u64, u64)>;
+
+fn encode_snapshot(slots: &[(u64, u64)], applied: u64, digest: u64) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(21 + slots.len() * 16);
     bytes.push(SNAPSHOT_VERSION);
     bytes.extend_from_slice(&u32::try_from(slots.len()).unwrap_or(u32::MAX).to_be_bytes());
     for &(slot, first) in slots {
         bytes.extend_from_slice(&slot.to_be_bytes());
         bytes.extend_from_slice(&first.to_be_bytes());
     }
-    state.encode(&mut bytes);
+    bytes.extend_from_slice(&applied.to_be_bytes());
+    bytes.extend_from_slice(&digest.to_be_bytes());
     bytes
 }
 
-/// The slot table and the state's bytes. A table the log could not have
-/// produced — not ascending in both — is refused, as is a count past the
-/// bytes that are there.
-/// A slot table: (slot, first lsn), ascending.
-type Slots = Vec<(u64, u64)>;
-
-fn decode_snapshot(bytes: &[u8]) -> Result<(Slots, &[u8]), NodeError> {
+/// The slot table, the applied position and the digest. A table the log
+/// could not have produced — not ascending in both — is refused, as is a
+/// count past the bytes that are there or bytes left over.
+fn decode_snapshot(bytes: &[u8]) -> Result<(Slots, u64, u64), NodeError> {
     let u64_at = |at: usize| -> Option<u64> {
         Some(u64::from_be_bytes(
             bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
@@ -280,7 +211,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(Slots, &[u8]), NodeError> {
     let end = count
         .checked_mul(16)
         .and_then(|n| n.checked_add(5))
-        .filter(|&end| end <= bytes.len())
+        .filter(|&end| end.checked_add(16) == Some(bytes.len()))
         .ok_or(NodeError::SnapshotDamaged)?;
     let mut slots: Slots = Vec::with_capacity(count);
     for index in 0..count {
@@ -296,37 +227,24 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(Slots, &[u8]), NodeError> {
         }
         slots.push(entry);
     }
-    let state = bytes.get(end..).ok_or(NodeError::SnapshotDamaged)?;
-    Ok((slots, state))
+    let applied = u64_at(end).ok_or(NodeError::SnapshotDamaged)?;
+    let digest = u64_at(end + 8).ok_or(NodeError::SnapshotDamaged)?;
+    Ok((slots, applied, digest))
 }
 
-/// A digest of the limits, compared at every link: a fixed function of the
-/// values (FNV-1a), not of the build, so nodes on different builds agree.
-pub fn limits_digest(limits: &Limits) -> u64 {
-    let fields = [
-        limits.max_subscriptions_per_session,
-        limits.max_subscriptions,
-        limits.max_retained,
-        limits.max_retained_bytes,
-        limits.max_inflight,
-        limits.max_backlog,
-        limits.max_backlog_bytes,
-        limits.max_total_queued_bytes,
-    ];
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for field in fields {
-        for byte in (field as u64).to_be_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-    }
-    hash
+/// `Status::digest` after `record`: xxh3-64 over the digest before it and
+/// the record's bytes, so it covers every record applied, in order.
+fn fold_digest(digest: u64, record: &[u8]) -> u64 {
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(&digest.to_be_bytes());
+    hasher.update(record);
+    hasher.digest()
 }
 
 /// What every node of one cluster must share, as one number (ADR-0008
 /// step 7a, D-104 A): the voters, the first slot and its owner — they fix
-/// the schedule — the timing and the bounds that decide liveness and what
-/// a batch may hold, and the `apply` limits, part of what the log means.
+/// the schedule — and the timing and the bounds that decide liveness and
+/// what a batch may hold.
 /// Sent in every HELLO; a link with another digest is refused, and a data
 /// directory keeps the digest it was first used with. Addresses are not in
 /// it: a node may listen on `0.0.0.0` while its peers name it by host.
@@ -349,19 +267,8 @@ pub fn cluster_digest(config: &NodeConfig) -> u64 {
         config.max_frame as u64,
         lag_records,
         lag_ticks,
-        limits_digest(&config.limits),
+        config.max_record as u64,
     ]);
-    // Nothing for a cluster without step 7c, so its digest, and every data
-    // directory pinned to it, stays as it was.
-    let fields = fields.chain(config.sessions.into_iter().flat_map(|c| {
-        [
-            u64::MAX - 1,
-            c.connect_window,
-            c.max_connect_tombstones as u64,
-            c.max_persisted_sessions as u64,
-            c.max_detached_queued_bytes as u64,
-        ]
-    }));
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for field in fields {
         for byte in field.to_be_bytes() {
@@ -409,9 +316,8 @@ fn pin_cluster(data: &Path, digest: u64) -> Result<(), NodeError> {
     }
 }
 
-/// The next incarnation of this node, durable before it is used: the
-/// gateway numbers its sessions from it, and no number may serve two
-/// incarnations (`gateway::Config::first_session`).
+/// The next incarnation of this node, durable before it is used: peers
+/// learn from it that a new process speaks (D-151 A).
 fn incarnation(data: &Path) -> Result<u64, NodeError> {
     let path = data.join("incarnation");
     let mut previous = [0u8; 8];
@@ -433,26 +339,11 @@ fn incarnation(data: &Path) -> Result<u64, NodeError> {
     Ok(next)
 }
 
-/// What the node loop owns besides the applied state.
+/// What the node loop owns besides the applied position.
 struct Loop {
     core: Voter,
     links: BTreeMap<u8, mpsc::Sender<Frame>>,
-    gateway: Option<Gateway>,
-    conns: HashMap<u64, mqtt::Conn>,
-    /// Connections whose reader waits for the gateway to want more.
-    paused: BTreeSet<u64>,
-    /// Credentials (D-158 A), the checks allowed to run at once, the checks
-    /// in flight by connection, and where their verdicts go: back in as
-    /// MQTT events.
-    authority: Option<Arc<auth::Authority>>,
-    permits: Arc<tokio::sync::Semaphore>,
-    checks: Checks,
-    mqtt_events: mpsc::Sender<mqtt::Event>,
-    /// Connections not yet admitted, by source (D-165 A); shared with the
-    /// accept loop, which counts them in.
-    waiting: Arc<mqtt::Waiting>,
-    unadmitted: HashMap<u64, std::net::IpAddr>,
-    started: tokio::time::Instant,
+    max_record: usize,
     /// What this node measures about itself (D-112); refusals and give-ups
     /// among it (D-115 A: counted, never silent).
     measured: metrics::Measured,
@@ -468,13 +359,9 @@ enum TraceRequest {
 }
 
 impl Loop {
-    fn now(&self) -> Duration {
-        self.started.elapsed()
-    }
-
     /// What `Node::metrics` hands out: the measurements, the cores' counts
     /// and the status, read together in one pass of the loop.
-    fn snapshot(&self, id: u8, applied: u64) -> metrics::Snapshot {
+    fn snapshot(&self, id: u8, applied: u64, digest: u64) -> metrics::Snapshot {
         let m = &self.measured;
         metrics::Snapshot {
             node: id,
@@ -482,7 +369,7 @@ impl Loop {
                 end: self.core.end(),
                 commit: self.core.commit(),
                 applied,
-                digest: 0,
+                digest,
                 slot: self.core.slot(),
                 leading: self.core.leading(),
                 refused: m.refused,
@@ -491,7 +378,6 @@ impl Loop {
             durable: self.core.durable(),
             voter: self.core.stats(),
             replicas: self.core.replicas(),
-            gateway: self.gateway.as_ref().map(Gateway::load),
             accepted: m.accepted,
             refused: m.refused,
             committed: m.committed,
@@ -509,14 +395,27 @@ impl Loop {
             own: m.own,
             replica_progress: m.replicas.clone(),
             flights: m.flights.clone(),
-            serving: self.gateway.as_ref().is_some_and(Gateway::ready),
-            refused_at_accept: self.waiting.refused(),
         }
     }
 
     /// This node's own proposal: the core holds it until its record
-    /// commits and sends it when a sequencer can take it (D-109 B).
+    /// commits and sends it when a sequencer can take it (D-109 B). One
+    /// past `max_record`, with the origin property the core adds
+    /// (`Voter::submit`), is refused: a batch of the largest must fit a
+    /// frame.
     fn propose(&mut self, proposal: Proposal) {
+        let origin = 3 + usize::from(journal::ORIGIN_BYTES);
+        if proposal
+            .body
+            .len()
+            .saturating_add(proposal.properties.len())
+            .saturating_add(origin)
+            > self.max_record
+        {
+            self.measured.refused();
+            tracing::warn!("proposal refused: larger than max_record");
+            return;
+        }
         if self.core.submit(proposal).is_ok() {
             self.measured.accepted(tokio::time::Instant::now());
         } else {
@@ -525,200 +424,6 @@ impl Loop {
                 "proposal refused: this node holds a full queue of uncommitted proposals"
             );
         }
-    }
-
-    /// Carries out what the gateway asked for, until it asks nothing.
-    fn gateway_actions(&mut self) {
-        loop {
-            let Some(gateway) = self.gateway.as_mut() else {
-                return;
-            };
-            let actions = gateway.take_actions();
-            if actions.is_empty() {
-                return;
-            }
-            for action in actions {
-                match action {
-                    Action::Propose(proposal) => {
-                        let mut body = Vec::new();
-                        if proposal.encode(&mut body).is_err() {
-                            // The gateway checks lengths before it proposes.
-                            tracing::error!("a gateway proposal does not encode");
-                            continue;
-                        }
-                        self.propose(Proposal {
-                            kind: proposal.kind(),
-                            properties: proposal.properties().to_vec(),
-                            body,
-                        });
-                    }
-                    Action::Send { conn, bytes } => {
-                        let full = self
-                            .conns
-                            .get(&conn)
-                            .is_some_and(|c| c.writer.try_send(bytes).is_err());
-                        if full {
-                            // The client does not read: closed, not buffered
-                            // without bound.
-                            self.drop_conn(conn);
-                            if let Some(g) = self.gateway.as_mut() {
-                                g.closed(conn);
-                            }
-                        }
-                    }
-                    Action::Close { conn } => self.drop_conn(conn),
-                    Action::Authenticate {
-                        conn,
-                        username,
-                        password,
-                    } => self.authenticate(conn, username, password),
-                }
-            }
-        }
-    }
-
-    /// Checks a CONNECT's credentials off the loop (D-158 A). A password
-    /// hash is slow by design and argon2 takes about 19 MiB a check, so at
-    /// most one check per CPU runs at once, on a blocking thread, holding
-    /// its permit until the hash is done. A check belongs to its
-    /// connection: the connection going cancels it while it waits, so the
-    /// waiting checks are at most the gateway's connections, each holding
-    /// one CONNECT's user name and password. The verdict comes back in as
-    /// an MQTT event. Without credentials, or if the check fails to run,
-    /// the client is refused: never let in.
-    fn authenticate(
-        &mut self,
-        conn: u64,
-        username: Option<bytes::Bytes>,
-        password: Option<bytes::Bytes>,
-    ) {
-        let authority = self.authority.clone();
-        let permits = Arc::clone(&self.permits);
-        let events = self.mqtt_events.clone();
-        let task = tokio::spawn(async move {
-            let verdict = match (authority, permits.acquire_owned().await) {
-                (Some(authority), Ok(permit)) => tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    match authority.authenticate(username.as_deref(), password.as_deref()) {
-                        auth::Authenticated::Allowed(permissions) => {
-                            gateway::Verdict::Allowed(Box::new(Rules(permissions)))
-                        }
-                        auth::Authenticated::BadCredentials => gateway::Verdict::BadCredentials,
-                        auth::Authenticated::NotAuthorized => gateway::Verdict::NotAuthorized,
-                    }
-                })
-                .await
-                .unwrap_or(gateway::Verdict::NotAuthorized),
-                _ => gateway::Verdict::NotAuthorized,
-            };
-            let _ = events
-                .send(mqtt::Event::Authenticated { conn, verdict })
-                .await;
-        });
-        self.checks.start(conn, task.abort_handle());
-    }
-
-    /// Dropping the handle closes the socket once its queue is written; a
-    /// credentials check still waiting is cancelled.
-    fn drop_conn(&mut self, conn: u64) {
-        self.conns.remove(&conn);
-        self.paused.remove(&conn);
-        self.checks.cancel(conn);
-        if let Some(source) = self.unadmitted.remove(&conn) {
-            self.waiting.leave(source);
-        }
-    }
-
-    /// A connection the gateway has admitted no longer waits (D-165 A).
-    fn admitted(&mut self, conn: u64) {
-        let open = self
-            .gateway
-            .as_ref()
-            .is_some_and(|g| g.session(conn).is_some());
-        if open {
-            if let Some(source) = self.unadmitted.remove(&conn) {
-                self.waiting.leave(source);
-            }
-        }
-    }
-
-    fn credit(&mut self, conn: u64) {
-        // Backpressure from the outbox too (D-120 A): while it is full, no
-        // client is read, so a publish waits in TCP instead of being refused.
-        let room = !self.core.outbox_full();
-        let wants = room && self.gateway.as_ref().is_some_and(|g| g.wants_read(conn));
-        match self.conns.get(&conn) {
-            Some(c) if wants => {
-                let _ = c.credit.try_send(());
-            }
-            Some(_) => {
-                self.paused.insert(conn);
-            }
-            None => {}
-        }
-    }
-
-    /// Gives a credit to every paused connection the gateway would now read.
-    fn resume(&mut self) {
-        if self.core.outbox_full() {
-            return;
-        }
-        let Some(gateway) = self.gateway.as_ref() else {
-            return;
-        };
-        let ready: Vec<u64> = self
-            .paused
-            .iter()
-            .copied()
-            .filter(|&c| gateway.wants_read(c))
-            .collect();
-        for conn in ready {
-            self.paused.remove(&conn);
-            if let Some(c) = self.conns.get(&conn) {
-                let _ = c.credit.try_send(());
-            }
-        }
-    }
-
-    fn mqtt(&mut self, event: mqtt::Event) {
-        let now = self.now();
-        let Some(gateway) = self.gateway.as_mut() else {
-            return;
-        };
-        match event {
-            mqtt::Event::Opened {
-                conn,
-                handle,
-                source,
-            } => {
-                // Refused: the handle is dropped and the socket closes.
-                if gateway.accept(conn, now) {
-                    self.conns.insert(conn, handle);
-                    self.unadmitted.insert(conn, source);
-                    self.credit(conn);
-                } else {
-                    self.waiting.leave(source);
-                }
-            }
-            mqtt::Event::Bytes { conn, bytes } => {
-                gateway.received(conn, &bytes, now);
-                self.gateway_actions();
-                self.credit(conn);
-                self.admitted(conn);
-            }
-            mqtt::Event::Closed { conn } => {
-                gateway.closed(conn);
-                self.drop_conn(conn);
-            }
-            mqtt::Event::Authenticated { conn, verdict } => {
-                gateway.authenticated(conn, verdict, now);
-                self.checks.finished(conn);
-                self.gateway_actions();
-                self.credit(conn);
-                self.admitted(conn);
-            }
-        }
-        self.gateway_actions();
     }
 }
 
@@ -738,22 +443,14 @@ impl Node {
         let chain = recovered.chain;
         // The snapshot, then the log after it, with nothing between them.
         let end = chain.next_lsn().saturating_sub(1);
-        let (snapshot_slots, state) = match (&recovered.snapshot, config.sessions) {
-            (Some(bytes), None) => {
-                let (slots, state) = decode_snapshot(bytes)?;
-                (slots, State::decode(config.limits, state)?)
-            }
-            (Some(bytes), Some(connect)) => {
-                let (slots, state) = decode_snapshot(bytes)?;
-                (slots, State::decode_connect(config.limits, connect, state)?)
-            }
-            (None, None) => (Vec::new(), State::new(config.limits)),
-            (None, Some(connect)) => (Vec::new(), State::with_connect(config.limits, connect)),
+        let (snapshot_slots, applied, applied_digest) = match &recovered.snapshot {
+            Some(bytes) => decode_snapshot(bytes)?,
+            None => (Vec::new(), 0, 0),
         };
         let first = recovered.first.unwrap_or(end.saturating_add(1));
-        if state.applied().saturating_add(1) < first || state.applied() > end {
+        if applied.saturating_add(1) < first || applied > end {
             return Err(NodeError::SnapshotGap {
-                snapshot: state.applied(),
+                snapshot: applied,
                 first,
                 end,
             });
@@ -775,9 +472,9 @@ impl Node {
         let slot = config.core.slot;
         let id = config.core.id;
 
-        // This process's life, durable before use: numbers the gateway's
-        // sessions, orders this node's reports past its restarts, and tells
-        // peers in HELLO that this is a new process (D-151 A).
+        // This process's life, durable before use: orders this node's
+        // reports past its restarts, and tells peers in HELLO that this is
+        // a new process (D-151 A).
         let life = incarnation(&config.data)?;
 
         let (inbound, mut inbound_rx) = mpsc::channel::<link::Inbound>(1024);
@@ -831,55 +528,14 @@ impl Node {
                 config.tls.clone(),
             )));
         }
-        let started = tokio::time::Instant::now();
-        let (mqtt_tx, mut mqtt_rx) = mpsc::channel::<mqtt::Event>(1024);
-        let waiting = Arc::new(mqtt::Waiting::new(MAX_WAITING_PER_SOURCE));
-        let mut mqtt_listen = None;
         let mut metrics_listen = None;
-        let gateway = match &config.mqtt {
-            Some(m) => {
-                let first_session = life << 32;
-                let listener = Listener::bind(
-                    TransportConfig {
-                        listen: m.listen,
-                        ..config.transport
-                    },
-                    Arc::clone(&budget),
-                    m.tls.clone(),
-                )?;
-                mqtt_listen = Some(listener.local_addr()?);
-                tasks.push(tokio::spawn(mqtt::listen(
-                    listener,
-                    m.write_queue,
-                    mqtt::Handshakes {
-                        within: m.gateway.connect_timeout,
-                        at_once: m.gateway.max_connections,
-                    },
-                    Arc::clone(&waiting),
-                    mqtt_tx.clone(),
-                )));
-                Some(Gateway::new(
-                    gateway::Config {
-                        node: id,
-                        first_session,
-                        authenticate: m.authority.is_some(),
-                        connect_through_log: config.sessions.is_some(),
-                        ..m.gateway
-                    },
-                    started.elapsed(),
-                ))
-            }
-            None => None,
-        };
-
         let (proposals, mut proposals_rx) = mpsc::channel::<Proposal>(1024);
-        let (effects, _) = broadcast::channel(4096);
+        let (records, _) = broadcast::channel(4096);
         let (status_tx, status) = watch::channel(Status::default());
         let (ended_tx, ended) = watch::channel(());
         let (stop, mut stop_rx) = oneshot::channel::<()>();
         let (hand_offs, mut hand_offs_rx) =
             mpsc::channel::<oneshot::Sender<Result<(), cluster::ClusterError>>>(4);
-        let (reloads, mut reloads_rx) = mpsc::channel::<Arc<auth::Authority>>(4);
         // Snapshots on demand (D-112): nothing is built while nobody asks.
         let (metrics, mut metrics_rx) = mpsc::channel::<oneshot::Sender<metrics::Snapshot>>(4);
         let (trace, mut trace_rx) = mpsc::channel::<TraceRequest>(4);
@@ -897,7 +553,7 @@ impl Node {
             cluster::merge_slots(&snapshot_slots, &recovered.slots),
             recovered.promised,
         )
-        .knowing_commit(state.applied())
+        .knowing_commit(applied)
         // What forwarding waits for after a restart: the slot of the last
         // committed record, from the snapshot until the replay passes it.
         .knowing_applied_slot(snapshot_slots.last().map(|&(slot, _)| slot))
@@ -909,48 +565,33 @@ impl Node {
         let mut node = Loop {
             core,
             links,
-            gateway,
-            conns: HashMap::new(),
-            paused: BTreeSet::new(),
-            authority: config.mqtt.as_ref().and_then(|m| m.authority.clone()),
-            checks: Checks::default(),
-            permits: Arc::new(tokio::sync::Semaphore::new(
-                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-            )),
-            mqtt_events: mqtt_tx.clone(),
-            waiting: Arc::clone(&waiting),
-            unadmitted: HashMap::new(),
-            started,
+            max_record: config.max_record,
             measured: metrics::Measured::default(),
             trace: metrics::Trace::default(),
         };
-        // The gateway's NodeReset goes to the log before anything else.
-        node.gateway_actions();
-        let effects_tx = effects.clone();
+        let records_tx = records.clone();
         let heartbeat = config.heartbeat;
         let snapshot_every = config.snapshot_every.max(1);
-        let sessions = config.sessions.is_some();
         // At most half a frame (`NodeConfig::check`): the batches read go
         // out in one.
         let read_bytes = config.read_bytes;
-        let mut state = state;
+        let (mut applied, mut digest) = (applied, applied_digest);
         // The committed log's slot table, from committed records only, kept
         // to go into the next snapshot and pruned by each compaction
         // (D-73 A, D-79 A).
         let mut committed_slots = snapshot_slots;
         tasks.push(tokio::spawn(async move {
             // However the loop ends — stopped, a failed log, a record that
-            // does not apply, a panic — this is dropped, and `Node::stopped`
+            // does not decode, a panic — this is dropped, and `Node::stopped`
             // sees the channel close (D-152 A).
             let _ended = ended_tx;
-            let mut snapshot = state.applied();
+            let mut snapshot = applied;
             let mut snapshotting = false;
             let mut retained_floor = 0u64;
             // Appended by this process and not yet applied: bounded by the
             // sequencer's uncommitted bound and the replication window.
             let mut recent: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
             let mut reading = false;
-            let mut last = Status::default();
             let mut tick = tokio::time::interval(heartbeat);
             loop {
                 tokio::select! {
@@ -969,13 +610,7 @@ impl Node {
                             node.core.commit(),
                             tokio::time::Instant::now(),
                         );
-                        let now = node.now();
-                        if let Some(g) = node.gateway.as_mut() {
-                            g.tick(now);
-                        }
-                        node.gateway_actions();
                     }
-                    Some(event) = mqtt_rx.recv() => node.mqtt(event),
                     // A HELLO after the first is ignored; forwards are messages.
                     Some((from, frame)) = inbound_rx.recv() => {
                         if let Frame::Message(message) = frame {
@@ -998,15 +633,8 @@ impl Node {
                     Some(reply) = hand_offs_rx.recv() => {
                         let _ = reply.send(node.core.hand_off());
                     }
-                    // Checks already running keep the credentials they started
-                    // with; open sessions keep their grants (D-166 A).
-                    Some(authority) = reloads_rx.recv() => {
-                        if node.authority.is_some() {
-                            node.authority = Some(authority);
-                        }
-                    }
                     Some(reply) = metrics_rx.recv() => {
-                        let _ = reply.send(node.snapshot(id, state.applied()));
+                        let _ = reply.send(node.snapshot(id, applied, digest));
                     }
                     Some(request) = trace_rx.recv() => match request {
                         TraceRequest::Start(capacity) => node.trace.start(capacity),
@@ -1158,11 +786,10 @@ impl Node {
                         }
                     }
                 }
-                // Apply what is committed, in order; each record's effects
-                // reach the gateway before the next record is applied.
+                // Hand out what is committed, in order.
                 let commit = node.core.commit();
-                while state.applied() < commit {
-                    let next = state.applied().saturating_add(1);
+                while applied < commit {
+                    let next = applied.saturating_add(1);
                     let Some(record) = recent.remove(&next) else {
                         // Older than this process: read it back.
                         if !reading {
@@ -1186,74 +813,43 @@ impl Node {
                     node.measured
                         .left_outbox(lost, confirmed, tokio::time::Instant::now());
                     if lost > 0 {
-                        tracing::warn!(lost, "proposals lost before a later one of this node committed; their publishers time out");
+                        tracing::warn!(lost, "proposals lost before a later one of this node committed");
                     }
-                    let mut out = Vec::new();
-                    let mut clients = Vec::new();
-                    let applied = if sessions {
-                        state.apply_connect(&decoded, &mut out, &mut clients)
-                    } else {
-                        state.apply(&decoded, &mut out)
-                    };
-                    if let Err(error) = applied {
-                        tracing::error!(%error, "a committed record does not apply; the node stops");
-                        return;
+                    applied = next;
+                    digest = fold_digest(digest, &record);
+                    // Copied only while someone listens.
+                    if records_tx.receiver_count() > 0 {
+                        let _ = records_tx.send(Committed {
+                            lsn: decoded.lsn,
+                            slot: decoded.slot,
+                            kind: decoded.kind,
+                            properties: decoded.properties.bytes().to_vec(),
+                            body: decoded.body.to_vec(),
+                        });
                     }
-                    if let Some(g) = node.gateway.as_mut() {
-                        // What a `Connect` proposed from now on has seen.
-                        g.applied(next);
-                    }
-                    if out.is_empty() && clients.is_empty() {
-                        continue;
-                    }
-                    // Observers see an effect before any client does: a test
-                    // can then check a PUBACK came after its commit.
-                    // Cloned only for a test that listens.
-                    if effects_tx.receiver_count() > 0 {
-                        let _ = effects_tx.send((next, decoded.slot, out.clone()));
-                    }
-                    let now = node.now();
-                    if let Some(g) = node.gateway.as_mut() {
-                        // Step 7c's first: a resumed session is open before
-                        // what drains to it arrives.
-                        for effect in &clients {
-                            g.client_effect(effect, now);
-                        }
-                        for effect in &out {
-                            g.effect(effect, now);
-                        }
-                    }
-                    node.gateway_actions();
                 }
                 let now = tokio::time::Instant::now();
                 node.measured.committed_through(commit, now);
                 node.measured
                     .roles(node.core.taking(), node.core.leading(), node.core.slot(), now);
                 node.measured.blocked(node.core.outbox_full(), now);
-                node.resume();
                 // Only what is durable here: a restart must find the log up
                 // to the snapshot, or it could not check the two meet.
                 if !snapshotting
-                    && state.applied().saturating_sub(snapshot) >= snapshot_every
-                    && state.applied() <= node.core.durable()
+                    && applied.saturating_sub(snapshot) >= snapshot_every
+                    && applied <= node.core.durable()
                 {
-                    let bytes = encode_snapshot(&committed_slots, &state);
+                    let bytes = encode_snapshot(&committed_slots, applied, digest);
                     let _ = wal.send(wal::Command::Snapshot {
-                        lsn: state.applied(),
+                        lsn: applied,
                         bytes,
                     });
                     snapshotting = true;
                 }
-                // The digest hashes the whole state: only when it changed.
-                let digest = if state.applied() == last.applied {
-                    last.digest
-                } else {
-                    state.digest()
-                };
-                last = Status {
+                let last = Status {
                     end: node.core.end(),
                     commit,
-                    applied: state.applied(),
+                    applied,
                     digest,
                     slot: node.core.slot(),
                     leading: node.core.leading(),
@@ -1270,14 +866,12 @@ impl Node {
 
         Ok(Self {
             listen,
-            mqtt: mqtt_listen,
             proposals,
             hand_offs,
-            reloads,
             metrics,
             metrics_listen,
             trace,
-            effects,
+            records,
             status,
             ended,
             stop: Some(stop),
@@ -1287,16 +881,10 @@ impl Node {
     }
 
     /// Proposes a record: to the log if this node is the sequencer, over
-    /// the link to it otherwise.
+    /// the link to it otherwise. Its properties are the caller's, followed
+    /// by this node's origin property.
     pub async fn propose(&self, proposal: Proposal) {
         let _ = self.proposals.send(proposal).await;
-    }
-
-    /// Credentials for the CONNECTs from now on (D-166 A): the caller has
-    /// checked them. Only replaces credentials the node started with, never
-    /// turns them on. `false` once the node stopped.
-    pub async fn reload_authority(&self, authority: Arc<auth::Authority>) -> bool {
-        self.reloads.send(authority).await.is_ok()
     }
 
     /// Asks this node to hand its slot over to the next owner in the
@@ -1355,21 +943,22 @@ impl Node {
     }
 
     /// Resolves once the node loop has ended — `shutdown`, or a failure it
-    /// logged: a failed log, a committed record that does not decode or
-    /// apply, or a panic. A node in this state serves nothing; its process
+    /// logged: a failed log, a committed record that does not decode, or a
+    /// panic. A node in this state serves nothing; its process
     /// should exit (D-152 A).
     pub async fn stopped(&self) {
         let mut ended = self.ended.clone();
         while ended.changed().await.is_ok() {}
     }
 
-    /// Every committed record's effects, as this node applies them, with
-    /// its lsn and slot: `(lsn, slot, effects)`.
-    pub fn effects(&self) -> broadcast::Receiver<(u64, u64, Vec<Effect>)> {
-        self.effects.subscribe()
+    /// Every committed record, in log order, as this node reaches it. A
+    /// receiver that falls more than 4 096 records behind loses the oldest
+    /// (`RecvError::Lagged`): the log keeps them, this channel does not.
+    pub fn records(&self) -> broadcast::Receiver<Committed> {
+        self.records.subscribe()
     }
 
-    /// Stops the node: its links and connections close, the loop ends, the log thread
+    /// Stops the node: its links close, the loop ends, the log thread
     /// finishes what it was given and exits.
     pub async fn shutdown(mut self) {
         if let Some(stop) = self.stop.take() {
@@ -1393,54 +982,25 @@ mod tests {
 
     #[test]
     fn a_snapshot_body_carries_the_slot_table_and_refuses_a_damaged_one() {
-        let state = State::new(Limits::default());
         let slots = vec![(3, 20), (4, 30)];
-        let bytes = encode_snapshot(&slots, &state);
-        let (decoded, rest) = decode_snapshot(&bytes).unwrap();
-        assert_eq!(decoded, slots);
-        assert_eq!(State::decode(Limits::default(), rest).unwrap(), state);
+        let bytes = encode_snapshot(&slots, 35, 7);
+        assert_eq!(decode_snapshot(&bytes).unwrap(), (slots, 35, 7));
 
-        // Another version, a count past the bytes, a table not ascending.
+        // Another version, a count past the bytes, a table not ascending,
+        // bytes left over, and every cut.
         let mut other = bytes.clone();
-        other[0] = 1;
+        other[0] = 2;
         assert!(decode_snapshot(&other).is_err());
         let mut long = bytes.clone();
         long[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(decode_snapshot(&long).is_err());
-        let backwards = encode_snapshot(&[(4, 30), (3, 20)], &state);
+        let backwards = encode_snapshot(&[(4, 30), (3, 20)], 35, 7);
         assert!(decode_snapshot(&backwards).is_err());
-        for cut in 0..5 {
+        let mut more = bytes.clone();
+        more.push(0);
+        assert!(decode_snapshot(&more).is_err());
+        for cut in 0..bytes.len() {
             assert!(decode_snapshot(&bytes[..cut]).is_err());
         }
-    }
-
-    /// D-158 A: a connection that goes takes its waiting check with it, and
-    /// a second check for one connection replaces the first: the checks
-    /// waiting never outnumber the connections.
-    #[tokio::test]
-    async fn a_check_is_cancelled_with_its_connection() {
-        let permits = Arc::new(tokio::sync::Semaphore::new(0));
-        let waiting = |permits: &Arc<tokio::sync::Semaphore>| {
-            let permits = Arc::clone(permits);
-            tokio::spawn(async move {
-                let _ = permits.acquire_owned().await;
-            })
-        };
-        let mut checks = Checks::default();
-        let (first, second, other) = (waiting(&permits), waiting(&permits), waiting(&permits));
-        checks.start(1, first.abort_handle());
-        checks.start(1, second.abort_handle());
-        checks.start(2, other.abort_handle());
-        assert!(first.await.unwrap_err().is_cancelled(), "replaced");
-        assert_eq!(checks.0.len(), 2);
-        checks.cancel(1);
-        assert!(
-            second.await.unwrap_err().is_cancelled(),
-            "its connection went"
-        );
-        checks.finished(2);
-        assert!(checks.0.is_empty());
-        assert!(!other.is_finished(), "a finished check is not cancelled");
-        other.abort();
     }
 }

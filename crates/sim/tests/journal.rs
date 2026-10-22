@@ -68,7 +68,7 @@ fn run(seed: u64, zeros: bool) -> (u32, u32) {
         let entries: Vec<Entry<'_>> = bodies
             .iter()
             .map(|b| Entry {
-                kind: Kind::Publish,
+                kind: Kind::Data,
                 properties: &[],
                 body: b,
             })

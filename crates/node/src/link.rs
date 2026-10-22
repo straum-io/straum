@@ -249,7 +249,7 @@ pub struct Accepting {
 
 /// Accepts links from peers. A link opens with the sender's HELLO: another
 /// frame version, an unknown node, this node's own id, another slot, or
-/// another configuration digest — cluster parameters or `apply` limits — is
+/// another configuration digest — the cluster's parameters — is
 /// refused. With TLS, the sender's certificate must name the node its
 /// HELLO names, checked before HELLO has any effect (D-171 A).
 pub async fn listen(
@@ -382,7 +382,7 @@ async fn introduced(
                 {
                     tracing::error!(
                         node,
-                        "link refused: unknown node, another slot, or another configuration (cluster parameters or apply limits)"
+                        "link refused: unknown node, another slot, or another configuration (cluster parameters)"
                     );
                     return None;
                 }

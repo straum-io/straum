@@ -1087,8 +1087,8 @@ impl Sequencer {
             // has not reported, and each resend without progress doubles the
             // wait for the next (capped). Resending a window at every
             // heartbeat to a replica that was only slow piled duplicates onto
-            // a slow network until it carried little else (found by the
-            // gateway simulation). A replica stuck on a lost message stops
+            // a slow network until it carried little else (found by a
+            // simulation since removed with MQTT, D-188 A). A replica stuck on a lost message stops
             // advancing, so it is still repaired, within a bounded wait.
             if peer.reported == peer.reported_at_tick {
                 peer.stalled_ticks = peer.stalled_ticks.saturating_add(1);
