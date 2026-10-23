@@ -9,7 +9,8 @@ and the build and release setup the new code will use:
 - `crates/straum-store`: a content-addressed log storage engine on compio
   (one shard, local; [README](crates/straum-store/README.md)).
   `crates/straum-store-bench` is its disk benchmark, `tools/dedup-survey` a
-  duplicate survey over log files.
+  duplicate survey over log files, `tools/block-survey` a block compression
+  survey.
 - `.github/`: CI (`ci.yml`), the release pipeline (`release.yml`), the PR
   body check (`pr-contract.yml`), the Issue and PR templates.
 - `Cargo.toml`, `clippy.toml`: the workspace settings (members under
