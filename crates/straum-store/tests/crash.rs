@@ -30,8 +30,8 @@ fn mode(name: &str) -> WriteMode {
     match name {
         "sequential" => WriteMode::Sequential,
         "parallel" => WriteMode::ParallelSync,
-        // Below most payloads of the writer (up to ~3 KiB): a mix of inline
-        // and segment objects.
+        // Applies to a batch's compressed block (payloads up to ~3 KiB, up
+        // to 16 a batch): a mix of inline and segment blocks.
         "inline" => WriteMode::InlineSmall { threshold: 1024 },
         other => panic!("unknown write mode {other}"),
     }
@@ -41,6 +41,9 @@ fn config(mode_name: &str) -> Config {
     Config {
         segment_max_bytes: 4096,
         write_mode: mode(mode_name),
+        // The dictionary is trained early in the run, so kills also land
+        // before, during and after training.
+        dict_train_bytes: 32 << 10,
         ..Config::default()
     }
 }
@@ -158,6 +161,7 @@ fn sigkill_at_random_points(mode_name: &str) {
     let mut acked: HashMap<(String, u64), Vec<u8>> = HashMap::new();
     let mut killed_mid_run = 0;
     let mut compactions = 0;
+    let mut dictionary = None;
 
     for i in 0..iterations {
         let mut child = Command::new(&exe)
@@ -212,23 +216,32 @@ fn sigkill_at_random_points(mode_name: &str) {
             }
         }
 
-        verify(&dir.0, &acked, i, mode_name);
+        dictionary = verify(&dir.0, &acked, i, mode_name);
     }
     println!(
-        "crash test {mode_name}: {killed_mid_run} kills, {} acknowledged publishes verified, {compactions} completed compactions",
+        "crash test {mode_name}: {killed_mid_run} kills, {} acknowledged publishes verified, {compactions} completed compactions, dictionary {dictionary:?}",
         acked.len()
     );
     assert_eq!(killed_mid_run, iterations);
 }
 
-fn verify(dir: &std::path::Path, acked: &HashMap<(String, u64), Vec<u8>>, i: u64, mode_name: &str) {
+/// Returns the store's dictionary length (`Store::dictionary_bytes`).
+fn verify(
+    dir: &std::path::Path,
+    acked: &HashMap<(String, u64), Vec<u8>>,
+    i: u64,
+    mode_name: &str,
+) -> Option<usize> {
     let rt = compio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let store = match Store::open(dir, config(mode_name)).await {
             Ok(store) => store,
             Err(e) => panic!("iteration {i}: recovery failed: {e}"),
         };
-        for ((topic, seq), payload) in acked {
+        // In topic order, so consecutive reads share decompressed blocks.
+        let mut sorted: Vec<_> = acked.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for ((topic, seq), payload) in sorted {
             let got = store.read(topic.as_bytes(), *seq).await.unwrap();
             assert_eq!(
                 got.as_ref(),
@@ -252,5 +265,6 @@ fn verify(dir: &std::path::Path, acked: &HashMap<(String, u64), Vec<u8>>, i: u64
         for (id, n) in &counts {
             assert_eq!(store.refcount(id), Some(*n), "iteration {i}: refcount");
         }
-    });
+        store.dictionary_bytes()
+    })
 }

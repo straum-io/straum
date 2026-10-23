@@ -13,7 +13,7 @@ use straum_store::{Config, Message, Store, StoreError};
 
 const BATCHES: u8 = 5;
 
-/// A WAL of 5 frames, one per batch (PutObject + Publish each).
+/// A WAL of 5 frames, one per batch (PutBlock + PutObject + Publish each).
 async fn build(dir: &Path) {
     let mut store = Store::open(dir, Config::default()).await.unwrap();
     for i in 0..BATCHES {
@@ -206,7 +206,9 @@ async fn old_format_wal_is_unsupported() {
 async fn batch_over_max_frame_is_rejected_before_io() {
     let dir = TempDir::new("walmax");
     let config = Config {
-        // 10 messages need 21 + 10 × (65 + 32) = 991 bytes; 2 need 215.
+        // Bound: frame header 21, PutBlock 75, per message PutObject 73,
+        // Publish 51 and PutTopic 22 (new topic, counted per message).
+        // 10 messages: 1556 bytes; 2: 388.
         max_frame_bytes: 512,
         ..Config::default()
     };

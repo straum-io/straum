@@ -2,8 +2,9 @@
 
 All integers are little-endian. Every variable-length record carries a length
 prefix. CRC32C is Castagnoli (crate `crc32c`). An object id is the 32-byte
-BLAKE3 hash of the object's raw bytes. Code: `src/codec.rs` (WAL, topic index
-entries) and `src/store.rs` (file names, segments).
+BLAKE3 hash of the object's raw bytes. Code: `src/codec.rs` (WAL, raw
+blocks, topic index entries), `src/block.rs` (zstd) and `src/store.rs` (file
+names, segments).
 
 ## Store directory
 
@@ -20,18 +21,54 @@ A topic name is 1 to 100 bytes (`MAX_TOPIC`), so the hex file name (up to 200
 characters plus `.idx`) fits NAME_MAX = 255. Segment ids are never reused: the
 next id is the highest seen in the WAL or on disk plus one.
 
+## Blocks
+
+Objects are stored in blocks. The new objects of one batch (`put_batch`), in
+order of first appearance in the batch, form one block; compaction forms one
+block from the live objects of partly dead blocks. A batch whose objects are
+all known makes no block.
+
+Raw block: every object as `len varint | bytes`, concatenated; object `i` of
+the block is the `i`-th. A zero-length object takes one byte.
+
+Stored block: the raw block compressed with zstd level 1 as one zstd frame,
+with the store's dictionary once one exists. The WAL records the stored
+length, the raw length, the dictionary number (0: none) and the CRC32C of
+the raw block. Reading an object decompresses its block, checks the raw
+length, the CRC and that the block splits into exactly the recorded number
+of objects (any failure is `CorruptBlock`, never data), then checks the
+object's BLAKE3 (`HashMismatch`). The last decompressed blocks are cached
+(`Config::block_cache_blocks`, default 16, least recently used first out).
+
+Block numbers start at 0 and are never reused: the next number is the
+highest in the WAL plus one.
+
+### Dictionary
+
+One dictionary per store, trained once. When the raw bytes of new objects
+stored in blocks without a dictionary reach `Config::dict_train_bytes`
+(default 1 MiB; 0 disables training), the next non-empty batch trains a
+dictionary of at most 64 KiB on the objects of those blocks, in block order,
+at most 10 MiB of samples. The batch's frame carries it in a PutDict record
+before its block, and every later block, compaction's included, uses it.
+Earlier blocks keep no dictionary. Training reads only durable blocks, so a
+batch retried after a crash trains the same dictionary; replay reads the
+dictionary from the WAL and never trains. If zstd builds no dictionary (too
+few or too uniform samples), the PutDict record is empty and training is not
+tried again.
+
 ## Data segment `seg-<id>.dat`
 
-The raw bytes of objects concatenated, without headers or framing:
+Stored blocks concatenated, without headers or framing:
 
 ```text
-offset 0                                                     file len
-| object A (len_A bytes) | object B (len_B bytes) | ... | orphan tail? |
+offset 0                                                       file len
+| block A (len_A bytes) | block B (len_B bytes) | ... | orphan tail? |
 ```
 
-Only the WAL knows where an object lies (PutObject and Compact records).
-Bytes no WAL record points to (orphans of a crash before the WAL fsync) are
-allowed: compaction removes them. A zero-length object takes 0 bytes.
+Only the WAL knows where a block lies (PutBlock and Compact records). Bytes
+no WAL record points to (orphans of a crash before the WAL fsync) are
+allowed: compaction removes them.
 
 ## WAL `wal.log`
 
@@ -44,7 +81,7 @@ rewritten segment).
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 7 |
+| 8 | 4 | `version` u32 = 8 |
 | 12 | 4 | `crc` u32: CRC32C of bytes `[0..12)` |
 
 A new WAL is written to `wal.log.tmp`, synced (`fsync`), renamed to `wal.log`,
@@ -54,7 +91,9 @@ a header, an empty file, another version) is `UnsupportedFormat`, and the file
 is not changed. Earlier versions are not supported: 1 had no mode byte in the
 frame, 2 full ids in Publish and in the topic index, 3 `topic_seq` in topic
 index entries, 4 fixed-width Publish and Release with the topic name, 5
-fixed-width PutObject and PutInline, 6 a topic index of 20-byte entries.
+fixed-width PutObject and PutInline, 6 a topic index of 20-byte entries, 7
+uncompressed objects located by segment offset (PutObject type 1, PutInline
+type 5, Compact type 4).
 
 ### Frame
 
@@ -70,28 +109,32 @@ fixed-width PutObject and PutInline, 6 a topic index of 20-byte entries.
 A frame takes `21 + len` bytes. An unknown `mode` under a valid CRC is
 `CorruptWal`.
 
-`mode` tells whether the frame's object bytes could become durable after the
-frame itself:
+`mode` tells whether the frame's block could become durable after the frame
+itself:
 
-| `mode` | Written by | Object bytes durable before the frame? |
+| `mode` | Written by | Block bytes durable before the frame? |
 |---|---|---|
-| 1 Sequential | a batch in Sequential mode; every `release_before` and compaction frame | yes: the segment fdatasync precedes the frame write; release and compaction frames carry no new bytes (compaction's new segment is synced before its frame) |
+| 1 Sequential | a batch in Sequential mode; every `release_before` and compaction frame | yes: the segment fdatasync precedes the frame write; release frames carry no block, and compaction's new segment is synced before its frame |
 | 2 ParallelSync | a batch in ParallelSync mode | no: the segment and WAL fdatasyncs run concurrently |
-| 3 InlineSmall | a batch in InlineSmall mode | objects in the WAL are inside the frame (CRC); objects in segments: yes, Sequential order (`flush_segment`, then `append_frame` in `put_batch_inner`) |
+| 3 InlineSmall | a batch in InlineSmall mode | an inline block is inside the frame (CRC); a segment block: yes, Sequential order (`flush_segment`, then `append_frame` in `put_batch_inner`) |
 
 `Config::max_frame_bytes` (default 64 MiB) sets the largest frame. An
 operation that would produce a larger frame is rejected with `FrameTooLarge`
-before any I/O; for a batch the bound counts every object as new.
+before any I/O; for a batch the bound counts every object as new, an inline
+block at its threshold or zstd's bound, and a dictionary at 64 KiB when
+training is due.
 
 ### Record
 
 | Field | Size |
 |---|---|
 | `len`: payload length, varint | 1–10 |
-| `type` u8: 1 PutObject, 2 Publish, 3 Release, 4 Compact, 5 PutInline, 6 PutTopic | 1 |
+| `type` u8: 2 Publish, 3 Release, 6 PutTopic, 7 PutBlock, 8 PutInlineBlock, 9 PutObject, 10 PutDict, 11 Compact | 1 |
 | payload by type, below | `len` |
 
-A record has no checksum of its own: the frame CRC covers it.
+A record has no checksum of its own: the frame CRC covers it. Types 1, 4 and
+5 belong to version 7 and earlier; under a valid frame CRC any unknown type
+is `CorruptWal`.
 
 **varint**: unsigned LEB128, 7 bits per byte, low bits first, the high bit of
 a byte meaning "another byte follows"; a u64 takes 1–10 bytes (0–127 one byte,
@@ -106,28 +149,83 @@ trailing bytes are corruption.
 
 Every new object gets a local `object_number` (u64): 0, 1, 2, … in write
 order, never reused (the number of an object removed by compaction is not
-reused either). Compaction does not change it (only the location). The full
-BLAKE3 id is written once, in PutObject or PutInline; Publish and the topic
-index refer to the number. In memory: id → number (deduplication) and number →
-(location, length, refcount); both are rebuilt from PutObject/PutInline. The
-next number after open is the highest in the WAL plus one (the WAL is never
-cut; a future WAL checkpoint has to store it explicitly).
+reused either). Compaction does not change it (only the block and index).
+The full BLAKE3 id is written once, in PutObject; Publish and the topic
+index refer to the number. In memory: id → number (deduplication), number →
+(block, index, refcount), and block number → (location, lengths, dictionary,
+CRC, object count); all are rebuilt from the WAL. The next number after open
+is the highest in the WAL plus one (the WAL is never cut; a future WAL
+checkpoint has to store it explicitly).
 
-### 1 — PutObject (payload 36–72 bytes)
+### Delta bases within a frame
+
+A frame starts with the next object number and the next block number (known
+from earlier frames). A PutBlock or PutInlineBlock number is a delta from the
+next expected block number (normally 0); it then becomes the frame's current
+block, with next index 0. A PutObject number is a delta from the next
+expected object number (normally 0). A PutObject block is a zigzag delta from
+the frame's current block (normally 0), and its index a delta from the
+current block's next index (normally 0); the PutObject then sets both.
+
+### 7 — PutBlock (payload 10–64 bytes)
+
+| Field | Size |
+|---|---|
+| Δ`block_number`, varint: from the expected next block, normally 0 | 1–10 |
+| `segment` varint (never `u64::MAX`) | 1–10 |
+| `offset` varint: offset in the segment | 1–10 |
+| `len` varint: stored (compressed) length | 1–10 |
+| `raw_len` varint | 1–10 |
+| `dict` varint: dictionary number, 0 none | 1–10 |
+| `crc` u32: CRC32C of the raw block | 4 |
+
+The block number must be above every earlier one. The PutObject records of
+its objects follow in the same frame, in index order 0, 1, 2, …; a block
+without objects is `CorruptWal`.
+
+### 8 — PutInlineBlock (payload 7–34 + stored length)
+
+Only in `WriteMode::InlineSmall { threshold }` (default 4096): a batch's
+block whose stored length is at most the threshold is stored inside the WAL
+frame.
+
+| Field | Size |
+|---|---|
+| Δ`block_number`, varint: as in PutBlock | 1–10 |
+| `raw_len` varint | 1–10 |
+| `dict` varint | 1–10 |
+| `crc` u32 | 4 |
+| the stored block, to the end of the payload | the rest |
+
+The block's location is the absolute offset of its stored bytes in
+`wal.log`. **Inline blocks are never reclaimed.** Compaction rewrites
+segments only; reclaiming WAL space needs a WAL checkpoint and truncation,
+which do not exist yet.
+
+### 9 — PutObject (payload 35–62 bytes)
 
 | Field | Size |
 |---|---|
 | `object_id` (BLAKE3), full | 32 |
 | Δ`object_number`, varint: from the expected next number, normally 0 | 1–10 |
-| `segment` varint (never `u64::MAX`) | 1–10 |
-| `offset` varint: offset in the segment | 1–10 |
-| `len` varint: object length, ≤ u32::MAX | 1–5 |
+| Δ`block`, zigzag varint: normally 0 | 1–10 |
+| Δ`index`, varint: normally 0 | 1–10 |
 
-The expected next number at the frame start is the next object number when
-the frame starts; after each PutObject/PutInline it is that record's number
-plus one. Numbers are assigned in order, so the delta is normally 0 (one
-byte). The number must be above every earlier number in the WAL, otherwise
-`CorruptWal`.
+The number must be above every earlier number in the WAL, the block must be
+introduced by the same frame, and the index must be that block's next one;
+otherwise `CorruptWal`. A known id is not written again: Publish refers to
+its number.
+
+### 10 — PutDict (payload 1–10 + dictionary length)
+
+| Field | Size |
+|---|---|
+| `dict_number` varint: 1, 2, … in order | 1–10 |
+| dictionary bytes, to the end of the payload; empty: training built none | 0–65536 |
+
+Written before the first block that uses it, in the same frame. A block
+referring to a dictionary number without a non-empty PutDict before it is
+`CorruptWal`. The writer creates at most one (number 1).
 
 ### 6 — PutTopic (payload 1–10 + name length)
 
@@ -152,8 +250,7 @@ a number that has no PutTopic is `CorruptWal`.
 
 Deltas are taken within the frame, from the previous Publish of the same
 frame. For a frame's first Publish, the object number base is the next object
-number when the frame starts (known from earlier frames: the highest number in
-PutObject/PutInline plus one), and the time base is 0, so the time is written
+number when the frame starts, and the time base is 0, so the time is written
 in full. Deltas are computed modulo 2^64. A repeated message referring to an
 old object gives a negative number delta.
 
@@ -164,40 +261,24 @@ old object gives a negative number delta.
 | `topic_number` varint | 1–10 |
 | `topic_seq` varint: always the topic's first live entry | 1–10 |
 
-### 4 — Compact (payload 20 + 40·`count` bytes)
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 8 | `old` u64: the rewritten segment |
-| 8 | 8 | `new` u64: the new segment; `u64::MAX` = none (no live objects) |
-| 16 | 4 | `count` u32 |
-| 20 + 40·i | 32 | `object_id` of the i-th kept object |
-| 52 + 40·i | 8 | `offset` u64 in `new` |
-
-Objects of `old` not listed are removed. On replay the listed set must equal
-the objects of `old` with refcount > 0, otherwise it is an error.
-
-### 5 — PutInline (payload 33–42 + object length)
-
-Only in `WriteMode::InlineSmall { threshold }` (default 4096): a new object no
-larger than the threshold is stored inside the WAL frame.
+### 11 — Compact (payload 4–31, + 2–20 per kept block, + a rewritten block)
 
 | Field | Size |
 |---|---|
-| `object_id` (BLAKE3), full | 32 |
-| Δ`object_number`, varint: as in PutObject | 1–10 |
-| the object's bytes, to the end of the payload | the rest |
+| `old` varint: the rewritten segment | 1–10 |
+| `new` varint: the new segment; `u64::MAX` = none | 1–10 |
+| `kept` varint: number of blocks copied unchanged | 1–10 |
+| per kept block: `block_number` varint, `offset` varint in `new` | 2–20 each |
+| `rewritten` u8: 0 none, 1 follows | 1 |
+| if 1: `block_number`, `offset`, `len`, `raw_len`, `dict` varints, `crc` u32 | 9–54 |
+| if 1: `count` varint, then `count` object numbers, varints, in index order | 1–10 + 1–10 each |
 
-The object length is the record's `len` minus 32 and minus the length of the
-number varint. The object index records the storage kind and location:
-segment + offset (PutObject) or the absolute offset of the object's bytes in
-`wal.log` (PutInline). On replay the BLAKE3 of the bytes is compared with
-`object_id`; a mismatch under a valid frame CRC is `CorruptWal`.
-Deduplication does not depend on the location: a known id adds a reference.
-
-**Objects in the WAL are never reclaimed.** Compaction rewrites segments only;
-a PutInline object with no references stays in the index and in the WAL.
-Reclaiming them needs a WAL checkpoint and truncation, which do not exist yet.
+On replay, with `B` the blocks of `old`: every kept block is in `B` and holds
+only live objects (refcount > 0); the rewritten block's objects are exactly
+the live objects of the other blocks of `B`; every other object of `B` is
+dead and is removed with its id. Blocks of `B` not kept are removed. Any
+other combination is `CorruptWal`. With `new` = `u64::MAX` there are no kept
+or rewritten blocks.
 
 ### Example: frame 9 (ParallelSync) with a new topic `ab` and two Publish records, next object number 300 at the frame start
 
@@ -239,27 +320,31 @@ its CRC does not match.
 3. A frame with a valid CRC but a `seq` out of order (a gap or a repeat),
    unparsable records, or records contradicting earlier frames is the error
    `CorruptWal { offset, reason }`, and the file is not changed.
-4. The last complete frame: every object it introduces (PutObject) must lie in
-   full in its segment, and the BLAKE3 of the bytes read must equal
-   `object_id`. If not:
+4. The last complete frame: every block it introduces (PutBlock or
+   PutInlineBlock) must be stored in full, decompress to its recorded raw
+   length and CRC, split into its recorded objects, and each object's BLAKE3
+   must equal its `object_id`. If not:
    * `mode` = ParallelSync and nothing follows the frame in the file: the
      frame was never acknowledged (a crash between the WAL and segment
      fdatasyncs). The WAL is cut at the frame start, the segment bytes become
-     orphans for compaction, and the recovery report gets `FrameDropped`;
+     orphans for compaction, and the recovery report gets `FrameDropped`
+     (reason `ObjectMissing`, `BlockCorrupted` or `ObjectHashMismatch`);
    * `mode` = Sequential or InlineSmall: the bytes were durable before the
-     frame, so this is corruption: error `MissingObject` (object absent or
-     short) or `HashMismatch` (wrong bytes), and no file is changed;
+     frame, so this is corruption: error `MissingObject` (block absent or
+     short), `CorruptBlock` (does not decode) or `HashMismatch`, and no file
+     is changed;
    * a torn tail follows the frame: the next frame had started, so this one
      was acknowledged (a frame starts only after the previous one is durable).
      Corruption in any mode: an error, and no file is changed.
 
-   Residual ParallelSync risk: an acknowledged last frame whose object bytes
+   Residual ParallelSync risk: an acknowledged last frame whose block bytes
    are later corrupted on disk cannot be told from a crash before
    acknowledgement; such a frame is dropped (and reported).
-5. Objects of earlier frames are checked at open for presence and bounds
-   only: the object must lie in full within its segment file, otherwise
-   `MissingObject` (an error, not a repair). Their content is not hashed at
-   open; it is checked on every read (`HashMismatch`).
+5. Blocks of earlier frames are checked at open for presence and bounds
+   only: a segment block must lie in full within its segment file, otherwise
+   `MissingObject` (naming the block's lowest-numbered object; an error, not a
+   repair). Their content is not decompressed at open; it is checked on every
+   read (`CorruptBlock`, `HashMismatch`).
 
 ### Recovery report
 
@@ -325,12 +410,14 @@ not treated as an error.
 
 ## Write order (one batch)
 
-`Config::write_mode` sets the mode.
+`Config::write_mode` sets the mode. Before the steps below: deduplication
+by BLAKE3 id, the dictionary if training is due, and the batch's new
+objects compressed into one block.
 
 `Sequential` (default):
 
 ```text
-1. new objects → the active segment, one write per segment
+1. the block → the active segment, one write
    (a new segment: create_new + directory fsync)
 2. fdatasync of every touched segment
 3. the batch's frame → one write to wal.log
@@ -339,8 +426,8 @@ not treated as an error.
 6. acknowledgement
 ```
 
-`InlineSmall`: Sequential order. If the batch holds only objects stored in the
-WAL, steps 1–2 do not happen: one fdatasync per batch.
+`InlineSmall`: Sequential order. If the block is inline (or the batch has
+no new object), steps 1–2 do not happen: one fdatasync per batch.
 
 `ParallelSync`:
 
@@ -355,9 +442,9 @@ WAL, steps 1–2 do not happen: one fdatasync per batch.
 5. acknowledgement
 ```
 
-A crash between steps 3 and 5 can leave a durable frame without durable object
-bytes. Such a frame is the last in the file (the next batch does not start
-before the previous one is acknowledged), and recovery drops it (rule 4
+A crash between steps 3 and 5 can leave a durable frame without durable
+block bytes. Such a frame is the last in the file (the next batch does not
+start before the previous one is acknowledged), and recovery drops it (rule 4
 above).
 
 ## Metadata per message
@@ -366,29 +453,33 @@ For a batch of `b` messages:
 
 | Part | Bytes |
 |---|---|
-| PutObject (new object only) | 2 + 32 + Δnumber 1 + segment 1 + offset 1–4 (segments up to 64 MiB) + length 1–5 |
+| PutObject (new object only) | 2 + 32 + Δnumber 1 + Δblock 1 + Δindex 1 |
+| PutBlock (one per batch with new objects) | 2 + Δnumber 1 + segment 1 + offset 1–4 (segments up to 64 MiB) + length, raw length 1–5 each + dictionary 1 + CRC 4, shared by `b` |
 | Publish | 2 + 4…40: topic number and seq 1–10 each; number and time deltas usually 1 byte each; the time of a frame's first Publish about 6 bytes for millisecond time |
 | frame header | 21 / `b` |
 | topic index entry | ~2 (+ ~9 for a block's first entry and a 4-byte CRC per 64 entries) |
 | PutTopic | once per topic |
+| PutDict | once per store, up to 64 KiB + 3 |
 
-A message with already known bytes has no PutObject. The metadata hardly
-depends on the message size: only the varint lengths of the segment offset and
-the object length do. In `InlineSmall`, for an object up to the threshold,
-PutInline replaces PutObject: 2–3 + 33 bytes of metadata plus the object's
-bytes in the WAL; nothing goes to a segment.
-
-`examples/meta_bytes.rs` measures these from the store's write counters (a
-5-byte topic, millisecond time).
+A message with already known bytes has no PutObject and adds nothing to a
+block. `Stats::metadata_bytes` counts WAL and topic index bytes except inline
+blocks; the dictionary counts as metadata. `examples/meta_bytes.rs` measures
+these from the store's write counters (a 5-byte topic, millisecond time).
 
 ## Compaction order (per rewritten segment)
 
+A segment is rewritten when one of its blocks holds a dead object or the
+file holds bytes no block covers.
+
 ```text
-1. live objects (hash checked) → seg-<new>.dat, fdatasync, directory fsync
+1. blocks whose objects are all live → copied unchanged to seg-<new>.dat
+   (decoded and hash-checked first); live objects of partly dead blocks
+   (hash-checked) → one new block, compressed, appended;
+   fdatasync, directory fsync
 2. a frame with one Compact record → wal.log, fdatasync
 3. the in-memory index switches to new; seg-<old>.dat is deleted
 ```
 
-A crash before step 2 leaves `new`, which the WAL does not refer to; a crash
-after it leaves `old`, which the WAL no longer refers to. Both are deleted at
-open.
+Blocks whose objects are all dead are not copied. A crash before step 2
+leaves `new`, which the WAL does not refer to; a crash after it leaves `old`,
+which the WAL no longer refers to. Both are deleted at open.

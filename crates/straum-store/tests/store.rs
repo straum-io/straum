@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{TempDir, copy_dir, wal_frame_starts};
+use common::{Rng, TempDir, copy_dir, wal_frame_starts};
 use straum_store::{Config, Message, ObjectId, Store, StoreError};
 
 fn msg<'a>(topic: &'a str, payload: &'a [u8]) -> Message<'a> {
@@ -36,10 +36,12 @@ async fn dedup_counts_references_and_keeps_every_sequence() {
     assert_eq!(store.refcount(&ObjectId::of(b"y")), Some(1));
     assert_eq!(store.object_count(), 2);
     assert_eq!(
-        store.stats().segment_bytes,
+        store.stats().payload_bytes_new,
         2,
-        "each distinct object written once"
+        "each distinct object stored once"
     );
+    let block_bytes = store.stats().segment_bytes;
+    assert!(block_bytes > 0, "one compressed block");
     for (topic, seq, want) in [
         ("a", 0, b"x"),
         ("a", 1, b"x"),
@@ -53,7 +55,7 @@ async fn dedup_counts_references_and_keeps_every_sequence() {
 
     // A later batch with known bytes writes nothing to the segment.
     store.put_batch(&[msg("c", b"y")], 2).await.unwrap();
-    assert_eq!(store.stats().segment_bytes, 2);
+    assert_eq!(store.stats().segment_bytes, block_bytes);
     assert_eq!(store.refcount(&ObjectId::of(b"y")), Some(2));
 }
 
@@ -150,9 +152,12 @@ async fn compaction_reclaims_released_objects() {
     assert_eq!(store.release_before(b"a", 3).await.unwrap(), 2);
     assert_eq!(store.refcount(&ObjectId::of(b"dead-1")), Some(0));
 
+    // Each batch block is now partly dead: its live object is recompressed
+    // into a new block.
     let stats = store.compact().await.unwrap();
     assert_eq!(stats.objects_dropped, 2);
-    assert_eq!(stats.bytes_reclaimed, 12);
+    assert_eq!(stats.segments_rewritten, 2);
+    assert!(stats.bytes_reclaimed > 0);
     assert_eq!(store.refcount(&ObjectId::of(b"dead-1")), None);
     assert_eq!(store.refcount(&ObjectId::of(b"live-1")), Some(2));
     assert_eq!(store.object_count(), 2);
@@ -229,10 +234,16 @@ async fn corrupted_object_fails_read() {
         store.put_batch(&[msg("t", b"payload")], 1).await.unwrap();
     }
     let seg = dir.0.join("seg-0000000000000000.dat");
-    std::fs::write(&seg, b"PAYLOAD").unwrap();
+    let mut bytes = std::fs::read(&seg).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x40;
+    std::fs::write(&seg, bytes).unwrap();
     let store = Store::open(&dir.0, Config::default()).await.unwrap();
     let err = store.read(b"t", 0).await.unwrap_err();
-    assert!(matches!(err, StoreError::HashMismatch(_)), "{err}");
+    assert!(
+        matches!(err, StoreError::CorruptBlock { block: 0, .. }),
+        "{err}"
+    );
 }
 
 #[compio::test]
@@ -334,13 +345,15 @@ fn macos_runtime_uses_polling() {
 async fn inline_small_stores_small_objects_in_the_wal() {
     let dir = TempDir::new("inline");
     let config = Config {
-        write_mode: straum_store::WriteMode::InlineSmall { threshold: 16 },
+        write_mode: straum_store::WriteMode::InlineSmall { threshold: 64 },
         ..Config::default()
     };
-    let big = vec![7u8; 100];
+    // Incompressible: its block stays above the threshold.
+    let mut rng = Rng(7);
+    let big: Vec<u8> = (0..200).map(|_| rng.next() as u8).collect();
     {
         let mut store = Store::open(&dir.0, config).await.unwrap();
-        // Inline only: no segment, one fdatasync (the WAL).
+        // An inline block only: no segment, one fdatasync (the WAL).
         store
             .put_batch(&[msg("t", b"small"), msg("t", b"tiny")], 0)
             .await
@@ -348,7 +361,7 @@ async fn inline_small_stores_small_objects_in_the_wal() {
         assert_eq!(store.segment_count(), 0);
         assert_eq!(store.stats().fsyncs, 1);
         assert_eq!(store.stats().segment_bytes, 0);
-        // Mixed: the large object goes to a segment.
+        // The block of the large object goes to a segment.
         store
             .put_batch(&[msg("t", &big), msg("u", b"small")], 1)
             .await
@@ -361,8 +374,8 @@ async fn inline_small_stores_small_objects_in_the_wal() {
         assert_eq!(store.release_before(b"t", 2).await.unwrap(), 3);
         assert_eq!(store.release_before(b"u", 2).await.unwrap(), 1);
         let stats = store.compact().await.unwrap();
-        assert_eq!(stats.objects_dropped, 1, "only the segment object");
-        // Inline objects are not reclaimed: still indexed with no references.
+        assert_eq!(stats.objects_dropped, 1, "only the segment block's object");
+        // Inline blocks are not reclaimed: still indexed with no references.
         assert_eq!(store.refcount(&ObjectId::of(b"tiny")), Some(0));
         assert_eq!(store.refcount(&ObjectId::of(&big)), None);
         store.put_batch(&[msg("v", b"tiny")], 3).await.unwrap();
@@ -404,17 +417,12 @@ async fn dedup_counters_for_repeated_and_distinct_payloads() {
         assert_eq!(s.payload_bytes_received, N * len, "{mode:?}");
         assert_eq!(s.payload_bytes_new, len, "{mode:?}");
         assert_eq!(s.payload_bytes_saved, (N - 1) * len, "{mode:?}");
-        // Inline: the object's bytes are in the WAL but are not metadata.
-        let inline = if mode == WriteMode::INLINE_SMALL {
-            len
+        // Inline: the block's bytes are in the WAL but are not metadata.
+        if mode == WriteMode::INLINE_SMALL {
+            assert!(s.metadata_bytes < s.wal_bytes + s.topic_bytes, "{mode:?}");
         } else {
-            0
-        };
-        assert_eq!(
-            s.metadata_bytes,
-            s.wal_bytes + s.topic_bytes - inline,
-            "{mode:?}"
-        );
+            assert_eq!(s.metadata_bytes, s.wal_bytes + s.topic_bytes, "{mode:?}");
+        }
 
         // Distinct payloads: nothing deduplicated.
         let dir = TempDir::new("dedup-distinct");

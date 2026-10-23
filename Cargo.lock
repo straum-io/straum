@@ -964,6 +964,7 @@ dependencies = [
  "crc32c",
  "proptest",
  "thiserror",
+ "zstd",
 ]
 
 [[package]]

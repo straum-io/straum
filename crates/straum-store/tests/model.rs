@@ -50,8 +50,9 @@ struct ModelTopic {
 #[derive(Default)]
 struct Model {
     topics: HashMap<usize, ModelTopic>,
-    /// Payloads in the store's object index, and whether stored inline.
-    /// Dead segment objects leave it at compaction; inline ones never do.
+    /// Payloads in the store's object index, and whether stored in an
+    /// inline block. Dead objects in segment blocks leave it at compaction;
+    /// those in inline blocks never do.
     indexed: HashMap<usize, bool>,
     inline_threshold: Option<usize>,
 }
@@ -108,6 +109,11 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
         let config = Config {
             segment_max_bytes: 64,
             write_mode: mode,
+            // Training runs after a few batches; on these uniform payloads
+            // it may build no dictionary, which is a path too.
+            dict_train_bytes: 256,
+            // Small, so reads also go through eviction.
+            block_cache_blocks: 2,
             ..Config::default()
         };
         let payloads = payloads();
@@ -185,10 +191,11 @@ proptest! {
         store_matches_model(ops, WriteMode::ParallelSync);
     }
 
-    /// Threshold 64: payloads of 0, 1, 7 and 33 bytes go inline, 100 and 300
-    /// to segments.
+    /// Whether a block goes inline depends on its compressed size, which
+    /// the model does not predict: with this threshold every block does.
+    /// The crash test mixes inline and segment blocks.
     #[test]
     fn inline_small_matches_model(ops in prop::collection::vec(op(), 1..40)) {
-        store_matches_model(ops, WriteMode::InlineSmall { threshold: 64 });
+        store_matches_model(ops, WriteMode::InlineSmall { threshold: u32::MAX });
     }
 }

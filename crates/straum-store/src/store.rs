@@ -1,7 +1,10 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
+use std::rc::Rc;
 use std::task::Poll;
 
 use compio::BufResult;
@@ -10,10 +13,13 @@ use compio::fs::{File, OpenOptions};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 
 use crate::StoreError;
+use crate::block::{self, Codecs};
 use crate::codec::{
-    self, FRAME_HEADER, FrameBuilder, FrameMode, INDEX_BLOCK, IndexWriter, MAX_TOPIC, NO_SEGMENT,
-    ObjectId, RECORD_COMPACT_BASE, RECORD_PUBLISH, RECORD_PUT_INLINE_BASE, RECORD_PUT_OBJECT,
-    RECORD_PUT_TOPIC_BASE, RECORD_RELEASE, Record, WAL_FILE_HEADER,
+    self, FRAME_HEADER, FrameBuilder, FrameMode, INDEX_BLOCK, IndexWriter, MAX_TOPIC, MAX_VARINT,
+    NO_DICT, NO_SEGMENT, ObjectId, RECORD_COMPACT_BASE, RECORD_COMPACT_KEPT,
+    RECORD_COMPACT_REWRITTEN, RECORD_PUBLISH, RECORD_PUT_BLOCK, RECORD_PUT_DICT_BASE,
+    RECORD_PUT_INLINE_BLOCK_BASE, RECORD_PUT_OBJECT, RECORD_PUT_TOPIC_BASE, RECORD_RELEASE, Record,
+    Rewritten, WAL_FILE_HEADER,
 };
 
 const WAL_FILE: &str = "wal.log";
@@ -32,10 +38,11 @@ pub enum WriteMode {
     /// segment bytes are not: recovery detects it and drops that frame (it
     /// was never acknowledged).
     ParallelSync,
-    /// Experimental. New objects of at most `threshold` bytes are stored in
-    /// the WAL frame itself; larger ones go to segments, committed as in
-    /// `Sequential`. A batch of inline objects only needs one fdatasync (the
-    /// WAL). Inline bytes are never reclaimed: that needs a WAL checkpoint.
+    /// Experimental. A batch's compressed block of at most `threshold`
+    /// bytes is stored in the WAL frame itself; a larger one goes to a
+    /// segment, committed as in `Sequential`. A batch with an inline block
+    /// only needs one fdatasync (the WAL). Inline blocks are never
+    /// reclaimed: that needs a WAL checkpoint.
     InlineSmall { threshold: u32 },
 }
 
@@ -61,6 +68,14 @@ pub struct Config {
     /// `StoreError::FrameTooLarge`.
     pub max_frame_bytes: u32,
     pub write_mode: WriteMode,
+    /// Decompressed blocks kept for reads, most recently used; 0 keeps none.
+    /// Memory is at most this many times the largest raw block (the new
+    /// objects of one batch).
+    pub block_cache_blocks: usize,
+    /// Raw bytes of new objects stored without a dictionary after which the
+    /// store trains its dictionary, once, on the objects of those blocks.
+    /// 0: never.
+    pub dict_train_bytes: u64,
 }
 
 impl Default for Config {
@@ -69,6 +84,8 @@ impl Default for Config {
             segment_max_bytes: 64 << 20,
             max_frame_bytes: 64 << 20,
             write_mode: WriteMode::Sequential,
+            block_cache_blocks: 16,
+            dict_train_bytes: 1 << 20,
         }
     }
 }
@@ -86,8 +103,9 @@ pub struct Message<'a> {
 pub struct Stats {
     /// `fdatasync`/`fsync` calls on files and directories.
     pub fsyncs: u64,
+    /// Bytes written to segments: compressed blocks.
     pub segment_bytes: u64,
-    /// All WAL bytes, inline object bytes included.
+    /// All WAL bytes, inline blocks included.
     pub wal_bytes: u64,
     pub topic_bytes: u64,
     pub messages_accepted: u64,
@@ -95,12 +113,12 @@ pub struct Stats {
     /// batch): a reference was added, no bytes written.
     pub messages_deduplicated: u64,
     pub payload_bytes_received: u64,
-    /// Payload bytes stored as new objects (in segments or inline).
+    /// Payload bytes stored as new objects, before compression.
     pub payload_bytes_new: u64,
     /// Payload bytes not written because the object already existed.
     pub payload_bytes_saved: u64,
     /// WAL and topic index bytes that are not object bytes: `wal_bytes +
-    /// topic_bytes` minus the inline object bytes in the WAL.
+    /// topic_bytes` minus the inline blocks in the WAL.
     pub metadata_bytes: u64,
 }
 
@@ -111,17 +129,38 @@ pub struct CompactStats {
     pub bytes_reclaimed: u64,
 }
 
-/// Where an object's bytes live.
+/// Where a block's bytes live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Location {
     Segment {
         id: u64,
         offset: u64,
     },
-    /// Absolute offset in `wal.log` (an inline object).
+    /// Absolute offset in `wal.log` (an inline block).
     Wal {
         offset: u64,
     },
+}
+
+/// A compressed run of objects: the new objects of one batch, or the live
+/// objects compaction moved out of partly dead blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Block {
+    loc: Location,
+    /// Stored (compressed) bytes.
+    len: u64,
+    raw_len: u64,
+    dict: u64,
+    /// CRC32C of the raw block.
+    crc: u32,
+    /// Objects the block holds, dead ones included.
+    objects: u64,
+}
+
+/// A decompressed block and the byte range of each of its objects.
+struct Decoded {
+    raw: Vec<u8>,
+    spans: Vec<Range<usize>>,
 }
 
 /// Every change recovery made to the store directory during `Store::open`.
@@ -173,16 +212,21 @@ pub enum RecoveryAction {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropReason {
+    /// The block holding the object is missing or short.
     ObjectMissing,
+    /// The object's bytes do not match its BLAKE3 id.
     ObjectHashMismatch,
+    /// The block does not decompress, or fails its length or CRC check.
+    BlockCorrupted,
 }
 
 struct Object {
     /// Full BLAKE3 id; WAL Publish records and topic indexes use the
     /// object number instead.
     id: ObjectId,
-    loc: Location,
-    len: u32,
+    block: u64,
+    /// Position in the block.
+    index: u64,
     /// Live topic entries pointing at this object.
     refs: u64,
 }
@@ -243,6 +287,18 @@ pub struct Store {
     /// BLAKE3 id → object number, for deduplication.
     ids: HashMap<ObjectId, u64>,
     next_object: u64,
+    /// Block number → block. Numbers are never reused.
+    blocks: HashMap<u64, Block>,
+    next_block: u64,
+    codecs: RefCell<Codecs>,
+    /// Recently decompressed blocks, most recently used last.
+    cache: RefCell<VecDeque<(u64, Rc<Decoded>)>>,
+    /// Raw bytes of new objects stored in blocks without a dictionary: the
+    /// training trigger (`Config::dict_train_bytes`).
+    dictless_raw: u64,
+    /// Length of the dictionary once training ran; `Some(0)` if it built
+    /// none. Training runs once.
+    dictionary: Option<usize>,
     next_topic: u64,
     /// Open handles of every segment the WAL references.
     segments: HashMap<u64, File>,
@@ -252,7 +308,7 @@ pub struct Store {
     wal_buf: Vec<u8>,
     seg_buf: Vec<u8>,
     stats: Stats,
-    /// Inline object bytes written to the WAL since open (InlineSmall).
+    /// Inline block bytes written to the WAL since open (InlineSmall).
     inline_bytes: u64,
     recovery: RecoveryReport,
     poisoned: bool,
@@ -264,10 +320,11 @@ impl Store {
     /// A WAL without this version's file header is `UnsupportedFormat`. A
     /// torn last frame is truncated; a bad frame followed by a valid one is
     /// `WalCorrupted` and nothing is modified. If the last complete frame
-    /// introduces an object that is missing or fails its BLAKE3, the frame is
-    /// dropped only when it was written in ParallelSync and nothing follows
-    /// it (it was never acknowledged); otherwise that is corruption
-    /// (`MissingObject`, `HashMismatch`) and no file is changed. Objects of
+    /// introduces a block that is missing, does not decode, or holds an
+    /// object that fails its BLAKE3, the frame is dropped only when it was
+    /// written in ParallelSync and nothing follows it (it was never
+    /// acknowledged); otherwise that is corruption (`MissingObject`,
+    /// `CorruptBlock`, `HashMismatch`) and no file is changed. Blocks of
     /// earlier frames are checked for presence and bounds only; their content
     /// is verified on read. Recovery then deletes segment files the WAL does
     /// not reference, repairs topic index files from the WAL and recomputes
@@ -288,9 +345,11 @@ impl Store {
         // after it is mid-log damage; the file is then left untouched.
         let mut frames = Vec::new();
         let mut pos = WAL_FILE_HEADER;
-        // Next object number at the start of each frame: the Publish delta
-        // base. Object numbers only grow, so it is the highest seen + 1.
+        // Next object and block numbers at the start of each frame: delta
+        // bases. Both only grow, so each is the highest seen + 1.
         let mut next_object = 0u64;
+        let mut next_block = 0u64;
+        let mut dicts = Vec::new();
         while pos < bytes.len() {
             let offset = pos as u64;
             let Some(frame) = codec::decode_frame(&bytes[pos..]) else {
@@ -307,10 +366,21 @@ impl Store {
                 return Err(corrupt("frame sequence number out of order"));
             }
             let mode = codec::frame_mode(&frame).map_err(corrupt)?;
-            let records = codec::decode_records(&frame, next_object).map_err(corrupt)?;
+            let records =
+                codec::decode_records(&frame, next_object, next_block).map_err(corrupt)?;
             for rec in &records {
-                if let Record::PutObject { number, .. } | Record::PutInline { number, .. } = rec {
-                    next_object = next_object.max(number.saturating_add(1));
+                match rec {
+                    Record::PutObject { number, .. } => {
+                        next_object = next_object.max(number.saturating_add(1));
+                    }
+                    Record::PutBlock { number, .. } | Record::PutInlineBlock { number, .. } => {
+                        next_block = next_block.max(number.saturating_add(1));
+                    }
+                    Record::Compact {
+                        rewritten: Some(r), ..
+                    } => next_block = next_block.max(r.block.saturating_add(1)),
+                    Record::PutDict { data, .. } => dicts.push(*data),
+                    _ => {}
                 }
             }
             pos += frame.size();
@@ -318,28 +388,33 @@ impl Store {
         }
         let torn = pos < bytes.len();
 
-        // The last complete frame's new objects must be fully in their
-        // segments with a matching BLAKE3. Only a ParallelSync frame with
-        // nothing after it can lack them legitimately (crash before it was
-        // acknowledged); it is dropped. Anywhere else the frame was durable
-        // after its object bytes, or was followed by another frame and so
-        // acknowledged: corruption, reported with no file changed.
+        // The last complete frame's new blocks must be fully stored, decode,
+        // and hold objects with a matching BLAKE3. Only a ParallelSync frame
+        // with nothing after it can lack them legitimately (crash before it
+        // was acknowledged); it is dropped. Anywhere else the frame was
+        // durable after its block bytes, or was followed by another frame
+        // and so acknowledged: corruption, reported with no file changed.
         let mut dropped = None;
+        let mut check = codecs_for(&dicts)?;
         if let Some((offset, mode, records)) = frames.last()
-            && let Some((object, reason)) = first_bad_object(&dir, records).await?
+            && let Some(bad) = first_bad_object(&dir, records, &mut check).await?
         {
             if *mode != FrameMode::ParallelSync || torn {
-                return Err(match reason {
-                    DropReason::ObjectMissing => StoreError::MissingObject(object),
-                    DropReason::ObjectHashMismatch => StoreError::HashMismatch(object),
+                return Err(match bad.reason {
+                    DropReason::ObjectMissing => StoreError::MissingObject(bad.object),
+                    DropReason::ObjectHashMismatch => StoreError::HashMismatch(bad.object),
+                    DropReason::BlockCorrupted => StoreError::CorruptBlock {
+                        block: bad.block,
+                        reason: bad.why,
+                    },
                 });
             }
             dropped = Some(RecoveryAction::FrameDropped {
                 frame_seq: frames.len() as u64 - 1,
                 offset: *offset,
                 mode: *mode,
-                object,
-                reason,
+                object: bad.object,
+                reason: bad.reason,
                 bytes_removed: bytes.len() as u64 - offset,
             });
             pos = *offset as usize;
@@ -364,12 +439,14 @@ impl Store {
         let next_frame = frames.len() as u64;
         for (offset, _, records) in frames {
             let body_at = offset + FRAME_HEADER as u64;
+            let corrupt = |reason| StoreError::CorruptWal { offset, reason };
             for rec in records {
-                replay
-                    .apply(rec, body_at)
-                    .map_err(|reason| StoreError::CorruptWal { offset, reason })?;
+                replay.apply(rec, body_at).map_err(corrupt)?;
             }
+            replay.finish_frame().map_err(corrupt)?;
         }
+        let codecs = codecs_for(&replay.dicts)?;
+        let dictionary = replay.dicts.last().map(|d| d.len());
 
         let segments = open_segments(&dir, &mut replay, &mut report).await?;
         let topics = open_topics(&dir, &replay, &mut report).await?;
@@ -391,6 +468,12 @@ impl Store {
             objects: replay.objects,
             ids: replay.ids,
             next_object: replay.next_object,
+            blocks: replay.blocks,
+            next_block: replay.next_block,
+            codecs: RefCell::new(codecs),
+            cache: RefCell::new(VecDeque::new()),
+            dictless_raw: replay.dictless_raw,
+            dictionary,
             next_topic: replay.topic_names.len() as u64,
             segments,
             active: None,
@@ -407,11 +490,12 @@ impl Store {
     /// Durably appends a batch and returns the topic sequence number of each
     /// message, in order.
     ///
-    /// Group commit: new objects go to the active segment in one write per
-    /// segment, followed by one `fdatasync` per segment; then one WAL frame
-    /// holding all records of the batch, one write and one `fdatasync`. Only then does this
-    /// return. Bytes already stored (same BLAKE3 hash) are not written again.
-    /// Timestamps are `now_ms`, raised per topic to keep them non-decreasing.
+    /// Group commit: the batch's new objects (bytes not already stored, by
+    /// BLAKE3 hash) form one block, compressed with zstd, written to the
+    /// active segment in one write and one `fdatasync`; then one WAL frame
+    /// holding all records of the batch, one write and one `fdatasync`. Only
+    /// then does this return. Known bytes only add a reference. Timestamps
+    /// are `now_ms`, raised per topic to keep them non-decreasing.
     pub async fn put_batch(
         &mut self,
         batch: &[Message<'_>],
@@ -424,16 +508,28 @@ impl Store {
             }
             u32::try_from(m.payload.len()).map_err(|_| StoreError::ObjectTooLarge)?;
         }
-        // Upper bound: every object counted as new.
-        let inline = self.config.write_mode.inline_threshold();
+        let train = !batch.is_empty() && self.should_train();
+        // Upper bound: every object counted as new. An inline block is at
+        // most the threshold and at most zstd's bound for the raw block.
+        let block = match self.config.write_mode.inline_threshold() {
+            Some(t) => {
+                let raw: usize = batch.iter().map(|m| MAX_VARINT + m.payload.len()).sum();
+                let inline = t.min(block::compress_bound(raw));
+                RECORD_PUT_BLOCK.max(RECORD_PUT_INLINE_BLOCK_BASE + inline)
+            }
+            None => RECORD_PUT_BLOCK,
+        };
+        let dict = if train {
+            RECORD_PUT_DICT_BASE + block::DICT_SIZE
+        } else {
+            0
+        };
         let frame: usize = FRAME_HEADER
+            + block
+            + dict
             + batch
                 .iter()
                 .map(|m| {
-                    let put = match inline {
-                        Some(t) if m.payload.len() <= t => RECORD_PUT_INLINE_BASE + m.payload.len(),
-                        _ => RECORD_PUT_OBJECT,
-                    };
                     // A new topic adds its PutTopic (counted per message: an
                     // upper bound).
                     let topic = if self.topics.contains_key(m.topic) {
@@ -441,11 +537,11 @@ impl Store {
                     } else {
                         RECORD_PUT_TOPIC_BASE + m.topic.len()
                     };
-                    put + RECORD_PUBLISH + topic
+                    RECORD_PUT_OBJECT + RECORD_PUBLISH + topic
                 })
                 .sum::<usize>();
         self.check_frame(frame)?;
-        let res = self.put_batch_inner(batch, now_ms).await;
+        let res = self.put_batch_inner(batch, now_ms, train).await;
         self.poison_on_err(res)
     }
 
@@ -453,72 +549,127 @@ impl Store {
         &mut self,
         batch: &[Message<'_>],
         now_ms: u64,
+        train: bool,
     ) -> Result<Vec<u64>, StoreError> {
         self.begin_write();
+        let dict = if train {
+            Some(self.train_dictionary().await?)
+        } else {
+            None
+        };
+        let (frame_object, frame_block) = (self.next_object, self.next_block);
+        // New objects, in order of first appearance, form block `block`.
+        let block = self.next_block;
+        let mut raw = Vec::new();
+        let mut numbers = Vec::with_capacity(batch.len());
+        // Added to `stats` once the batch is durable.
+        let (mut deduplicated, mut new_bytes, mut new_objects) = (0, 0, 0);
+        for m in batch {
+            let id = ObjectId::of(m.payload);
+            if let Some(&number) = self.ids.get(&id) {
+                deduplicated += 1;
+                numbers.push((number, false));
+                continue;
+            }
+            let number = self.next_object;
+            self.next_object += 1;
+            codec::push_block_object(&mut raw, m.payload);
+            let object = Object {
+                id,
+                block,
+                index: new_objects,
+                refs: 0,
+            };
+            self.objects.insert(number, object);
+            self.ids.insert(id, number);
+            new_objects += 1;
+            new_bytes += m.payload.len() as u64;
+            numbers.push((number, true));
+        }
+
         let mut seqs = Vec::with_capacity(batch.len());
         let mut wal_buf = std::mem::take(&mut self.wal_buf);
         wal_buf.clear();
-        let mut frame = FrameBuilder::begin(&mut wal_buf, self.next_object);
-        // Added to `stats` once the batch is durable.
-        let (mut deduplicated, mut new_bytes, mut inline_bytes) = (0, 0, 0);
-        for m in batch {
-            let id = ObjectId::of(m.payload);
-            let known = self.ids.get(&id).copied();
-            match known {
-                Some(_) => deduplicated += 1,
-                None => new_bytes += m.payload.len() as u64,
+        let mut frame = FrameBuilder::begin(&mut wal_buf, frame_object, frame_block);
+        if let Some(data) = &dict {
+            // The only dictionary: number 1.
+            let number = 1;
+            frame.record(&mut wal_buf, &Record::PutDict { number, data })?;
+            if !data.is_empty() {
+                self.codecs.get_mut().add_dictionary(number, data)?;
             }
-            let number = match known {
-                Some(number) => number,
-                None => {
-                    let number = self.next_object;
-                    self.next_object += 1;
-                    // Checked in put_batch.
-                    let len = m.payload.len() as u32;
-                    let inline = self.config.write_mode.inline_threshold();
-                    let loc = if inline.is_some_and(|t| m.payload.len() <= t) {
-                        // The frame starts at `wal_len`, at index 0 of the buffer.
-                        let put = Record::PutInline {
-                            id,
-                            number,
-                            data: m.payload,
-                            data_at: 0,
-                        };
-                        frame.record(&mut wal_buf, &put)?;
-                        // The object's bytes end the record just written;
-                        // the frame starts at `wal_len`, at index 0.
-                        let offset = self.wal_len + (wal_buf.len() - m.payload.len()) as u64;
-                        inline_bytes += m.payload.len() as u64;
-                        Location::Wal { offset }
-                    } else {
-                        let (segment, offset) = self.reserve(u64::from(len)).await?;
-                        self.seg_buf.extend_from_slice(m.payload);
-                        let put = Record::PutObject {
-                            id,
-                            number,
-                            segment,
-                            offset,
-                            len,
-                        };
-                        frame.record(&mut wal_buf, &put)?;
-                        Location::Segment {
-                            id: segment,
-                            offset,
-                        }
-                    };
-                    let object = Object {
-                        id,
-                        loc,
-                        len,
-                        refs: 0,
-                    };
-                    self.objects.insert(number, object);
-                    self.ids.insert(id, number);
-                    number
+            self.dictionary = Some(data.len());
+        }
+        let mut inline_bytes = 0;
+        if new_objects > 0 {
+            self.next_block += 1;
+            let codecs = self.codecs.get_mut();
+            let packed = codecs.compress(&raw)?;
+            let dict = codecs.dict();
+            let crc = crc32c::crc32c(&raw);
+            let (len, raw_len) = (packed.len() as u64, raw.len() as u64);
+            let inline = self.config.write_mode.inline_threshold();
+            let loc = if inline.is_some_and(|t| packed.len() <= t) {
+                let put = Record::PutInlineBlock {
+                    number: block,
+                    raw_len,
+                    dict,
+                    crc,
+                    data: &packed,
+                    data_at: 0,
+                };
+                frame.record(&mut wal_buf, &put)?;
+                inline_bytes = len;
+                // The block's bytes end the record just written; the frame
+                // starts at `wal_len`, at index 0 of the buffer.
+                Location::Wal {
+                    offset: self.wal_len + (wal_buf.len() - packed.len()) as u64,
+                }
+            } else {
+                let (segment, offset) = self.reserve(len).await?;
+                self.seg_buf.extend_from_slice(&packed);
+                let put = Record::PutBlock {
+                    number: block,
+                    segment,
+                    offset,
+                    len,
+                    raw_len,
+                    dict,
+                    crc,
+                };
+                frame.record(&mut wal_buf, &put)?;
+                Location::Segment {
+                    id: segment,
+                    offset,
                 }
             };
-            if let Some(object) = self.objects.get_mut(&number) {
-                object.refs += 1;
+            let b = Block {
+                loc,
+                len,
+                raw_len,
+                dict,
+                crc,
+                objects: new_objects,
+            };
+            self.blocks.insert(block, b);
+            if dict == NO_DICT {
+                self.dictless_raw += raw_len;
+            }
+        }
+
+        for (m, (number, new)) in batch.iter().zip(numbers) {
+            let Some(object) = self.objects.get_mut(&number) else {
+                unreachable!("found or inserted above")
+            };
+            object.refs += 1;
+            if new {
+                let put = Record::PutObject {
+                    id: object.id,
+                    number,
+                    block: object.block,
+                    index: object.index,
+                };
+                frame.record(&mut wal_buf, &put)?;
             }
 
             let new_topic = !self.topics.contains_key(m.topic);
@@ -548,8 +699,8 @@ impl Store {
             seqs.push(seq);
         }
         match self.config.write_mode {
-            // InlineSmall keeps Sequential's order for segment objects; with
-            // only inline objects the segment flush is a no-op.
+            // InlineSmall keeps Sequential's order for a segment block; with
+            // an inline block the segment flush is a no-op.
             WriteMode::Sequential => {
                 self.flush_segment().await?;
                 self.append_frame(wal_buf, frame, FrameMode::Sequential)
@@ -564,6 +715,12 @@ impl Store {
         }
         self.write_topic_entries().await?;
         self.in_flight = false;
+        if new_objects > 0 {
+            // Recent objects are the likeliest reads.
+            let spans = codec::split_block(&raw)
+                .map_err(|reason| StoreError::CorruptBlock { block, reason })?;
+            self.cache_insert(block, Rc::new(Decoded { raw, spans }));
+        }
         let received: u64 = batch.iter().map(|m| m.payload.len() as u64).sum();
         let s = &mut self.stats;
         s.messages_accepted += batch.len() as u64;
@@ -573,6 +730,48 @@ impl Store {
         s.payload_bytes_saved += received - new_bytes;
         self.inline_bytes += inline_bytes;
         Ok(seqs)
+    }
+
+    fn should_train(&self) -> bool {
+        self.dictionary.is_none()
+            && self.config.dict_train_bytes > 0
+            && self.dictless_raw >= self.config.dict_train_bytes
+    }
+
+    /// Trains the dictionary on the objects of the blocks stored without
+    /// one, in block order, up to `block::DICT_SAMPLE_CAP` bytes. Depends
+    /// only on durable state, so a batch retried after a crash trains the
+    /// same dictionary; replay reads it from the WAL and never trains.
+    async fn train_dictionary(&self) -> Result<Vec<u8>, StoreError> {
+        let mut numbers: Vec<u64> = self
+            .blocks
+            .iter()
+            .filter(|(_, b)| b.dict == NO_DICT)
+            .map(|(&n, _)| n)
+            .collect();
+        numbers.sort_unstable();
+        let mut decoded = Vec::new();
+        let mut total = 0;
+        for n in numbers {
+            if total >= block::DICT_SAMPLE_CAP {
+                break;
+            }
+            let d = self.block(n).await?;
+            total += d.raw.len();
+            decoded.push(d);
+        }
+        let mut samples = Vec::new();
+        let mut bytes = 0;
+        'blocks: for d in &decoded {
+            for span in &d.spans {
+                if bytes + span.len() > block::DICT_SAMPLE_CAP {
+                    break 'blocks;
+                }
+                bytes += span.len();
+                samples.push(&d.raw[span.clone()]);
+            }
+        }
+        Ok(block::train(&samples))
     }
 
     /// Releases the live entries of `topic` with a timestamp below `cutoff_ms`
@@ -603,7 +802,7 @@ impl Store {
         };
         let mut wal_buf = std::mem::take(&mut self.wal_buf);
         wal_buf.clear();
-        let mut frame = FrameBuilder::begin(&mut wal_buf, self.next_object);
+        let mut frame = FrameBuilder::begin(&mut wal_buf, self.next_object, self.next_block);
         let mut released = 0;
         while let Some(&(number, timestamp)) = topic.live.front() {
             if timestamp >= cutoff_ms {
@@ -637,16 +836,20 @@ impl Store {
         }
     }
 
-    /// Mark and sweep. Marks objects with a non-zero refcount; every segment
-    /// holding a dead object or unreferenced bytes (orphans of a crash) is
-    /// rewritten with only its live objects:
+    /// Mark and sweep. Marks objects with a non-zero refcount. Every segment
+    /// holding a block with a dead object, or unreferenced bytes (orphans of
+    /// a crash), is rewritten: blocks whose objects are all live are copied
+    /// unchanged, blocks whose objects are all dead are dropped, and the
+    /// live objects of partly dead blocks are recompressed together into one
+    /// new block:
     ///
     /// 1. write the new segment, `fdatasync` it, `fsync` the directory
     /// 2. append a frame with one Compact record to the WAL, `fdatasync` it
     /// 3. switch the index to the new segment, delete the old file
     ///
     /// A crash before step 2 leaves an unreferenced new segment and a crash
-    /// after it a stale old one; recovery deletes either.
+    /// after it a stale old one; recovery deletes either. Inline blocks stay
+    /// in the WAL: reclaiming them needs a WAL checkpoint.
     pub async fn compact(&mut self) -> Result<CompactStats, StoreError> {
         self.usable()?;
         let res = self.compact_inner().await;
@@ -658,13 +861,19 @@ impl Store {
         // Seal the active segment so it can be compacted too. Every batch
         // flushed it, so nothing is buffered.
         self.active = None;
-        let mut by_segment: HashMap<u64, Vec<u64>> = HashMap::new();
-        // Inline objects stay in the WAL and in the index even when dead:
-        // reclaiming them needs a WAL checkpoint, which does not exist yet.
-        for (&number, object) in &self.objects {
-            if let Location::Segment { id: segment, .. } = object.loc {
-                by_segment.entry(segment).or_default().push(number);
+        let mut by_segment: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+        for (&number, b) in &self.blocks {
+            if let Location::Segment { id, offset } = b.loc {
+                by_segment.entry(id).or_default().push((offset, number));
             }
+        }
+        // Block → its objects: `(index, object number, live)`.
+        let mut members: HashMap<u64, Vec<(u64, u64, bool)>> = HashMap::new();
+        for (&number, o) in &self.objects {
+            members
+                .entry(o.block)
+                .or_default()
+                .push((o.index, number, o.refs > 0));
         }
         let mut ids: Vec<u64> = self.segments.keys().copied().collect();
         ids.sort_unstable();
@@ -673,77 +882,155 @@ impl Store {
                 continue;
             };
             let file_len = old_file.metadata().await?.len();
-            let members = by_segment.remove(&old).unwrap_or_default();
-            let mut live = Vec::new();
-            let mut live_bytes = 0;
-            for number in &members {
-                if let Some(o) = self.objects.get(number).filter(|o| o.refs > 0) {
-                    live.push(*number);
-                    live_bytes += u64::from(o.len);
+            let mut blocks = by_segment.remove(&old).unwrap_or_default();
+            blocks.sort_unstable();
+            let (mut kept, mut partial, mut dead) = (Vec::new(), Vec::new(), Vec::new());
+            let mut stored = 0;
+            for &(_, n) in &blocks {
+                stored += self.blocks.get(&n).map_or(0, |b| b.len);
+                let objs = members.get(&n).map_or(&[][..], Vec::as_slice);
+                let live = objs.iter().filter(|o| o.2).count();
+                if live == 0 {
+                    dead.push(n);
+                } else if live == objs.len() {
+                    kept.push(n);
+                } else {
+                    partial.push(n);
                 }
             }
-            // Objects never overlap, so equal sizes mean no unreferenced byte.
-            if live.len() == members.len() && live_bytes == file_len {
+            // Blocks never overlap, so equal sizes mean no unreferenced byte.
+            if partial.is_empty() && dead.is_empty() && stored == file_len {
                 continue;
             }
-
-            self.check_frame(FRAME_HEADER + RECORD_COMPACT_BASE + 40 * live.len())?;
+            // Live objects of partly dead blocks, in block then index order.
+            let mut moved = Vec::new();
+            for n in &partial {
+                let mut objs: Vec<_> = members
+                    .get(n)
+                    .map_or(&[][..], Vec::as_slice)
+                    .iter()
+                    .filter(|o| o.2)
+                    .copied()
+                    .collect();
+                objs.sort_unstable();
+                moved.extend(objs.into_iter().map(|(_, number, _)| number));
+            }
+            let rewrite_bound = if moved.is_empty() {
+                0
+            } else {
+                RECORD_COMPACT_REWRITTEN + MAX_VARINT * moved.len()
+            };
+            self.check_frame(
+                FRAME_HEADER
+                    + RECORD_COMPACT_BASE
+                    + RECORD_COMPACT_KEPT * kept.len()
+                    + rewrite_bound,
+            )?;
             self.begin_write();
-            // `(id, new offset)` for the Compact record; numbers to relocate.
-            let mut kept = Vec::with_capacity(live.len());
-            let mut moved = Vec::with_capacity(live.len());
-            let new = if live.is_empty() {
+            let mut kept_at = Vec::with_capacity(kept.len());
+            let mut rewritten = None;
+            let mut new_len = 0;
+            let new = if kept.is_empty() && moved.is_empty() {
                 NO_SEGMENT
             } else {
                 let new = self.next_segment;
                 self.next_segment += 1;
-                let mut buf = Vec::with_capacity(live_bytes as usize);
-                for &number in &live {
-                    // Verifies the hash: corruption is not copied forward.
-                    let (id, bytes) = self.read_object(number).await?;
-                    kept.push((id, buf.len() as u64));
-                    moved.push((number, buf.len() as u64));
-                    buf.extend_from_slice(&bytes);
+                let mut buf = Vec::new();
+                for &n in &kept {
+                    // Verified first: corruption is not copied forward.
+                    let objs = members.get(&n).map_or(&[][..], Vec::as_slice);
+                    let stored = self.load_verified(n, objs).await?;
+                    kept_at.push((n, buf.len() as u64));
+                    buf.extend_from_slice(&stored);
+                }
+                if !moved.is_empty() {
+                    let mut raw = Vec::new();
+                    for &number in &moved {
+                        // Verifies the hash.
+                        let (_, bytes) = self.read_object(number).await?;
+                        codec::push_block_object(&mut raw, &bytes);
+                    }
+                    let codecs = self.codecs.get_mut();
+                    let packed = codecs.compress(&raw)?;
+                    let block = self.next_block;
+                    self.next_block += 1;
+                    rewritten = Some(Rewritten {
+                        block,
+                        offset: buf.len() as u64,
+                        len: packed.len() as u64,
+                        raw_len: raw.len() as u64,
+                        dict: codecs.dict(),
+                        crc: crc32c::crc32c(&raw),
+                        objects: moved,
+                    });
+                    buf.extend_from_slice(&packed);
                 }
                 let file = create_segment(&self.dir, new).await?;
-                let n = buf.len() as u64;
+                new_len = buf.len() as u64;
                 write_all(&file, buf, 0).await.0?;
                 file.sync_data().await?;
                 sync_dir(&self.dir).await?;
                 self.stats.fsyncs += 2;
-                self.stats.segment_bytes += n;
+                self.stats.segment_bytes += new_len;
                 self.segments.insert(new, file);
                 new
             };
 
             let mut wal_buf = std::mem::take(&mut self.wal_buf);
             wal_buf.clear();
-            let mut frame = FrameBuilder::begin(&mut wal_buf, self.next_object);
-            let compact = Record::Compact { old, new, kept };
+            let mut frame = FrameBuilder::begin(&mut wal_buf, self.next_object, self.next_block);
+            let compact = Record::Compact {
+                old,
+                new,
+                kept: kept_at.clone(),
+                rewritten: rewritten.clone(),
+            };
             frame.record(&mut wal_buf, &compact)?;
             self.append_frame(wal_buf, frame, FrameMode::Sequential)
                 .await?;
             self.in_flight = false;
 
-            for number in &members {
-                if self.objects.get(number).is_some_and(|o| o.refs == 0)
-                    && let Some(o) = self.objects.remove(number)
-                {
-                    self.ids.remove(&o.id);
-                    stats.objects_dropped += 1;
+            for n in dead.iter().chain(&partial) {
+                for &(_, number, live) in members.get(n).map_or(&[][..], Vec::as_slice) {
+                    if !live && let Some(o) = self.objects.remove(&number) {
+                        self.ids.remove(&o.id);
+                        stats.objects_dropped += 1;
+                    }
+                }
+                self.blocks.remove(n);
+                self.uncache(*n);
+            }
+            for (n, offset) in kept_at {
+                if let Some(b) = self.blocks.get_mut(&n) {
+                    b.loc = Location::Segment { id: new, offset };
                 }
             }
-            for (number, offset) in moved {
-                if let Some(o) = self.objects.get_mut(&number) {
-                    o.loc = Location::Segment { id: new, offset };
+            if let Some(r) = rewritten {
+                for (index, number) in (0..).zip(&r.objects) {
+                    if let Some(o) = self.objects.get_mut(number) {
+                        o.block = r.block;
+                        o.index = index;
+                    }
                 }
+                let b = Block {
+                    loc: Location::Segment {
+                        id: new,
+                        offset: r.offset,
+                    },
+                    len: r.len,
+                    raw_len: r.raw_len,
+                    dict: r.dict,
+                    crc: r.crc,
+                    objects: r.objects.len() as u64,
+                };
+                self.blocks.insert(r.block, b);
             }
             self.segments.remove(&old);
             // Not followed by a directory fsync: if the unlink is lost, the
             // WAL no longer references the file and recovery deletes it.
             compio::fs::remove_file(segment_path(&self.dir, old)).await?;
             stats.segments_rewritten += 1;
-            stats.bytes_reclaimed += file_len - live_bytes;
+            stats.bytes_reclaimed += file_len.saturating_sub(new_len);
         }
         Ok(stats)
     }
@@ -826,6 +1113,12 @@ impl Store {
         self.segments.len()
     }
 
+    /// Length of the store's compression dictionary; `None` before training
+    /// ran (`Config::dict_train_bytes`), `Some(0)` if training built none.
+    pub fn dictionary_bytes(&self) -> Option<usize> {
+        self.dictionary
+    }
+
     fn check_frame(&self, bytes: usize) -> Result<(), StoreError> {
         if bytes > self.config.max_frame_bytes as usize {
             return Err(StoreError::FrameTooLarge);
@@ -868,35 +1161,126 @@ impl Store {
             .objects
             .get(&number)
             .ok_or(StoreError::UnknownObjectNumber(number))?;
-        let id = &object.id;
-        let (file, offset) = match object.loc {
-            Location::Segment {
-                id: segment,
-                offset,
-            } => (
-                self.segments
-                    .get(&segment)
-                    .ok_or(StoreError::MissingObject(*id))?,
-                offset,
-            ),
+        let d = self.block(object.block).await?;
+        let span = usize::try_from(object.index)
+            .ok()
+            .and_then(|i| d.spans.get(i))
+            .ok_or(StoreError::CorruptBlock {
+                block: object.block,
+                reason: "object index past the end of its block",
+            })?;
+        let bytes = d.raw[span.clone()].to_vec();
+        if ObjectId::of(&bytes) != object.id {
+            return Err(StoreError::HashMismatch(object.id));
+        }
+        Ok((object.id, bytes))
+    }
+
+    /// Block `number`, decompressed and checked, from the cache or disk.
+    async fn block(&self, number: u64) -> Result<Rc<Decoded>, StoreError> {
+        if let Some(d) = self.cached(number) {
+            return Ok(d);
+        }
+        let b = self.stored_block(number)?;
+        let stored = self.read_stored(number, b).await?;
+        let d = decode_block(&mut self.codecs.borrow_mut(), b, &stored).map_err(|reason| {
+            StoreError::CorruptBlock {
+                block: number,
+                reason,
+            }
+        })?;
+        let d = Rc::new(d);
+        self.cache_insert(number, Rc::clone(&d));
+        Ok(d)
+    }
+
+    /// The stored bytes of block `number` after checking that it decodes
+    /// and that each of `objects` matches its BLAKE3 id.
+    async fn load_verified(
+        &self,
+        number: u64,
+        objects: &[(u64, u64, bool)],
+    ) -> Result<Vec<u8>, StoreError> {
+        let b = self.stored_block(number)?;
+        let stored = self.read_stored(number, b).await?;
+        let d = decode_block(&mut self.codecs.borrow_mut(), b, &stored).map_err(|reason| {
+            StoreError::CorruptBlock {
+                block: number,
+                reason,
+            }
+        })?;
+        for &(index, object, _) in objects {
+            let Some(o) = self.objects.get(&object) else {
+                continue;
+            };
+            let span = usize::try_from(index).ok().and_then(|i| d.spans.get(i));
+            if span.is_none_or(|span| ObjectId::of(&d.raw[span.clone()]) != o.id) {
+                return Err(StoreError::HashMismatch(o.id));
+            }
+        }
+        Ok(stored)
+    }
+
+    fn stored_block(&self, number: u64) -> Result<&Block, StoreError> {
+        self.blocks.get(&number).ok_or(StoreError::CorruptBlock {
+            block: number,
+            reason: "block not in the index",
+        })
+    }
+
+    async fn read_stored(&self, number: u64, b: &Block) -> Result<Vec<u8>, StoreError> {
+        let missing = StoreError::CorruptBlock {
+            block: number,
+            reason: "stored bytes missing or truncated",
+        };
+        let (file, offset) = match b.loc {
+            Location::Segment { id, offset } => match self.segments.get(&id) {
+                Some(file) => (file, offset),
+                None => return Err(missing),
+            },
             Location::Wal { offset } => (&self.wal, offset),
         };
-        let len = object.len as usize;
+        let len = usize::try_from(b.len).map_err(|_| StoreError::CorruptBlock {
+            block: number,
+            reason: "block too large for this platform",
+        })?;
         // `slice` caps the read at `len` even if the allocation is larger.
         let BufResult(res, buf) = file
             .read_exact_at(Vec::with_capacity(len).slice(..len), offset)
             .await;
         match res {
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                return Err(StoreError::MissingObject(*id));
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Err(missing),
+            res => {
+                res?;
+                Ok(buf.into_inner())
             }
-            res => res?,
         }
-        let buf = buf.into_inner();
-        if ObjectId::of(&buf) != *id {
-            return Err(StoreError::HashMismatch(*id));
+    }
+
+    fn cached(&self, number: u64) -> Option<Rc<Decoded>> {
+        let mut cache = self.cache.borrow_mut();
+        let at = cache.iter().position(|(n, _)| *n == number)?;
+        let entry = cache.remove(at)?;
+        let d = Rc::clone(&entry.1);
+        cache.push_back(entry);
+        Some(d)
+    }
+
+    fn cache_insert(&self, number: u64, d: Rc<Decoded>) {
+        let cap = self.config.block_cache_blocks;
+        if cap == 0 {
+            return;
         }
-        Ok((*id, buf))
+        let mut cache = self.cache.borrow_mut();
+        cache.retain(|(n, _)| *n != number);
+        while cache.len() >= cap {
+            cache.pop_front();
+        }
+        cache.push_back((number, d));
+    }
+
+    fn uncache(&self, number: u64) {
+        self.cache.borrow_mut().retain(|(n, _)| *n != number);
     }
 
     /// Assigns `len` bytes in the active segment, sealing it or creating a new
@@ -1108,6 +1492,15 @@ struct Replay<'a> {
     /// One above the highest object number in the WAL: numbers of objects
     /// compaction dropped are not reused either.
     next_object: u64,
+    blocks: HashMap<u64, Block>,
+    /// One above the highest block number in the WAL.
+    next_block: u64,
+    /// Blocks introduced by the frame being replayed.
+    frame_blocks: Vec<u64>,
+    /// Dictionaries by number − 1; empty: training built none.
+    dicts: Vec<&'a [u8]>,
+    /// Raw bytes of batch blocks stored without a dictionary.
+    dictless_raw: u64,
     topics: HashMap<&'a [u8], ReplayTopic>,
     /// Topic number → name, from PutTopic records; numbers are contiguous.
     topic_names: Vec<&'a [u8]>,
@@ -1151,48 +1544,121 @@ impl<'a> Replay<'a> {
         Ok(())
     }
 
+    fn add_block(&mut self, number: u64, block: Block) -> Result<(), &'static str> {
+        if number < self.next_block {
+            return Err("block number not above every earlier one");
+        }
+        let known = block.dict == NO_DICT
+            || usize::try_from(block.dict - 1)
+                .ok()
+                .and_then(|i| self.dicts.get(i))
+                .is_some_and(|d| !<[u8]>::is_empty(d));
+        if !known {
+            return Err("block references an unknown dictionary");
+        }
+        self.next_block = number + 1;
+        self.blocks.insert(number, block);
+        Ok(())
+    }
+
+    /// A block introduced by a batch frame: `PutObject` records follow.
+    fn add_batch_block(&mut self, number: u64, block: Block) -> Result<(), &'static str> {
+        self.add_block(number, block)?;
+        if block.dict == NO_DICT {
+            self.dictless_raw += block.raw_len;
+        }
+        self.frame_blocks.push(number);
+        Ok(())
+    }
+
+    /// Checks at the end of each frame: every block it introduced holds at
+    /// least one object.
+    fn finish_frame(&mut self) -> Result<(), &'static str> {
+        for n in self.frame_blocks.drain(..) {
+            if self.blocks.get(&n).is_none_or(|b| b.objects == 0) {
+                return Err("block without objects");
+            }
+        }
+        Ok(())
+    }
+
     /// `body_at`: WAL offset of the frame body holding `rec`.
     fn apply(&mut self, rec: Record<'a>, body_at: u64) -> Result<(), &'static str> {
         match rec {
-            Record::PutObject {
-                id,
+            Record::PutDict { number, data } => {
+                if number != self.dicts.len() as u64 + 1 {
+                    return Err("dictionary number out of sequence");
+                }
+                self.dicts.push(data);
+            }
+            Record::PutBlock {
                 number,
                 segment,
                 offset,
                 len,
+                raw_len,
+                dict,
+                crc,
             } => {
                 if segment == NO_SEGMENT {
-                    return Err("PutObject into the reserved segment id");
+                    return Err("PutBlock into the reserved segment id");
                 }
-                let object = Object {
-                    id,
+                let block = Block {
                     loc: Location::Segment {
                         id: segment,
                         offset,
                     },
                     len,
-                    refs: 0,
+                    raw_len,
+                    dict,
+                    crc,
+                    objects: 0,
                 };
-                self.add_object(number, object)?;
+                self.add_batch_block(number, block)?;
                 self.segments.insert(segment);
                 self.see(segment);
             }
-            Record::PutInline {
-                id,
+            Record::PutInlineBlock {
                 number,
+                raw_len,
+                dict,
+                crc,
                 data,
                 data_at,
             } => {
-                // Under a valid frame CRC a mismatch is a writer bug.
-                if ObjectId::of(data) != id {
-                    return Err("inline object does not match its id");
-                }
-                let object = Object {
-                    id,
+                let block = Block {
                     loc: Location::Wal {
                         offset: body_at + data_at as u64,
                     },
-                    len: u32::try_from(data.len()).map_err(|_| "inline object too large")?,
+                    len: data.len() as u64,
+                    raw_len,
+                    dict,
+                    crc,
+                    objects: 0,
+                };
+                self.add_batch_block(number, block)?;
+            }
+            Record::PutObject {
+                id,
+                number,
+                block,
+                index,
+            } => {
+                if !self.frame_blocks.contains(&block) {
+                    return Err("PutObject outside the frame of its block");
+                }
+                let b = self
+                    .blocks
+                    .get_mut(&block)
+                    .ok_or("PutObject references an unknown block")?;
+                if index != b.objects {
+                    return Err("object index out of order");
+                }
+                b.objects += 1;
+                let object = Object {
+                    id,
+                    block,
+                    index,
                     refs: 0,
                 };
                 self.add_object(number, object)?;
@@ -1244,56 +1710,124 @@ impl<'a> Replay<'a> {
                     .ok_or("Release of an entry whose object has no references")?;
                 object.refs -= 1;
             }
-            Record::Compact { old, new, kept } => {
-                if !self.segments.remove(&old) {
-                    return Err("Compact of a segment the WAL does not reference");
+            Record::Compact {
+                old,
+                new,
+                kept,
+                rewritten,
+            } => self.compact(old, new, kept, rewritten)?,
+        }
+        Ok(())
+    }
+
+    /// Applies a Compact record. The writer copies blocks whose objects are
+    /// all live (`kept`), drops blocks whose objects are all dead, and moves
+    /// the live objects of the other blocks of `old` into `rewritten`; any
+    /// other combination is corruption.
+    fn compact(
+        &mut self,
+        old: u64,
+        new: u64,
+        kept: Vec<(u64, u64)>,
+        rewritten: Option<Rewritten>,
+    ) -> Result<(), &'static str> {
+        if !self.segments.remove(&old) {
+            return Err("Compact of a segment the WAL does not reference");
+        }
+        if new == NO_SEGMENT {
+            if !kept.is_empty() || rewritten.is_some() {
+                return Err("Compact keeps blocks without a new segment");
+            }
+        } else if !self.segments.insert(new) {
+            return Err("Compact into a segment already in use");
+        }
+        self.see(old);
+        if new != NO_SEGMENT {
+            self.see(new);
+        }
+        let old_blocks: HashSet<u64> = self
+            .blocks
+            .iter()
+            .filter(|(_, b)| matches!(b.loc, Location::Segment { id, .. } if id == old))
+            .map(|(&n, _)| n)
+            .collect();
+        let kept_set: HashMap<u64, u64> = kept.iter().copied().collect();
+        if kept_set.len() != kept.len() || kept.iter().any(|(n, _)| !old_blocks.contains(n)) {
+            return Err("Compact keeps a block that is not in the old segment");
+        }
+        let moved: HashMap<u64, u64> = rewritten
+            .iter()
+            .flat_map(|r| r.objects.iter().zip(0..).map(|(&n, i)| (n, i)))
+            .collect();
+        if let Some(r) = &rewritten
+            && (r.objects.is_empty() || moved.len() != r.objects.len())
+        {
+            return Err("Compact rewrites a block with no or repeated objects");
+        }
+        let new_block = rewritten.as_ref().map(|r| r.block);
+        let mut relocated = 0;
+        let mut bad = None;
+        let ids = &mut self.ids;
+        self.objects.retain(|number, o| {
+            if !old_blocks.contains(&o.block) {
+                return true;
+            }
+            if kept_set.contains_key(&o.block) {
+                if o.refs == 0 {
+                    bad = Some("Compact keeps a block with dead objects");
                 }
-                if new == NO_SEGMENT {
-                    if !kept.is_empty() {
-                        return Err("Compact keeps objects without a new segment");
-                    }
-                } else if !self.segments.insert(new) {
-                    return Err("Compact into a segment already in use");
+                return true;
+            }
+            match (moved.get(number), o.refs > 0, new_block) {
+                (Some(&index), true, Some(block)) => {
+                    o.block = block;
+                    o.index = index;
+                    relocated += 1;
+                    true
                 }
-                self.see(old);
-                if new != NO_SEGMENT {
-                    self.see(new);
+                (None, false, _) => {
+                    ids.remove(&o.id);
+                    false
                 }
-                let kept: HashMap<ObjectId, u64> = kept.into_iter().collect();
-                let mut matched = 0;
-                let mut bad = false;
-                let ids = &mut self.ids;
-                self.objects.retain(|_, o| {
-                    if !matches!(o.loc, Location::Segment { id, .. } if id == old) {
-                        return true;
-                    }
-                    match (kept.get(&o.id), o.refs > 0) {
-                        (Some(&offset), true) => {
-                            o.loc = Location::Segment { id: new, offset };
-                            matched += 1;
-                            true
-                        }
-                        (None, false) => {
-                            ids.remove(&o.id);
-                            false
-                        }
-                        _ => {
-                            bad = true;
-                            true
-                        }
-                    }
-                });
-                if bad || matched != kept.len() {
-                    return Err("Compact kept set differs from the live objects of the segment");
+                _ => {
+                    bad = Some("Compact moved set differs from the live objects of the segment");
+                    true
                 }
             }
+        });
+        if let Some(reason) = bad {
+            return Err(reason);
+        }
+        if relocated != moved.len() {
+            return Err("Compact moved set differs from the live objects of the segment");
+        }
+        self.blocks
+            .retain(|n, _| !old_blocks.contains(n) || kept_set.contains_key(n));
+        for (n, offset) in kept {
+            if let Some(b) = self.blocks.get_mut(&n) {
+                b.loc = Location::Segment { id: new, offset };
+            }
+        }
+        if let Some(r) = rewritten {
+            let block = Block {
+                loc: Location::Segment {
+                    id: new,
+                    offset: r.offset,
+                },
+                len: r.len,
+                raw_len: r.raw_len,
+                dict: r.dict,
+                crc: r.crc,
+                objects: r.objects.len() as u64,
+            };
+            self.add_block(r.block, block)?;
         }
         Ok(())
     }
 }
 
 /// Deletes segment files the WAL does not reference, opens the others and
-/// checks that every indexed object lies within its segment file.
+/// checks that every block lies within its segment file.
 async fn open_segments(
     dir: &Path,
     replay: &mut Replay<'_>,
@@ -1343,22 +1877,35 @@ async fn open_segments(
             Err(e) => return Err(e.into()),
         }
     }
-    for o in replay.objects.values() {
-        let id = &o.id;
-        // Inline objects were read from the WAL frames themselves.
+    // The lowest-numbered object of each block names it in errors.
+    let mut first: HashMap<u64, (u64, ObjectId)> = HashMap::new();
+    for (&number, o) in &replay.objects {
+        let e = first.entry(o.block).or_insert((number, o.id));
+        if number < e.0 {
+            *e = (number, o.id);
+        }
+    }
+    for (n, b) in &replay.blocks {
+        // Inline blocks are inside the WAL frames themselves.
         let Location::Segment {
             id: segment,
             offset,
-        } = o.loc
+        } = b.loc
         else {
             continue;
         };
-        let end = offset.checked_add(u64::from(o.len));
+        let end = offset.checked_add(b.len);
         if lens
             .get(&segment)
             .is_none_or(|&len| end.is_none_or(|end| end > len))
         {
-            return Err(StoreError::MissingObject(*id));
+            return Err(match first.get(n) {
+                Some(&(_, id)) => StoreError::MissingObject(id),
+                None => StoreError::CorruptBlock {
+                    block: *n,
+                    reason: "stored bytes missing or truncated",
+                },
+            });
         }
     }
     Ok(segments)
@@ -1586,44 +2133,146 @@ async fn join2<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
     }
 }
 
-/// The first segment object the records introduce that is not fully in its
-/// segment file or whose bytes do not match its BLAKE3 id. Used on the last
-/// WAL frame only; earlier frames get a presence and bounds check
-/// (`open_segments`), their content is verified on read.
+/// Codecs for the dictionaries of a WAL, numbered from 1 in order; an empty
+/// one (training built none) gets no decoder.
+fn codecs_for(dicts: &[&[u8]]) -> Result<Codecs, StoreError> {
+    let mut codecs = Codecs::new()?;
+    for (number, dict) in (1..).zip(dicts) {
+        if !<[u8]>::is_empty(dict) {
+            codecs.add_dictionary(number, dict)?;
+        }
+    }
+    Ok(codecs)
+}
+
+/// Decompresses a block's stored bytes and checks them against the WAL: raw
+/// length, CRC32C, layout and object count.
+fn decode_block(codecs: &mut Codecs, b: &Block, stored: &[u8]) -> Result<Decoded, &'static str> {
+    let raw = codecs.decompress(b.dict, stored, b.raw_len, b.crc)?;
+    let spans = codec::split_block(&raw)?;
+    if spans.len() as u64 != b.objects {
+        return Err("block holds another number of objects than the WAL says");
+    }
+    Ok(Decoded { raw, spans })
+}
+
+/// A block of the last frame that cannot back its objects.
+struct BadObject {
+    /// The first object of the block, or the object that failed its hash.
+    object: ObjectId,
+    block: u64,
+    reason: DropReason,
+    why: &'static str,
+}
+
+/// The first block the records introduce that is not fully stored, does not
+/// decode, or holds an object whose bytes do not match its BLAKE3 id. Used
+/// on the last WAL frame only; earlier frames get a presence and bounds
+/// check (`open_segments`), their content is verified on read.
 async fn first_bad_object(
     dir: &Path,
     records: &[Record<'_>],
-) -> Result<Option<(ObjectId, DropReason)>, StoreError> {
+    codecs: &mut Codecs,
+) -> Result<Option<BadObject>, StoreError> {
     for rec in records {
-        let Record::PutObject {
-            id,
-            segment,
-            offset,
-            len,
-            ..
-        } = rec
-        else {
+        let (number, loc, len, raw_len, dict, crc, inline) = match rec {
+            Record::PutBlock {
+                number,
+                segment,
+                offset,
+                len,
+                raw_len,
+                dict,
+                crc,
+            } => (
+                *number,
+                Some((*segment, *offset)),
+                *len,
+                *raw_len,
+                *dict,
+                *crc,
+                None,
+            ),
+            Record::PutInlineBlock {
+                number,
+                raw_len,
+                dict,
+                crc,
+                data,
+                ..
+            } => (
+                *number,
+                None,
+                data.len() as u64,
+                *raw_len,
+                *dict,
+                *crc,
+                Some(*data),
+            ),
+            _ => continue,
+        };
+        // In index order: replay rejects any other.
+        let objects: Vec<ObjectId> = records
+            .iter()
+            .filter_map(|r| match r {
+                Record::PutObject { id, block, .. } if *block == number => Some(*id),
+                _ => None,
+            })
+            .collect();
+        // Replay rejects a block without objects.
+        let Some(&first) = objects.first() else {
             continue;
         };
-        let file = match File::open(segment_path(dir, *segment)).await {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Ok(Some((*id, DropReason::ObjectMissing)));
-            }
-            Err(e) => return Err(e.into()),
+        let bad = |object, reason, why| {
+            Ok(Some(BadObject {
+                object,
+                block: number,
+                reason,
+                why,
+            }))
         };
-        let len = *len as usize;
-        let BufResult(res, buf) = file
-            .read_exact_at(Vec::with_capacity(len).slice(..len), *offset)
-            .await;
-        match res {
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                return Ok(Some((*id, DropReason::ObjectMissing)));
+        let stored = match (inline, loc) {
+            (Some(data), _) => data.to_vec(),
+            (None, Some((segment, offset))) => {
+                let file = match File::open(segment_path(dir, segment)).await {
+                    Ok(file) => file,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        return bad(first, DropReason::ObjectMissing, "");
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let Ok(len) = usize::try_from(len) else {
+                    return bad(first, DropReason::ObjectMissing, "");
+                };
+                let BufResult(res, buf) = file
+                    .read_exact_at(Vec::with_capacity(len).slice(..len), offset)
+                    .await;
+                match res {
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        return bad(first, DropReason::ObjectMissing, "");
+                    }
+                    res => res?,
+                }
+                buf.into_inner()
             }
-            res => res?,
-        }
-        if ObjectId::of(&buf.into_inner()) != *id {
-            return Ok(Some((*id, DropReason::ObjectHashMismatch)));
+            (None, None) => continue,
+        };
+        let block = Block {
+            loc: Location::Wal { offset: 0 },
+            len,
+            raw_len,
+            dict,
+            crc,
+            objects: objects.len() as u64,
+        };
+        let d = match decode_block(codecs, &block, &stored) {
+            Ok(d) => d,
+            Err(why) => return bad(first, DropReason::BlockCorrupted, why),
+        };
+        for (id, span) in objects.iter().zip(&d.spans) {
+            if ObjectId::of(&d.raw[span.clone()]) != *id {
+                return bad(*id, DropReason::ObjectHashMismatch, "");
+            }
         }
     }
     Ok(None)
@@ -1689,8 +2338,8 @@ mod tests {
     fn object(id: ObjectId, refs: u64) -> Object {
         Object {
             id,
-            loc: Location::Segment { id: 0, offset: 0 },
-            len: 1,
+            block: 0,
+            index: 0,
             refs,
         }
     }
@@ -1722,13 +2371,24 @@ mod tests {
         ));
     }
 
-    fn put(id: ObjectId, number: u64, offset: u64) -> Record<'static> {
+    fn put_block(number: u64, segment: u64, offset: u64) -> Record<'static> {
+        Record::PutBlock {
+            number,
+            segment,
+            offset,
+            len: 1,
+            raw_len: 2,
+            dict: NO_DICT,
+            crc: 0,
+        }
+    }
+
+    fn put(id: ObjectId, number: u64, block: u64, index: u64) -> Record<'static> {
         Record::PutObject {
             id,
             number,
-            segment: 0,
-            offset,
-            len: 1,
+            block,
+            index,
         }
     }
 
@@ -1787,16 +2447,35 @@ mod tests {
         );
 
         let mut r = replay_with_topic();
-        r.apply(put(id, 0, 0), 0).unwrap();
         assert_eq!(
-            r.apply(put(id, 1, 1), 0),
+            r.apply(put(id, 0, 0, 0), 0),
+            Err("PutObject outside the frame of its block")
+        );
+        r.apply(put_block(0, 0, 0), 0).unwrap();
+        assert_eq!(
+            r.apply(put(id, 0, 0, 1), 0),
+            Err("object index out of order")
+        );
+        r.apply(put(id, 0, 0, 0), 0).unwrap();
+        assert_eq!(
+            r.apply(put(id, 1, 0, 1), 0),
             Err("new object already in the index"),
             "same id twice"
         );
         assert_eq!(
-            r.apply(put(ObjectId::of(b"y"), 0, 1), 0),
+            r.apply(put(ObjectId::of(b"y"), 0, 0, 2), 0),
             Err("object number not above every earlier one"),
             "number reused"
+        );
+        r.finish_frame().unwrap();
+        assert_eq!(
+            r.apply(put(ObjectId::of(b"z"), 5, 0, 3), 0),
+            Err("PutObject outside the frame of its block"),
+            "an earlier frame's block"
+        );
+        assert_eq!(
+            r.apply(put_block(0, 0, 1), 0),
+            Err("block number not above every earlier one")
         );
         r.apply(publish(0, 0), 0).unwrap();
         assert_eq!(
@@ -1812,42 +2491,126 @@ mod tests {
         let release = |seq| Record::Release { topic: 0, seq };
         assert_eq!(r.apply(release(1), 0), Err("Release out of order"));
         r.apply(release(0), 0).unwrap();
-        // The object is dead now: a Compact that keeps it is inconsistent.
+        // The object is dead now: a Compact that keeps its block is
+        // inconsistent.
         let keep = Record::Compact {
             old: 0,
             new: 1,
-            kept: vec![(id, 0)],
+            kept: vec![(0, 0)],
+            rewritten: None,
         };
         assert!(r.apply(keep, 0).is_err());
+
+        let mut r = Replay::default();
+        r.apply(put_block(3, 0, 0), 0).unwrap();
+        assert_eq!(r.finish_frame(), Err("block without objects"));
+        let mut b = put_block(4, 0, 0);
+        if let Record::PutBlock { dict, .. } = &mut b {
+            *dict = 1;
+        }
+        assert_eq!(r.apply(b, 0), Err("block references an unknown dictionary"));
+        assert_eq!(
+            r.apply(
+                Record::PutDict {
+                    number: 2,
+                    data: b"d"
+                },
+                0
+            ),
+            Err("dictionary number out of sequence")
+        );
+    }
+
+    /// Segment 0 holds block 0 (objects a live, b dead), block 1 (c live)
+    /// and block 2 (d dead).
+    fn replay_for_compaction() -> (Replay<'static>, [ObjectId; 4]) {
+        let ids = [b"a", b"b", b"c", b"d"].map(|b| ObjectId::of(b));
+        let mut r = replay_with_topic();
+        r.apply(put_block(0, 0, 0), 0).unwrap();
+        r.apply(put(ids[0], 0, 0, 0), 0).unwrap();
+        r.apply(put(ids[1], 1, 0, 1), 0).unwrap();
+        r.apply(put_block(1, 0, 1), 0).unwrap();
+        r.apply(put(ids[2], 2, 1, 0), 0).unwrap();
+        r.apply(put_block(2, 0, 2), 0).unwrap();
+        r.apply(put(ids[3], 3, 2, 0), 0).unwrap();
+        r.finish_frame().unwrap();
+        r.apply(publish(0, 0), 0).unwrap();
+        r.apply(publish(1, 2), 0).unwrap();
+        (r, ids)
+    }
+
+    fn rewritten(objects: Vec<u64>) -> Option<Rewritten> {
+        Some(Rewritten {
+            block: 3,
+            offset: 1,
+            len: 1,
+            raw_len: 2,
+            dict: NO_DICT,
+            crc: 0,
+            objects,
+        })
     }
 
     #[test]
     fn replay_applies_compaction_and_keeps_numbers() {
-        let (a, b) = (ObjectId::of(b"a"), ObjectId::of(b"b"));
-        let mut r = replay_with_topic();
-        r.apply(put(a, 0, 0), 0).unwrap();
-        r.apply(put(b, 1, 1), 0).unwrap();
-        r.apply(publish(0, 0), 0).unwrap();
+        let (mut r, ids) = replay_for_compaction();
         r.apply(
             Record::Compact {
                 old: 0,
                 new: 1,
-                kept: vec![(a, 0)],
+                kept: vec![(1, 0)],
+                rewritten: rewritten(vec![0]),
             },
             0,
         )
         .unwrap();
         assert!(!r.objects.contains_key(&1), "dead object dropped");
-        assert!(!r.ids.contains_key(&b), "and its id");
-        let o = &r.objects[&0];
-        assert_eq!(
-            (o.id, o.loc, o.refs),
-            (a, Location::Segment { id: 1, offset: 0 }, 1)
-        );
+        assert!(!r.objects.contains_key(&3), "dead block's object dropped");
+        assert!(!r.ids.contains_key(&ids[1]), "and its id");
+        let a = &r.objects[&0];
+        assert_eq!((a.id, a.block, a.index, a.refs), (ids[0], 3, 0, 1));
+        let c = &r.objects[&2];
+        assert_eq!((c.block, c.index), (1, 0), "kept block keeps its objects");
+        assert_eq!(r.blocks[&1].loc, Location::Segment { id: 1, offset: 0 });
+        assert_eq!(r.blocks[&3].loc, Location::Segment { id: 1, offset: 1 });
+        assert!(!r.blocks.contains_key(&0) && !r.blocks.contains_key(&2));
         assert_eq!(r.segments, HashSet::from([1]));
         assert_eq!(r.max_segment, Some(1));
-        // Number 1 belonged to the dropped object and is not reused.
-        assert_eq!(r.next_object, 2);
+        // Numbers of dropped objects and blocks are not reused.
+        assert_eq!((r.next_object, r.next_block), (4, 4));
+    }
+
+    #[test]
+    fn replay_rejects_inconsistent_compaction() {
+        let compact = |kept, rewritten| Record::Compact {
+            old: 0,
+            new: 1,
+            kept,
+            rewritten,
+        };
+        for (what, rec) in [
+            ("live object left behind", compact(vec![(1, 0)], None)),
+            (
+                "dead object moved",
+                compact(vec![(1, 0)], rewritten(vec![0, 1])),
+            ),
+            (
+                "block with a dead object kept",
+                compact(vec![(0, 0), (1, 0)], None),
+            ),
+            (
+                "block of another segment",
+                compact(vec![(1, 0), (9, 0)], rewritten(vec![0])),
+            ),
+            (
+                "object moved twice",
+                compact(vec![(1, 0)], rewritten(vec![0, 0])),
+            ),
+            ("live block dropped", compact(vec![], rewritten(vec![0]))),
+        ] {
+            let (mut r, _) = replay_for_compaction();
+            assert!(r.apply(rec, 0).is_err(), "{what}");
+        }
     }
 
     #[test]

@@ -1,7 +1,10 @@
-//! Content-addressed log storage engine, phase 1: one shard, local only.
+//! Content-addressed log storage engine: one shard, local only. Objects are
+//! deduplicated by BLAKE3 id; the new objects of each batch are stored as
+//! one zstd-compressed block.
 //!
 //! On-disk formats and recovery rules: `docs/format.md` in this crate.
 
+mod block;
 mod codec;
 mod store;
 
@@ -44,6 +47,10 @@ pub enum StoreError {
     MissingObject(ObjectId),
     #[error("object {0:?} failed its hash check")]
     HashMismatch(ObjectId),
+    /// A block's stored bytes are missing, do not decompress, or fail the
+    /// raw length, CRC32C or layout the WAL records for them.
+    #[error("block {block} is corrupt: {reason}")]
+    CorruptBlock { block: u64, reason: &'static str },
     /// A topic entry or Publish record refers to an object number the
     /// object index does not hold.
     #[error("object number {0} is not in the object index")]
