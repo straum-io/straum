@@ -5,6 +5,17 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/straum-io/straum"
+
+# compio is pinned to an exact version: the storage engine's I/O calls were
+# checked against this release.
+[workspace.dependencies]
+compio = { version = "=0.19.2", default-features = false, features = ["runtime", "fs", "macros", "io-uring"] }
+blake3 = "1"
+crc32c = "0.6"
+thiserror = "2"
+proptest = "1"
 
 # Unsafe policy: docs/architecture/unified-stream.md §4.1, ADR-0002.
 # `forbid` everywhere until a crate is exempted under that policy; an
