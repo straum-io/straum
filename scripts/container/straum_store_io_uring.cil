@@ -1,0 +1,4 @@
+; Lets rootless Podman containers (container_t) create and map io_uring
+; instances. Installed in the Podman VM only, for io_uring tests in
+; containers. Remove with: sudo semodule -r straum_store_io_uring
+(allow container_t io_uring_t (anon_inode (create map read write)))

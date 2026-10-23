@@ -18,6 +18,8 @@ and the build and release setup the new code will use:
   image, the Debian and PPA packaging and the Kubernetes package. They
   build the `straum-server` binary and work again once a crate provides it.
 - `scripts/linux.sh`: runs cargo in a Linux container on macOS.
+- `scripts/container/`: runs cargo in a Linux container with io_uring
+  enabled, on a dedicated Podman machine.
 
 The release pipeline runs only on version tags.
 

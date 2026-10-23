@@ -32,7 +32,11 @@ Write modes (`Config::write_mode`):
 cargo build
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+scripts/container/linux.sh --switch-machine test --workspace   # Linux, io_uring
 ```
+
+The container script and its Podman machine setup are described in
+`scripts/container/README.md`.
 
 Test variables: `STRAUM_STORE_CRASH_ITERATIONS` (default 200),
 `STRAUM_STORE_CRASH_SEED` (default 24301), `PROPTEST_CASES` (default 128).
