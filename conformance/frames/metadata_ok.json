@@ -1,0 +1,49 @@
+{
+  "name": "metadata_ok",
+  "note": "one known topic and one UnknownTopic",
+  "direction": "response",
+  "type_code": 32771,
+  "correlation_id": "6",
+  "frame_bytes": 122,
+  "message": {
+    "type": "MetadataOk",
+    "body": {
+      "cluster_id": "c1",
+      "controller_node_id": 1,
+      "nodes": [
+        {
+          "node_id": 1,
+          "host": "127.0.0.1",
+          "port": 9092,
+          "rack": ""
+        }
+      ],
+      "topics": [
+        {
+          "name": "orders",
+          "error": 0,
+          "partitions": [
+            {
+              "partition": 0,
+              "leader_node_id": 1,
+              "leader_epoch": 1,
+              "replicas": [
+                1
+              ],
+              "in_sync_replicas": [
+                1
+              ],
+              "start_seq": "0",
+              "next_seq": "42"
+            }
+          ]
+        },
+        {
+          "name": "missing",
+          "error": "UnknownTopic",
+          "partitions": []
+        }
+      ]
+    }
+  }
+}

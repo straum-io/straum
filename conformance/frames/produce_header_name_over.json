@@ -1,0 +1,32 @@
+{
+  "name": "produce_header_name_over",
+  "note": "a 257 B header name: MessageTooLarge with default limits",
+  "direction": "request",
+  "type_code": 6,
+  "correlation_id": "17",
+  "frame_bytes": 326,
+  "message": {
+    "type": "Produce",
+    "body": {
+      "topic": "orders",
+      "partition": 0,
+      "producer_id": "7",
+      "producer_seq": "1",
+      "ack_level": 1,
+      "expected_leader_epoch": 0,
+      "timeout_ms": 0,
+      "messages": [
+        {
+          "key": null,
+          "headers": [
+            {
+              "name": "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e",
+              "value": ""
+            }
+          ],
+          "body": "78"
+        }
+      ]
+    }
+  }
+}

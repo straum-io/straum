@@ -1,0 +1,41 @@
+{
+  "name": "produce_keyed",
+  "note": "a key; repeated header names and an empty header value",
+  "direction": "request",
+  "type_code": 6,
+  "correlation_id": "11",
+  "frame_bytes": 111,
+  "message": {
+    "type": "Produce",
+    "body": {
+      "topic": "orders",
+      "partition": 0,
+      "producer_id": "7",
+      "producer_seq": "1",
+      "ack_level": 1,
+      "expected_leader_epoch": 0,
+      "timeout_ms": 0,
+      "messages": [
+        {
+          "key": "757365722d3432",
+          "headers": [],
+          "body": "68656c6c6f"
+        },
+        {
+          "key": null,
+          "headers": [
+            {
+              "name": "7472616365",
+              "value": "616263"
+            },
+            {
+              "name": "7472616365",
+              "value": ""
+            }
+          ],
+          "body": "68656c6c6f"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "error_unsupported_version",
+  "note": "the broker's range in min_version and max_version",
+  "direction": "response",
+  "type_code": 65535,
+  "correlation_id": "2",
+  "frame_bytes": 51,
+  "message": {
+    "type": "Error",
+    "body": {
+      "code": "UnsupportedVersion",
+      "message": "no common version",
+      "leader_node_id": 0,
+      "leader_epoch": 0,
+      "retry_after_ms": 0,
+      "min_version": 0,
+      "max_version": 0
+    }
+  }
+}

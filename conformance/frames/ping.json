@@ -1,0 +1,14 @@
+{
+  "name": "ping",
+  "note": "",
+  "direction": "request",
+  "type_code": 2,
+  "correlation_id": "4",
+  "frame_bytes": 22,
+  "message": {
+    "type": "Ping",
+    "body": {
+      "nonce": "72623859790382856"
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "metadata_all",
+  "note": "empty list: every topic",
+  "direction": "request",
+  "type_code": 3,
+  "correlation_id": "5",
+  "frame_bytes": 18,
+  "message": {
+    "type": "Metadata",
+    "body": {
+      "topics": []
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "describe_topic_ok",
+  "note": "",
+  "direction": "response",
+  "type_code": 32777,
+  "correlation_id": "22",
+  "frame_bytes": 72,
+  "message": {
+    "type": "DescribeTopicOk",
+    "body": {
+      "name": "orders",
+      "replication_factor": 1,
+      "retention_ms": "86400000",
+      "partitions": [
+        {
+          "partition": 0,
+          "start_seq": "0",
+          "next_seq": "42",
+          "message_count": "42",
+          "index_bytes": "512"
+        }
+      ]
+    }
+  }
+}

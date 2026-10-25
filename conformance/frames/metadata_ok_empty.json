@@ -1,0 +1,17 @@
+{
+  "name": "metadata_ok_empty",
+  "note": "no nodes, no topics",
+  "direction": "response",
+  "type_code": 32771,
+  "correlation_id": "5",
+  "frame_bytes": 28,
+  "message": {
+    "type": "MetadataOk",
+    "body": {
+      "cluster_id": "",
+      "controller_node_id": 4294967295,
+      "nodes": [],
+      "topics": []
+    }
+  }
+}

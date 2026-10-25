@@ -1,0 +1,17 @@
+{
+  "name": "metadata_topics",
+  "note": "a topic name of the maximum 80 bytes",
+  "direction": "request",
+  "type_code": 3,
+  "correlation_id": "6",
+  "frame_bytes": 108,
+  "message": {
+    "type": "Metadata",
+    "body": {
+      "topics": [
+        "orders",
+        "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt"
+      ]
+    }
+  }
+}

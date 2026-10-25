@@ -1,0 +1,12 @@
+{
+  "name": "list_topics",
+  "note": "empty body",
+  "direction": "request",
+  "type_code": 8,
+  "correlation_id": "21",
+  "frame_bytes": 14,
+  "message": {
+    "type": "ListTopics",
+    "body": {}
+  }
+}

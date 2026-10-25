@@ -1,0 +1,17 @@
+{
+  "name": "produce_ok_max",
+  "note": "largest values",
+  "direction": "response",
+  "type_code": 32774,
+  "correlation_id": "13",
+  "frame_bytes": 38,
+  "message": {
+    "type": "ProduceOk",
+    "body": {
+      "base_seq": "18446744073709551615",
+      "count": 4294967295,
+      "leader_epoch": 4294967295,
+      "timestamp_ms": "18446744073709551615"
+    }
+  }
+}

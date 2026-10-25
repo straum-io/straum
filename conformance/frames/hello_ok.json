@@ -1,0 +1,18 @@
+{
+  "name": "hello_ok",
+  "note": "",
+  "direction": "response",
+  "type_code": 32769,
+  "correlation_id": "1",
+  "frame_bytes": 32,
+  "message": {
+    "type": "HelloOk",
+    "body": {
+      "version": 0,
+      "cluster_id": "c1",
+      "node_id": 1,
+      "max_frame_bytes": 8388608,
+      "max_message_bytes": 1048576
+    }
+  }
+}
