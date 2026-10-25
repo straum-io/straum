@@ -1,0 +1,15 @@
+[package]
+name = "straum-broker-bench"
+version = "0.1.0"
+description = "End-to-end load generator for the Straum broker"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+straum-client = { path = "../straum-client" }
+
+[lints]
+workspace = true

@@ -1019,6 +1019,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "straum-broker-bench"
+version = "0.1.0"
+dependencies = [
+ "straum-client",
+]
+
+[[package]]
 name = "straum-client"
 version = "0.1.0"
 dependencies = [
