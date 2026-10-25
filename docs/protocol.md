@@ -300,7 +300,9 @@ partitions through deduplication and are not attributed to one).
 
 ### 4.11 BrokerStats
 
-Empty request body. `BrokerStatsOk`, counters since the broker started:
+Empty request body. `BrokerStatsOk`, counters since the broker started.
+The store counters (`fsyncs` to `index_bytes`) include the broker's own
+records, such as one per CreateTopic:
 
 | Field | Type | |
 |---|---|---|

@@ -22,8 +22,9 @@ use compio::buf::{IntoInner, IoBuf};
 use compio::io::{AsyncReadExt, AsyncWriteExt};
 use compio::net::{TcpListener, TcpStream};
 use straum_proto::{
-    self as proto, ErrorBody, ErrorCode, FetchOk, FetchedMessage, FrameHeader, HelloOk, MetadataOk,
-    Node, PartitionMetadata, ProduceOk, Request, Response, TopicMetadata, ack, types,
+    self as proto, BrokerStatsOk, DescribeTopicOk, ErrorBody, ErrorCode, FetchOk, FetchedMessage,
+    FrameHeader, HelloOk, MetadataOk, Node, PartitionDescription, PartitionMetadata, ProduceOk,
+    Request, Response, TopicMetadata, TopicSummary, ack, types,
 };
 use straum_store::{Store, StoreError};
 
@@ -513,6 +514,18 @@ fn handle(
             let resp = metadata(sh, &topics);
             conn.respond(sh, corr, &resp, charge);
         }
+        Request::ListTopics => {
+            let topics = sh
+                .catalog
+                .borrow()
+                .topics()
+                .map(|t| TopicSummary {
+                    name: t.name.clone(),
+                    partitions: t.partitions,
+                })
+                .collect();
+            conn.respond(sh, corr, &Response::ListTopicsOk { topics }, charge);
+        }
         Request::DeleteTopic { .. } => conn.error(
             sh,
             corr,
@@ -526,6 +539,8 @@ fn handle(
             compio::runtime::spawn(async move {
                 let resp = match req {
                     Request::CreateTopic(c) => create_topic(&sh, c).await,
+                    Request::DescribeTopic { name } => describe_topic(&sh, &name).await,
+                    Request::BrokerStats => broker_stats(&sh).await,
                     Request::Fetch(f) => fetch(&sh, f).await,
                     _ => Response::error(ErrorCode::Unsupported, "unexpected request"),
                 };
@@ -895,6 +910,60 @@ async fn create_topic(sh: &Shared, c: proto::CreateTopic) -> Response {
     let seqs = |t: &[u8]| store.topic_range(t).unwrap_or((0, 0));
     sh.catalog.borrow_mut().add(record, seqs);
     Response::CreateTopicOk
+}
+
+async fn describe_topic(sh: &Shared, name: &str) -> Response {
+    if let Err(code) = catalog::check_name(name) {
+        return Response::error(code, "topic name");
+    }
+    let Some(record) = sh.catalog.borrow().topic(name).cloned() else {
+        return Response::error(ErrorCode::UnknownTopic, name);
+    };
+    let store = sh.store.lock().await;
+    let catalog = sh.catalog.borrow();
+    let partitions = (0..record.partitions)
+        .filter_map(|p| catalog.lookup(name, p).ok().map(|e| (p, e)))
+        .map(|(p, e)| {
+            let (start, next) = (e.partition.start_seq.get(), e.partition.next_seq.get());
+            PartitionDescription {
+                partition: p,
+                start_seq: start,
+                next_seq: next,
+                message_count: next - start,
+                index_bytes: store
+                    .topic_stats(&e.partition.store_topic)
+                    .map_or(0, |s| s.index_bytes),
+            }
+        })
+        .collect();
+    Response::DescribeTopicOk(DescribeTopicOk {
+        name: record.name,
+        replication_factor: record.replication_factor,
+        retention_ms: record.retention_ms,
+        partitions,
+    })
+}
+
+async fn broker_stats(sh: &Shared) -> Response {
+    let s = sh.store.lock().await.stats();
+    Response::BrokerStatsOk(BrokerStatsOk {
+        node_id: sh.identity.node_id,
+        open_connections: sh.connections.get(),
+        pending_bytes: sh.pending_bytes.get(),
+        pending_bytes_peak: sh.pending_peak.get(),
+        max_pending_bytes: sh.config.max_pending_bytes,
+        fetch_waiters: sh.fetch_waiters.get(),
+        produce_requests: sh.counters.produce_requests.get(),
+        groups_committed: sh.counters.groups_committed.get(),
+        fsyncs: s.fsyncs,
+        messages_accepted: s.messages_accepted,
+        messages_deduplicated: s.messages_deduplicated,
+        body_bytes_received: s.payload_bytes_received,
+        body_bytes_new: s.payload_bytes_new,
+        wal_bytes: s.wal_bytes,
+        segment_bytes: s.segment_bytes,
+        index_bytes: s.topic_bytes,
+    })
 }
 
 async fn fetch(sh: &Shared, f: proto::Fetch) -> Response {
