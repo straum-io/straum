@@ -122,8 +122,8 @@ async fn old_format_version_is_unsupported() {
     let path = dir.0.join("wal.log");
     let mut wal = std::fs::read(&path).unwrap();
     wal[8..12].copy_from_slice(&1u32.to_le_bytes());
-    let crc = crc32c::crc32c(&wal[..12]);
-    wal[12..16].copy_from_slice(&crc.to_le_bytes());
+    let crc = crc32c::crc32c(&wal[..20]);
+    wal[20..24].copy_from_slice(&crc.to_le_bytes());
     std::fs::write(&path, &wal).unwrap();
     let before = snapshot(&dir.0);
     let err = Store::open(&dir.0, Config::default()).await.err().unwrap();

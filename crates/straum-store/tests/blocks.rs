@@ -6,7 +6,7 @@
 mod common;
 
 use common::{Rng, TempDir};
-use straum_store::{Config, Message, ObjectId, Store, WriteMode};
+use straum_store::{Config, ConfigOverride, Message, ObjectId, Store, WriteMode};
 
 fn msg<'a>(topic: &'a [u8], payload: &'a [u8]) -> Message<'a> {
     Message { topic, payload }
@@ -174,6 +174,146 @@ async fn compaction_rewrites_partly_dead_blocks() {
         store.put_batch(&[msg(b"x", &lines[0])], 11).await.unwrap();
         assert_eq!(store.read(b"x", 0).await.unwrap(), Some(lines[0].clone()));
     }
+}
+
+/// InlineSmall with a threshold between the sizes of small and large
+/// blocks: compaction rewrites and drops segment blocks as in the other
+/// modes and leaves inline blocks, whose bytes stay in the WAL.
+#[compio::test]
+async fn compaction_in_inline_small_keeps_inline_blocks() {
+    let dir = TempDir::new("blocks-compact-inline");
+    let config = Config {
+        write_mode: WriteMode::InlineSmall { threshold: 256 },
+        segment_max_bytes: 1,
+        ..Config::default()
+    };
+    // Random bytes do not compress: 8 of 100 bytes make a block over the
+    // threshold, 1 or 2 of 20 bytes one under it.
+    let mut rng = Rng(11);
+    let mut random = |len: usize| -> Vec<u8> { (0..len).map(|_| rng.next() as u8).collect() };
+    let big: Vec<Vec<u8>> = (0..12).map(|_| random(100)).collect();
+    let small: Vec<Vec<u8>> = (0..3).map(|_| random(20)).collect();
+    let mut store = Store::open(&dir.0, config).await.unwrap();
+    // Segment block: big 0..4 to "dead", 4..8 to "live".
+    let first: Vec<Message> = big[..8]
+        .iter()
+        .enumerate()
+        .map(|(i, p)| msg(if i < 4 { b"dead" } else { b"live" }, p))
+        .collect();
+    store.put_batch(&first, 1).await.unwrap();
+    // Inline blocks: small 0, 1 to "dead"; small 2 to "live".
+    store
+        .put_batch(&[msg(b"dead", &small[0]), msg(b"dead", &small[1])], 2)
+        .await
+        .unwrap();
+    store
+        .put_batch(&[msg(b"live", &small[2])], 3)
+        .await
+        .unwrap();
+    // Segment block: big 8..12, all to "dead".
+    let last: Vec<Message> = big[8..].iter().map(|p| msg(b"dead", p)).collect();
+    store.put_batch(&last, 4).await.unwrap();
+    assert_eq!(store.segment_count(), 2, "two segment blocks, two inline");
+    assert_eq!(store.release_before(b"dead", 10).await.unwrap(), 10);
+
+    let stats = store.compact().await.unwrap();
+    // The first segment block rewritten, the last dropped. Inline blocks
+    // are never reclaimed: their dead objects stay, unreferenced.
+    assert_eq!(stats.segments_rewritten, 2);
+    assert_eq!(stats.objects_dropped, 8);
+    assert_eq!(store.segment_count(), 1);
+    assert_eq!(store.object_count(), 4 + 3);
+    for p in &small[..2] {
+        assert_eq!(store.refcount(&ObjectId::of(p)), Some(0));
+    }
+    for p in big[..4].iter().chain(&big[8..]) {
+        assert_eq!(store.refcount(&ObjectId::of(p)), None, "dead reclaimed");
+    }
+    let live: Vec<&Vec<u8>> = big[4..8].iter().chain([&small[2]]).collect();
+    for (seq, p) in live.iter().enumerate() {
+        assert_eq!(
+            store.read(b"live", seq as u64).await.unwrap().as_ref(),
+            Some(*p)
+        );
+    }
+
+    drop(store);
+    let mut store = Store::open(&dir.0, config).await.unwrap();
+    assert!(
+        store.recovery_report().is_empty(),
+        "{:?}",
+        store.recovery_report()
+    );
+    for (seq, p) in live.iter().enumerate() {
+        let got = store.read(b"live", seq as u64).await.unwrap();
+        assert_eq!(got.as_ref(), Some(*p), "after restart live/{seq}");
+    }
+    // An unreferenced inline object is referenced again, not stored twice.
+    store.put_batch(&[msg(b"x", &small[0])], 11).await.unwrap();
+    assert_eq!(store.refcount(&ObjectId::of(&small[0])), Some(1));
+    assert_eq!(store.read(b"x", 0).await.unwrap(), Some(small[0].clone()));
+    assert_eq!(store.release_before(b"live", 10).await.unwrap(), 5);
+    store.compact().await.unwrap();
+    assert_eq!(store.segment_count(), 0);
+}
+
+/// The training threshold is fixed when the WAL is created: a reopen with
+/// another `dict_train_bytes` neither trains early nor delays training.
+#[compio::test]
+async fn dictionary_threshold_is_the_one_in_the_wal() {
+    let dir = TempDir::new("blocks-dict-threshold");
+    let config = Config {
+        dict_train_bytes: 32 << 10,
+        ..Config::default()
+    };
+    let batch = |n: u64| -> Vec<Vec<u8>> { (n..n + 64).map(line).collect() };
+    let mut store = Store::open(&dir.0, config).await.unwrap();
+    assert!(store.recovery_report().config_overrides.is_empty());
+    // About 100 bytes a line: two batches stay under 32 KiB.
+    for n in [0, 64] {
+        let lines = batch(n);
+        let msgs: Vec<Message> = lines.iter().map(|p| msg(b"t", p)).collect();
+        store.put_batch(&msgs, n).await.unwrap();
+    }
+    drop(store);
+
+    for configured in [1, 0, 1 << 30] {
+        let reopened = Config {
+            dict_train_bytes: configured,
+            ..config
+        };
+        let store = Store::open(&dir.0, reopened).await.unwrap();
+        assert_eq!(
+            store.recovery_report().config_overrides,
+            [ConfigOverride::DictTrainBytes {
+                configured,
+                stored: 32 << 10,
+            }]
+        );
+        assert!(store.recovery_report().is_empty(), "no file changed");
+    }
+
+    // With 1 byte the next batch would train; the WAL's 32 KiB applies.
+    let mut store = Store::open(
+        &dir.0,
+        Config {
+            dict_train_bytes: 1,
+            ..config
+        },
+    )
+    .await
+    .unwrap();
+    let mut n = 128;
+    while store.dictionary_bytes().is_none() {
+        let lines = batch(n);
+        let msgs: Vec<Message> = lines.iter().map(|p| msg(b"t", p)).collect();
+        store.put_batch(&msgs, n).await.unwrap();
+        n += 64;
+        assert!(n < 64 * 20, "no training");
+    }
+    // Training ran at the start of the sixth batch, as without the reopen
+    // (`dictionary_is_trained_once_and_survives_restart`).
+    assert_eq!(n, 6 * 64);
 }
 
 #[compio::test]

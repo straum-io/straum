@@ -177,8 +177,8 @@ async fn old_format_wal_is_unsupported() {
     let with_version = |v: u32| {
         let mut w = wal.clone();
         w[8..12].copy_from_slice(&v.to_le_bytes());
-        let crc = crc32c::crc32c(&w[..12]);
-        w[12..16].copy_from_slice(&crc.to_le_bytes());
+        let crc = crc32c::crc32c(&w[..20]);
+        w[20..24].copy_from_slice(&crc.to_le_bytes());
         w
     };
     let current = u32::from_le_bytes(wal[8..12].try_into().unwrap());

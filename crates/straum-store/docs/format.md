@@ -37,8 +37,10 @@ length, the raw length, the dictionary number (0: none) and the CRC32C of
 the raw block. Reading an object decompresses its block, checks the raw
 length, the CRC and that the block splits into exactly the recorded number
 of objects (any failure is `CorruptBlock`, never data), then checks the
-object's BLAKE3 (`HashMismatch`). The last decompressed blocks are cached
-(`Config::block_cache_blocks`, default 16, least recently used first out).
+object's BLAKE3 (`HashMismatch`). The last decompressed blocks are cached,
+least recently used first out, within two limits: `Config::block_cache_blocks`
+(default 16) blocks and `Config::block_cache_bytes` (default 64 MiB) of raw
+bytes and object offsets. A block larger than the byte limit is not cached.
 
 Block numbers start at 0 and are never reused: the next number is the
 highest in the WAL plus one.
@@ -46,8 +48,9 @@ highest in the WAL plus one.
 ### Dictionary
 
 One dictionary per store, trained once. When the raw bytes of new objects
-stored in blocks without a dictionary reach `Config::dict_train_bytes`
-(default 1 MiB; 0 disables training), the next non-empty batch trains a
+stored in blocks without a dictionary reach the threshold in the WAL file
+header (`Config::dict_train_bytes` when the WAL was created; default 1 MiB;
+0 disables training), the next non-empty batch trains a
 dictionary of at most 64 KiB on the objects of those blocks, in block order,
 at most 10 MiB of samples. The batch's frame carries it in a PutDict record
 before its block, and every later block, compaction's included, uses it.
@@ -72,7 +75,7 @@ allowed: compaction removes them.
 
 ## WAL `wal.log`
 
-A file header (16 bytes), then frames. One frame is one batch of messages
+A file header (24 bytes), then frames. One frame is one batch of messages
 (`put_batch`), one `release_before` call, or one compaction step (one
 rewritten segment).
 
@@ -81,19 +84,26 @@ rewritten segment).
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 8 |
-| 12 | 4 | `crc` u32: CRC32C of bytes `[0..12)` |
+| 8 | 4 | `version` u32 = 9 |
+| 12 | 8 | `dict_train_bytes` u64: the dictionary training threshold |
+| 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
+
+`dict_train_bytes` is written once, from `Config::dict_train_bytes`, when
+the WAL is created, and never changes. At open the store uses the header's
+value: a different `Config::dict_train_bytes` is ignored and listed in
+`RecoveryReport::config_overrides` (`ConfigOverride::DictTrainBytes`), so a
+reopen cannot move a trigger that has not fired.
 
 A new WAL is written to `wal.log.tmp`, synced (`fsync`), renamed to `wal.log`,
 and then the directory is synced. So `wal.log` never exists without a complete
-header. A file that does not start with exactly these 16 bytes (a WAL without
-a header, an empty file, another version) is `UnsupportedFormat`, and the file
-is not changed. Earlier versions are not supported: 1 had no mode byte in the
+header. A file that does not start with an intact 24-byte header of this
+version (a WAL without a header, an empty file, another version, a header
+CRC mismatch) is `UnsupportedFormat`, and the file is not changed. Earlier versions are not supported: 1 had no mode byte in the
 frame, 2 full ids in Publish and in the topic index, 3 `topic_seq` in topic
 index entries, 4 fixed-width Publish and Release with the topic name, 5
 fixed-width PutObject and PutInline, 6 a topic index of 20-byte entries, 7
 uncompressed objects located by segment offset (PutObject type 1, PutInline
-type 5, Compact type 4).
+type 5, Compact type 4), 8 a 16-byte header without `dict_train_bytes`.
 
 ### Frame
 
@@ -304,7 +314,7 @@ of the file can be unacknowledged.
 
 ### Recovery
 
-Reading starts at byte 16. A frame is bad if its header or body is short or
+Reading starts at byte 24. A frame is bad if its header or body is short or
 its CRC does not match.
 
 1. A bad frame with no frame with a valid CRC readable from any later byte up
@@ -359,6 +369,10 @@ report means recovery changed nothing. No change is made without an entry.
 | `OrphanSegmentRemoved { segment }` | a segment file the WAL does not refer to was deleted |
 | `UnknownTopicIndexRemoved { path }` | an index of a topic absent from the WAL was deleted |
 | `TopicIndexRepaired { path, entries_kept, bytes_truncated, entries_rewritten }` | a topic index was cut and/or rewritten from the WAL |
+
+`config_overrides` lists `Config` values the WAL replaced, which change no
+file: `DictTrainBytes { configured, stored }` when `Config::dict_train_bytes`
+differs from the WAL header's value (`stored` is used).
 
 The report is kept in the open `Store`'s memory and is not written to disk.
 

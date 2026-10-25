@@ -54,7 +54,6 @@ struct Model {
     /// inline block. Dead objects in segment blocks leave it at compaction;
     /// those in inline blocks never do.
     indexed: HashMap<usize, bool>,
-    inline_threshold: Option<usize>,
 }
 
 impl Model {
@@ -117,13 +116,7 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
             ..Config::default()
         };
         let payloads = payloads();
-        let mut model = Model {
-            inline_threshold: match mode {
-                WriteMode::InlineSmall { threshold } => Some(threshold as usize),
-                _ => None,
-            },
-            ..Model::default()
-        };
+        let mut model = Model::default();
         let mut store = Store::open(&dir.0, config).await.unwrap();
         for (now, op) in (1u64..).zip(ops) {
             match op {
@@ -135,11 +128,14 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
                             payload: &payloads[p],
                         })
                         .collect();
+                    let segment_before = store.stats().segment_bytes;
                     let seqs = store.put_batch(&batch, now).await.unwrap();
+                    // Whether the batch's block went inline depends on its
+                    // compressed size; the model reads it from the store:
+                    // only a segment block adds segment bytes.
+                    let inline = matches!(mode, WriteMode::InlineSmall { .. })
+                        && store.stats().segment_bytes == segment_before;
                     for (&(t, p), seq) in msgs.iter().zip(seqs) {
-                        let inline = model
-                            .inline_threshold
-                            .is_some_and(|th| payloads[p].len() <= th);
                         model.indexed.entry(p).or_insert(inline);
                         let mt = model.topics.entry(t).or_default();
                         assert_eq!(seq, mt.entries.len() as u64, "assigned seq");
@@ -191,11 +187,60 @@ proptest! {
         store_matches_model(ops, WriteMode::ParallelSync);
     }
 
-    /// Whether a block goes inline depends on its compressed size, which
-    /// the model does not predict: with this threshold every block does.
-    /// The crash test mixes inline and segment blocks.
+    /// Every block inline.
     #[test]
     fn inline_small_matches_model(ops in prop::collection::vec(op(), 1..40)) {
         store_matches_model(ops, WriteMode::InlineSmall { threshold: u32::MAX });
     }
+
+    /// Inline and segment blocks mixed (`mixed_threshold_makes_both_kinds`).
+    #[test]
+    fn inline_small_mixed_matches_model(ops in prop::collection::vec(op(), 1..40)) {
+        store_matches_model(ops, WriteMode::InlineSmall { threshold: MIXED_THRESHOLD });
+    }
+}
+
+/// Between the compressed sizes of small and large blocks of `payloads()`.
+const MIXED_THRESHOLD: u32 = 24;
+
+/// With `MIXED_THRESHOLD`, a block of one 1-byte payload goes inline and a
+/// block of every payload goes to a segment, before and after training.
+#[test]
+fn mixed_threshold_makes_both_kinds() {
+    let rt = compio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let dir = TempDir::new("model-mixed");
+        let config = Config {
+            segment_max_bytes: 64,
+            write_mode: WriteMode::InlineSmall {
+                threshold: MIXED_THRESHOLD,
+            },
+            dict_train_bytes: 256,
+            ..Config::default()
+        };
+        let mut store = Store::open(&dir.0, config).await.unwrap();
+        let payloads = payloads();
+        let mut kinds = Vec::new();
+        for round in 0..3u8 {
+            // Fresh bytes each round, so every block holds new objects.
+            let fresh: Vec<Vec<u8>> = payloads
+                .iter()
+                .map(|p| p.iter().map(|b| b ^ (0x40 + round)).collect())
+                .collect();
+            for batch in [&fresh[1..2], &fresh[..]] {
+                let msgs: Vec<Message> = batch
+                    .iter()
+                    .map(|p| Message {
+                        topic: b"a",
+                        payload: p,
+                    })
+                    .collect();
+                let before = store.stats().segment_bytes;
+                store.put_batch(&msgs, 1).await.unwrap();
+                kinds.push(store.stats().segment_bytes > before);
+            }
+        }
+        assert!(store.dictionary_bytes().is_some(), "training ran");
+        assert_eq!(kinds, [false, true, false, true, false, true], "segment?");
+    });
 }

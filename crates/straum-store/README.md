@@ -10,7 +10,10 @@ macOS (development only). No tokio, including transitively.
 - The new objects of each batch form one block, compressed with zstd level 1
   and, once trained, a 64 KiB dictionary (`Config::dict_train_bytes`).
   Reads decompress the block and check its CRC and the object's BLAKE3; the
-  last blocks read are cached (`Config::block_cache_blocks`).
+  last blocks read are cached (`Config::block_cache_blocks`, default 16,
+  and `Config::block_cache_bytes`, default 64 MiB; a larger block is not
+  cached). The training threshold is fixed in the WAL file header when the
+  WAL is created.
 - Group commit: one segment `fdatasync` and one WAL `fdatasync` per batch;
   a batch is acknowledged only after both.
 - Recovery from the WAL cuts a torn tail and checks topic indexes and

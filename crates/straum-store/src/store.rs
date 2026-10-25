@@ -69,12 +69,16 @@ pub struct Config {
     pub max_frame_bytes: u32,
     pub write_mode: WriteMode,
     /// Decompressed blocks kept for reads, most recently used; 0 keeps none.
-    /// Memory is at most this many times the largest raw block (the new
-    /// objects of one batch).
     pub block_cache_blocks: usize,
+    /// Upper bound on the memory of the decompressed blocks kept for reads
+    /// (raw bytes and object offsets). A block larger than this is not
+    /// kept; the least recently used blocks are evicted once either this or
+    /// `block_cache_blocks` would be exceeded.
+    pub block_cache_bytes: usize,
     /// Raw bytes of new objects stored without a dictionary after which the
     /// store trains its dictionary, once, on the objects of those blocks.
-    /// 0: never.
+    /// 0: never. Recorded in a new WAL's file header; on reopen the WAL's
+    /// value is used (`ConfigOverride::DictTrainBytes`).
     pub dict_train_bytes: u64,
 }
 
@@ -85,6 +89,7 @@ impl Default for Config {
             max_frame_bytes: 64 << 20,
             write_mode: WriteMode::Sequential,
             block_cache_blocks: 16,
+            block_cache_bytes: 64 << 20,
             dict_train_bytes: 1 << 20,
         }
     }
@@ -163,17 +168,88 @@ struct Decoded {
     spans: Vec<Range<usize>>,
 }
 
-/// Every change recovery made to the store directory during `Store::open`.
-/// Empty: recovery changed nothing.
+impl Decoded {
+    /// Heap bytes held, as counted against `Config::block_cache_bytes`.
+    fn bytes(&self) -> usize {
+        self.raw.capacity() + self.spans.capacity() * size_of::<Range<usize>>()
+    }
+}
+
+/// Decompressed blocks kept for reads, least recently used first. A linear
+/// scan: the count limit is small (`Config::block_cache_blocks`, default 16).
+struct BlockCache {
+    entries: VecDeque<(u64, Rc<Decoded>)>,
+    bytes: usize,
+    max_blocks: usize,
+    max_bytes: usize,
+}
+
+impl BlockCache {
+    fn new(max_blocks: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            bytes: 0,
+            max_blocks,
+            max_bytes,
+        }
+    }
+
+    fn get(&mut self, number: u64) -> Option<Rc<Decoded>> {
+        let at = self.entries.iter().position(|(n, _)| *n == number)?;
+        let entry = self.entries.remove(at)?;
+        let d = Rc::clone(&entry.1);
+        self.entries.push_back(entry);
+        Some(d)
+    }
+
+    fn insert(&mut self, number: u64, d: Rc<Decoded>) {
+        self.remove(number);
+        let size = d.bytes();
+        if self.max_blocks == 0 || size > self.max_bytes {
+            return;
+        }
+        while self.entries.len() >= self.max_blocks || self.bytes + size > self.max_bytes {
+            let Some((_, old)) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes -= old.bytes();
+        }
+        self.bytes += size;
+        self.entries.push_back((number, d));
+    }
+
+    fn remove(&mut self, number: u64) {
+        if let Some(at) = self.entries.iter().position(|(n, _)| *n == number)
+            && let Some((_, old)) = self.entries.remove(at)
+        {
+            self.bytes -= old.bytes();
+        }
+    }
+}
+
+/// Every change recovery made to the store directory during `Store::open`,
+/// and every configuration value the WAL overrode.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
     pub actions: Vec<RecoveryAction>,
+    /// Not changes to the directory: `is_empty` ignores them.
+    pub config_overrides: Vec<ConfigOverride>,
 }
 
 impl RecoveryReport {
+    /// Recovery changed nothing in the directory.
     pub fn is_empty(&self) -> bool {
         self.actions.is_empty()
     }
+}
+
+/// A `Config` value replaced at open by the one the WAL recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigOverride {
+    /// The dictionary training threshold is fixed when the WAL is created
+    /// (its file header), so a reopen cannot move a trigger that has not
+    /// fired. `configured` was ignored; `stored` is used.
+    DictTrainBytes { configured: u64, stored: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -291,8 +367,7 @@ pub struct Store {
     blocks: HashMap<u64, Block>,
     next_block: u64,
     codecs: RefCell<Codecs>,
-    /// Recently decompressed blocks, most recently used last.
-    cache: RefCell<VecDeque<(u64, Rc<Decoded>)>>,
+    cache: RefCell<BlockCache>,
     /// Raw bytes of new objects stored in blocks without a dictionary: the
     /// training trigger (`Config::dict_train_bytes`).
     dictless_raw: u64,
@@ -329,15 +404,22 @@ impl Store {
     /// is verified on read. Recovery then deletes segment files the WAL does
     /// not reference, repairs topic index files from the WAL and recomputes
     /// refcounts. Every change is listed in `recovery_report()`.
-    pub async fn open(dir: impl AsRef<Path>, config: Config) -> Result<Self, StoreError> {
+    pub async fn open(dir: impl AsRef<Path>, mut config: Config) -> Result<Self, StoreError> {
         let dir = dir.as_ref().to_path_buf();
         let mut report = RecoveryReport::default();
         compio::fs::create_dir_all(dir.join(TOPICS_DIR)).await?;
         let wal_path = dir.join(WAL_FILE);
-        let wal = open_wal(&dir, &mut report).await?;
+        let wal = open_wal(&dir, &mut report, config.dict_train_bytes).await?;
         let bytes = compio::fs::read(&wal_path).await?;
-        if !codec::is_current_wal(&bytes) {
-            return Err(StoreError::UnsupportedFormat);
+        let stored = codec::decode_wal_header(&bytes).ok_or(StoreError::UnsupportedFormat)?;
+        if stored != config.dict_train_bytes {
+            report
+                .config_overrides
+                .push(ConfigOverride::DictTrainBytes {
+                    configured: config.dict_train_bytes,
+                    stored,
+                });
+            config.dict_train_bytes = stored;
         }
 
         // Only the last frame can be torn: a frame is written only after the
@@ -471,7 +553,10 @@ impl Store {
             blocks: replay.blocks,
             next_block: replay.next_block,
             codecs: RefCell::new(codecs),
-            cache: RefCell::new(VecDeque::new()),
+            cache: RefCell::new(BlockCache::new(
+                config.block_cache_blocks,
+                config.block_cache_bytes,
+            )),
             dictless_raw: replay.dictless_raw,
             dictionary,
             next_topic: replay.topic_names.len() as u64,
@@ -1258,29 +1343,15 @@ impl Store {
     }
 
     fn cached(&self, number: u64) -> Option<Rc<Decoded>> {
-        let mut cache = self.cache.borrow_mut();
-        let at = cache.iter().position(|(n, _)| *n == number)?;
-        let entry = cache.remove(at)?;
-        let d = Rc::clone(&entry.1);
-        cache.push_back(entry);
-        Some(d)
+        self.cache.borrow_mut().get(number)
     }
 
     fn cache_insert(&self, number: u64, d: Rc<Decoded>) {
-        let cap = self.config.block_cache_blocks;
-        if cap == 0 {
-            return;
-        }
-        let mut cache = self.cache.borrow_mut();
-        cache.retain(|(n, _)| *n != number);
-        while cache.len() >= cap {
-            cache.pop_front();
-        }
-        cache.push_back((number, d));
+        self.cache.borrow_mut().insert(number, d);
     }
 
     fn uncache(&self, number: u64) {
-        self.cache.borrow_mut().retain(|(n, _)| *n != number);
+        self.cache.borrow_mut().remove(number);
     }
 
     /// Assigns `len` bytes in the active segment, sealing it or creating a new
@@ -2075,7 +2146,11 @@ fn check_refcounts<'a>(
 /// Opens `wal.log`, creating it with its file header if missing. A new WAL is
 /// written to `wal.log.tmp`, synced and renamed, so `wal.log` never exists
 /// without a complete header.
-async fn open_wal(dir: &Path, report: &mut RecoveryReport) -> Result<File, StoreError> {
+async fn open_wal(
+    dir: &Path,
+    report: &mut RecoveryReport,
+    dict_train_bytes: u64,
+) -> Result<File, StoreError> {
     let path = dir.join(WAL_FILE);
     let tmp = dir.join(WAL_TMP);
     match compio::fs::remove_file(&tmp).await {
@@ -2089,7 +2164,7 @@ async fn open_wal(dir: &Path, report: &mut RecoveryReport) -> Result<File, Store
             .create_new(true)
             .open(&tmp)
             .await?;
-        write_all(&file, codec::wal_file_header().to_vec(), 0)
+        write_all(&file, codec::wal_file_header(dict_train_bytes).to_vec(), 0)
             .await
             .0?;
         file.sync_all().await?;
@@ -2611,6 +2686,70 @@ mod tests {
             let (mut r, _) = replay_for_compaction();
             assert!(r.apply(rec, 0).is_err(), "{what}");
         }
+    }
+
+    fn decoded(raw_len: usize) -> Rc<Decoded> {
+        Rc::new(Decoded {
+            raw: vec![0; raw_len],
+            spans: Vec::new(),
+        })
+    }
+
+    fn cached_numbers(c: &BlockCache) -> Vec<u64> {
+        c.entries.iter().map(|(n, _)| *n).collect()
+    }
+
+    #[test]
+    fn block_cache_does_not_keep_a_block_larger_than_its_byte_limit() {
+        let mut c = BlockCache::new(16, 1000);
+        c.insert(1, decoded(400));
+        c.insert(2, decoded(1001));
+        assert!(c.get(2).is_none());
+        assert_eq!(
+            cached_numbers(&c),
+            [1],
+            "the oversized block evicts nothing"
+        );
+        assert_eq!(c.bytes, 400);
+        c.insert(3, decoded(1000));
+        assert_eq!(
+            cached_numbers(&c),
+            [3],
+            "a block of exactly the limit is kept"
+        );
+        assert_eq!(c.bytes, 1000);
+    }
+
+    #[test]
+    fn block_cache_evicts_least_recently_used_by_bytes() {
+        let mut c = BlockCache::new(16, 1000);
+        for n in 1..=3 {
+            c.insert(n, decoded(300));
+        }
+        assert!(c.get(1).is_some(), "1 becomes the most recently used");
+        c.insert(4, decoded(300));
+        assert_eq!(cached_numbers(&c), [3, 1, 4], "2 evicted: 1200 > 1000");
+        c.insert(5, decoded(700));
+        assert_eq!(cached_numbers(&c), [4, 5]);
+        assert_eq!(c.bytes, 1000);
+        c.remove(4);
+        assert_eq!((cached_numbers(&c), c.bytes), (vec![5], 700));
+    }
+
+    #[test]
+    fn block_cache_evicts_by_count_and_keeps_nothing_at_zero() {
+        let mut c = BlockCache::new(2, 1 << 20);
+        for n in 1..=3 {
+            c.insert(n, decoded(10));
+        }
+        assert_eq!(cached_numbers(&c), [2, 3]);
+        assert_eq!(c.bytes, 20);
+        c.insert(3, decoded(30));
+        assert_eq!((cached_numbers(&c), c.bytes), (vec![2, 3], 40), "replaced");
+        let mut none = BlockCache::new(0, 1 << 20);
+        none.insert(1, decoded(10));
+        assert!(none.get(1).is_none());
+        assert_eq!(none.bytes, 0);
     }
 
     #[test]

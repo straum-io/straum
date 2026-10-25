@@ -38,11 +38,11 @@ pub fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// Byte offsets where each WAL frame starts (docs/format.md: a 16-byte file
+/// Byte offsets where each WAL frame starts (docs/format.md: a 24-byte file
 /// header, then frames of `21 + len` bytes with `len u32` first).
 pub fn wal_frame_starts(wal: &[u8]) -> Vec<usize> {
     let mut starts = Vec::new();
-    let mut pos = 16;
+    let mut pos = 24;
     while pos + 21 <= wal.len() {
         starts.push(pos);
         let len = u32::from_le_bytes(wal[pos..pos + 4].try_into().unwrap()) as usize;

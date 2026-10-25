@@ -14,10 +14,13 @@ impl ObjectId {
     }
 }
 
-/// `magic [8] | version u32 | crc32c u32` at the start of `wal.log`.
-pub const WAL_FILE_HEADER: usize = 16;
+/// `magic [8] | version u32 | dict_train_bytes u64 | crc32c u32` at the
+/// start of `wal.log`.
+pub const WAL_FILE_HEADER: usize = 24;
 pub const WAL_MAGIC: [u8; 8] = *b"STRMWAL\0";
-pub const WAL_VERSION: u32 = 8;
+pub const WAL_VERSION: u32 = 9;
+/// Header bytes covered by the header CRC (everything before it).
+const WAL_HEADER_CRC_AT: usize = 20;
 /// `len u32 | seq u64 | count u32 | mode u8 | crc32c u32`.
 pub const FRAME_HEADER: usize = 21;
 /// Header bytes covered by the frame CRC (everything before it).
@@ -67,18 +70,25 @@ const PUT_OBJECT: u8 = 9;
 const PUT_DICT: u8 = 10;
 const COMPACT: u8 = 11;
 
-pub fn wal_file_header() -> [u8; WAL_FILE_HEADER] {
+/// The file header of a new WAL. `dict_train_bytes` is the dictionary
+/// training threshold for the WAL's lifetime (`Config::dict_train_bytes` at
+/// creation).
+pub fn wal_file_header(dict_train_bytes: u64) -> [u8; WAL_FILE_HEADER] {
     let mut h = [0; WAL_FILE_HEADER];
     h[..8].copy_from_slice(&WAL_MAGIC);
     h[8..12].copy_from_slice(&WAL_VERSION.to_le_bytes());
-    let crc = crc32c::crc32c(&h[..12]);
-    h[12..].copy_from_slice(&crc.to_le_bytes());
+    h[12..20].copy_from_slice(&dict_train_bytes.to_le_bytes());
+    let crc = crc32c::crc32c(&h[..WAL_HEADER_CRC_AT]);
+    h[WAL_HEADER_CRC_AT..].copy_from_slice(&crc.to_le_bytes());
     h
 }
 
-/// True if `buf` starts with this version's intact file header.
-pub fn is_current_wal(buf: &[u8]) -> bool {
-    buf.get(..WAL_FILE_HEADER) == Some(&wal_file_header()[..])
+/// The `dict_train_bytes` of `buf`'s file header if `buf` starts with this
+/// version's intact header; `None` for anything else.
+pub fn decode_wal_header(buf: &[u8]) -> Option<u64> {
+    let h: &[u8; WAL_FILE_HEADER] = buf.get(..WAL_FILE_HEADER)?.try_into().ok()?;
+    let dict_train_bytes = u64::from_le_bytes(h[12..20].try_into().ok()?);
+    (*h == wal_file_header(dict_train_bytes)).then_some(dict_train_bytes)
 }
 
 /// Longest unsigned LEB128 encoding of a u64.
@@ -1031,19 +1041,25 @@ mod tests {
 
     #[test]
     fn wal_file_header_is_recognised() {
-        let h = wal_file_header();
+        let h = wal_file_header(0x0102_0304_0506_0708);
         assert_eq!(&h[..8], b"STRMWAL\0");
         assert_eq!(&h[8..12], &WAL_VERSION.to_le_bytes());
-        assert!(is_current_wal(&h));
+        assert_eq!(&h[12..20], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(decode_wal_header(&h), Some(0x0102_0304_0506_0708));
         for version in (1..WAL_VERSION).chain([WAL_VERSION + 1]) {
             // An older or a future version, with a valid header CRC.
             let mut other = h;
             other[8..12].copy_from_slice(&version.to_le_bytes());
-            let crc = crc32c::crc32c(&other[..12]);
-            other[12..].copy_from_slice(&crc.to_le_bytes());
-            assert!(!is_current_wal(&other), "version {version}");
+            let crc = crc32c::crc32c(&other[..WAL_HEADER_CRC_AT]);
+            other[WAL_HEADER_CRC_AT..].copy_from_slice(&crc.to_le_bytes());
+            assert_eq!(decode_wal_header(&other), None, "version {version}");
         }
-        assert!(!is_current_wal(&h[..15]));
+        for i in 0..WAL_FILE_HEADER {
+            let mut flipped = h;
+            flipped[i] ^= 1;
+            assert_eq!(decode_wal_header(&flipped), None, "byte {i} flipped");
+        }
+        assert_eq!(decode_wal_header(&h[..WAL_FILE_HEADER - 1]), None);
     }
 
     #[test]
