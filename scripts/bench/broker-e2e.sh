@@ -170,7 +170,7 @@ fi
 
 max_run=0
 for size in $SIZES; do
-    run=$((MAX_BYTES + MAX_BYTES / size * OVERHEAD_PER_MSG))
+    run=$((MAX_BYTES + MAX_BYTES * OVERHEAD_PER_MSG / size))
     [ "$run" -gt "$max_run" ] && max_run=$run
 done
 planned=$((max_run + BUILD_BYTES))
@@ -272,8 +272,7 @@ start_broker() {
     "$BROKER" --data-dir "$data" --listen 127.0.0.1:0 --cluster-id bench --node-id 1 \
         </dev/null >/dev/null 2>"$err" &
     BROKER_PID=$!
-    local i
-    for i in $(seq 1 100); do
+    for _ in $(seq 1 100); do
         BROKER_ADDR="$(sed -n 's/^straum-broker: listening on //p' "$err")"
         [ -n "$BROKER_ADDR" ] && break
         kill -0 "$BROKER_PID" 2>/dev/null || break
