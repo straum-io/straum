@@ -803,7 +803,7 @@ impl IndexWriter {
     /// Appends the entry with topic_seq `self.seq()`. Returns true if it
     /// starts a block.
     pub fn push(&mut self, out: &mut Vec<u8>, number: u64, timestamp: u64) -> bool {
-        let first = self.seq % INDEX_BLOCK == 0;
+        let first = self.seq.is_multiple_of(INDEX_BLOCK);
         let start = out.len();
         if first {
             self.crc = crc32c::crc32c(&(self.seq / INDEX_BLOCK).to_le_bytes());
@@ -817,7 +817,7 @@ impl IndexWriter {
         self.prev_number = number;
         self.prev_timestamp = timestamp;
         self.seq += 1;
-        if self.seq % INDEX_BLOCK == 0 {
+        if self.seq.is_multiple_of(INDEX_BLOCK) {
             out.extend_from_slice(&self.crc.to_le_bytes());
         }
         first

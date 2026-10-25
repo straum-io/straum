@@ -2,6 +2,9 @@ name: ci
 
 # The validation of rules.md §17 on every PR and on main. The Linux container
 # run of scripts/linux.sh is not needed here: the runner is Linux.
+# linux_runtime_uses_io_uring is skipped on the runner, whose kernel and
+# seccomp policy for io_uring Straum does not control; the io_uring check is
+# scripts/container/linux.sh (crates/straum-store/README.md).
 # While crates/ holds no crate, cargo refuses a workspace without members, so
 # the cargo steps are skipped and the jobs pass.
 on:
@@ -38,7 +41,7 @@ jobs:
       - if: steps.ws.outputs.crates == 'true'
         run: cargo test --workspace --all-targets --no-run
       - if: steps.ws.outputs.crates == 'true'
-        run: cargo test --workspace --tests
+        run: cargo test --workspace --tests -- --skip linux_runtime_uses_io_uring
 
   # Line, region and function coverage, reported, not gated (ECO-D-7).
   coverage:
@@ -65,6 +68,6 @@ jobs:
         run: |
           {
             echo '```text'
-            cargo llvm-cov --workspace --tests --summary-only | tail -1
+            cargo llvm-cov --workspace --tests --summary-only -- --skip linux_runtime_uses_io_uring | tail -1
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"

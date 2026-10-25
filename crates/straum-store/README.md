@@ -91,6 +91,10 @@ Test variables: `STRAUM_STORE_CRASH_ITERATIONS` (default 200),
 | `tests/store.rs::macos_runtime_uses_polling` | `#[cfg(target_os = "macos")]` | compio selected the polling driver |
 | `tests/crash.rs::*` | Unix | `Child::kill` is SIGKILL on Unix |
 
+CI on GitHub runners skips `linux_runtime_uses_io_uring` (the runner's
+io_uring policy is not under the repository's control);
+`scripts/container/linux.sh` runs it.
+
 All other tests run on every platform. On macOS, `sync_data` is `fdatasync`,
 which does not flush the drive cache, so durability holds on Linux only.
 
