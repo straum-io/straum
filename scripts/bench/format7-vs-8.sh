@@ -26,14 +26,18 @@
 set -uo pipefail
 
 FORMAT7_COMMIT=7d298a243662516ae404e85c124fdb8693de0694
-# 1-minute load average above which a run is marked noisy: the benchmark
-# itself keeps about one task runnable or in uninterruptible fsync wait.
-LOAD_THRESHOLD=1.5
-# Load average above which the machine is not quiet before the first run.
+# 1-minute load average above which a run is marked noisy. The benchmark
+# itself raises it: tasks waiting in fsync and io_uring workers count. In
+# the straum-test container smoke test (4 cores) it reached 1.82.
+LOAD_THRESHOLD=3
+# Load average above which the machine is not quiet before the first run,
+# after the builds and downloads; the script waits up to LOAD_SETTLE_SECONDS
+# for it to fall below.
 LOAD_START_THRESHOLD=0.5
+LOAD_SETTLE_SECONDS=300
 SAMPLE_SECONDS=10
 # Disk allowance for the two release builds (target directories). The
-# smoke test in the straum-test container used about 0.4 GiB for both.
+# smoke test in the straum-test container (aarch64) used 372 MB for both.
 BUILD_BYTES=$((2 * 1024 * 1024 * 1024))
 
 # Loghub (https://github.com/logpai/loghub), Zenodo record 8196385, v8.
@@ -218,10 +222,6 @@ virt="$(systemd-detect-virt 2>/dev/null || true)"
 clk_tck="$(getconf CLK_TCK)"
 load_before="$(cat /proc/loadavg)"
 NOISY=0
-if above "$(load_now)" "$LOAD_START_THRESHOLD"; then
-    NOISY=1
-    echo "format7-vs-8: warning: load average $(load_now) above $LOAD_START_THRESHOLD before the first run" >&2
-fi
 
 {
     echo "# Environment"
@@ -230,11 +230,14 @@ fi
     echo "- Matrix: $([ "$QUICK" -eq 1 ] && echo "quick (smoke test, not a benchmark)" || echo full)"
     echo "- Commits: format7 \`$FORMAT7_COMMIT\`; format8 \`$FORMAT8_COMMIT\` (tracked files changed: $dirty)"
     echo "- Script: last changed in \`$script_commit\`, run from \`$FORMAT8_COMMIT\`"
-    echo "- CPU: $(awk -F: '/^model name/ {sub(/^ /, "", $2); print $2; exit}' /proc/cpuinfo)"
+    cpu="$(awk -F: '/^model name/ {sub(/^ /, "", $2); print $2; exit}' /proc/cpuinfo)"
+    [ -n "$cpu" ] || cpu="$(lscpu 2>/dev/null | awk -F: '/^(Vendor ID|Model name)/ {gsub(/^ +/, "", $2); printf "%s%s", sep, $2; sep = " "}')"
+    echo "- CPU: ${cpu:-unknown}"
     echo "- Cores: $(nproc) online; $(lscpu 2>/dev/null | awk -F: '/^(Socket|Core|Thread)/ {gsub(/^ +/, "", $2); printf "%s%s: %s", sep, $1, $2; sep = "; "}')"
     echo "- RAM: $(awk '/^MemTotal/ {print $2, $3}' /proc/meminfo)"
     echo "- Virtualization: ${virt:-not detected (systemd-detect-virt missing)}"
     echo "- Kernel: $(uname -srvm)"
+    # shellcheck source=/dev/null
     echo "- Distribution: $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
     echo "- CPU frequency governor: ${governors:-not available}"
     echo "- io_uring_disabled: $uring"
@@ -356,6 +359,18 @@ PAYLOADS="$PAYLOADS random"
 } >>"$ENV_MD"
 
 # --- Runs --------------------------------------------------------------------
+
+# The builds and downloads load the machine; let the load average settle.
+waited=0
+while above "$(load_now)" "$LOAD_START_THRESHOLD" && [ "$waited" -lt "$LOAD_SETTLE_SECONDS" ]; do
+    sleep 10
+    waited=$((waited + 10))
+done
+if above "$(load_now)" "$LOAD_START_THRESHOLD"; then
+    NOISY=1
+    echo "format7-vs-8: warning: load average $(load_now) above $LOAD_START_THRESHOLD before the first run" >&2
+fi
+echo "- Load average at the first run: $(cat /proc/loadavg) (after waiting $waited s)" >>"$ENV_MD"
 
 BENCH_DIR="$WORK/bench"
 HEADER=1

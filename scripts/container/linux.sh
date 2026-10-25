@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+# shellcheck disable=SC2317 # on_signal and restore run from traps
 # Run a cargo command inside a Linux container on the dedicated Podman
 # machine `straum-test`, which allows io_uring (seccomp profile and SELinux
 # module next to this script; setup in scripts/container/README.md). Used on

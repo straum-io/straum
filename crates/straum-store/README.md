@@ -209,10 +209,12 @@ What it does:
    then each mode in both formats, alternating which format goes first.
    After each store run, the read workloads: up to 10 000 reads or 5 s
    each; format 8 with the default block cache and with it off.
-5. Samples the load average and CPU frequency every 10 s (`quiet.csv`). A
-   1-minute load average above 1.5 at a run start, or above 0.5 before the
-   first run, prints a warning and marks the run noisy in `env.md`; the
-   benchmark goes on.
+5. Samples the load average and CPU frequency every 10 s (`quiet.csv`).
+   Before the first run it waits up to 5 minutes for the 1-minute load
+   average to fall to 0.5 after the builds. Above 0.5 then, or above 3 at
+   any run start (the benchmark itself raises the load: fsync waits and
+   io_uring workers), it prints a warning and marks the run noisy in
+   `env.md`; the benchmark goes on.
 6. Writes the medians and the spread of msgs/s per configuration.
 7. Deletes `<dir>/work` and its worktree entries, also after a failure,
    unless `--keep`.
