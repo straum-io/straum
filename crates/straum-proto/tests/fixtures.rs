@@ -1,7 +1,7 @@
 //! The golden frames (`conformance/frames/`) and partitioner vectors
 //! (`conformance/partitioner/vectors.json`) are generated from this crate.
 //! This test fails if the committed files differ from what it generates;
-//! `STRAUM_UPDATE_FIXTURES=1 cargo test -p straum-proto --test fixtures`
+//! `STRAUM_UPDATE_FIXTURES=1 cargo test -p straum-proto --test fixtures committed_fixtures_are_up_to_date`
 //! rewrites them.
 
 mod common;
@@ -59,7 +59,7 @@ fn generate() -> Vec<(String, Vec<u8>)> {
         ("a", b"a".to_vec()),
         ("check value", b"123456789".to_vec()),
         ("user-42", b"user-42".to_vec()),
-        ("utf-8", "ключ-ü".as_bytes().to_vec()),
+        ("utf-8", "κλειδί-ü".as_bytes().to_vec()),
         ("binary", vec![0, 0xff, 0x80, 0x7f]),
         ("1 KiB", vec![b'k'; 1024]),
     ];
@@ -131,7 +131,7 @@ fn committed_fixtures_are_up_to_date() {
     }
     assert!(
         stale.is_empty(),
-        "conformance fixtures out of date: {stale:?}; run STRAUM_UPDATE_FIXTURES=1 cargo test -p straum-proto --test fixtures"
+        "conformance fixtures out of date: {stale:?}; run STRAUM_UPDATE_FIXTURES=1 cargo test -p straum-proto --test fixtures committed_fixtures_are_up_to_date"
     );
 }
 

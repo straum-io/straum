@@ -49,7 +49,7 @@ The fixtures are generated from `crates/straum-proto`
 date. To regenerate after a protocol change:
 
 ```bash
-STRAUM_UPDATE_FIXTURES=1 cargo test -p straum-proto --test fixtures
+STRAUM_UPDATE_FIXTURES=1 cargo test -p straum-proto --test fixtures committed_fixtures_are_up_to_date
 ```
 
 ## Partitioner
