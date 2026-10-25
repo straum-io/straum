@@ -1,0 +1,297 @@
+{
+  "name": "create_produce_fetch",
+  "description": "CreateTopic, Produce and Fetch on partition 0; seqs in order; Metadata reflects them; TopicExists.",
+  "steps": [
+    {
+      "connect": "a"
+    },
+    {
+      "send": "a",
+      "id": "hello",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 0,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "hello",
+      "response": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "conformance",
+          "node_id": 1
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "create",
+      "request": {
+        "type": "CreateTopic",
+        "body": {
+          "name": "orders",
+          "partitions": 1,
+          "replication_factor": 1,
+          "retention_ms": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "create",
+      "response": {
+        "type": "CreateTopicOk"
+      }
+    },
+    {
+      "send": "a",
+      "id": "again",
+      "request": {
+        "type": "CreateTopic",
+        "body": {
+          "name": "orders",
+          "partitions": 1,
+          "replication_factor": 1,
+          "retention_ms": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "again",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "TopicExists"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "p1",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "orders",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": "6f6e65"
+            },
+            {
+              "key": "6b31",
+              "headers": [
+                {
+                  "name": "68",
+                  "value": "76"
+                },
+                {
+                  "name": "68",
+                  "value": ""
+                }
+              ],
+              "body": "74776f"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "p1",
+      "response": {
+        "type": "ProduceOk",
+        "body": {
+          "base_seq": "0",
+          "count": 2,
+          "leader_epoch": 1
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "p2",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "orders",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "2",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": "",
+              "headers": [],
+              "body": "7468726565"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "p2",
+      "response": {
+        "type": "ProduceOk",
+        "body": {
+          "base_seq": "2",
+          "count": 1
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "f",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "orders",
+          "partition": 0,
+          "from_seq": "0",
+          "max_bytes": 1048576,
+          "max_wait_ms": 0,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "f",
+      "response": {
+        "type": "FetchOk",
+        "body": {
+          "leader_epoch": 1,
+          "start_seq": "0",
+          "next_seq": "3",
+          "messages": [
+            {
+              "seq": "0",
+              "timestamp_ms": "*",
+              "key": null,
+              "headers": [],
+              "body": "6f6e65"
+            },
+            {
+              "seq": "1",
+              "timestamp_ms": "*",
+              "key": "6b31",
+              "headers": [
+                {
+                  "name": "68",
+                  "value": "76"
+                },
+                {
+                  "name": "68",
+                  "value": ""
+                }
+              ],
+              "body": "74776f"
+            },
+            {
+              "seq": "2",
+              "timestamp_ms": "*",
+              "key": "",
+              "headers": [],
+              "body": "7468726565"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "f2",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "orders",
+          "partition": 0,
+          "from_seq": "2",
+          "max_bytes": 1048576,
+          "max_wait_ms": 0,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "f2",
+      "response": {
+        "type": "FetchOk",
+        "body": {
+          "messages": {
+            "$len": 1
+          }
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "meta",
+      "request": {
+        "type": "Metadata",
+        "body": {
+          "topics": []
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "meta",
+      "response": {
+        "type": "MetadataOk",
+        "body": {
+          "cluster_id": "conformance",
+          "controller_node_id": 1,
+          "nodes": [
+            {
+              "node_id": 1,
+              "host": "127.0.0.1",
+              "port": "*",
+              "rack": ""
+            }
+          ],
+          "topics": [
+            {
+              "name": "orders",
+              "error": 0,
+              "partitions": [
+                {
+                  "partition": 0,
+                  "leader_node_id": 1,
+                  "leader_epoch": 1,
+                  "replicas": [
+                    1
+                  ],
+                  "in_sync_replicas": [
+                    1
+                  ],
+                  "start_seq": "0",
+                  "next_seq": "3"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,150 @@
+{
+  "name": "fenced_leader_epoch",
+  "description": "FencedLeaderEpoch with the same leader: the client refreshes Metadata and retries on the same connection with the new epoch.",
+  "client": {
+    "op": "produce",
+    "topic": "t",
+    "partition": 0,
+    "producer_id": "77",
+    "producer_seq": "5",
+    "messages": [
+      {
+        "key": "6b",
+        "headers": [],
+        "body": "68656c6c6f"
+      }
+    ]
+  },
+  "server": [
+    {
+      "accept": true
+    },
+    {
+      "expect": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "auth_mechanism": "none"
+        }
+      },
+      "reply": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "fake",
+          "node_id": 1,
+          "max_frame_bytes": 8388608,
+          "max_message_bytes": 1048576
+        }
+      }
+    },
+    {
+      "expect": {
+        "type": "Produce",
+        "body": {
+          "topic": "t",
+          "partition": 0,
+          "producer_id": "77",
+          "producer_seq": "5",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "messages": [
+            {
+              "key": "6b",
+              "headers": [],
+              "body": "68656c6c6f"
+            }
+          ]
+        }
+      },
+      "reply": {
+        "type": "Error",
+        "body": {
+          "code": "FencedLeaderEpoch",
+          "message": "",
+          "leader_node_id": 1,
+          "leader_epoch": 2,
+          "retry_after_ms": 0,
+          "min_version": 0,
+          "max_version": 0
+        }
+      }
+    },
+    {
+      "expect": {
+        "type": "Metadata"
+      },
+      "reply": {
+        "type": "MetadataOk",
+        "body": {
+          "cluster_id": "fake",
+          "controller_node_id": 1,
+          "nodes": [
+            {
+              "node_id": 1,
+              "host": "{{host}}",
+              "port": "{{port}}",
+              "rack": ""
+            }
+          ],
+          "topics": [
+            {
+              "name": "t",
+              "error": 0,
+              "partitions": [
+                {
+                  "partition": 0,
+                  "leader_node_id": 1,
+                  "leader_epoch": 2,
+                  "replicas": [
+                    1
+                  ],
+                  "in_sync_replicas": [
+                    1
+                  ],
+                  "start_seq": "0",
+                  "next_seq": "10"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": {
+        "type": "Produce",
+        "body": {
+          "topic": "t",
+          "partition": 0,
+          "producer_id": "77",
+          "producer_seq": "5",
+          "ack_level": 1,
+          "expected_leader_epoch": 2,
+          "messages": [
+            {
+              "key": "6b",
+              "headers": [],
+              "body": "68656c6c6f"
+            }
+          ]
+        }
+      },
+      "reply": {
+        "type": "ProduceOk",
+        "body": {
+          "base_seq": "12",
+          "count": 1,
+          "leader_epoch": 2,
+          "timestamp_ms": "1761350400000"
+        }
+      }
+    }
+  ],
+  "result": {
+    "ok": {
+      "base_seq": "12",
+      "leader_epoch": 2
+    }
+  }
+}

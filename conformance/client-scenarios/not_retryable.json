@@ -1,0 +1,77 @@
+{
+  "name": "not_retryable",
+  "description": "An error that is not retryable (UnknownTopic) is returned to the caller at once.",
+  "client": {
+    "op": "produce",
+    "topic": "t",
+    "partition": 0,
+    "producer_id": "77",
+    "producer_seq": "5",
+    "messages": [
+      {
+        "key": "6b",
+        "headers": [],
+        "body": "68656c6c6f"
+      }
+    ]
+  },
+  "server": [
+    {
+      "accept": true
+    },
+    {
+      "expect": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "auth_mechanism": "none"
+        }
+      },
+      "reply": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "fake",
+          "node_id": 1,
+          "max_frame_bytes": 8388608,
+          "max_message_bytes": 1048576
+        }
+      }
+    },
+    {
+      "expect": {
+        "type": "Produce",
+        "body": {
+          "topic": "t",
+          "partition": 0,
+          "producer_id": "77",
+          "producer_seq": "5",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "messages": [
+            {
+              "key": "6b",
+              "headers": [],
+              "body": "68656c6c6f"
+            }
+          ]
+        }
+      },
+      "reply": {
+        "type": "Error",
+        "body": {
+          "code": "UnknownTopic",
+          "message": "",
+          "leader_node_id": 0,
+          "leader_epoch": 0,
+          "retry_after_ms": 0,
+          "min_version": 0,
+          "max_version": 0
+        }
+      }
+    }
+  ],
+  "result": {
+    "error": "UnknownTopic"
+  }
+}

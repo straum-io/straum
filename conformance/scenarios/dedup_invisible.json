@@ -1,0 +1,207 @@
+{
+  "name": "dedup_invisible",
+  "description": "The same body produced twice, with different keys and headers, gives two seqs; BrokerStats counts one deduplicated message; Fetch returns each publication's own key and headers.",
+  "steps": [
+    {
+      "connect": "a"
+    },
+    {
+      "send": "a",
+      "id": "hello",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 0,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "hello",
+      "response": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "conformance",
+          "node_id": 1
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "create",
+      "request": {
+        "type": "CreateTopic",
+        "body": {
+          "name": "d",
+          "partitions": 1,
+          "replication_factor": 1,
+          "retention_ms": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "create",
+      "response": {
+        "type": "CreateTopicOk"
+      }
+    },
+    {
+      "send": "a",
+      "id": "p1",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "d",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": "6b65792d61",
+              "headers": [
+                {
+                  "name": "68",
+                  "value": "31"
+                }
+              ],
+              "body": "73616d6520626f6479"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "p1",
+      "response": {
+        "type": "ProduceOk",
+        "body": {
+          "base_seq": "0"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "p2",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "d",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "2",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": "6b65792d62",
+              "headers": [
+                {
+                  "name": "68",
+                  "value": "32"
+                },
+                {
+                  "name": "78",
+                  "value": ""
+                }
+              ],
+              "body": "73616d6520626f6479"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "p2",
+      "response": {
+        "type": "ProduceOk",
+        "body": {
+          "base_seq": "1"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "s",
+      "request": {
+        "type": "BrokerStats"
+      }
+    },
+    {
+      "expect": "a",
+      "id": "s",
+      "response": {
+        "type": "BrokerStatsOk",
+        "body": {
+          "messages_accepted": "3",
+          "messages_deduplicated": "1"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "f",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "d",
+          "partition": 0,
+          "from_seq": "0",
+          "max_bytes": 1048576,
+          "max_wait_ms": 0,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "f",
+      "response": {
+        "type": "FetchOk",
+        "body": {
+          "messages": [
+            {
+              "seq": "0",
+              "timestamp_ms": "*",
+              "key": "6b65792d61",
+              "headers": [
+                {
+                  "name": "68",
+                  "value": "31"
+                }
+              ],
+              "body": "73616d6520626f6479"
+            },
+            {
+              "seq": "1",
+              "timestamp_ms": "*",
+              "key": "6b65792d62",
+              "headers": [
+                {
+                  "name": "68",
+                  "value": "32"
+                },
+                {
+                  "name": "78",
+                  "value": ""
+                }
+              ],
+              "body": "73616d6520626f6479"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

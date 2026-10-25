@@ -1,0 +1,227 @@
+{
+  "name": "unknown_topic_and_partition",
+  "description": "UnknownTopic and UnknownPartition on every request that names a partition; Metadata reports UnknownTopic per topic.",
+  "steps": [
+    {
+      "connect": "a"
+    },
+    {
+      "send": "a",
+      "id": "hello",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 0,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "hello",
+      "response": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "conformance",
+          "node_id": 1
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "create",
+      "request": {
+        "type": "CreateTopic",
+        "body": {
+          "name": "orders",
+          "partitions": 1,
+          "replication_factor": 1,
+          "retention_ms": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "create",
+      "response": {
+        "type": "CreateTopicOk"
+      }
+    },
+    {
+      "send": "a",
+      "id": "p",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "missing",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": "78"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "p",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "UnknownTopic"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "pp",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "orders",
+          "partition": 1,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": "78"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "pp",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "UnknownPartition"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "f",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "missing",
+          "partition": 0,
+          "from_seq": "0",
+          "max_bytes": 1048576,
+          "max_wait_ms": 0,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "f",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "UnknownTopic"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "fp",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "orders",
+          "partition": 7,
+          "from_seq": "0",
+          "max_bytes": 1048576,
+          "max_wait_ms": 0,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "fp",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "UnknownPartition"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "d",
+      "request": {
+        "type": "DescribeTopic",
+        "body": {
+          "name": "missing"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "d",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "UnknownTopic"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "m",
+      "request": {
+        "type": "Metadata",
+        "body": {
+          "topics": [
+            "orders",
+            "missing"
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "m",
+      "response": {
+        "type": "MetadataOk",
+        "body": {
+          "topics": [
+            {
+              "name": "orders",
+              "error": 0,
+              "partitions": {
+                "$len": 1
+              }
+            },
+            {
+              "name": "missing",
+              "error": "UnknownTopic",
+              "partitions": []
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
