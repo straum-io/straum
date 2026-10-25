@@ -7,7 +7,7 @@
 mod common;
 
 use common::TempDir;
-use straum_store::{Config, Entry, Message, ObjectId, Store, WriteMode};
+use straum_store::{Config, Entry, Message, ObjectId, Store, StoreError, WriteMode};
 
 const MODES: [WriteMode; 3] = [
     WriteMode::Sequential,
@@ -173,4 +173,61 @@ async fn attributes_survive_release_and_compaction() {
         drop(store);
         store = Store::open(&dir.0, config).await.unwrap();
     }
+}
+
+#[compio::test]
+async fn the_frame_bound_counts_attributes_and_is_additive() {
+    let dir = TempDir::new("pub-bound");
+    let config = Config {
+        max_frame_bytes: 2048,
+        ..Config::default()
+    };
+    let mut store = Store::open(&dir.0, config).await.unwrap();
+    let key = vec![b'k'; 4000];
+    let big = Message {
+        topic: b"t",
+        payload: b"x",
+        key: Some(&key),
+        ..Message::default()
+    };
+    let small = Message {
+        topic: b"t",
+        payload: b"x",
+        ..Message::default()
+    };
+    assert!(store.batch_frame_bytes(&[big]) > 4000);
+    let err = store.put_batch(&[big], 0).await.unwrap_err();
+    assert!(matches!(err, StoreError::FrameTooLarge), "{err}");
+    assert_eq!(store.stats().wal_bytes, 0, "refused before any I/O");
+    let empty = store.batch_frame_bytes(&[]);
+    for batch in [vec![small, small], vec![small, big, small]] {
+        let parts: usize = batch
+            .iter()
+            .map(|m| store.batch_frame_bytes(std::slice::from_ref(m)) - empty)
+            .sum();
+        assert_eq!(store.batch_frame_bytes(&batch), empty + parts);
+    }
+    assert_eq!(store.max_frame_bytes(), 2048);
+    store.put_batch(&[small], 0).await.unwrap();
+}
+
+#[compio::test]
+async fn topic_stats_follow_publish_and_release() {
+    let dir = TempDir::new("pub-stats");
+    let mut store = Store::open(&dir.0, Config::default()).await.unwrap();
+    assert_eq!(store.topic_stats(b"t"), None);
+    let msgs: Vec<Message> = (0..3)
+        .map(|_| Message {
+            topic: b"t",
+            payload: b"p",
+            ..Message::default()
+        })
+        .collect();
+    store.put_batch(&msgs, 1).await.unwrap();
+    store.release_before(b"t", 2).await.unwrap();
+    let s = store.topic_stats(b"t").unwrap();
+    assert_eq!((s.first_live, s.next_seq), (3, 3));
+    assert!(s.index_bytes > 0);
+    store.put_batch(&msgs[..1], 5).await.unwrap();
+    assert_eq!(store.topic_stats(b"t").unwrap().next_seq, 4);
 }

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 pub use codec::{FrameMode, MAX_TOPIC, ObjectId};
 pub use store::{
     CompactStats, Config, DropReason, Entry, Message, RecoveryAction, RecoveryReport, Stats, Store,
-    WriteMode,
+    TopicStats, WriteMode,
 };
 
 #[derive(Debug, thiserror::Error)]

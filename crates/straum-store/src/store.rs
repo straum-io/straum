@@ -94,6 +94,17 @@ pub struct Entry {
     pub payload: Vec<u8>,
 }
 
+/// One topic's counters, from memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TopicStats {
+    /// The first live seq.
+    pub first_live: u64,
+    /// The seq the next entry gets.
+    pub next_seq: u64,
+    /// Bytes of the topic's index file.
+    pub index_bytes: u64,
+}
+
 /// Counters since `open`, in memory only: they start at zero on every open
 /// and are not persisted. Recovery work is not counted. Message counters
 /// cover acknowledged batches only.
@@ -876,8 +887,21 @@ impl Store {
         }))
     }
 
-    /// Upper bound of the WAL frame of `batch`: every object counted as new.
-    fn batch_frame_bytes(&self, batch: &[Message<'_>]) -> usize {
+    /// Counters of `topic`; `None` if it has no entry.
+    pub fn topic_stats(&self, topic: &[u8]) -> Option<TopicStats> {
+        self.topics.get(topic).map(|t| TopicStats {
+            first_live: t.first_live,
+            next_seq: t.first_live + t.live.len() as u64,
+            index_bytes: t.index_len,
+        })
+    }
+
+    /// The upper bound of the WAL frame `put_batch` checks against
+    /// `Config::max_frame_bytes` before any I/O. Additive over messages:
+    /// the bound of two batches together is the sum of their bounds minus
+    /// the bound of an empty batch, so a caller can grow a batch message by
+    /// message. A batch over the limit fails with `FrameTooLarge`.
+    pub fn batch_frame_bytes(&self, batch: &[Message<'_>]) -> usize {
         let inline = self.config.write_mode.inline_threshold();
         FRAME_HEADER
             + batch
@@ -897,6 +921,10 @@ impl Store {
                     put + RECORD_PUBLISH + codec::attrs_len(m.key, m.headers) + topic
                 })
                 .sum::<usize>()
+    }
+
+    pub fn max_frame_bytes(&self) -> u32 {
+        self.config.max_frame_bytes
     }
 
     /// `None` if the object is not in the index (never stored, or reclaimed).

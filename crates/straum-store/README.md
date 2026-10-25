@@ -13,6 +13,9 @@ driver on macOS (development only). No tokio, including transitively.
   headers and timestamp. Without key and headers a publication costs no
   extra byte (measured with `examples/meta_bytes`); with them, the key and
   headers are neither deduplicated nor compressed.
+- `Store::topic_stats` (first and next seq, index bytes) and
+  `Store::batch_frame_bytes` (the frame bound `put_batch` checks before any
+  I/O, additive over messages) let a caller size its batches.
 - Group commit: one segment `fdatasync` and one WAL `fdatasync` per batch;
   a batch is acknowledged only after both.
 - Recovery from the WAL cuts a torn tail and checks topic indexes and
@@ -54,7 +57,7 @@ Test variables: `STRAUM_STORE_CRASH_ITERATIONS` (default 200),
 | `src/store.rs` | reference count reconciliation; replay rejecting an inconsistent WAL; applying Compact; file names |
 | `tests/store.rs` | deduplication; one fsync per file per batch; restart; rotation; compaction; orphans; corrupted objects and indexes; WAL truncation at every byte of the last record (Publish, Release, Compact) |
 | `tests/model.rs` | proptest: random publish (with no key, an empty key, or a key and headers), release, compact and restart against an in-memory model, 128 cases per write mode |
-| `tests/publication.rs` | keys and headers through restart, release and compaction in every write mode; one object for the same payload under different keys |
+| `tests/publication.rs` | keys and headers through restart, release and compaction in every write mode; one object for the same payload under different keys; the frame bound counts them and is additive; `topic_stats` |
 | `tests/crash.rs` | a writer in a child process killed with SIGKILL at a random moment, checked after each restart; one test per write mode |
 | `tests/wal_corruption.rs` | any flipped bit in a middle frame gives `WalCorrupted` and leaves the file unchanged; in the last frame, truncation; a lost first half of the last frame is a torn tail; truncation at every byte; a `seq` gap; an old format gives `UnsupportedFormat`; `max_frame_bytes` |
 | `tests/fault_injection.rs` | hand-built ParallelSync states: missing or wrong object bytes of the last frame drop the frame; a missing object of an earlier frame gives `MissingObject`; every write mode |
