@@ -1,0 +1,19 @@
+[package]
+name = "straum-broker"
+version = "0.1.0"
+description = "The Straum broker: one shard on one core, over straum-store"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+straum-proto = { path = "../straum-proto" }
+straum-store = { path = "../straum-store" }
+compio = { workspace = true, features = ["net", "time", "signal"] }
+crc32c.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
