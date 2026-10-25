@@ -3,20 +3,25 @@
 [![CI](https://github.com/straum-io/straum/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/straum-io/straum/actions/workflows/ci.yml)
 ![Status: rebuilding](https://img.shields.io/badge/status-rebuilding-lightgrey)
 
-Straum is being rebuilt from scratch. This repository holds no code right
-now, only the build and release setup the new code will use:
+Straum is being rebuilt from scratch. This repository holds a storage engine
+and the build and release setup the new code will use:
 
+- `crates/straum-store`: a content-addressed log storage engine on compio
+  (one shard, local; [README](crates/straum-store/README.md)).
+  `crates/straum-store-bench` is its disk benchmark, `tools/dedup-survey` a
+  duplicate survey over log files.
 - `.github/`: CI (`ci.yml`), the release pipeline (`release.yml`), the PR
   body check (`pr-contract.yml`), the Issue and PR templates.
 - `Cargo.toml`, `clippy.toml`: the workspace settings (members under
-  `crates/`, lints, release profile).
+  `crates/` and `tools/`, lints, release profile).
 - `Dockerfile`, `debian/`, `deploy/kubernetes/`, `scripts/ppa.sh`: the
   image, the Debian and PPA packaging and the Kubernetes package. They
   build the `straum-server` binary and work again once a crate provides it.
 - `scripts/linux.sh`: runs cargo in a Linux container on macOS.
+- `scripts/container/`: runs cargo in a Linux container with io_uring
+  enabled, on a dedicated Podman machine.
 
-While `crates/` is empty, CI skips its cargo steps, and the release
-pipeline runs only on version tags.
+The release pipeline runs only on version tags.
 
 The previous code, a replicated log with scheduled leadership, is kept
 under the tag

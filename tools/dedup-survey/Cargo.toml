@@ -1,0 +1,18 @@
+[package]
+name = "dedup-survey"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+straum-store = { path = "../../crates/straum-store" }
+compio.workspace = true
+# Compressed plain-log baseline (zstd level 3, 1 MiB chunks). Exact version:
+# compressed sizes depend on it.
+zstd = "=0.14.3"
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "straum-store-bench"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+straum-store = { path = "../straum-store" }
+compio.workspace = true
+crc32c.workspace = true
+
+[lints]
+workspace = true
