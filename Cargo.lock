@@ -1011,6 +1011,8 @@ version = "0.1.0"
 dependencies = [
  "compio",
  "crc32c",
+ "straum-client",
+ "straum-conformance",
  "straum-proto",
  "straum-store",
  "thiserror",

@@ -15,5 +15,9 @@ compio = { workspace = true, features = ["net", "time", "signal"] }
 crc32c.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+straum-client = { path = "../straum-client" }
+straum-conformance = { path = "../straum-conformance" }
+
 [lints]
 workspace = true
