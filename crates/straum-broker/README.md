@@ -63,7 +63,7 @@ also a flag, `--key value`, with `-` or `_`; flags win.
 | `data_dir` | required | identity file and the store (`store/`) |
 | `cluster_id` | required | at most 64 bytes |
 | `node_id` | required | not 0 |
-| `listen` | `127.0.0.1:7171` | |
+| `listen` | `127.0.0.1:7171` | loopback only: version 0 has no authentication, so another address is refused at startup |
 | `advertised_host`, `advertised_port` | from `listen` | the address Metadata reports |
 | `max_frame_bytes` | 8 MiB | larger frames: `FrameTooLarge`, connection closed |
 | `max_message_bytes` | 1 MiB | body |

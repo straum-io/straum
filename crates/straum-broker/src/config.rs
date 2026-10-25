@@ -179,6 +179,12 @@ impl Config {
                 "cluster_id is required, at most 64 bytes",
             ),
             (self.node_id != 0, "node_id is required and not 0"),
+            // Version 0 authenticates no client, and admin requests share
+            // the listener: it never leaves loopback.
+            (
+                self.listen.ip().is_loopback(),
+                "listen is a loopback address (version 0 has no authentication)",
+            ),
             (self.max_frame_bytes >= 64, "max_frame_bytes is at least 64"),
             (
                 self.max_message_bytes <= self.max_frame_bytes,
@@ -271,6 +277,14 @@ mod tests {
         let mut c = base();
         c.node_id = 0;
         assert!(c.validate().is_err());
+        for addr in ["0.0.0.0:7171", "192.168.1.2:7171", "[::]:7171"] {
+            let mut c = base();
+            c.set("listen", addr).unwrap();
+            assert!(c.validate().is_err(), "{addr}");
+        }
+        let mut c = base();
+        c.set("listen", "[::1]:0").unwrap();
+        assert!(c.validate().is_ok());
         assert!(Config::default().set("nope", "1").is_err());
         assert!(Config::default().set("store_write_mode", "fast").is_err());
     }
