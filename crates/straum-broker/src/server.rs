@@ -73,6 +73,7 @@ struct Shared {
     /// Notified when pending bytes are released.
     pending_released: Event,
     connections: Cell<u32>,
+    fetch_waiters: Cell<u32>,
     /// Requests read and not yet answered, on all connections.
     outstanding: Cell<u64>,
     answered: Event,
@@ -169,6 +170,7 @@ pub async fn serve(
         pending_peak: Cell::new(0),
         pending_released: Event::default(),
         connections: Cell::new(0),
+        fetch_waiters: Cell::new(0),
         outstanding: Cell::new(0),
         answered: Event::default(),
         closing: Cell::new(false),
@@ -901,14 +903,32 @@ async fn fetch(sh: &Shared, f: proto::Fetch) -> Response {
         Err(e) => return Response::Error(e),
     };
     let max_bytes = f.max_bytes.min(sh.config.max_fetch_bytes) as usize;
-    match read_messages(sh, &partition, f.from_seq, max_bytes).await {
-        Ok(messages) => Response::FetchOk(FetchOk {
-            leader_epoch: epoch,
-            start_seq: partition.start_seq.get(),
-            next_seq: partition.next_seq.get(),
-            messages,
-        }),
-        Err(e) => Response::error(ErrorCode::StorageError, e.to_string()),
+    let wait = Duration::from_millis(u64::from(f.max_wait_ms.min(sh.config.max_fetch_wait_ms)));
+    let deadline = Instant::now() + wait;
+    loop {
+        let g = partition.committed.generation();
+        let messages = match read_messages(sh, &partition, f.from_seq, max_bytes).await {
+            Ok(m) => m,
+            Err(e) => return Response::error(ErrorCode::StorageError, e.to_string()),
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if !messages.is_empty() || left.is_zero() || sh.closing.get() {
+            return Response::FetchOk(FetchOk {
+                leader_epoch: epoch,
+                start_seq: partition.start_seq.get(),
+                next_seq: partition.next_seq.get(),
+                messages,
+            });
+        }
+        if sh.fetch_waiters.get() >= sh.config.max_fetch_waiters {
+            return Response::Error(ErrorBody {
+                retry_after_ms: 100,
+                ..ErrorBody::new(ErrorCode::Overloaded, "too many waiting fetches")
+            });
+        }
+        sh.fetch_waiters.set(sh.fetch_waiters.get() + 1);
+        let _ = compio::time::timeout(left, partition.committed.wait_change(g)).await;
+        sh.fetch_waiters.set(sh.fetch_waiters.get() - 1);
     }
 }
 
