@@ -135,7 +135,11 @@ async fn survey(
     let mut batch = Vec::with_capacity(BATCH);
     for (i, chunk) in msgs.chunks(BATCH).enumerate() {
         batch.clear();
-        batch.extend(chunk.iter().map(|&payload| Message { topic, payload }));
+        batch.extend(chunk.iter().map(|&payload| Message {
+            topic,
+            payload,
+            ..Default::default()
+        }));
         store.put_batch(&batch, (i * BATCH) as u64).await?;
     }
     let s = store.stats();

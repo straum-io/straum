@@ -102,7 +102,11 @@ fn crash_child() {
             let batch: Vec<Message> = topics
                 .iter()
                 .zip(&payloads)
-                .map(|(&topic, payload)| Message { topic, payload })
+                .map(|(&topic, payload)| Message {
+                    topic,
+                    payload,
+                    ..Default::default()
+                })
                 .collect();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 pub use codec::{FrameMode, MAX_TOPIC, ObjectId};
 pub use store::{
-    CompactStats, Config, DropReason, Message, RecoveryAction, RecoveryReport, Stats, Store,
+    CompactStats, Config, DropReason, Entry, Message, RecoveryAction, RecoveryReport, Stats, Store,
     WriteMode,
 };
 

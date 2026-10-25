@@ -9,6 +9,7 @@ fn msg<'a>(topic: &'a str, payload: &'a [u8]) -> Message<'a> {
     Message {
         topic: topic.as_bytes(),
         payload,
+        ..Default::default()
     }
 }
 

@@ -60,6 +60,7 @@ async fn build(dir: &Path, mode: WriteMode) {
         let batch = [Message {
             topic: b"t",
             payload: &p,
+            ..Default::default()
         }];
         store.put_batch(&batch, u64::from(i)).await.unwrap();
     }
@@ -270,6 +271,7 @@ async fn inline_small_damaged_last_frame_is_dropped() {
             let batch = [Message {
                 topic: b"t",
                 payload: &p,
+                ..Default::default()
             }];
             store.put_batch(&batch, u64::from(i)).await.unwrap();
         }

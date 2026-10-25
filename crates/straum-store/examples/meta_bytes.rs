@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let before = store.stats();
                         for (b, chunk) in payloads.chunks(batch).enumerate() {
                             let msgs: Vec<Message> =
-                                chunk.iter().map(|p| Message { topic: TOPIC, payload: p }).collect();
+                                chunk.iter().map(|p| Message { topic: TOPIC, payload: p, ..Default::default() }).collect();
                             // Realistic Unix-millisecond timestamps: varint
                             // sizes depend on the value (fixed-width before
                             // the compact Publish format, so earlier results
