@@ -1017,6 +1017,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "straum-client"
+version = "0.1.0"
+dependencies = [
+ "straum-proto",
+]
+
+[[package]]
 name = "straum-proto"
 version = "0.1.0"
 dependencies = [
