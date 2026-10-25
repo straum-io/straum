@@ -12,5 +12,12 @@ straum-store = { path = "../straum-store" }
 compio.workspace = true
 crc32c.workspace = true
 
+# `blocks`: the engine has a block cache (compressed blocks, WAL format 8
+# and later). Off, the bench builds against WAL format 7
+# (scripts/bench/format7-vs-8.sh).
+[features]
+default = ["blocks"]
+blocks = []
+
 [lints]
 workspace = true

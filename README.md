@@ -21,6 +21,9 @@ and the build and release setup the new code will use:
 - `scripts/linux.sh`: runs cargo in a Linux container on macOS.
 - `scripts/container/`: runs cargo in a Linux container with io_uring
   enabled, on a dedicated Podman machine.
+- `scripts/bench/format7-vs-8.sh`: the storage engine's format 7 against
+  its compressed-block format on a Linux machine
+  ([how to run it](crates/straum-store/README.md#format-7-against-format-8-on-a-linux-machine)).
 
 The release pipeline runs only on version tags.
 

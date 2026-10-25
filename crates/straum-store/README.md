@@ -128,18 +128,103 @@ store in `Sequential`, `ParallelSync` or `InlineSmall` mode). Matrix: sizes
 {100, 1024, 10240} × batches {1, 8, 64, 512}; a run lasts up to 1000 batches
 or 1 GiB, at least 100 batches; 5 repetitions, then a `median` row.
 
-CSV columns: `mode, msg_size, batch, rep, messages, batches, elapsed_ns,
-msgs_per_s, fsyncs, fsyncs_per_batch, bytes_written, bytes_per_msg,
-wal_bytes_per_msg, batch_p50_ns, batch_p99_ns, rep_min_msgs_per_s,
+Payloads (`--payload`): `pattern` (the default: the message index, then a
+fixed fill), `random` (a xorshift64* stream from `--seed`, incompressible)
+or `file:<path>` (consecutive windows of the file; after its end the windows
+start one byte further in, so payloads repeat only where the file does).
+`--reads N` reopens the store after the writes and reads it twice, in
+`topic_seq` order and at random `topic_seq`s, up to N reads or
+`--read-seconds` each, once per `--read-cache` setting (`default`, or `off`:
+`block_cache_blocks = 0`); rows go to `--reads-out`. Reads come from the
+page cache. The `blocks` feature (default) builds the bench for an engine
+with a block cache; without it the bench builds against WAL format 7, which
+has none (`cache` is `none` in its rows).
+
+CSV columns: `label, payload, mode, msg_size, batch, rep, messages, batches,
+elapsed_ns, msgs_per_s, fsyncs, fsyncs_per_batch, bytes_written,
+bytes_per_msg, wal_bytes_per_msg, disk_bytes_per_msg, batch_p50_ns,
+batch_p99_ns, cpu_ns_per_msg, peak_rss_bytes, rep_min_msgs_per_s,
 rep_max_msgs_per_s, spread_pct, dedup_msgs, bytes_saved,
 meta_bytes_per_msg`. `rep_min_msgs_per_s`, `rep_max_msgs_per_s` and
 `spread_pct` (max − min over median msgs/s, in percent) are filled in the
 `median` row only. `dedup_msgs`, `bytes_saved` and `meta_bytes_per_msg` come
 from `Store::stats()` and are 0 for `raw` and `hashcopy`. `elapsed_ns` sums
 the batch write calls only. `bytes_written` for store modes is segments plus
-WAL plus indexes.
+WAL plus indexes; `disk_bytes_per_msg` is what the files allocate
+(`st_blocks`). `cpu_ns_per_msg` is user plus system time of the process over
+the write loop, payload preparation included, from `/proc/self/stat` (the
+accounting `getrusage` reports; calling `getrusage` itself needs `unsafe`
+or the libc crate); `peak_rss_bytes` is `VmHWM` after the write loop, reset
+before it. Both are Linux only. Read rows: `label, payload, mode, msg_size,
+batch, rep, workload, cache, messages, reads, elapsed_ns, msgs_per_s,
+read_p50_ns, read_p99_ns, cpu_ns_per_read`.
 
 Results from macOS, or from a container on macOS, show direction only.
+
+### Format 7 against format 8 on a Linux machine
+
+`scripts/bench/format7-vs-8.sh` compares the engine before compressed blocks
+(WAL format 7, commit `7d298a2`) with the checked-out commit (compressed
+blocks; WAL format 8, version 9 since the dictionary training threshold
+moved into the file header), from a fresh clone on a Linux machine:
+
+```bash
+git clone https://github.com/straum-io/straum.git
+cd straum
+git checkout store-block-compression
+scripts/bench/format7-vs-8.sh --out ~/format7-vs-8
+```
+
+`--out` must be a new or empty directory on the disk to measure. `--quick`
+runs a minimal matrix as a smoke test of the script (not a benchmark);
+`--keep` keeps the worktrees, builds and datasets.
+
+Before it starts, the script checks, and stops with a message if one fails:
+Linux; io_uring not disabled (`kernel.io_uring_disabled`); `rustc` and
+`cargo` at least the workspace `rust-version` (it prints the rustup command
+and stops if they are missing; it installs nothing); `git`, `curl`, `tar`,
+`unzip`, `sha256sum`, `findmnt`, `lsblk`; `--out` on a filesystem on a local
+block device (not tmpfs, overlay, a network or FUSE filesystem); free space
+of at least twice the planned data (datasets, the largest run, a 2 GiB
+allowance for the builds). It never uses sudo and changes no system
+setting. It needs network access to crates.io and zenodo.org.
+
+What it does:
+
+1. Records the machine in `env.md`: CPU, cores, RAM, virtualization, kernel,
+   distribution, CPU frequency governor, the disk and filesystem with mount
+   options, rustc and cargo, both commits, load average before and after.
+2. Adds git worktrees for both commits under `<dir>/work`, puts the
+   checked-out commit's `crates/straum-store-bench` into the format 7 tree,
+   checks that both `[profile.*]` sections are identical, and builds the
+   bench in release for each (format 7 without the `blocks` feature).
+   Stops unless both binaries report the io_uring driver.
+3. Downloads the Loghub OpenStack, SSH and BGL logs (Zenodo record 8196385)
+   and checks the SHA-256 of every archive and log file against the values
+   in the script.
+4. Runs every write mode at sizes {100, 1024, 10240} × batches {1, 8, 64,
+   512} on four payloads (the three logs and `random`, seed 1), 5
+   repetitions, each run up to 1000 batches or 1 GiB and at least 100
+   batches. Per repetition it runs the `raw` and `hashcopy` baselines,
+   then each mode in both formats, alternating which format goes first.
+   After each store run, the read workloads: up to 10 000 reads or 5 s
+   each; format 8 with the default block cache and with it off.
+5. Samples the load average and CPU frequency every 10 s (`quiet.csv`). A
+   1-minute load average above 1.5 at a run start, or above 0.5 before the
+   first run, prints a warning and marks the run noisy in `env.md`; the
+   benchmark goes on.
+6. Writes the medians and the spread of msgs/s per configuration.
+7. Deletes `<dir>/work` and its worktree entries, also after a failure,
+   unless `--keep`.
+
+Results in `<dir>`: `env.md`, `writes.csv` and `reads.csv` (one row per
+run), `writes-median.csv` and `reads-median.csv`, `quiet.csv`, and
+`commands.log` (every command with its exit status, and a final line). The
+exit status is 0 only if every step succeeded. The full matrix's duration
+on a bare-metal machine has not been measured.
+
+The datasets are Loghub (Jieming Zhu et al., ISSRE 2023), CC BY 4.0 on
+Zenodo; they stay under `<dir>/work` and are deleted with it.
 
 ## Dependencies
 

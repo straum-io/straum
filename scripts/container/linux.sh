@@ -9,6 +9,9 @@
 #   scripts/container/linux.sh run -p straum-store --example uring_probe
 #   scripts/container/linux.sh --switch-machine test --workspace
 #   STORE_CONTAINER_ARGS="-v /host/dir:/bench" scripts/container/linux.sh run ...
+#   scripts/container/linux.sh -- scripts/bench/format7-vs-8.sh --quick --out /bench/out
+#
+# After `--`, the rest is run as a command instead of cargo.
 #
 # Podman on macOS runs one machine at a time. If another machine is
 # running, the script refuses and stops nothing, unless --switch-machine is
@@ -36,11 +39,11 @@ if [ "${1:-}" = "--switch-machine" ]; then
 fi
 
 if ! command -v podman >/dev/null 2>&1; then
-    echo "scripts/linux.sh: podman not found" >&2
+    echo "scripts/container/linux.sh: podman not found" >&2
     exit 127
 fi
 if ! podman machine inspect "$MACHINE" >/dev/null 2>&1; then
-    echo "scripts/linux.sh: Podman machine '$MACHINE' does not exist." >&2
+    echo "scripts/container/linux.sh: Podman machine '$MACHINE' does not exist." >&2
     echo "Create it as described in scripts/container/README.md." >&2
     exit 1
 fi
@@ -62,7 +65,7 @@ for line in $(podman machine list --format '{{.Name}}|{{.Running}}'); do
 done
 
 if [ -n "$other" ] && [ "$SWITCH" -eq 0 ]; then
-    echo "scripts/linux.sh: Podman machine '$other' is running; only one machine can run at a time." >&2
+    echo "scripts/container/linux.sh: Podman machine '$other' is running; only one machine can run at a time." >&2
     echo "Nothing was stopped. To let this script stop '$other', run '$MACHINE' for the command" >&2
     echo "and start '$other' again afterwards, pass --switch-machine as the first argument:" >&2
     echo "  scripts/container/linux.sh --switch-machine ${*:-test --workspace}" >&2
@@ -90,11 +93,11 @@ restore() {
     status=$?
     trap - EXIT
     if [ "$started" -eq 1 ]; then
-        echo "scripts/linux.sh: stopping '$MACHINE'" >&2
+        echo "scripts/container/linux.sh: stopping '$MACHINE'" >&2
         podman machine stop "$MACHINE" >/dev/null || status=1
     fi
     if [ -n "$other" ]; then
-        echo "scripts/linux.sh: starting '$other' again" >&2
+        echo "scripts/container/linux.sh: starting '$other' again" >&2
         podman machine start "$other" >/dev/null || status=1
     fi
     exit "$status"
@@ -103,10 +106,10 @@ restore() {
 if [ "$target_running" -eq 0 ]; then
     trap restore EXIT
     if [ -n "$other" ]; then
-        echo "scripts/linux.sh: stopping '$other' (--switch-machine)" >&2
+        echo "scripts/container/linux.sh: stopping '$other' (--switch-machine)" >&2
         podman machine stop "$other" >/dev/null
     fi
-    echo "scripts/linux.sh: starting '$MACHINE'" >&2
+    echo "scripts/container/linux.sh: starting '$MACHINE'" >&2
     started=1
     podman machine start "$MACHINE" >/dev/null
 fi
@@ -123,7 +126,9 @@ podman --connection "$MACHINE" run --rm --name "$NAME" \
     -v straum-container-target:/src/target \
     ${STORE_CONTAINER_ARGS:-} \
     "$IMAGE" \
-    sh -c 'rustup component add clippy rustfmt >/dev/null 2>&1 || true; exec cargo "$@"' cargo "$@" &
+    sh -c 'rustup component add clippy rustfmt >/dev/null 2>&1 || true
+        if [ "${1:-}" = "--" ]; then shift; exec "$@"; fi
+        exec cargo "$@"' cargo "$@" &
 child=$!
 status=0
 wait "$child" || status=$?
