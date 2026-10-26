@@ -129,7 +129,7 @@ Results from macOS, or from a container on macOS, show direction only.
 | Crate | Why |
 |---|---|
 | straum-store, straum-proto | the engine and the protocol |
-| compio =0.19.2, features `net`, `time`, `signal` | TCP, timeouts of waiting fetches, SIGTERM and SIGINT; the same pinned compio as the engine, adding its `compio-net` and `compio-signal` crates |
+| compio =0.19.2, features `net`, `time`, `signal` | TCP, timeouts of waiting fetches, SIGTERM and SIGINT; the same pinned compio as the engine, adding its `compio-net` and `compio-signal` crates, which bring `nix` (through `compio-signal`) and `either` (through `compio-net`) |
 | crc32c | the identity file's checksum; already used by the engine |
 | thiserror | the startup error enum |
 
