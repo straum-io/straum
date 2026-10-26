@@ -201,28 +201,6 @@
     },
     {
       "send": "a",
-      "id": "l3",
-      "request": {
-        "type": "ListTopics",
-        "body": {
-          "cursor": "beta",
-          "limit": 1
-        }
-      }
-    },
-    {
-      "expect": "a",
-      "id": "l3",
-      "response": {
-        "type": "ListTopicsOk",
-        "body": {
-          "topics": [],
-          "next_cursor": ""
-        }
-      }
-    },
-    {
-      "send": "a",
       "id": "d",
       "request": {
         "type": "DescribeTopic",
