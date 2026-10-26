@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::rc::Rc;
 use std::task::Poll;
+use std::time::Instant;
 
 use compio::BufResult;
 use compio::buf::{IntoInner, IoBuf};
@@ -130,6 +131,35 @@ fn block_ranges(lens: impl IntoIterator<Item = usize>, cap: u64) -> Vec<Range<us
 pub struct Message<'a> {
     pub topic: &'a [u8],
     pub payload: &'a [u8],
+}
+
+/// When the last batch's syncs ran, in nanoseconds from the start of its
+/// commit (`Store::last_commit_timing`): for diagnosing write modes, not
+/// for decisions inside the store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitTiming {
+    /// The segment `fdatasync`s of the batch (from the first start to the
+    /// last end); `None` if the batch wrote no segment bytes.
+    pub segment_sync: Option<(u64, u64)>,
+    /// The WAL `fdatasync`; `None` if the batch wrote no frame.
+    pub wal_sync: Option<(u64, u64)>,
+}
+
+impl CommitTiming {
+    /// Both syncs ran and their intervals intersect.
+    pub fn overlapped(&self) -> bool {
+        matches!(
+            (self.segment_sync, self.wal_sync),
+            (Some((a0, a1)), Some((b0, b1))) if a0 < b1 && b0 < a1
+        )
+    }
+}
+
+/// Widens `within` to cover `start..end`, as nanoseconds since `from`.
+fn widen(within: &mut Option<(u64, u64)>, from: Instant, start: Instant, end: Instant) {
+    let ns = |t: Instant| t.saturating_duration_since(from).as_nanos() as u64;
+    let (a, b) = (ns(start), ns(end));
+    *within = Some(within.map_or((a, b), |(x, y)| (x.min(a), y.max(b))));
 }
 
 /// Counters since `open`, in memory only: they start at zero on every open
@@ -416,6 +446,9 @@ pub struct Store {
     stats: Stats,
     /// Inline block bytes written to the WAL since open (InlineSmall).
     inline_bytes: u64,
+    /// Start of the current batch's commit, and its syncs so far.
+    commit_start: Instant,
+    timing: CommitTiming,
     recovery: RecoveryReport,
     poisoned: bool,
 }
@@ -600,6 +633,8 @@ impl Store {
             seg_buf: Vec::new(),
             stats: Stats::default(),
             inline_bytes: 0,
+            commit_start: Instant::now(),
+            timing: CommitTiming::default(),
             recovery: report,
             poisoned: false,
         })
@@ -681,6 +716,8 @@ impl Store {
         train: bool,
     ) -> Result<Vec<u64>, StoreError> {
         self.begin_write();
+        self.commit_start = Instant::now();
+        self.timing = CommitTiming::default();
         let dict = if train {
             Some(self.train_dictionary().await?)
         } else {
@@ -1292,6 +1329,11 @@ impl Store {
         self.blocks.len()
     }
 
+    /// When the last `put_batch`'s segment and WAL syncs ran.
+    pub fn last_commit_timing(&self) -> CommitTiming {
+        self.timing
+    }
+
     /// Length of the store's compression dictionary; `None` before training
     /// ran (`Config::dict_train_bytes`), `Some(0)` if training built none.
     pub fn dictionary_bytes(&self) -> Option<usize> {
@@ -1501,7 +1543,14 @@ impl Store {
         buf.clear();
         self.seg_buf = buf;
         res?;
+        let t = Instant::now();
         active.file.sync_data().await?;
+        widen(
+            &mut self.timing.segment_sync,
+            self.commit_start,
+            t,
+            Instant::now(),
+        );
         active.written += n;
         self.stats.fsyncs += 1;
         self.stats.segment_bytes += n;
@@ -1526,7 +1575,14 @@ impl Store {
         let (res, buf) = write_all(&self.wal, buf, self.wal_len).await;
         self.wal_buf = buf;
         res?;
+        let t = Instant::now();
         self.wal.sync_data().await?;
+        widen(
+            &mut self.timing.wal_sync,
+            self.commit_start,
+            t,
+            Instant::now(),
+        );
         self.wal_len += n;
         self.next_frame += 1;
         self.stats.fsyncs += 1;
@@ -1561,21 +1617,28 @@ impl Store {
         let wal_side = async {
             let (res, buf) = write_all(&wal, buf, wal_at).await;
             res?;
+            let t = Instant::now();
             wal.sync_data().await?;
-            io::Result::Ok(buf)
+            io::Result::Ok((buf, (t, Instant::now())))
         };
         let seg_side = async {
             let Some((file, at)) = &seg else {
-                return io::Result::Ok(seg_buf);
+                return io::Result::Ok((seg_buf, None));
             };
             let (res, buf) = write_all(file, seg_buf, *at).await;
             res?;
+            let t = Instant::now();
             file.sync_data().await?;
-            Ok(buf)
+            Ok((buf, Some((t, Instant::now()))))
         };
         let (wal_res, seg_res) = join2(wal_side, seg_side).await;
-        self.wal_buf = wal_res?;
-        let mut seg_buf = seg_res?;
+        let (wal_buf, (w0, w1)) = wal_res?;
+        self.wal_buf = wal_buf;
+        widen(&mut self.timing.wal_sync, self.commit_start, w0, w1);
+        let (mut seg_buf, seg_span) = seg_res?;
+        if let Some((s0, s1)) = seg_span {
+            widen(&mut self.timing.segment_sync, self.commit_start, s0, s1);
+        }
         seg_buf.clear();
         self.seg_buf = seg_buf;
         self.wal_len += wal_n;

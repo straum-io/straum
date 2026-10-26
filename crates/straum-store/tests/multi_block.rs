@@ -1,7 +1,8 @@
 //! `Config::max_block_raw_bytes`: a batch's new objects split into blocks
 //! within the limit, an oversized object alone, duplicates across the
 //! blocks of a batch, compaction within the same limit, and frames with
-//! several blocks under damage in every write mode.
+//! several blocks under damage in every write mode. Also
+//! `Store::last_commit_timing`.
 
 #![allow(clippy::unwrap_used)] // test crate: helpers outside #[test] fns panic on failure by design
 
@@ -246,4 +247,41 @@ async fn a_batch_can_mix_inline_and_segment_blocks() {
     assert_eq!(store.refcount(&ObjectId::of(&c)), Some(0));
     assert_eq!(store.refcount(&ObjectId::of(&a)), Some(1));
     assert_eq!(store.read(b"t0", 1).await.unwrap().as_deref(), Some(&b[..]));
+}
+
+/// `last_commit_timing`: Sequential syncs the segment before the WAL;
+/// ParallelSync records both; an inline batch, and a batch of known bytes
+/// only, sync no segment.
+#[compio::test]
+async fn commit_timing_records_each_sync() {
+    let p = random(7, 5000);
+    for mode in MODES {
+        let dir = TempDir::new("cap-timing");
+        let config = Config {
+            write_mode: mode,
+            ..Config::default()
+        };
+        let mut store = Store::open(&dir.0, config).await.unwrap();
+        store.put_batch(&[msg(b"t", &p)], 1).await.unwrap();
+        let t = store.last_commit_timing();
+        let (seg, wal) = (t.segment_sync.unwrap(), t.wal_sync.unwrap());
+        assert!(seg.0 <= seg.1 && wal.0 <= wal.1, "{mode:?}: {t:?}");
+        if mode == WriteMode::Sequential {
+            assert!(seg.1 <= wal.0 && !t.overlapped(), "segment first: {t:?}");
+        }
+        store.put_batch(&[msg(b"t", &p)], 2).await.unwrap();
+        let t = store.last_commit_timing();
+        assert_eq!(t.segment_sync, None, "{mode:?}: known bytes only");
+        assert!(t.wal_sync.is_some());
+    }
+    let dir = TempDir::new("cap-timing-inline");
+    let config = Config {
+        write_mode: WriteMode::INLINE_SMALL,
+        ..Config::default()
+    };
+    let mut store = Store::open(&dir.0, config).await.unwrap();
+    store.put_batch(&[msg(b"t", b"small")], 1).await.unwrap();
+    let t = store.last_commit_timing();
+    assert_eq!(t.segment_sync, None, "inline block: {t:?}");
+    assert!(t.wal_sync.is_some() && !t.overlapped());
 }
