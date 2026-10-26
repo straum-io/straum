@@ -76,12 +76,12 @@ pub struct Config {
     /// kept; the least recently used blocks are evicted once either this or
     /// `block_cache_blocks` would be exceeded.
     pub block_cache_bytes: usize,
-    /// Most entries in a topic's seek table (file offsets of index blocks).
-    /// Up to this many blocks every block's offset is kept; beyond it every
-    /// other offset is dropped and the stride between kept offsets doubles,
-    /// so a read walks up to `stride` blocks from the nearest kept offset.
-    /// Bounds a topic's seek table to 8 bytes times this, whatever its
-    /// length. 0 is taken as 1.
+    /// Index blocks of a topic up to which its seek table keeps every
+    /// block's file offset (a lookup reads one block). Beyond it the table
+    /// keeps one offset per `SEEK_STRIDE` (64) blocks, and a lookup reads
+    /// at most 64 blocks from the nearest kept offset. A topic's table holds
+    /// at most this many offsets while dense, then grows by one offset per
+    /// 64 blocks (8 bytes per 4096 entries). 0 is taken as 1.
     pub seek_table_max_entries: usize,
     /// Raw bytes of new objects stored without a dictionary after which the
     /// store trains its dictionary, once, on the objects of those blocks.
@@ -409,19 +409,31 @@ impl SeekTable {
     }
 }
 
-/// Records that index block number `*blocks` starts at file offset `at`:
-/// kept if it falls on the stride; when the table would exceed `max`
-/// entries, every other kept offset is dropped and the stride doubles.
+/// Blocks between kept seek offsets once a topic's table is sparse.
+const SEEK_STRIDE: u64 = 64;
+
+/// Records that index block number `*blocks` starts at file offset `at`.
+/// Dense (stride 1) up to `max` offsets; when the dense table would exceed
+/// `max`, only every `SEEK_STRIDE`-th offset is kept from then on. The
+/// vector's capacity never exceeds `max` + 1 while dense.
 fn seek_push(starts: &mut Vec<u64>, stride: &mut u64, blocks: &mut u64, at: u64, max: usize) {
+    let max = max.max(1);
     if (*blocks).is_multiple_of(*stride) {
+        if *stride == 1 && starts.len() == starts.capacity() {
+            // Grow without overshooting the dense bound.
+            let extra = starts.len().max(4).min(max + 1 - starts.len().min(max));
+            starts.reserve_exact(extra.max(1));
+        }
         starts.push(at);
-        if starts.len() > max.max(1) {
+        if *stride == 1 && starts.len() > max {
             let mut i = 0;
             starts.retain(|_| {
+                let keep = i % SEEK_STRIDE == 0;
                 i += 1;
-                i % 2 == 1
+                keep
             });
-            *stride *= 2;
+            starts.shrink_to_fit();
+            *stride = SEEK_STRIDE;
         }
     }
     *blocks += 1;
@@ -440,8 +452,8 @@ struct Topic {
     /// (`Store::index_entry`). Rebuilt at open, which reads the whole index
     /// anyway to check it against the WAL.
     block_starts: Vec<u64>,
-    /// Blocks between kept offsets: 1, then doubled whenever the table
-    /// would exceed `Config::seek_table_max_entries`.
+    /// Blocks between kept offsets: 1, then `SEEK_STRIDE` once the dense
+    /// table would exceed `Config::seek_table_max_entries`.
     stride: u64,
     /// Index blocks started so far.
     blocks: u64,
@@ -1071,15 +1083,19 @@ impl Store {
         self.usable()?;
         // The entries to release, oldest first, read before anything is
         // written: a damaged index block fails the call here, not midway.
+        // Collection stops as soon as one more release would not fit a
+        // frame, so memory stays within the frame bound.
         let mut numbers = Vec::new();
         if let Some(t) = self.topics.get(topic) {
             for seq in t.first_live..t.next_seq {
                 match self.topic_entry(topic, t, seq).await? {
-                    Some((number, ts)) if ts < cutoff_ms => numbers.push(number),
+                    Some((number, ts)) if ts < cutoff_ms => {
+                        self.check_frame(FRAME_HEADER + (numbers.len() + 1) * RECORD_RELEASE)?;
+                        numbers.push(number);
+                    }
                     _ => break,
                 }
             }
-            self.check_frame(FRAME_HEADER + numbers.len() * RECORD_RELEASE)?;
         }
         let res = self.release_inner(topic, &numbers).await;
         self.poison_on_err(res)
@@ -1354,8 +1370,9 @@ impl Store {
     }
 
     /// Entry `seq` of `topic` as stored in its index file: `(object number,
-    /// timestamp)`, released entries included. Reads one block (at most 64
-    /// entries); `None` past the last entry.
+    /// timestamp)`, released entries included. Reads one index block, or up
+    /// to 64 blocks once the topic's seek table is sparse; `None` past the
+    /// last entry.
     pub async fn index_entry(
         &self,
         topic: &[u8],
@@ -2724,6 +2741,30 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seek_table_is_dense_up_to_max_then_keeps_every_64th_block() {
+        let max = 100;
+        let mut t = SeekTable::default();
+        for b in 0..max as u64 {
+            t.push(b * 10, max);
+            assert!(
+                t.starts.capacity() <= max + 1,
+                "capacity {}",
+                t.starts.capacity()
+            );
+        }
+        assert_eq!((t.stride, t.starts.len()), (1, max));
+        // Block 100 makes the dense table too large: blocks 0 and 64 stay.
+        t.push(1000, max);
+        assert_eq!((t.stride, t.starts.clone()), (64, vec![0, 640]));
+        // Then one offset per 64 blocks: blocks 128, 192.
+        for b in 101..200u64 {
+            t.push(b * 10, max);
+        }
+        assert_eq!(t.starts, vec![0, 640, 1280, 1920]);
+        assert_eq!(t.blocks, 200);
+    }
 
     fn object(id: ObjectId, refs: u64) -> Object {
         Object {

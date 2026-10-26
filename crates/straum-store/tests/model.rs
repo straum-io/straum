@@ -113,6 +113,8 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
             dict_train_bytes: 256,
             // Small, so reads also go through eviction.
             block_cache_blocks: 2,
+            // Sparse seek table after the first block: lookups walk blocks.
+            seek_table_max_entries: 1,
             // Payloads of up to 300 bytes: batches split into several
             // blocks, and the largest payloads are blocks of their own.
             max_block_raw_bytes: 128,

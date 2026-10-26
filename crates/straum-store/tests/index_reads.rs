@@ -83,8 +83,9 @@ async fn a_full_block_damaged_after_open_fails_every_read_of_it() {
     assert_eq!(store.read(b"t", 129).await.unwrap(), Some(payload(129)));
 }
 
-/// A seek table of at most 2 entries: with 20 full blocks the stride grows
-/// to 16, so reads walk up to 15 blocks from the nearest kept offset.
+/// A seek table dense up to 2 entries: after the third block it keeps one
+/// offset per 64 blocks, so with 20 full blocks every read walks from
+/// block 0.
 fn tiny_seek() -> Config {
     Config {
         seek_table_max_entries: 2,
@@ -150,4 +151,25 @@ async fn a_damaged_block_fails_every_walk_through_it() {
         store.read(b"t", 20 * 64 + 4).await.unwrap(),
         Some(payload(20 * 64 + 4))
     );
+}
+
+/// `release_before` stops reading entries as soon as one more release would
+/// not fit a frame: `FrameTooLarge`, and nothing is written.
+#[compio::test]
+async fn a_release_too_large_for_a_frame_fails_before_writing() {
+    let dir = TempDir::new("index-release-bound");
+    let config = Config {
+        max_frame_bytes: 4096,
+        ..Config::default()
+    };
+    let mut store = Store::open(&dir.0, config).await.unwrap();
+    fill(&mut store, 2000).await;
+    let wal_before = std::fs::read(dir.0.join("wal.log")).unwrap();
+    assert!(matches!(
+        store.release_before(b"t", u64::MAX).await,
+        Err(StoreError::FrameTooLarge)
+    ));
+    assert_eq!(std::fs::read(dir.0.join("wal.log")).unwrap(), wal_before);
+    // A release that fits still works.
+    assert_eq!(store.release_before(b"t", 10).await.unwrap(), 10);
 }

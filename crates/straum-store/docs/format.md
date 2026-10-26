@@ -408,16 +408,18 @@ The block number is part of the CRC, so a block at the wrong position fails
 the check. The encoding is deterministic: the same entries always give the
 same bytes.
 
-**Lookup by `topic_seq`.** A seek table in memory holds the file offsets of
-blocks 0, `stride`, 2 × `stride`, … (8 bytes each): block `topic_seq div 64`
-is found by one positional read from the nearest kept offset to the next
-one, walking the full blocks in between (each checked against its CRC).
-`stride` starts at 1, so up to `Config::seek_table_max_entries` blocks
-(default 65 536) every block's offset is kept and a lookup reads one block;
-when the table would grow past that, every other offset is dropped and the
-stride doubles. A topic's seek table therefore stays within 8 bytes times
-`seek_table_max_entries` (512 KiB by default) whatever its length, and a
-lookup reads at most `stride` blocks. The table is built at open (the index
+**Lookup by `topic_seq`.** A seek table in memory holds file offsets of index
+blocks (8 bytes each): block `topic_seq div 64` is found by one positional
+read from the nearest kept offset to the next one, walking the full blocks
+in between (each checked against its CRC). Up to
+`Config::seek_table_max_entries` blocks (default 65 536, about 4.2 M
+entries) every block's offset is kept and a lookup reads one block; when
+the table would grow past that, only the offsets of blocks 0, 64, 128, …
+are kept from then on, and a lookup reads at most 64 blocks. While dense the
+table's allocation is at most `seek_table_max_entries` + 1 offsets (about
+512 KiB by default); once sparse it grows by 8 bytes per 64 blocks (about
+0.002 bytes per entry). Paging the sparse table to a file is a later step
+(ADR-0014). The table is built at open (the index
 is read in full anyway for the check against the WAL) and extended on
 write. `Store::index_entry(topic, seq)`.
 
