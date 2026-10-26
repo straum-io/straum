@@ -11,8 +11,10 @@
 //!
 //! A run lasts `--seconds` or until `--max-bytes` of bodies are acknowledged,
 //! whichever comes first, and at least `--min-requests` requests. Each run
-//! uses a topic of its own. Bodies are bytes of a xorshift64* stream, unique,
-//! so nothing is deduplicated. Ack latency is from sending a Produce to
+//! uses a topic of its own. Bodies are bytes of a xorshift64* stream seeded
+//! from the run's topic name (which holds the start time, the configuration
+//! and the repetition) and the producer, so they are unique across producers,
+//! repetitions and runs, and nothing is deduplicated. Ack latency is from sending a Produce to
 //! receiving its ProduceOk; groups and fsyncs come from the broker's
 //! BrokerStats before and after the run. One CSV row per run.
 
@@ -110,6 +112,23 @@ impl XorShift {
     }
 }
 
+/// The body stream's seed for one producer of one run: FNV-1a of the
+/// run's topic name, mixed with the producer index (splitmix64). Never 0,
+/// the one state xorshift never leaves.
+fn body_seed(topic: &str, producer: usize) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in topic.bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut z = h
+        ^ (producer as u64)
+            .wrapping_add(1)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    (z ^ (z >> 31)) | 1
+}
+
 fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted
         .get(((sorted.len() as f64 - 1.0) * p).round() as usize)
@@ -146,7 +165,7 @@ fn run(a: &Args, topic: &str, size: usize, producers: usize, per: usize) -> Resu
             let min_requests = a.min_requests;
             std::thread::spawn(move || -> Result<(Vec<u64>, u64), String> {
                 let mut c = Client::connect(config).map_err(|e| e.to_string())?;
-                let mut rng = XorShift(0x9e37_79b9_7f4a_7c15 ^ (p as u64 + 1));
+                let mut rng = XorShift(body_seed(&topic, p));
                 let mut lat = Vec::new();
                 let mut msgs = 0;
                 for seq in 0.. {
@@ -275,5 +294,26 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn first_body(topic: &str, producer: usize) -> Vec<u8> {
+        let mut b = vec![0; 64];
+        XorShift(body_seed(topic, producer)).fill(&mut b);
+        b
+    }
+
+    #[test]
+    fn bodies_differ_across_repetitions_runs_and_producers() {
+        let rep1 = first_body("bench-1-100-16-64-1", 0);
+        assert_ne!(rep1, first_body("bench-1-100-16-64-2", 0), "repetition");
+        assert_ne!(rep1, first_body("bench-2-100-16-64-1", 0), "invocation");
+        assert_ne!(rep1, first_body("bench-1-1024-16-64-1", 0), "configuration");
+        assert_ne!(rep1, first_body("bench-1-100-16-64-1", 1), "producer");
+        assert_eq!(rep1, first_body("bench-1-100-16-64-1", 0), "deterministic");
     }
 }
