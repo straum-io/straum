@@ -18,7 +18,7 @@ impl ObjectId {
 /// start of `wal.log`.
 pub const WAL_FILE_HEADER: usize = 24;
 pub const WAL_MAGIC: [u8; 8] = *b"STRMWAL\0";
-pub const WAL_VERSION: u32 = 10;
+pub const WAL_VERSION: u32 = 11;
 /// Header bytes covered by the header CRC (everything before it).
 const WAL_HEADER_CRC_AT: usize = 20;
 /// `len u32 | seq u64 | count u32 | mode u8 | crc32c u32`.
@@ -51,8 +51,7 @@ impl FrameMode {
         }
     }
 }
-/// Topic names are 1..=MAX_TOPIC bytes; the hex file name then stays under
-/// NAME_MAX (255) on every supported filesystem.
+/// Topic names are 1..=MAX_TOPIC bytes.
 pub const MAX_TOPIC: usize = 100;
 /// Segment id meaning "no new segment": compaction dropped every block.
 pub const NO_SEGMENT: u64 = u64::MAX;
@@ -795,93 +794,228 @@ pub fn split_block(raw: &[u8]) -> Result<Vec<std::ops::Range<usize>>, &'static s
 }
 
 /// Entries per topic index block. Entry `seq` is entry `seq % 64` of block
-/// `seq / 64`; the index starts at seq 0 and is never cut, so topic_seq is
-/// implicit.
+/// `seq / 64`; topic_seq is implicit.
 pub const INDEX_BLOCK: u64 = 64;
 
 /// Encodes topic index entries in order. In a block, the first entry is
 /// `number varint | timestamp varint`; each later one is `zigzag(number −
 /// previous number) varint | (timestamp − previous timestamp) varint`
-/// (timestamps do not decrease within a topic). After its 64th entry a
-/// block ends with `crc32c u32` over the block number (u64 LE) and the
-/// block's entry bytes. The encoding is deterministic: the same entries
-/// always give the same bytes.
+/// (timestamps do not decrease within a topic). A full block is stored as
+/// the body of an index record, whose CRC covers it. The encoding is
+/// deterministic: the same entries always give the same bytes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IndexWriter {
     seq: u64,
     prev_number: u64,
     prev_timestamp: u64,
-    crc: u32,
 }
 
 impl IndexWriter {
+    /// A writer whose next entry gets topic_seq `seq` and follows the entry
+    /// `(prev_number, prev_timestamp)`.
+    pub fn resume(seq: u64, prev_number: u64, prev_timestamp: u64) -> Self {
+        Self {
+            seq,
+            prev_number,
+            prev_timestamp,
+        }
+    }
+
+    /// The topic_seq the next entry gets.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// The last entry's timestamp (0 before the first).
+    pub fn last_timestamp(&self) -> u64 {
+        self.prev_timestamp
+    }
+
     /// Appends the entry with topic_seq `self.seq()`. Returns true if it
-    /// starts a block.
+    /// completes a block.
     pub fn push(&mut self, out: &mut Vec<u8>, number: u64, timestamp: u64) -> bool {
-        let first = self.seq.is_multiple_of(INDEX_BLOCK);
-        let start = out.len();
-        if first {
-            self.crc = crc32c::crc32c(&(self.seq / INDEX_BLOCK).to_le_bytes());
+        if self.seq.is_multiple_of(INDEX_BLOCK) {
             put_uvarint(out, number);
             put_uvarint(out, timestamp);
         } else {
             put_uvarint(out, zigzag(number.wrapping_sub(self.prev_number) as i64));
             put_uvarint(out, timestamp.wrapping_sub(self.prev_timestamp));
         }
-        self.crc = crc32c::crc32c_append(self.crc, &out[start..]);
         self.prev_number = number;
         self.prev_timestamp = timestamp;
         self.seq += 1;
-        if self.seq.is_multiple_of(INDEX_BLOCK) {
-            out.extend_from_slice(&self.crc.to_le_bytes());
-        }
-        first
+        self.seq.is_multiple_of(INDEX_BLOCK)
     }
 }
 
-/// A topic index block decoded from the start of `buf`.
-#[derive(Debug, PartialEq, Eq)]
-pub struct IndexBlock {
-    /// `(object number, timestamp)`, up to 64.
-    pub entries: Vec<(u64, u64)>,
-    /// Byte offset just after each entry, from the block start.
-    pub ends: Vec<usize>,
-    /// 64 entries followed by a CRC that matches.
-    pub sealed: bool,
-}
-
-/// Decodes block `block` from the start of `buf`: entries until 64, the end
-/// of `buf`, or a malformed varint (a torn or unwritten tail).
-pub fn decode_index_block(buf: &[u8], block: u64) -> IndexBlock {
-    let mut b = IndexBlock {
-        entries: Vec::new(),
-        ends: Vec::new(),
-        sealed: false,
-    };
+/// The entries of one block (full, or the incomplete last one), encoded by
+/// `IndexWriter` from a block start. `None` unless `buf` is a whole number
+/// of well-formed entries, at most 64.
+pub fn decode_index_entries(buf: &[u8]) -> Option<Vec<(u64, u64)>> {
+    let mut entries = Vec::with_capacity(INDEX_BLOCK as usize);
     let mut pos = 0;
     let (mut number, mut timestamp) = (0u64, 0u64);
-    while (b.entries.len() as u64) < INDEX_BLOCK {
-        let Ok((x, n)) = get_uvarint(&buf[pos..]) else {
-            return b;
-        };
-        let Ok((y, m)) = get_uvarint(&buf[pos + n..]) else {
-            return b;
-        };
-        if b.entries.is_empty() {
+    while pos < buf.len() {
+        if entries.len() as u64 == INDEX_BLOCK {
+            return None;
+        }
+        let (x, n) = get_uvarint(&buf[pos..]).ok()?;
+        let (y, m) = get_uvarint(&buf[pos + n..]).ok()?;
+        if entries.is_empty() {
             (number, timestamp) = (x, y);
         } else {
             number = number.wrapping_add(unzigzag(x) as u64);
             timestamp = timestamp.wrapping_add(y);
         }
         pos += n + m;
-        b.entries.push((number, timestamp));
-        b.ends.push(pos);
+        entries.push((number, timestamp));
     }
-    if let Some(stored) = buf.get(pos..pos + 4) {
-        let crc = crc32c::crc32c_append(crc32c::crc32c(&block.to_le_bytes()), &buf[..pos]);
-        b.sealed = crc == u32_at(stored, 0);
+    Some(entries)
+}
+
+/// `magic [8] | version u32 | created_at u64 | crc32c u32` at the start of
+/// an index segment `idx-<id>.dat`.
+pub const INDEX_HEADER: usize = 24;
+pub const INDEX_MAGIC: [u8; 8] = *b"STRMIDX\0";
+
+/// The file header of a new index segment. `created_at`: the WAL frame
+/// sequence number the store's next frame had when the segment was created.
+pub fn index_header(created_at: u64) -> [u8; INDEX_HEADER] {
+    let mut h = [0; INDEX_HEADER];
+    h[..8].copy_from_slice(&INDEX_MAGIC);
+    h[8..12].copy_from_slice(&WAL_VERSION.to_le_bytes());
+    h[12..20].copy_from_slice(&created_at.to_le_bytes());
+    let crc = crc32c::crc32c(&h[..20]);
+    h[20..].copy_from_slice(&crc.to_le_bytes());
+    h
+}
+
+/// `created_at` of an intact index segment header of this version.
+pub fn decode_index_header(buf: &[u8]) -> Option<u64> {
+    let h: &[u8; INDEX_HEADER] = buf.get(..INDEX_HEADER)?.try_into().ok()?;
+    let created_at = u64::from_le_bytes(h[12..20].try_into().ok()?);
+    (*h == index_header(created_at)).then_some(created_at)
+}
+
+/// Index record kinds.
+pub const INDEX_RECORD_BLOCK: u8 = 1;
+pub const INDEX_RECORD_SEEK_PAGE: u8 = 2;
+
+/// Where an index record lies: `segment u32 | len u32 | offset u64`, 16
+/// bytes in a seek page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexLoc {
+    pub segment: u32,
+    /// The whole record, header and CRC included.
+    pub len: u32,
+    pub offset: u64,
+}
+
+pub const INDEX_LOC: usize = 16;
+
+impl IndexLoc {
+    fn put(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.segment.to_le_bytes());
+        out.extend_from_slice(&self.len.to_le_bytes());
+        out.extend_from_slice(&self.offset.to_le_bytes());
     }
-    b
+
+    fn at(b: &[u8]) -> Self {
+        Self {
+            segment: u32_at(b, 0),
+            len: u32_at(b, 4),
+            offset: u64_at(b, 8),
+        }
+    }
+}
+
+/// An index record: `kind u8 | len varint | topic varint | number varint |
+/// stamp varint | body (len bytes) | crc32c u32` over everything before the
+/// CRC.
+#[derive(Debug, PartialEq, Eq)]
+pub struct IndexRecord<'a> {
+    pub kind: u8,
+    /// Topic number.
+    pub topic: u64,
+    /// Block number, or the seek page's number within its level.
+    pub number: u64,
+    /// The WAL frame sequence number after the frames the record describes.
+    pub stamp: u64,
+    pub body: &'a [u8],
+    /// Bytes the whole record takes.
+    pub size: usize,
+}
+
+/// Appends an index record; returns its size in bytes.
+pub fn put_index_record(
+    out: &mut Vec<u8>,
+    kind: u8,
+    topic: u64,
+    number: u64,
+    stamp: u64,
+    body: &[u8],
+) -> usize {
+    let start = out.len();
+    out.push(kind);
+    put_uvarint(out, body.len() as u64);
+    put_uvarint(out, topic);
+    put_uvarint(out, number);
+    put_uvarint(out, stamp);
+    out.extend_from_slice(body);
+    let crc = crc32c::crc32c(&out[start..]);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.len() - start
+}
+
+/// The index record at the start of `buf`; `None` if it is short, malformed
+/// or fails its CRC (a torn, unwritten or damaged record).
+pub fn decode_index_record(buf: &[u8]) -> Option<IndexRecord<'_>> {
+    let kind = *buf.first()?;
+    let mut pos = 1;
+    let mut field = || {
+        let (v, n) = get_uvarint(buf.get(pos..)?).ok()?;
+        pos += n;
+        Some(v)
+    };
+    let (len, topic, number, stamp) = (field()?, field()?, field()?, field()?);
+    let end = pos.checked_add(usize::try_from(len).ok()?)?;
+    let stored = buf.get(end..end.checked_add(4)?)?;
+    if crc32c::crc32c(&buf[..end]) != u32_at(stored, 0) {
+        return None;
+    }
+    Some(IndexRecord {
+        kind,
+        topic,
+        number,
+        stamp,
+        body: &buf[pos..end],
+        size: end + 4,
+    })
+}
+
+/// A seek page's body: `level u8 | locations, 16 bytes each`.
+pub fn seek_page_body(level: u8, locs: &[IndexLoc]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + locs.len() * INDEX_LOC);
+    out.push(level);
+    for loc in locs {
+        loc.put(&mut out);
+    }
+    out
+}
+
+/// The level and the number of locations of a seek page body; `None` if
+/// malformed.
+pub fn seek_page_shape(body: &[u8]) -> Option<(u8, usize)> {
+    let (&level, locs) = body.split_first()?;
+    locs.len()
+        .is_multiple_of(INDEX_LOC)
+        .then_some((level, locs.len() / INDEX_LOC))
+}
+
+/// Location `i` of a seek page body whose shape was checked.
+pub fn seek_page_loc(body: &[u8], i: usize) -> Option<IndexLoc> {
+    let at = 1 + i.checked_mul(INDEX_LOC)?;
+    body.get(at..at + INDEX_LOC).map(IndexLoc::at)
 }
 
 // Callers pass slices whose length was checked; out-of-range reads cannot occur.
@@ -1376,21 +1510,19 @@ mod tests {
         }
     }
 
-    fn index_of(entries: &[(u64, u64)]) -> (Vec<u8>, Vec<usize>) {
+    fn index_of(entries: &[(u64, u64)]) -> Vec<Vec<u8>> {
         let mut w = IndexWriter::default();
-        let mut out = Vec::new();
-        let mut starts = Vec::new();
+        let mut blocks = vec![Vec::new()];
         for &(n, t) in entries {
-            let at = out.len();
-            if w.push(&mut out, n, t) {
-                starts.push(at);
+            if w.push(blocks.last_mut().unwrap(), n, t) {
+                blocks.push(Vec::new());
             }
         }
-        (out, starts)
+        blocks
     }
 
     #[test]
-    fn index_blocks_round_trip_and_seal() {
+    fn index_blocks_round_trip() {
         // New objects in order, a deduplicated reference back, a time step.
         let entries: Vec<(u64, u64)> = (0..150u64)
             .map(|i| {
@@ -1398,35 +1530,79 @@ mod tests {
                 (n, 1_700_000_000_000 + i / 7)
             })
             .collect();
-        let (bytes, starts) = index_of(&entries);
-        assert_eq!(starts.len(), 3);
-        for (b, &start) in starts.iter().enumerate() {
-            let block = decode_index_block(&bytes[start..], b as u64);
+        let blocks = index_of(&entries);
+        assert_eq!(blocks.len(), 3);
+        for (b, bytes) in blocks.iter().enumerate() {
             let want = &entries[b * 64..((b + 1) * 64).min(entries.len())];
-            assert_eq!(block.entries, want, "block {b}");
-            assert_eq!(block.sealed, want.len() == 64, "block {b}");
+            assert_eq!(decode_index_entries(bytes).unwrap(), want, "block {b}");
         }
         // About 2 bytes per entry: 1 + 1 for consecutive numbers and equal
         // or +1 timestamps; the first entry of a block is absolute.
-        assert!(bytes.len() < 150 * 3, "{} bytes", bytes.len());
+        let total: usize = blocks.iter().map(Vec::len).sum();
+        assert!(total < 150 * 3, "{total} bytes");
+        // A cut inside an entry, or more than 64 entries, is not a block.
+        assert_eq!(
+            decode_index_entries(&blocks[0][..blocks[0].len() - 1]),
+            None
+        );
+        assert_eq!(
+            decode_index_entries(&[blocks[0].clone(), vec![0, 0]].concat()),
+            None
+        );
+        // The encoding resumes from the writer state.
+        let mut w = IndexWriter::resume(64, entries[63].0, entries[63].1);
+        let mut out = Vec::new();
+        for &(n, t) in &entries[64..128] {
+            w.push(&mut out, n, t);
+        }
+        assert_eq!(out, blocks[1]);
+        assert_eq!((w.seq(), w.last_timestamp()), (128, entries[127].1));
     }
 
     #[test]
-    fn index_block_crc_covers_position_and_bytes() {
-        let entries: Vec<(u64, u64)> = (0..128).map(|i| (i, 5)).collect();
-        let (bytes, starts) = index_of(&entries);
-        let block0 = &bytes[..starts[1]];
-        assert!(decode_index_block(block0, 0).sealed);
-        // The same bytes at block 1's position do not seal.
-        assert!(!decode_index_block(block0, 1).sealed);
-        let mut bad = block0.to_vec();
-        bad[5] ^= 1;
-        assert!(!decode_index_block(&bad, 0).sealed);
-        // A torn block: entries up to the cut, not sealed.
-        let torn = decode_index_block(&bytes[..10], 0);
-        assert!(!torn.sealed);
-        assert!(torn.entries.len() < 64);
-        assert_eq!(torn.entries, entries[..torn.entries.len()]);
+    fn index_record_crc_covers_topic_number_stamp_and_body() {
+        let mut buf = Vec::new();
+        let size = put_index_record(&mut buf, INDEX_RECORD_BLOCK, 7, 300, 42, b"entries");
+        assert_eq!(size, buf.len());
+        let rec = decode_index_record(&buf).unwrap();
+        assert_eq!(
+            (
+                rec.kind, rec.topic, rec.number, rec.stamp, rec.body, rec.size
+            ),
+            (INDEX_RECORD_BLOCK, 7, 300, 42, &b"entries"[..], size)
+        );
+        // Every byte is covered: any flip fails, and so does a cut.
+        for i in 0..buf.len() {
+            let mut bad = buf.clone();
+            bad[i] ^= 0x01;
+            assert_ne!(decode_index_record(&bad).as_ref(), Some(&rec), "byte {i}");
+        }
+        assert_eq!(decode_index_record(&buf[..size - 1]), None);
+        assert_eq!(decode_index_record(&[0; 32]), None);
+    }
+
+    #[test]
+    fn seek_pages_and_headers_round_trip() {
+        let locs: Vec<IndexLoc> = (0..3)
+            .map(|i| IndexLoc {
+                segment: i,
+                len: 100 + i,
+                offset: u64::MAX - u64::from(i),
+            })
+            .collect();
+        let body = seek_page_body(2, &locs);
+        assert_eq!(body.len(), 1 + 3 * INDEX_LOC);
+        assert_eq!(seek_page_shape(&body), Some((2, 3)));
+        for (i, loc) in locs.iter().enumerate() {
+            assert_eq!(seek_page_loc(&body, i), Some(*loc));
+        }
+        assert_eq!(seek_page_loc(&body, 3), None);
+        assert_eq!(seek_page_shape(&body[..5]), None);
+        let h = index_header(77);
+        assert_eq!(decode_index_header(&h), Some(77));
+        let mut bad = h;
+        bad[13] ^= 1;
+        assert_eq!(decode_index_header(&bad), None);
     }
 
     #[test]
@@ -1437,7 +1613,7 @@ mod tests {
             (u64::MAX, 0),
             (1 << 63, 1),
         ];
-        let (bytes, _) = index_of(&entries);
-        assert_eq!(decode_index_block(&bytes, 0).entries, entries);
+        let blocks = index_of(&entries);
+        assert_eq!(decode_index_entries(&blocks[0]).unwrap(), entries);
     }
 }

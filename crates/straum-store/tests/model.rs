@@ -33,7 +33,8 @@ enum Op {
 
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        4 => prop::collection::vec((0..TOPICS.len(), 0..6usize), 0..8).prop_map(Op::Put),
+        // Up to 32 messages, so topics fill several 64-entry index blocks.
+        4 => prop::collection::vec((0..TOPICS.len(), 0..6usize), 0..32).prop_map(Op::Put),
         2 => (0..TOPICS.len(), 0..6u64).prop_map(|(topic, age)| Op::Release { topic, age }),
         1 => Just(Op::Compact),
         1 => Just(Op::Restart),
@@ -113,8 +114,11 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
             dict_train_bytes: 256,
             // Small, so reads also go through eviction.
             block_cache_blocks: 2,
-            // Sparse seek table after the first block: lookups walk blocks.
-            seek_table_max_entries: 1,
+            // Seek pages of two locations: lookups read several pages.
+            seek_page_entries: 2,
+            // Index segments rotate between batches.
+            index_segment_max_bytes: 256,
+            index_open_files: 2,
             // Payloads of up to 300 bytes: batches split into several
             // blocks, and the largest payloads are blocks of their own.
             max_block_raw_bytes: 128,

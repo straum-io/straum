@@ -60,19 +60,8 @@ async fn torn_tail_is_truncated_and_reported() {
         }),
         "{actions:?}"
     );
-    // The topic index still had the dropped entry: repaired and reported.
-    assert!(
-        actions.iter().any(|a| matches!(
-            a,
-            RecoveryAction::TopicIndexRepaired {
-                entries_kept: 2,
-                bytes_truncated,
-                entries_rewritten: 0,
-                ..
-            } if *bytes_truncated > 0
-        )),
-        "{actions:?}"
-    );
+    // The dropped entry was in the tail, which is in memory only.
+    assert_eq!(actions.len(), 1, "{actions:?}");
     drop(store);
     let store = Store::open(&dir.0, Config::default()).await.unwrap();
     assert!(store.recovery_report().is_empty(), "second open is clean");
@@ -83,9 +72,9 @@ async fn orphans_and_lost_files_are_reported() {
     let dir = TempDir::new("report-orphans");
     build(&dir.0).await;
     std::fs::write(dir.0.join("seg-00000000000000ff.dat"), b"orphan").unwrap();
-    std::fs::write(dir.0.join("topics/7a7a.idx"), b"unknown topic").unwrap();
+    // An index segment whose header never became durable.
+    std::fs::write(dir.0.join("idx-0000000000000007.dat"), b"STRMIDX").unwrap();
     std::fs::write(dir.0.join("wal.log.tmp"), b"half-created").unwrap();
-    std::fs::remove_file(dir.0.join("topics/74.idx")).unwrap();
     let store = Store::open(&dir.0, Config::default()).await.unwrap();
     let actions = &store.recovery_report().actions;
     assert!(
@@ -97,21 +86,14 @@ async fn orphans_and_lost_files_are_reported() {
         "{actions:?}"
     );
     assert!(
-        actions.contains(&RecoveryAction::UnknownTopicIndexRemoved {
-            path: dir.0.join("topics/7a7a.idx")
+        actions.contains(&RecoveryAction::IndexSegmentRemoved {
+            segment: 7,
+            bytes: 7
         }),
         "{actions:?}"
     );
-    assert!(
-        actions.contains(&RecoveryAction::TopicIndexRepaired {
-            path: dir.0.join("topics/74.idx"),
-            entries_kept: 0,
-            bytes_truncated: 0,
-            entries_rewritten: 3,
-        }),
-        "{actions:?}"
-    );
-    assert_eq!(actions.len(), 4, "{actions:?}");
+    assert_eq!(actions.len(), 3, "{actions:?}");
+    assert!(!dir.0.join("idx-0000000000000007.dat").exists());
     assert_eq!(store.read(b"t", 2).await.unwrap(), Some(vec![2; 32]));
 }
 

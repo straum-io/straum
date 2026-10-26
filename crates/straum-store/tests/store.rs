@@ -2,8 +2,11 @@
 
 mod common;
 
-use common::{Rng, TempDir, copy_dir, wal_frame_starts};
-use straum_store::{Config, Message, ObjectId, Store, StoreError};
+use common::{
+    INDEX_BLOCK_RECORD, Rng, TempDir, copy_dir, edit, find_index_record, index_segments,
+    reseal_index_record, snapshot, wal_frame_starts,
+};
+use straum_store::{Config, Message, ObjectId, RecoveryAction, Store, StoreError};
 
 fn msg<'a>(topic: &'a str, payload: &'a [u8]) -> Message<'a> {
     Message {
@@ -71,10 +74,12 @@ async fn one_fsync_per_file_per_batch() {
     let batch: Vec<Message> = payloads.iter().map(|p| msg("t", p)).collect();
     let before = store.stats().fsyncs;
     store.put_batch(&batch, 1).await.unwrap();
+    // The first full index block also creates the index segment: its
+    // header sync and a directory fsync. Index records are not synced.
     assert_eq!(
         store.stats().fsyncs - before,
-        2,
-        "segment + WAL, not per message"
+        4,
+        "segment + WAL + index segment creation, not per message"
     );
 
     // Only known bytes: nothing for the segment, one WAL fsync.
@@ -444,106 +449,129 @@ async fn dedup_counters_for_repeated_and_distinct_payloads() {
 }
 
 /// `n` messages with distinct payloads `i.to_le_bytes()` to topic "t", one
-/// batch, timestamp 7. Returns the topic index bytes.
-async fn index_of_messages(dir: &std::path::Path, n: u32) -> Vec<u8> {
+/// batch, timestamp 7.
+async fn write_messages(dir: &std::path::Path, n: u32) {
     let payloads: Vec<[u8; 4]> = (0..n).map(u32::to_le_bytes).collect();
     let batch: Vec<Message> = payloads.iter().map(|p| msg("t", p)).collect();
     let mut store = Store::open(dir, Config::default()).await.unwrap();
     store.put_batch(&batch, 7).await.unwrap();
-    std::fs::read(dir.join("topics/74.idx")).unwrap()
 }
 
-/// docs/format.md: a sealed block ends with CRC32C over the block number
-/// (u64 LE) and the block's entry bytes.
-fn reseal_block(block: &mut [u8], number: u64) {
-    let body = block.len() - 4;
-    let crc = crc32c::crc32c_append(crc32c::crc32c(&number.to_le_bytes()), &block[..body]);
-    block[body..].copy_from_slice(&crc.to_le_bytes());
-}
-
+/// An intact block record holding other entries than the WAL was written
+/// that way: an error, and no file changes.
 #[compio::test]
-async fn topic_index_disagreeing_with_wal_fails_recovery() {
+async fn index_block_disagreeing_with_wal_fails_recovery() {
     let dir = TempDir::new("topic-mismatch");
-    // Exactly one sealed block: 64 entries and its CRC.
-    let mut bytes = index_of_messages(&dir.0, 64).await;
+    write_messages(&dir.0, 64).await;
+    let rec = find_index_record(&dir.0, INDEX_BLOCK_RECORD, 0, 0);
     // Entry 0 holds object number 0 as a 1-byte varint; make it 1 and
-    // re-seal, so the block is valid but disagrees with the WAL.
-    assert_eq!(bytes[0], 0);
-    bytes[0] = 1;
-    reseal_block(&mut bytes, 0);
-    std::fs::write(dir.0.join("topics/74.idx"), &bytes).unwrap();
+    // reseal, so the record is intact but disagrees with the WAL.
+    edit(&rec.path, |b| {
+        assert_eq!(b[rec.body.start], 0);
+        b[rec.body.start] = 1;
+        reseal_index_record(b, rec.offset, rec.size);
+    });
+    let before = snapshot(&dir.0);
     let err = Store::open(&dir.0, Config::default()).await.err().unwrap();
     assert!(
-        matches!(err, StoreError::TopicMismatch { seq: 0, .. }),
+        matches!(&err, StoreError::TopicMismatch { topic, seq: 0 } if topic == b"t"),
         "{err}"
     );
+    assert!(snapshot(&dir.0) == before, "files changed");
 }
 
+/// An intact record of a durable frame for a block the WAL does not have.
 #[compio::test]
-async fn lost_topic_index_is_rebuilt_from_wal() {
-    let dir = TempDir::new("topic-rebuild");
-    let good = index_of_messages(&dir.0, 100).await;
-    let path = dir.0.join("topics/74.idx");
-    // Unsynced pages lost: cut inside the open block, zero-extended.
-    let mut bytes = good.clone();
-    bytes.truncate(good.len() - 3);
-    bytes.resize(good.len(), 0);
-    std::fs::write(&path, bytes).unwrap();
-    let store = Store::open(&dir.0, Config::default()).await.unwrap();
-    assert_eq!(
-        read(&store, "t", 99).await.as_deref(),
-        Some(&99u32.to_le_bytes()[..])
-    );
-    assert_eq!(
-        std::fs::read(&path).unwrap(),
-        good,
-        "repaired byte for byte"
-    );
-    drop(store);
-    std::fs::remove_file(&path).unwrap();
-    let store = Store::open(&dir.0, Config::default()).await.unwrap();
-    assert_eq!(
-        read(&store, "t", 0).await.as_deref(),
-        Some(&0u32.to_le_bytes()[..])
-    );
-    assert_eq!(std::fs::read(&path).unwrap(), good, "rebuilt byte for byte");
-}
-
-/// topic_seq is implicit: a block copied to another block position fails
-/// its CRC (which covers the block number) and is rewritten from the WAL.
-#[compio::test]
-async fn index_block_at_wrong_position_is_rewritten() {
-    let dir = TempDir::new("topic-moved");
-    let good = index_of_messages(&dir.0, 128).await;
-    let path = dir.0.join("topics/74.idx");
-    // Block 0 ends with the CRC after its 64th entry: find it by decoding
-    // through the public lookup, i.e. by reopening the store.
-    let block1 = {
-        let store = Store::open(&dir.0, Config::default()).await.unwrap();
-        assert_eq!(store.index_entry(b"t", 64).await.unwrap(), Some((64, 7)));
-        // Two equal-length sealed blocks (same entry sizes): half the file.
-        good.len() / 2
-    };
-    let moved = [&good[..block1], &good[..block1]].concat();
-    std::fs::write(&path, &moved).unwrap();
-    let store = Store::open(&dir.0, Config::default()).await.unwrap();
-    assert_eq!(
-        std::fs::read(&path).unwrap(),
-        good,
-        "rewritten from the WAL"
-    );
+async fn index_block_beyond_the_wal_fails_recovery() {
+    let dir = TempDir::new("topic-beyond");
+    write_messages(&dir.0, 64).await;
+    let rec = find_index_record(&dir.0, INDEX_BLOCK_RECORD, 0, 0);
+    // The number field follows kind, len (2 bytes: 64 entries are more
+    // than 127 bytes) and topic: block 0 → 5.
+    edit(&rec.path, |b| {
+        assert_eq!(b[rec.offset + 4], 0);
+        b[rec.offset + 4] = 5;
+        reseal_index_record(b, rec.offset, rec.size);
+    });
+    let before = snapshot(&dir.0);
+    let err = Store::open(&dir.0, Config::default()).await.err().unwrap();
     assert!(
-        store.recovery_report().actions.contains(
-            &straum_store::RecoveryAction::TopicIndexRepaired {
-                path: path.clone(),
-                entries_kept: 64,
-                bytes_truncated: (moved.len() - block1) as u64,
-                entries_rewritten: 64,
-            }
-        ),
-        "{:?}",
-        store.recovery_report()
+        matches!(err, StoreError::IndexSegmentCorrupt { segment: 0, .. }),
+        "{err}"
     );
+    assert!(snapshot(&dir.0) == before, "files changed");
+}
+
+#[compio::test]
+async fn lost_index_segment_is_rebuilt_from_wal() {
+    let dir = TempDir::new("topic-rebuild");
+    write_messages(&dir.0, 100).await;
+    let segments = index_segments(&dir.0);
+    assert_eq!(segments.len(), 1);
+    let good = std::fs::read(&segments[0]).unwrap();
+    // Unsynced pages lost: the record cut and zero-extended.
+    let mut cut = good.clone();
+    cut.truncate(good.len() - 3);
+    cut.resize(good.len(), 0);
+    std::fs::write(&segments[0], cut).unwrap();
+    for round in 0..2 {
+        if round == 1 {
+            // Then the segments are deleted altogether.
+            for path in index_segments(&dir.0) {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let store = Store::open(&dir.0, Config::default()).await.unwrap();
+        assert_eq!(
+            store.recovery_report().actions,
+            [RecoveryAction::TopicIndexRepaired {
+                topic: b"t".to_vec(),
+                blocks_rewritten: 1,
+                pages_rewritten: 0,
+            }],
+            "round {round}"
+        );
+        for seq in [0, 63, 64, 99] {
+            assert_eq!(
+                read(&store, "t", seq).await.as_deref(),
+                Some(&(seq as u32).to_le_bytes()[..])
+            );
+        }
+        drop(store);
+        let store = Store::open(&dir.0, Config::default()).await.unwrap();
+        assert!(store.recovery_report().is_empty(), "round {round}: clean");
+    }
+    // The rewritten record is the original one, in a new segment.
+    let rebuilt = std::fs::read(index_segments(&dir.0)[0].clone()).unwrap();
+    assert_eq!(rebuilt[24..], good[24..], "re-encoded byte for byte");
+}
+
+/// A damaged record ends what is read of its segment: the records after it
+/// are rewritten from the WAL, those before it are kept.
+#[compio::test]
+async fn a_damaged_record_ends_the_scan_of_its_segment() {
+    let dir = TempDir::new("topic-damaged");
+    write_messages(&dir.0, 3 * 64).await;
+    let rec = find_index_record(&dir.0, INDEX_BLOCK_RECORD, 0, 1);
+    edit(&rec.path, |b| b[rec.body.start + 5] ^= 0xff);
+    let store = Store::open(&dir.0, Config::default()).await.unwrap();
+    assert_eq!(
+        store.recovery_report().actions,
+        [RecoveryAction::TopicIndexRepaired {
+            topic: b"t".to_vec(),
+            blocks_rewritten: 2,
+            pages_rewritten: 0,
+        }]
+    );
+    for seq in 0..3 * 64u32 {
+        assert_eq!(
+            read(&store, "t", u64::from(seq)).await.as_deref(),
+            Some(&seq.to_le_bytes()[..])
+        );
+    }
+    drop(store);
+    let store = Store::open(&dir.0, Config::default()).await.unwrap();
+    assert!(store.recovery_report().is_empty());
 }
 
 #[compio::test]

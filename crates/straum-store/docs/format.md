@@ -13,13 +13,13 @@ names, segments).
 ├── wal.log                      the log (one file, not rotated)
 ├── wal.log.tmp                  only while a WAL is being created; deleted at open
 ├── seg-<id:016x>.dat            data segments; id is a u64 in hex, 16 digits
-└── topics/
-    └── <hex(topic)>.idx         a topic index; the name is the topic name's bytes in hex
+└── idx-<id:016x>.dat            index segments: topic index blocks and seek pages of every topic
 ```
 
-A topic name is 1 to 100 bytes (`MAX_TOPIC`), so the hex file name (up to 200
-characters plus `.idx`) fits NAME_MAX = 255. Segment ids are never reused: the
-next id is the highest seen in the WAL or on disk plus one.
+A topic name is 1 to 100 bytes (`MAX_TOPIC`). Segment ids are never reused:
+the next id is the highest seen in the WAL or on disk plus one. Index segment
+ids are a separate sequence: the highest on disk plus one, at most
+`u32::MAX`.
 
 ## Blocks
 
@@ -92,7 +92,7 @@ rewritten segment).
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 10 |
+| 8 | 4 | `version` u32 = 11 |
 | 12 | 8 | `dict_train_bytes` u64: the dictionary training threshold |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -112,7 +112,8 @@ index entries, 4 fixed-width Publish and Release with the topic name, 5
 fixed-width PutObject and PutInline, 6 a topic index of 20-byte entries, 7
 uncompressed objects located by segment offset (PutObject type 1, PutInline
 type 5, Compact type 4), 8 a 16-byte header without `dict_train_bytes`, 9
-at most one rewritten block per Compact record.
+at most one rewritten block per Compact record, 10 one index file per topic
+(`topics/<hex>.idx`).
 
 ### Frame
 
@@ -377,8 +378,9 @@ report means recovery changed nothing. No change is made without an entry.
 | `TornTailTruncated { frame_seq, offset, bytes_removed }` | a torn last frame was cut (rule 1) |
 | `FrameDropped { frame_seq, offset, mode, object, reason, bytes_removed }` | a complete last ParallelSync frame was dropped (rule 4) |
 | `OrphanSegmentRemoved { segment }` | a segment file the WAL does not refer to was deleted |
-| `UnknownTopicIndexRemoved { path }` | an index of a topic absent from the WAL was deleted |
-| `TopicIndexRepaired { path, entries_kept, bytes_truncated, entries_rewritten }` | a topic index was cut and/or rewritten from the WAL |
+| `IndexSegmentRemoved { segment, bytes }` | an index segment without an intact header was deleted (`bytes` its length) |
+| `StaleIndexRecordsFenced { records, segment }` | index records of cut WAL frames were found; index segment `segment` was created to keep them stale |
+| `TopicIndexRepaired { topic, blocks_rewritten, pages_rewritten }` | a topic's index blocks or seek pages were re-encoded from the WAL and appended |
 
 `config_overrides` lists `Config` values the WAL replaced, which change no
 file: `DictTrainBytes { configured, stored }` when `Config::dict_train_bytes`
@@ -386,69 +388,121 @@ differs from the WAL header's value (`stored` is used).
 
 The report is kept in the open `Store`'s memory and is not written to disk.
 
-## Topic index `topics/<hex>.idx`
+## Topic index
 
-A sequence of blocks of 64 entries; entry `topic_seq` is entry
-`topic_seq mod 64` of block `topic_seq div 64`. `topic_seq` is not stored: the
-file starts at seq 0 and is never cut (released entries stay in it; retention
-writes only the WAL). The last block may be incomplete.
-
-Block:
+A topic's index is the sequence of its entries `(object number,
+timestamp)`, one per published message, released ones included; entry
+`topic_seq` is entry `topic_seq mod 64` of block `topic_seq div 64`.
+`topic_seq` is not stored. Blocks of 64 entries are encoded as:
 
 | Part | Encoding |
 |---|---|
 | entry 0 | `object_number` varint, `timestamp` varint |
 | entries 1–63 | zigzag(`object_number` − previous) varint, (`timestamp` − previous) varint |
-| after the 64th entry | `crc` u32: CRC32C of the block number (u64 LE, not written), then of the block's entry bytes |
 
 Time does not decrease within a topic, so the time delta is unsigned. New
-objects come in order (number delta +1), so an entry is usually 2 bytes; the
-first entry of a block about 3 + 6 bytes; the CRC is 4 bytes per 64 entries.
-The block number is part of the CRC, so a block at the wrong position fails
-the check. The encoding is deterministic: the same entries always give the
-same bytes.
+objects come in order (number delta +1), so an entry is usually 2 bytes and
+the first entry of a block about 3 + 6 bytes. The encoding is
+deterministic: the same entries always give the same bytes.
 
-**Lookup by `topic_seq`.** A seek table in memory holds file offsets of index
-blocks (8 bytes each): block `topic_seq div 64` is found by one positional
-read from the nearest kept offset to the next one, walking the full blocks
-in between (each checked against its CRC). Up to
-`Config::seek_table_max_entries` blocks (default 65 536, about 4.2 M
-entries) every block's offset is kept and a lookup reads one block; when
-the table would grow past that, only the offsets of blocks 0, 64, 128, …
-are kept from then on, and a lookup reads at most 64 blocks. While dense the
-table's allocation is at most `seek_table_max_entries` + 1 offsets (about
-512 KiB by default); once sparse it grows by 8 bytes per 64 blocks (about
-0.002 bytes per entry). Paging the sparse table to a file is a later step
-(ADR-0014). The table is built at open (the index
-is read in full anyway for the check against the WAL) and extended on
-write. `Store::index_entry(topic, seq)`.
+A full block is stored once, as a record in the shared index segments. The
+last, incomplete block (at most 63 entries) is kept in memory, encoded, and
+read from there; it is rebuilt from the WAL at open.
 
-**Reads.** Live entries are not held in memory: every read of an entry
-(`Store::read`, `Store::entry`, `Store::index_entry`, and `release_before`
-finding the entries to release) takes it from the index file. A full block
-is used only if its CRC matches; otherwise the read fails with
-`TopicIndexCorrupt` and returns none of its entries (damage after open,
-which the check at open cannot see). The entries of the last, incomplete
-block, which has no CRC, are kept in memory (at most 63 per topic) and read
-from there. The last full block read is cached per topic.
+## Index segment `idx-<id>.dat`
 
-The file is derived from the WAL: written after the WAL fsync and not synced
-itself. At open the index is re-encoded from the WAL and compared with the
-file byte by byte:
+Append-only files shared by all topics: full topic index blocks and seek
+pages. A 24-byte header, then records.
 
-* the file equals the encoding: nothing is done;
-* the file is longer and matches the whole encoding: the extra bytes (entries
-  from a truncated WAL tail) are cut;
-* in the first differing block the file holds 64 entries with a valid CRC
-  while the WAL requires a full block with other entries: error
-  `TopicMismatch` (the block was written that way);
-* otherwise (an unwritten, zeroed, cut or foreign block) the file is cut at the
-  end of the block's last whole matching entry and the rest is rewritten from
-  the WAL; the report gets `TopicIndexRepaired`.
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | `magic` = `53 54 52 4d 49 44 58 00` (`"STRMIDX\0"`) |
+| 8 | 4 | `version` u32 = 11 (the WAL version) |
+| 12 | 8 | `created_at` u64: the store's next WAL frame number when the segment was created |
+| 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
-The last, incomplete block has no CRC of its own: a wrong entry in it cannot
-be told from an unwritten one and is rewritten from the WAL (and reported),
-not treated as an error.
+Record:
+
+| Field | Size |
+|---|---|
+| `kind` u8: 1 block, 2 seek page | 1 |
+| `len` varint: body length | 1–10 |
+| `topic` varint: topic number | 1–10 |
+| `number` varint: block number, or the seek page's number within its level | 1–10 |
+| `stamp` varint: the WAL frame number after the frames the record describes | 1–10 |
+| body | `len` |
+| `crc` u32: CRC32C of every byte of the record before it | 4 |
+
+A block's body is its 64 encoded entries. The CRC covers the topic and
+block number, so a record is never taken for another block. A seek page's
+body is `level u8` followed by `Config::seek_page_entries` (default 256)
+locations of 16 bytes: `segment u32 | len u32 | offset u64`, the whole
+record's length included. A level-0 page holds the locations of blocks
+`256k … 256k + 255` (page `k`); a level-`l` page those of level-(`l` − 1)
+pages `256k … 256k + 255`, that is of blocks `256^(l+1)·k` onwards. Only
+full pages are written.
+
+**Writing.** A batch's records go to the active segment in one write after
+the WAL fsync, not synced. Their stamp is the batch frame's number + 1. A
+segment is created (`create_new`, header, `fdatasync`, directory fsync)
+when the first record needs one, so its header is durable before any record
+in it; a store appends only to a segment it created. Before a batch, a
+segment holding at least `Config::index_segment_max_bytes` (default 64 MiB)
+is sealed; the next record starts a new one.
+
+**Lookup by `topic_seq`.** Per topic the store keeps in memory the seek
+pages not yet written (the spine): for each level, the locations after the
+level's last page, fewer than 256 each. The top level's entries cover the
+oldest blocks. A block under the spine's level `l` is found by reading `l`
+seek pages, then the block: one page up to 65 536 blocks (about 4.2 M
+entries), two up to about 1.07 G entries. Every page and block read must be
+intact (CRC) and be the expected kind, topic, level and number; otherwise
+the read fails with `TopicIndexCorrupt` and returns none of its entries.
+The last full block read is cached per topic. At most
+`Config::index_open_files` (default 64) segments are open for reads, least
+recently used closed first, plus the segment being written; a read in
+progress holds its handle until it completes, so concurrent reads can each
+add one.
+`Store::index_entry(topic, seq)`.
+
+**Recovery.** Index segments are derived from the WAL. At open:
+
+1. A segment without an intact header is deleted (`IndexSegmentRemoved`).
+   At most 24 bytes long, its creation stopped before the header sync and
+   it held no record. Longer, its header was damaged; its records are
+   re-derived from the WAL like any other lost record, but its `created_at`
+   is lost too (see the limit below).
+2. Each segment is read in order up to its first record that is short,
+   malformed or fails its CRC (unwritten, torn or damaged bytes).
+3. A record is stale if its stamp is above its segment's limit: the lowest
+   `created_at` of the later segments, and the WAL's frame count. A stale
+   record describes WAL frames that recovery cut; it is never used. If a
+   stale record is not already covered by a later segment's `created_at`,
+   a segment is created now (`created_at` = the frame count;
+   `StaleIndexRecordsFenced`), so that frames written later under the same
+   numbers do not make it look current.
+4. Every other block record must be a block the WAL has, with the WAL's
+   entries: otherwise `TopicMismatch` (other entries) or
+   `IndexSegmentCorrupt` (an unknown topic, a block beyond the topic's full
+   blocks, an unknown kind, a body that does not decode), and no file is
+   changed. Its location is used (the first, if several).
+5. Seek pages are rebuilt from the block locations, level by level; a page
+   found intact with exactly the expected locations is reused.
+6. Blocks and pages not found are re-encoded from the WAL and appended with
+   stamp = the frame count (`TopicIndexRepaired`).
+
+Open reads every index segment and replays every topic's entries; open time
+and open's peak memory (every index segment is held in memory during the
+check) grow with the history (ADR-0014: until checkpoints).
+
+**Limit.** A segment's `created_at` is the only proof that the stale
+records before it are stale. If the header of a fencing segment is damaged
+after new frames reused the stale records' frame numbers, those records
+look current at the next open, disagree with the WAL, and open fails with
+`TopicMismatch` (no file changed): an error, never wrong data
+(`tests/index_segments.rs`, `a_damaged_fence_header_fails_open`). Deleting
+every `idx-*.dat` file then lets open re-derive the whole index from the
+WAL (reported).
 
 ## Write order (one batch)
 
@@ -464,7 +518,9 @@ objects compressed into one block.
 2. fdatasync of every touched segment
 3. the batch's frame → one write to wal.log
 4. fdatasync of wal.log
-5. topic index writes (no fsync)
+5. index records of the blocks the batch completed → the active index
+   segment, one write (no fsync); a new index segment is created and synced
+   before step 1
 6. acknowledgement
 ```
 
@@ -480,7 +536,7 @@ no new object), steps 1–2 do not happen: one fdatasync per batch.
 3. two chains at once:
      the active segment's buffer → write → segment fdatasync
      the batch's frame → write to wal.log → wal.log fdatasync
-4. both chains done → topic index writes (no fsync)
+4. both chains done → index records (no fsync)
 5. acknowledgement
 ```
 
@@ -499,13 +555,13 @@ For a batch of `b` messages:
 | PutBlock (one per batch with new objects) | 2 + Δnumber 1 + segment 1 + offset 1–4 (segments up to 64 MiB) + length, raw length 1–5 each + dictionary 1 + CRC 4, shared by `b` |
 | Publish | 2 + 4…40: topic number and seq 1–10 each; number and time deltas usually 1 byte each; the time of a frame's first Publish about 6 bytes for millisecond time |
 | frame header | 21 / `b` |
-| topic index entry | ~2 (+ ~9 for a block's first entry and a 4-byte CRC per 64 entries) |
+| topic index entry | ~2 (+ ~9 for a block's first entry and about 13 bytes of record header and CRC per 64 entries; a seek page adds 16 bytes per 64 entries) |
 | PutTopic | once per topic |
 | PutDict | once per store, up to 64 KiB + 3 |
 
 A message with already known bytes has no PutObject and adds nothing to a
 block. `Stats::metadata_bytes` counts WAL and topic index bytes except inline
-blocks; the dictionary counts as metadata. `examples/meta_bytes.rs` measures
+blocks (index records are counted in `topic_bytes`); the dictionary counts as metadata. `examples/meta_bytes.rs` measures
 these from the store's write counters (a 5-byte topic, millisecond time).
 
 ## Compaction order (per rewritten segment)

@@ -17,17 +17,22 @@ macOS (development only). No tokio, including transitively.
   (`Config::block_cache_blocks`, default 16, and `Config::block_cache_bytes`,
   default 64 MiB; a larger block is not cached). The training threshold is
   fixed in the WAL file header when the WAL is created.
-- Topic entries are read from the topic index files, not held in memory:
-  per topic the store keeps the entries of the last, incomplete index block
-  (at most 63) and a seek table, dense up to
-  `Config::seek_table_max_entries` index blocks (default 65 536 offsets,
-  about 512 KiB), then one offset per 64 blocks (about 0.002 bytes per
-  entry). The object index (id → number → block)
-  is still in memory (ADR-0014 moves it to disk).
+- Topic entries are read from shared index segments (`idx-<id>.dat`), not
+  held in memory, and there is no file per topic: full 64-entry index
+  blocks of every topic are appended to one segment at a time, with seek
+  pages of 256 block locations. Per topic the store keeps the last,
+  incomplete block encoded (at most 63 entries) and the seek pages not yet
+  written (fewer than 256 locations of 16 bytes per level); a lookup reads
+  one seek page and one block up to about 4.2 M entries per topic. At most
+  `Config::index_open_files` (default 64) index segments are kept open for
+  reads (a read in progress holds its handle until it completes, so
+  concurrent reads can add one each). Topic state is still rebuilt from the WAL at open, and the object
+  index (id → number → block) is still in memory (ADR-0014).
 - Group commit: one segment `fdatasync` and one WAL `fdatasync` per batch;
   a batch is acknowledged only after both.
-- Recovery from the WAL cuts a torn tail and checks topic indexes and
-  reference counts against it. Every change recovery makes is listed in
+- Recovery from the WAL cuts a torn tail and checks the index segments and
+  reference counts against it; index blocks and seek pages lost with
+  unsynced pages are rewritten from the WAL. Every change recovery makes is listed in
   `Store::recovery_report()`.
 - Time-based retention, and mark-and-sweep compaction that survives a crash
   at any point: blocks whose objects are all dead are dropped, the live
@@ -86,18 +91,19 @@ Test variables: `STRAUM_STORE_CRASH_ITERATIONS` (default 200),
 
 | File | Covers |
 |---|---|
-| `src/codec.rs` | BLAKE3; WAL record encoding, one-byte deltas in batch records; rejection of every flipped bit and every truncated prefix; raw block layout; topic index entries |
+| `src/codec.rs` | BLAKE3; WAL record encoding, one-byte deltas in batch records; rejection of every flipped bit and every truncated prefix; raw block layout; topic index entries; index records (every flipped bit and a cut rejected), seek pages and the index segment header |
 | `src/block.rs` | compression round trip with and without a dictionary; deterministic training; a damaged block, a wrong length or CRC is rejected |
 | `src/store.rs` | reference count reconciliation; replay rejecting an inconsistent WAL (block and object order, dictionaries); applying and rejecting Compact; file names |
-| `tests/index_reads.rs` | live entries read from the index file: reads across full blocks and the in-memory tail, before and after reopen; release across a block boundary; a full block damaged after open fails `read`, `entry`, `index_entry` and `release_before` with `TopicIndexCorrupt`, writing nothing; a seek table dense up to 2 blocks (then one offset per 64) still finds every entry, and a damaged block fails every walk through it; a release too large for a frame fails with `FrameTooLarge` before writing |
-| `tests/store.rs` | deduplication; one fsync per file per batch; restart; rotation; compaction; orphans; a corrupted block fails the read; corrupted indexes; WAL truncation at every byte of the last record (Publish, Release, Compact) |
-| `tests/model.rs` | proptest: random publish, release, compact and restart against an in-memory model, 128 cases per write mode, with dictionary training and a two-block cache |
-| `tests/crash.rs` | a writer in a child process killed with SIGKILL at a random moment, checked after each restart; one test per write mode; the dictionary is trained during the run |
+| `tests/index_reads.rs` | live entries read from the index segments: reads across full blocks and the in-memory tail, before and after reopen; release across a block boundary; a full block damaged after open fails `read`, `entry`, `index_entry` and `release_before` with `TopicIndexCorrupt`, writing nothing; seek pages of 2 locations (four levels for 20 blocks) find every entry, and a damaged page fails exactly the blocks under it; reading across 20 index segments keeps at most `index_open_files` + 1 open; a release too large for a frame fails with `FrameTooLarge` before writing |
+| `tests/index_segments.rs` | index records of a cut WAL tail stay stale after new frames reuse their numbers (no false `TopicMismatch`); a damaged fence header fails open with `TopicMismatch`, no file changed (the documented limit); in every write mode, a deleted segment, all segments deleted, a damaged header, a cut record and zeroed unsynced pages are repaired from the WAL and reported, the WAL unchanged, and the next open is clean |
+| `tests/store.rs` | deduplication; one fsync per file per batch; restart; rotation; compaction; orphans; a corrupted block fails the read; an intact index block disagreeing with the WAL (`TopicMismatch`) or beyond it (`IndexSegmentCorrupt`) with no file changed; a lost or cut index segment rebuilt byte for byte; a damaged record ends the scan of its segment; WAL truncation at every byte of the last record (Publish, Release, Compact) |
+| `tests/model.rs` | proptest: random publish, release, compact and restart against an in-memory model, 128 cases per write mode, with dictionary training, a two-block cache, seek pages of 2 locations, index segments rotating every 256 bytes and two open index files |
+| `tests/crash.rs` | a writer in a child process killed with SIGKILL at a random moment, checked after each restart; one test per write mode; the dictionary is trained during the run; index segments rotate and seek pages (2 locations) fill during it |
 | `tests/wal_corruption.rs` | any flipped bit in a middle frame gives `WalCorrupted` and leaves the file unchanged; in the last frame, truncation; a lost first half of the last frame is a torn tail; truncation at every byte; a `seq` gap; an old format gives `UnsupportedFormat`; `max_frame_bytes` |
 | `tests/fault_injection.rs` | hand-built states: a missing, short or damaged block of the last frame drops the frame in ParallelSync and is an error otherwise; a missing block of an earlier frame gives `MissingObject`, a damaged one `CorruptBlock` on read; every write mode |
 | `tests/multi_block.rs` | `max_block_raw_bytes`: a batch split in order, an oversized object alone, duplicates across a batch's blocks, compaction within the limit, a frame of several blocks with one missing in every write mode; a batch mixing inline and segment blocks; `last_commit_timing` in every write mode |
 | `tests/blocks.rs` | duplicates within one block and across blocks; compaction of partly dead blocks, before and after restart; dictionary training once, read back from the WAL; a failed training recorded once; reads without a block cache |
-| `tests/recovery_report.rs` | a clean open reports and changes nothing; a torn tail, orphan segments and lost files are reported; an old format version gives `UnsupportedFormat` |
+| `tests/recovery_report.rs` | a clean open reports and changes nothing; a torn tail, orphan segments, an orphan index segment and a WAL temp file are reported; an old format version gives `UnsupportedFormat` |
 
 ### Platform-specific tests
 
@@ -301,7 +307,7 @@ been measured.
 | thiserror | the `StoreError` domain enum |
 | zstd =0.14.3 | block compression and dictionary training (default features off, `zdict_builder` on); exact version because stored bytes and sizes depend on it |
 | proptest (dev) | the model test |
-| crc32c (dev) | the topic index corruption test recomputes CRCs |
+| crc32c (dev) | the index corruption tests recompute CRCs |
 
 `tools/dedup-survey` and `tools/block-survey` (workspace crates, `publish =
 false`) use the same zstd version: the first for the zstd-compressed

@@ -8,8 +8,6 @@ mod block;
 mod codec;
 mod store;
 
-use std::path::PathBuf;
-
 pub use codec::{FrameMode, MAX_TOPIC, ObjectId};
 pub use store::{
     CommitTiming, CompactStats, Config, ConfigOverride, DropReason, Message, RecoveryAction,
@@ -55,12 +53,24 @@ pub enum StoreError {
     /// object index does not hold.
     #[error("object number {0} is not in the object index")]
     UnknownObjectNumber(u64),
-    #[error("topic index {path:?} disagrees with the WAL at entry {seq}")]
-    TopicMismatch { path: PathBuf, seq: u64 },
-    /// A full block of a topic index, read after open, fails its CRC (or
-    /// lies outside the file): its entries are not returned.
-    #[error("topic index {path:?}: block {block} is corrupt")]
-    TopicIndexCorrupt { path: PathBuf, block: u64 },
+    /// An intact index block record of a durable WAL frame holds other
+    /// entries than the WAL: it was written that way.
+    #[error("index of topic {topic:?} disagrees with the WAL at entry {seq}")]
+    TopicMismatch { topic: Vec<u8>, seq: u64 },
+    /// A full block of a topic index, or a seek page leading to it, read
+    /// after open, is missing, fails its CRC or is another block's: its
+    /// entries are not returned.
+    #[error("index of topic {topic:?}: block {block} is corrupt")]
+    TopicIndexCorrupt { topic: Vec<u8>, block: u64 },
+    /// An intact record of an index segment, from a durable WAL frame,
+    /// that cannot be: an unknown kind, an undecodable body, or a block the
+    /// WAL does not have. No file is changed.
+    #[error("index segment {segment} at offset {offset}: {reason}")]
+    IndexSegmentCorrupt {
+        segment: u64,
+        offset: u64,
+        reason: &'static str,
+    },
     #[error("refcount of {id:?}: WAL replay says {wal}, topic indexes say {topics}")]
     RefcountMismatch { id: ObjectId, wal: u64, topics: u64 },
 }

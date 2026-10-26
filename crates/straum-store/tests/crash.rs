@@ -41,6 +41,10 @@ fn config(mode_name: &str) -> Config {
     Config {
         segment_max_bytes: 4096,
         write_mode: mode(mode_name),
+        // Index segments rotate and seek pages fill often, so kills also
+        // land around both.
+        index_segment_max_bytes: 4096,
+        seek_page_entries: 2,
         // The dictionary is trained early in the run, so kills also land
         // before, during and after training.
         dict_train_bytes: 32 << 10,

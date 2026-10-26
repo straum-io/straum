@@ -16,16 +16,18 @@ use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use crate::StoreError;
 use crate::block::{self, Codecs};
 use crate::codec::{
-    self, FRAME_HEADER, FrameBuilder, FrameMode, INDEX_BLOCK, IndexWriter, MAX_TOPIC, MAX_VARINT,
-    NO_DICT, NO_SEGMENT, ObjectId, RECORD_COMPACT_BASE, RECORD_COMPACT_KEPT,
-    RECORD_COMPACT_REWRITTEN, RECORD_PUBLISH, RECORD_PUT_BLOCK, RECORD_PUT_DICT_BASE,
-    RECORD_PUT_INLINE_BLOCK_BASE, RECORD_PUT_OBJECT, RECORD_PUT_TOPIC_BASE, RECORD_RELEASE, Record,
-    Rewritten, WAL_FILE_HEADER,
+    self, FRAME_HEADER, FrameBuilder, FrameMode, INDEX_BLOCK, INDEX_HEADER, INDEX_RECORD_BLOCK,
+    INDEX_RECORD_SEEK_PAGE, IndexLoc, IndexWriter, MAX_TOPIC, MAX_VARINT, NO_DICT, NO_SEGMENT,
+    ObjectId, RECORD_COMPACT_BASE, RECORD_COMPACT_KEPT, RECORD_COMPACT_REWRITTEN, RECORD_PUBLISH,
+    RECORD_PUT_BLOCK, RECORD_PUT_DICT_BASE, RECORD_PUT_INLINE_BLOCK_BASE, RECORD_PUT_OBJECT,
+    RECORD_PUT_TOPIC_BASE, RECORD_RELEASE, Record, Rewritten, WAL_FILE_HEADER,
 };
 
 const WAL_FILE: &str = "wal.log";
 const WAL_TMP: &str = "wal.log.tmp";
-const TOPICS_DIR: &str = "topics";
+/// Bounds of `Config::seek_page_entries`.
+const SEEK_PAGE_MIN: usize = 2;
+const SEEK_PAGE_MAX: usize = 4096;
 
 /// How a batch's object bytes and its WAL frame are made durable.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -76,13 +78,18 @@ pub struct Config {
     /// kept; the least recently used blocks are evicted once either this or
     /// `block_cache_blocks` would be exceeded.
     pub block_cache_bytes: usize,
-    /// Index blocks of a topic up to which its seek table keeps every
-    /// block's file offset (a lookup reads one block). Beyond it the table
-    /// keeps one offset per `SEEK_STRIDE` (64) blocks, and a lookup reads
-    /// at most 64 blocks from the nearest kept offset. A topic's table holds
-    /// at most this many offsets while dense, then grows by one offset per
-    /// 64 blocks (8 bytes per 4096 entries). 0 is taken as 1.
-    pub seek_table_max_entries: usize,
+    /// An index segment holding at least this many bytes is sealed before
+    /// the next batch, and the next index record starts a new one; a
+    /// segment can exceed it by one batch's index records.
+    pub index_segment_max_bytes: u64,
+    /// Index segments kept open for reads, least recently used closed
+    /// first; the segment being written is open as well. 0 is taken as 1.
+    pub index_open_files: usize,
+    /// Locations per seek page (default 256): a topic's index block is
+    /// found through at most one seek page read up to this number squared
+    /// blocks, two up to its cube, and so on. Clamped to 2..=4096. Changing
+    /// it between opens rewrites every seek page at open (reported).
+    pub seek_page_entries: usize,
     /// Raw bytes of new objects stored without a dictionary after which the
     /// store trains its dictionary, once, on the objects of those blocks.
     /// 0: never. Recorded in a new WAL's file header; on reopen the WAL's
@@ -105,7 +112,9 @@ impl Default for Config {
             write_mode: WriteMode::Sequential,
             block_cache_blocks: 16,
             block_cache_bytes: 64 << 20,
-            seek_table_max_entries: 1 << 16,
+            index_segment_max_bytes: 64 << 20,
+            index_open_files: 64,
+            seek_page_entries: 256,
             dict_train_bytes: 1 << 20,
             max_block_raw_bytes: 64 << 10,
         }
@@ -344,14 +353,23 @@ pub enum RecoveryAction {
     },
     /// A segment file no WAL record references was deleted.
     OrphanSegmentRemoved { segment: u64 },
-    /// An index file of a topic the WAL does not know was deleted.
-    UnknownTopicIndexRemoved { path: PathBuf },
-    /// A topic index was cut and/or rewritten from the WAL.
+    /// An index segment without an intact header was deleted. With
+    /// `bytes` at most the header's 24, its creation stopped before the
+    /// header sync and it held no record; with more, its header was damaged
+    /// and the records it held are re-derived from the WAL
+    /// (`TopicIndexRepaired`).
+    IndexSegmentRemoved { segment: u64, bytes: u64 },
+    /// Index records of WAL frames that recovery cut (or that never became
+    /// durable) were found. Index segment `segment` was created so that they
+    /// stay recognised as stale once new frames reuse those frame numbers.
+    /// The records themselves are not changed.
+    StaleIndexRecordsFenced { records: u64, segment: u64 },
+    /// Full index blocks and seek pages of a topic that no index segment
+    /// held intact were re-encoded from the WAL and appended.
     TopicIndexRepaired {
-        path: PathBuf,
-        entries_kept: u64,
-        bytes_truncated: u64,
-        entries_rewritten: u64,
+        topic: Vec<u8>,
+        blocks_rewritten: u64,
+        pages_rewritten: u64,
     },
 }
 
@@ -380,108 +398,25 @@ struct Object {
 /// entries.
 type CachedBlock = (u64, Vec<(u64, u64)>);
 
-/// A topic's seek table while it is built at open.
-struct SeekTable {
-    starts: Vec<u64>,
-    stride: u64,
-    blocks: u64,
-}
-
-impl Default for SeekTable {
-    fn default() -> Self {
-        Self {
-            starts: Vec::new(),
-            stride: 1,
-            blocks: 0,
-        }
-    }
-}
-
-impl SeekTable {
-    fn push(&mut self, at: u64, max: usize) {
-        seek_push(
-            &mut self.starts,
-            &mut self.stride,
-            &mut self.blocks,
-            at,
-            max,
-        );
-    }
-}
-
-/// Blocks between kept seek offsets once a topic's table is sparse.
-const SEEK_STRIDE: u64 = 64;
-
-/// Records that index block number `*blocks` starts at file offset `at`.
-/// Dense (stride 1) up to `max` offsets; when the dense table would exceed
-/// `max`, only every `SEEK_STRIDE`-th offset is kept from then on. The
-/// vector's capacity never exceeds `max` + 1 while dense.
-fn seek_push(starts: &mut Vec<u64>, stride: &mut u64, blocks: &mut u64, at: u64, max: usize) {
-    let max = max.max(1);
-    if (*blocks).is_multiple_of(*stride) {
-        if *stride == 1 && starts.len() == starts.capacity() {
-            // Grow without overshooting the dense bound.
-            let extra = starts.len().max(4).min(max + 1 - starts.len().min(max));
-            starts.reserve_exact(extra.max(1));
-        }
-        starts.push(at);
-        if *stride == 1 && starts.len() > max {
-            let mut i = 0;
-            starts.retain(|_| {
-                let keep = i % SEEK_STRIDE == 0;
-                i += 1;
-                keep
-            });
-            starts.shrink_to_fit();
-            *stride = SEEK_STRIDE;
-        }
-    }
-    *blocks += 1;
-}
-
 struct Topic {
     /// Topic number from the topic's PutTopic record.
     number: u64,
-    file: File,
-    /// Encoder state after the last entry (released ones included).
+    /// Encoder state after the last entry (released ones included): the
+    /// next seq and the last timestamp.
     index: IndexWriter,
-    /// Bytes in the index file.
-    index_len: u64,
-    /// Seek table: file offsets of index blocks 0, `stride`, 2 × `stride`,
-    /// …, so entry `seq` is found by reading from the nearest kept block
-    /// (`Store::index_entry`). Rebuilt at open, which reads the whole index
-    /// anyway to check it against the WAL.
-    block_starts: Vec<u64>,
-    /// Blocks between kept offsets: 1, then `SEEK_STRIDE` once the dense
-    /// table would exceed `Config::seek_table_max_entries`.
-    stride: u64,
-    /// Index blocks started so far.
-    blocks: u64,
+    /// The encoded entries of the last, incomplete index block (at most
+    /// 63): it has no index record yet, so its entries are read from here.
+    tail: Vec<u8>,
+    /// Seek pages not yet written. `spine[0]` holds the locations of the
+    /// full blocks after the last level-0 seek page; `spine[l]` those of the
+    /// level-(l − 1) pages after the last level-l page. Full blocks are
+    /// covered oldest first by the top level's entries, newest last by
+    /// `spine[0]`: a lookup reads `l` seek pages for a block under
+    /// `spine[l]`. Each level holds fewer than `seek_page_entries`.
+    spine: Vec<Vec<IndexLoc>>,
     first_live: u64,
-    /// The seq the next entry gets.
-    next_seq: u64,
-    last_timestamp: u64,
-    /// `(object number, timestamp)` of the entries of the last, incomplete
-    /// index block (at most 63): that block has no CRC yet, so its entries
-    /// are read from memory. Entries of full blocks are read from the index
-    /// file and checked against the block's CRC.
-    tail: Vec<(u64, u64)>,
-    /// The last full block read from the index file.
+    /// The last full block read.
     read_cache: RefCell<Option<CachedBlock>>,
-    /// Encoded entries of the current batch, written after the WAL fsync.
-    pending: Vec<u8>,
-}
-
-impl Topic {
-    fn seek_push(&mut self, at: u64, max: usize) {
-        seek_push(
-            &mut self.block_starts,
-            &mut self.stride,
-            &mut self.blocks,
-            at,
-            max,
-        );
-    }
 }
 
 struct Active {
@@ -493,7 +428,7 @@ struct Active {
     written: u64,
 }
 
-/// One shard: a WAL, data segments and per-topic indexes in one directory.
+/// One shard: a WAL, data segments and index segments in one directory.
 ///
 /// `!Send` by design (compio is thread-per-core). A sharded deployment runs one
 /// independent `Store` per core, each with its own directory.
@@ -535,6 +470,7 @@ pub struct Store {
     active: Option<Active>,
     next_segment: u64,
     topics: HashMap<Vec<u8>, Topic>,
+    index: IndexSegments,
     wal_buf: Vec<u8>,
     seg_buf: Vec<u8>,
     stats: Stats,
@@ -560,12 +496,13 @@ impl Store {
     /// `CorruptBlock`, `HashMismatch`) and no file is changed. Blocks of
     /// earlier frames are checked for presence and bounds only; their content
     /// is verified on read. Recovery then deletes segment files the WAL does
-    /// not reference, repairs topic index files from the WAL and recomputes
-    /// refcounts. Every change is listed in `recovery_report()`.
+    /// not reference, checks the index segments against the WAL, appends
+    /// the index blocks and seek pages they lack, and recomputes refcounts.
+    /// Every change is listed in `recovery_report()`.
     pub async fn open(dir: impl AsRef<Path>, mut config: Config) -> Result<Self, StoreError> {
         let dir = dir.as_ref().to_path_buf();
         let mut report = RecoveryReport::default();
-        compio::fs::create_dir_all(dir.join(TOPICS_DIR)).await?;
+        compio::fs::create_dir_all(&dir).await?;
         let wal_path = dir.join(WAL_FILE);
         let wal = open_wal(&dir, &mut report, config.dict_train_bytes).await?;
         let bytes = compio::fs::read(&wal_path).await?;
@@ -691,7 +628,7 @@ impl Store {
         let dictionary = replay.dicts.last().map(|d| d.len());
 
         let segments = open_segments(&dir, &mut replay, &mut report).await?;
-        let topics = open_topics(&dir, &replay, config.seek_table_max_entries, &mut report).await?;
+        let (index, topics) = open_index(&dir, &replay, next_frame, &config, &mut report).await?;
         check_refcounts(
             &replay.objects,
             replay.topics.values().flat_map(|t| {
@@ -724,6 +661,7 @@ impl Store {
             segments,
             active: None,
             topics,
+            index,
             wal_buf: Vec::new(),
             seg_buf: Vec::new(),
             stats: Stats::default(),
@@ -813,6 +751,9 @@ impl Store {
         self.begin_write();
         self.commit_start = Instant::now();
         self.timing = CommitTiming::default();
+        // Only between batches: every record in a sealed segment then
+        // describes frames before the next segment's `created_at`.
+        self.index.seal_if_full();
         let dict = if train {
             Some(self.train_dictionary().await?)
         } else {
@@ -877,6 +818,8 @@ impl Store {
         }
 
         let mut seqs = Vec::with_capacity(batch.len());
+        // Index blocks the batch completes: (topic, block number, entries).
+        let mut filled = Vec::new();
         let mut wal_buf = std::mem::take(&mut self.wal_buf);
         wal_buf.clear();
         let mut frame = FrameBuilder::begin(&mut wal_buf, frame_object, frame_block);
@@ -962,8 +905,7 @@ impl Store {
             }
 
             let new_topic = !self.topics.contains_key(m.topic);
-            let seek_max = self.config.seek_table_max_entries;
-            let topic = self.topic_mut(m.topic).await?;
+            let topic = self.topic_mut(m.topic);
             if new_topic {
                 let put = Record::PutTopic {
                     number: topic.number,
@@ -971,18 +913,10 @@ impl Store {
                 };
                 frame.record(&mut wal_buf, &put)?;
             }
-            let seq = topic.next_seq;
-            let timestamp = now_ms.max(topic.last_timestamp);
-            topic.last_timestamp = timestamp;
-            topic.next_seq += 1;
-            topic.tail.push((number, timestamp));
-            if topic.tail.len() as u64 == INDEX_BLOCK {
-                // The block is full: its CRC follows it in the file.
-                topic.tail.clear();
-            }
-            let at = topic.index_len + topic.pending.len() as u64;
-            if topic.index.push(&mut topic.pending, number, timestamp) {
-                topic.seek_push(at, seek_max);
+            let seq = topic.index.seq();
+            let timestamp = now_ms.max(topic.index.last_timestamp());
+            if topic.index.push(&mut topic.tail, number, timestamp) {
+                filled.push((m.topic, seq / INDEX_BLOCK, std::mem::take(&mut topic.tail)));
             }
             let publish = Record::Publish {
                 topic: topic.number,
@@ -992,6 +926,12 @@ impl Store {
             };
             frame.record(&mut wal_buf, &publish)?;
             seqs.push(seq);
+        }
+        // Their records describe this batch's frame: the stamp is the frame
+        // number after it.
+        let stamp = self.next_frame + 1;
+        for (name, block, body) in filled {
+            self.add_index_block(name, block, &body, stamp).await?;
         }
         match self.config.write_mode {
             // InlineSmall keeps Sequential's order for a segment block; with
@@ -1008,7 +948,9 @@ impl Store {
             }
             WriteMode::ParallelSync => self.commit_parallel(wal_buf, frame).await?,
         }
-        self.write_topic_entries().await?;
+        // Index records are derived from the WAL and re-derived at open:
+        // written after the WAL fsync, not synced.
+        self.stats.topic_bytes += self.index.flush().await?;
         self.in_flight = false;
         // Recent objects are the likeliest reads.
         for (block, raw, _) in blocks {
@@ -1087,7 +1029,7 @@ impl Store {
         // frame, so memory stays within the frame bound.
         let mut numbers = Vec::new();
         if let Some(t) = self.topics.get(topic) {
-            for seq in t.first_live..t.next_seq {
+            for seq in t.first_live..t.index.seq() {
                 match self.topic_entry(topic, t, seq).await? {
                     Some((number, ts)) if ts < cutoff_ms => {
                         self.check_frame(FRAME_HEADER + (numbers.len() + 1) * RECORD_RELEASE)?;
@@ -1344,6 +1286,7 @@ impl Store {
 
     pub fn stats(&self) -> Stats {
         let mut s = self.stats;
+        s.fsyncs += self.index.fsyncs;
         s.metadata_bytes = s.wal_bytes + s.topic_bytes - self.inline_bytes;
         s
     }
@@ -1355,7 +1298,9 @@ impl Store {
 
     /// Live topic entries: `first_live..next_seq`.
     pub fn topic_range(&self, topic: &[u8]) -> Option<(u64, u64)> {
-        self.topics.get(topic).map(|t| (t.first_live, t.next_seq))
+        self.topics
+            .get(topic)
+            .map(|t| (t.first_live, t.index.seq()))
     }
 
     pub fn topics(&self) -> impl Iterator<Item = &[u8]> {
@@ -1369,10 +1314,10 @@ impl Store {
         Ok(number.and_then(|n| self.objects.get(&n)).map(|o| o.id))
     }
 
-    /// Entry `seq` of `topic` as stored in its index file: `(object number,
-    /// timestamp)`, released entries included. Reads one index block, or up
-    /// to 64 blocks once the topic's seek table is sparse; `None` past the
-    /// last entry.
+    /// Entry `seq` of `topic` as stored in its index: `(object number,
+    /// timestamp)`, released entries included. Reads one index block and at
+    /// most one seek page up to `seek_page_entries`² full blocks (one more
+    /// page per further power); `None` past the last entry.
     pub async fn index_entry(
         &self,
         topic: &[u8],
@@ -1386,65 +1331,88 @@ impl Store {
     }
 
     /// Entry `seq` of topic `name` (released entries included): from the
-    /// last, incomplete block in memory, or from a full block of the index
-    /// file, which must match its CRC (`TopicIndexCorrupt` otherwise).
-    /// `None` at or past `next_seq`.
+    /// last, incomplete block in memory, or from a full block's index
+    /// record, which must match its CRC, topic and block number
+    /// (`TopicIndexCorrupt` otherwise). `None` at or past the next seq.
     async fn topic_entry(
         &self,
         name: &[u8],
         t: &Topic,
         seq: u64,
     ) -> Result<Option<(u64, u64)>, StoreError> {
-        if seq >= t.next_seq {
+        let next = t.index.seq();
+        if seq >= next {
             return Ok(None);
-        }
-        let tail_start = t.next_seq - t.tail.len() as u64;
-        if seq >= tail_start {
-            return Ok(t.tail.get((seq - tail_start) as usize).copied());
         }
         let block = seq / INDEX_BLOCK;
         let at = (seq % INDEX_BLOCK) as usize;
+        let corrupt = |block| StoreError::TopicIndexCorrupt {
+            topic: name.to_vec(),
+            block,
+        };
+        if block == next / INDEX_BLOCK {
+            let entries = codec::decode_index_entries(&t.tail).ok_or_else(|| corrupt(block))?;
+            return Ok(entries.get(at).copied());
+        }
         if let Some((b, entries)) = t.read_cache.borrow().as_ref()
             && *b == block
         {
             return Ok(entries.get(at).copied());
         }
-        let corrupt = |block| StoreError::TopicIndexCorrupt {
-            path: topic_path(&self.dir, name),
-            block,
-        };
-        // Read from the nearest kept offset to the next one (or the end of
-        // the file) and walk the full blocks up to `block`.
-        let slot = usize::try_from(block / t.stride).unwrap_or(usize::MAX);
-        let (Some(&start), Some(&end)) = (
-            t.block_starts.get(slot),
-            t.block_starts.get(slot + 1).or(Some(&t.index_len)),
-        ) else {
-            return Err(corrupt(block));
-        };
-        let len = usize::try_from(end - start).map_err(|_| corrupt(block))?;
-        let BufResult(res, buf) = t
-            .file
-            .read_exact_at(Vec::with_capacity(len).slice(..len), start)
-            .await;
-        res?;
-        let buf = buf.into_inner();
-        let mut off = 0;
-        let mut b = slot as u64 * t.stride;
-        loop {
-            let decoded = codec::decode_index_block(buf.get(off..).unwrap_or_default(), b);
-            // Every block before the tail is full and must match its CRC.
-            if !decoded.sealed {
-                return Err(corrupt(b));
+        let loc = self.locate(t, block).await?.ok_or_else(|| corrupt(block))?;
+        let entries = self
+            .index
+            .record(loc, INDEX_RECORD_BLOCK, t.number, block)
+            .await?
+            .and_then(|body| codec::decode_index_entries(&body))
+            .filter(|e| e.len() as u64 == INDEX_BLOCK)
+            .ok_or_else(|| corrupt(block))?;
+        let entry = entries.get(at).copied();
+        *t.read_cache.borrow_mut() = Some((block, entries));
+        Ok(entry)
+    }
+
+    /// Where full block `block` of `t` lies: from the spine, through the
+    /// seek pages under it. `None` if the block is not covered or a seek
+    /// page on the way is damaged (missing, failing its CRC, or another
+    /// topic's, level's or number's).
+    async fn locate(&self, t: &Topic, block: u64) -> Result<Option<IndexLoc>, StoreError> {
+        let fan = self.index.fanout as u64;
+        let mut start = 0u64;
+        for (level, locs) in t.spine.iter().enumerate().rev() {
+            let span = fan.saturating_pow(level as u32);
+            let covered = span.saturating_mul(locs.len() as u64);
+            if block >= start.saturating_add(covered) {
+                start = start.saturating_add(covered);
+                continue;
             }
-            if b == block {
-                let entry = decoded.entries.get(at).copied();
-                *t.read_cache.borrow_mut() = Some((block, decoded.entries));
-                return Ok(entry);
+            let rel = block - start;
+            let Some(&first) = usize::try_from(rel / span).ok().and_then(|i| locs.get(i)) else {
+                return Ok(None);
+            };
+            let (mut loc, mut rel) = (first, rel % span);
+            for lower in (0..level as u32).rev() {
+                let span = fan.saturating_pow(lower);
+                let page = block / fan.saturating_pow(lower + 1);
+                let Some(body) = self
+                    .index
+                    .record(loc, INDEX_RECORD_SEEK_PAGE, t.number, page)
+                    .await?
+                    .filter(|b| codec::seek_page_shape(b) == Some((lower as u8, fan as usize)))
+                else {
+                    return Ok(None);
+                };
+                let Some(next) = usize::try_from(rel / span)
+                    .ok()
+                    .and_then(|i| codec::seek_page_loc(&body, i))
+                else {
+                    return Ok(None);
+                };
+                (loc, rel) = (next, rel % span);
             }
-            off += decoded.ends.last().copied().unwrap_or(0) + 4;
-            b += 1;
+            return Ok(Some(loc));
         }
+        Ok(None)
     }
 
     async fn entry_number(&self, topic: &[u8], seq: u64) -> Result<Option<u64>, StoreError> {
@@ -1480,6 +1448,12 @@ impl Store {
             self.blocks.get(&o.block)?.loc,
             Location::Wal { .. }
         ))
+    }
+
+    /// Index segment files the store holds open: at most
+    /// `Config::index_open_files` for reads, plus the one being written.
+    pub fn open_index_files(&self) -> usize {
+        self.index.files.borrow().len() + usize::from(self.index.active.is_some())
     }
 
     pub fn segment_count(&self) -> usize {
@@ -1816,66 +1790,258 @@ impl Store {
         Ok(())
     }
 
-    /// Topic index files are derived from the WAL and repaired by recovery, so
-    /// they are written after the WAL fsync and not synced themselves.
-    async fn write_topic_entries(&mut self) -> Result<(), StoreError> {
-        // Visits every topic per batch; with many topics, tracking the ones
-        // the batch touched would bound this by the batch size.
-        for topic in self.topics.values_mut() {
-            if topic.pending.is_empty() {
-                continue;
+    /// Appends the index record of full block `block` of topic `name` and
+    /// its location to the topic's spine; a level that fills becomes a seek
+    /// page, whose location moves up a level.
+    async fn add_index_block(
+        &mut self,
+        name: &[u8],
+        block: u64,
+        body: &[u8],
+        stamp: u64,
+    ) -> Result<(), StoreError> {
+        let created_at = self.next_frame;
+        let Some(number) = self.topics.get(name).map(|t| t.number) else {
+            unreachable!("the batch created the topic")
+        };
+        let mut loc = self
+            .index
+            .append(INDEX_RECORD_BLOCK, number, block, stamp, body, created_at)
+            .await?;
+        let fan = self.index.fanout;
+        for level in 0u32.. {
+            let Some(t) = self.topics.get_mut(name) else {
+                unreachable!("the batch created the topic")
+            };
+            if t.spine.len() <= level as usize {
+                t.spine.push(Vec::new());
             }
-            let n = topic.pending.len() as u64;
-            let (res, mut buf) = write_all(
-                &topic.file,
-                std::mem::take(&mut topic.pending),
-                topic.index_len,
-            )
-            .await;
-            buf.clear();
-            topic.pending = buf;
-            res?;
-            topic.index_len += n;
-            self.stats.topic_bytes += n;
+            let locs = &mut t.spine[level as usize];
+            locs.push(loc);
+            if locs.len() < fan {
+                break;
+            }
+            let body = codec::seek_page_body(level as u8, locs);
+            locs.clear();
+            // The page ends with `block`: its number at its level.
+            let page = (block + 1) / (fan as u64).saturating_pow(level + 1) - 1;
+            loc = self
+                .index
+                .append(
+                    INDEX_RECORD_SEEK_PAGE,
+                    number,
+                    page,
+                    stamp,
+                    &body,
+                    created_at,
+                )
+                .await?;
         }
         Ok(())
     }
 
-    async fn topic_mut(&mut self, name: &[u8]) -> Result<&mut Topic, StoreError> {
+    fn topic_mut(&mut self, name: &[u8]) -> &mut Topic {
+        // The key is allocated only for a new topic.
         if !self.topics.contains_key(name) {
-            // Recovery removed any index file of a topic the WAL does not know.
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(topic_path(&self.dir, name))
-                .await?;
             let number = self.next_topic;
             self.next_topic += 1;
-            self.topics.insert(
-                name.to_vec(),
-                Topic {
-                    number,
-                    file,
-                    index: IndexWriter::default(),
-                    index_len: 0,
-                    block_starts: Vec::new(),
-                    stride: 1,
-                    blocks: 0,
-                    first_live: 0,
-                    next_seq: 0,
-                    last_timestamp: 0,
-                    tail: Vec::new(),
-                    read_cache: RefCell::new(None),
-                    pending: Vec::new(),
-                },
-            );
+            let topic = Topic {
+                number,
+                index: IndexWriter::default(),
+                tail: Vec::new(),
+                spine: Vec::new(),
+                first_live: 0,
+                read_cache: RefCell::new(None),
+            };
+            self.topics.insert(name.to_vec(), topic);
         }
         match self.topics.get_mut(name) {
-            Some(topic) => Ok(topic),
+            Some(topic) => topic,
             None => unreachable!("inserted above"),
         }
+    }
+}
+
+/// The shared index segments `idx-<id>.dat`: full topic index blocks and
+/// seek pages of every topic, appended to one segment at a time.
+struct IndexSegments {
+    dir: PathBuf,
+    /// The segment being appended to. Only a segment created by this
+    /// `Store` is appended to; it is created when the first record needs it.
+    active: Option<Active>,
+    next_id: u64,
+    /// Records not yet written to `active`: written after the WAL fsync.
+    buf: Vec<u8>,
+    /// Segments open for reads, least recently used first.
+    files: RefCell<VecDeque<(u64, File)>>,
+    max_open: usize,
+    max_bytes: u64,
+    /// `Config::seek_page_entries`, clamped.
+    fanout: usize,
+    /// Syncs of segment creation since open.
+    fsyncs: u64,
+}
+
+impl IndexSegments {
+    fn new(dir: &Path, config: &Config) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            active: None,
+            next_id: 0,
+            buf: Vec::new(),
+            files: RefCell::new(VecDeque::new()),
+            max_open: config.index_open_files.max(1),
+            max_bytes: config.index_segment_max_bytes,
+            fanout: config.seek_page_entries.clamp(SEEK_PAGE_MIN, SEEK_PAGE_MAX),
+            fsyncs: 0,
+        }
+    }
+
+    /// Creates the next segment with its header, synced with its directory
+    /// entry before any record goes in: an intact header proves the
+    /// segment's `created_at`, which recovery relies on.
+    async fn start(&mut self, created_at: u64) -> Result<(), StoreError> {
+        let id = self.next_id;
+        if u32::try_from(id).is_err() {
+            return Err(io::Error::other("index segment ids exhausted").into());
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(index_path(&self.dir, id))
+            .await?;
+        self.next_id += 1;
+        write_all(&file, codec::index_header(created_at).to_vec(), 0)
+            .await
+            .0?;
+        file.sync_data().await?;
+        sync_dir(&self.dir).await?;
+        self.fsyncs += 2;
+        let len = INDEX_HEADER as u64;
+        self.active = Some(Active {
+            id,
+            file,
+            len,
+            written: len,
+        });
+        Ok(())
+    }
+
+    /// Seals the active segment once it holds `max_bytes`; call only
+    /// between batches, with `buf` written.
+    fn seal_if_full(&mut self) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|a| a.len >= self.max_bytes)
+        {
+            self.active = None;
+        }
+    }
+
+    /// Buffers a record; starts a segment (`created_at`) if none is active.
+    async fn append(
+        &mut self,
+        kind: u8,
+        topic: u64,
+        number: u64,
+        stamp: u64,
+        body: &[u8],
+        created_at: u64,
+    ) -> Result<IndexLoc, StoreError> {
+        if self.active.is_none() {
+            self.start(created_at).await?;
+        }
+        let Some(active) = self.active.as_mut() else {
+            unreachable!("started above")
+        };
+        let size = codec::put_index_record(&mut self.buf, kind, topic, number, stamp, body);
+        let loc = IndexLoc {
+            // Checked in `start`; a record is at most a few KiB.
+            segment: active.id as u32,
+            len: size as u32,
+            offset: active.len,
+        };
+        active.len += size as u64;
+        Ok(loc)
+    }
+
+    /// Writes the buffered records (no sync); returns the bytes written.
+    async fn flush(&mut self) -> Result<u64, StoreError> {
+        let Some(active) = self.active.as_mut() else {
+            return Ok(0);
+        };
+        if self.buf.is_empty() {
+            return Ok(0);
+        }
+        let n = self.buf.len() as u64;
+        let (res, mut buf) =
+            write_all(&active.file, std::mem::take(&mut self.buf), active.written).await;
+        buf.clear();
+        self.buf = buf;
+        res?;
+        active.written += n;
+        Ok(n)
+    }
+
+    /// A handle of segment `id`: the active one, or from the open files,
+    /// opening it (and closing the least recently used) if needed. `None`
+    /// if the file does not exist.
+    async fn file(&self, id: u64) -> Result<Option<File>, StoreError> {
+        if let Some(a) = self.active.as_ref().filter(|a| a.id == id) {
+            return Ok(Some(a.file.clone()));
+        }
+        {
+            let mut files = self.files.borrow_mut();
+            if let Some(at) = files.iter().position(|(n, _)| *n == id)
+                && let Some(entry) = files.remove(at)
+            {
+                let file = entry.1.clone();
+                files.push_back(entry);
+                return Ok(Some(file));
+            }
+        }
+        let file = match File::open(index_path(&self.dir, id)).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut files = self.files.borrow_mut();
+        while files.len() >= self.max_open {
+            files.pop_front();
+        }
+        files.push_back((id, file.clone()));
+        Ok(Some(file))
+    }
+
+    /// The body of the record at `loc` if it is intact (CRC) and is the
+    /// `kind` record of `topic` with `number`; `None` otherwise, including a
+    /// missing or short file.
+    async fn record(
+        &self,
+        loc: IndexLoc,
+        kind: u8,
+        topic: u64,
+        number: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(file) = self.file(u64::from(loc.segment)).await? else {
+            return Ok(None);
+        };
+        let len = loc.len as usize;
+        let BufResult(res, buf) = file
+            .read_exact_at(Vec::with_capacity(len).slice(..len), loc.offset)
+            .await;
+        match res {
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            res => res?,
+        }
+        let buf = buf.into_inner();
+        Ok(codec::decode_index_record(&buf)
+            .filter(|r| {
+                r.kind == kind && r.topic == topic && r.number == number && r.size == buf.len()
+            })
+            .map(|r| r.body.to_vec()))
     }
 }
 
@@ -2305,148 +2471,249 @@ async fn open_segments(
     Ok(segments)
 }
 
-/// Opens every topic index, checks it against the WAL and repairs it:
-/// entries missing or torn (the file is not synced) are rewritten from the
-/// WAL; entries beyond the WAL (their records were in a truncated tail) are
-/// cut. A checksummed entry that disagrees with the WAL is an error.
-async fn open_topics(
+/// A topic at open: its name, its entries from the WAL and its first live
+/// seq.
+type WalTopic<'r> = (&'r [u8], &'r [(u64, u64)], u64);
+
+/// A seek page found in an index segment: its location and body.
+type FoundPage<'b> = (IndexLoc, &'b [u8]);
+
+/// Checks the index segments against the WAL and rebuilds every topic's
+/// state. Index records are derived from the WAL and never synced, so an
+/// unwritten, torn or damaged record ends what is read of its segment, and
+/// the blocks and seek pages no segment holds intact are re-encoded and
+/// appended (`TopicIndexRepaired`). A record whose stamp is above its
+/// segment's limit (the lowest `created_at` of the later segments and the
+/// WAL's frame count) describes frames recovery cut: it is stale and
+/// ignored. Any other intact block record must equal the WAL's encoding of
+/// its block: otherwise `TopicMismatch` or `IndexSegmentCorrupt`, and no
+/// file is changed.
+async fn open_index(
     dir: &Path,
     replay: &Replay<'_>,
-    seek_max: usize,
+    next_frame: u64,
+    config: &Config,
     report: &mut RecoveryReport,
-) -> Result<HashMap<Vec<u8>, Topic>, StoreError> {
-    for entry in std::fs::read_dir(dir.join(TOPICS_DIR))? {
-        let entry = entry?;
-        let known = entry
-            .file_name()
-            .to_str()
-            .and_then(|n| n.strip_suffix(".idx"))
-            .and_then(unhex)
-            .is_some_and(|name| replay.topics.contains_key(name.as_slice()));
-        if !known {
-            // A topic whose first Publish never became durable.
-            compio::fs::remove_file(entry.path()).await?;
-            report
-                .actions
-                .push(RecoveryAction::UnknownTopicIndexRemoved { path: entry.path() });
+) -> Result<(IndexSegments, HashMap<Vec<u8>, Topic>), StoreError> {
+    let mut index = IndexSegments::new(dir, config);
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        if let Some(id) = entry?.file_name().to_str().and_then(parse_index_name) {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    index.next_id = ids.last().map_or(0, |m| m + 1);
+    // (id, created_at, bytes)
+    let mut segs = Vec::new();
+    let mut orphans = Vec::new();
+    for id in ids {
+        let bytes = compio::fs::read(index_path(dir, id)).await?;
+        match codec::decode_index_header(&bytes) {
+            Some(created_at) => segs.push((id, created_at, bytes)),
+            None => orphans.push((id, bytes.len() as u64)),
         }
     }
 
-    let mut topics = HashMap::new();
-    for (&name, t) in &replay.topics {
-        let path = topic_path(dir, name);
-        let bytes = match compio::fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
-        // The encoding is deterministic: re-encode the index from the WAL
-        // and compare bytes. The file must equal a prefix of it.
-        let mut index = IndexWriter::default();
-        let mut expected = Vec::new();
-        // Every block's start, for locating a difference below; open holds
-        // all replayed entries anyway. The kept seek table is bounded.
-        let mut block_starts = Vec::new();
-        let mut seek = SeekTable::default();
-        for &(number, timestamp) in &t.entries {
-            let at = expected.len();
-            if index.push(&mut expected, number, timestamp) {
-                block_starts.push(at as u64);
-                seek.push(at as u64, seek_max);
+    // Topics by number with their WAL entries; every PutTopic comes with
+    // the topic's first Publish.
+    let topics: Vec<WalTopic<'_>> = replay
+        .topic_names
+        .iter()
+        .map(|&name| {
+            replay
+                .topics
+                .get(name)
+                .map_or((name, &[][..], 0), |t| (name, &t.entries[..], t.first_live))
+        })
+        .collect();
+    let block = INDEX_BLOCK as usize;
+    let mut blocks: Vec<Vec<Option<IndexLoc>>> = topics
+        .iter()
+        .map(|(_, entries, _)| vec![None; entries.len() / block])
+        .collect();
+    let mut pages: HashMap<(u64, u8, u64), Vec<FoundPage<'_>>> = HashMap::new();
+    // fence[i]: the lowest created_at of the segments after segment i.
+    let mut fence = vec![u64::MAX; segs.len()];
+    for i in (1..segs.len()).rev() {
+        fence[i - 1] = fence[i].min(segs[i].1);
+    }
+    let mut unfenced = 0;
+    for (i, (id, _, bytes)) in segs.iter().enumerate() {
+        let limit = fence[i].min(next_frame);
+        let mut pos = INDEX_HEADER;
+        while let Some(rec) = codec::decode_index_record(&bytes[pos..]) {
+            let offset = pos as u64;
+            pos += rec.size;
+            if rec.stamp > limit {
+                // Stale. Fenced already if a later segment's created_at
+                // lies below its stamp.
+                if rec.stamp <= fence[i] {
+                    unfenced += 1;
+                }
+                continue;
+            }
+            let corrupt = |reason| StoreError::IndexSegmentCorrupt {
+                segment: *id,
+                offset,
+                reason,
+            };
+            let loc = IndexLoc {
+                segment: u32::try_from(*id).map_err(|_| corrupt("segment id above u32"))?,
+                len: u32::try_from(rec.size).map_err(|_| corrupt("record too large"))?,
+                offset,
+            };
+            match rec.kind {
+                INDEX_RECORD_BLOCK => {
+                    let t = usize::try_from(rec.topic)
+                        .ok()
+                        .filter(|&t| t < topics.len())
+                        .ok_or_else(|| corrupt("index block of a topic the WAL does not know"))?;
+                    let slot = usize::try_from(rec.number)
+                        .ok()
+                        .and_then(|b| blocks[t].get_mut(b))
+                        .ok_or_else(|| corrupt("index block beyond the topic's full blocks"))?;
+                    let first = rec.number as usize * block;
+                    let (name, entries, _) = topics[t];
+                    let want = &entries[first..first + block];
+                    let got = codec::decode_index_entries(rec.body)
+                        .ok_or_else(|| corrupt("index block does not decode"))?;
+                    if got != want {
+                        // Written that way: the record describes durable
+                        // frames only.
+                        let at = got.iter().zip(want).take_while(|(a, b)| a == b).count();
+                        return Err(StoreError::TopicMismatch {
+                            topic: name.to_vec(),
+                            seq: (first + at) as u64,
+                        });
+                    }
+                    slot.get_or_insert(loc);
+                }
+                INDEX_RECORD_SEEK_PAGE => {
+                    let (level, _) = codec::seek_page_shape(rec.body)
+                        .ok_or_else(|| corrupt("seek page does not decode"))?;
+                    pages
+                        .entry((rec.topic, level, rec.number))
+                        .or_default()
+                        .push((loc, rec.body));
+                }
+                _ => return Err(corrupt("unknown index record kind")),
             }
         }
-        let differ = bytes
-            .iter()
-            .zip(&expected)
-            .position(|(a, b)| a != b)
-            .unwrap_or(bytes.len().min(expected.len()));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)
-            .await?;
-        if differ == expected.len() && bytes.len() > expected.len() {
-            // Entries beyond the WAL (their records were in a truncated tail).
-            report.actions.push(RecoveryAction::TopicIndexRepaired {
-                path: path.clone(),
-                entries_kept: t.entries.len() as u64,
-                bytes_truncated: (bytes.len() - expected.len()) as u64,
-                entries_rewritten: 0,
+    }
+
+    // Changes start here, after every check passed.
+    for &(id, bytes) in &orphans {
+        compio::fs::remove_file(index_path(dir, id)).await?;
+        report
+            .actions
+            .push(RecoveryAction::IndexSegmentRemoved { segment: id, bytes });
+    }
+    if !orphans.is_empty() {
+        sync_dir(dir).await?;
+    }
+    if unfenced > 0 {
+        // New frames will reuse the stale records' frame numbers: a segment
+        // created now, at `next_frame`, keeps them stale for good.
+        index.start(next_frame).await?;
+        report
+            .actions
+            .push(RecoveryAction::StaleIndexRecordsFenced {
+                records: unfenced,
+                segment: index.next_id - 1,
             });
-            file.set_len(expected.len() as u64).await?;
-        } else if differ < bytes.len() || differ < expected.len() {
-            // Block holding the first difference, and its start.
-            let block = block_starts
-                .iter()
-                .rposition(|&start| start as usize <= differ)
-                .unwrap_or(0);
-            let start = block_starts.get(block).map_or(0, |&s| s as usize);
-            let want = codec::decode_index_block(&expected[start..], block as u64);
-            let have = bytes
-                .get(start..)
-                .map(|b| codec::decode_index_block(b, block as u64));
-            // A complete block with a valid CRC that disagrees with the WAL
-            // was written that way: corruption. Anything else is an
-            // unsynced or torn tail and is rewritten.
-            if want.sealed
-                && let Some(have) = have.filter(|h| h.sealed)
-            {
-                let at = want
-                    .entries
-                    .iter()
-                    .zip(&have.entries)
-                    .position(|(a, b)| a != b)
-                    .unwrap_or(0);
-                return Err(StoreError::TopicMismatch {
-                    path,
-                    seq: block as u64 * INDEX_BLOCK + at as u64,
-                });
-            }
-            // Keep whole entries of this block that lie before the difference.
-            let kept = want
-                .ends
-                .iter()
-                .take_while(|&&end| start + end <= differ)
-                .count();
-            let keep = start + kept.checked_sub(1).map_or(0, |k| want.ends[k]);
-            let entries_kept = block as u64 * INDEX_BLOCK + kept as u64;
-            report.actions.push(RecoveryAction::TopicIndexRepaired {
-                path: path.clone(),
-                entries_kept,
-                bytes_truncated: bytes.len().saturating_sub(keep) as u64,
-                entries_rewritten: t.entries.len() as u64 - entries_kept,
-            });
-            if bytes.len() != keep {
-                file.set_len(keep as u64).await?;
-            }
-            if keep < expected.len() {
-                write_all(&file, expected[keep..].to_vec(), keep as u64)
-                    .await
-                    .0?;
-            }
+    }
+
+    let fan = index.fanout;
+    let mut out = HashMap::with_capacity(topics.len());
+    for (number, ((name, entries, first_live), found)) in (0u64..).zip(topics.iter().zip(blocks)) {
+        let mut blocks_rewritten = 0;
+        let mut locs = Vec::with_capacity(found.len());
+        for (b, slot) in (0u64..).zip(found) {
+            let loc = match slot {
+                Some(loc) => loc,
+                None => {
+                    let first = b as usize * block;
+                    let mut body = Vec::new();
+                    let mut w = IndexWriter::resume(b * INDEX_BLOCK, 0, 0);
+                    for &(n, ts) in &entries[first..first + block] {
+                        w.push(&mut body, n, ts);
+                    }
+                    blocks_rewritten += 1;
+                    index
+                        .append(INDEX_RECORD_BLOCK, number, b, next_frame, &body, next_frame)
+                        .await?
+                }
+            };
+            locs.push(loc);
         }
-        let tail_start = t.entries.len() - t.entries.len() % INDEX_BLOCK as usize;
-        topics.insert(
+        // Seek pages level by level; a page is reused if a segment holds
+        // one with exactly the expected locations.
+        let mut pages_rewritten = 0;
+        let mut spine = Vec::new();
+        let mut level_locs = locs;
+        for level in 0u8.. {
+            let mut upper = Vec::with_capacity(level_locs.len() / fan);
+            for (k, group) in (0u64..).zip(level_locs.chunks_exact(fan)) {
+                let want = codec::seek_page_body(level, group);
+                let reused = pages
+                    .get(&(number, level, k))
+                    .and_then(|c| c.iter().find(|(_, body)| *body == want.as_slice()));
+                let loc = match reused {
+                    Some(&(loc, _)) => loc,
+                    None => {
+                        pages_rewritten += 1;
+                        index
+                            .append(
+                                INDEX_RECORD_SEEK_PAGE,
+                                number,
+                                k,
+                                next_frame,
+                                &want,
+                                next_frame,
+                            )
+                            .await?
+                    }
+                };
+                upper.push(loc);
+            }
+            spine.push(level_locs[upper.len() * fan..].to_vec());
+            if upper.is_empty() {
+                break;
+            }
+            level_locs = upper;
+        }
+        if blocks_rewritten + pages_rewritten > 0 {
+            report.actions.push(RecoveryAction::TopicIndexRepaired {
+                topic: name.to_vec(),
+                blocks_rewritten,
+                pages_rewritten,
+            });
+        }
+        let tail_start = entries.len() - entries.len() % block;
+        let (prev_number, prev_timestamp) =
+            tail_start.checked_sub(1).map_or((0, 0), |i| entries[i]);
+        let mut writer = IndexWriter::resume(tail_start as u64, prev_number, prev_timestamp);
+        let mut tail = Vec::new();
+        for &(n, ts) in &entries[tail_start..] {
+            writer.push(&mut tail, n, ts);
+        }
+        out.insert(
             name.to_vec(),
             Topic {
-                number: t.number,
-                file,
-                index,
-                index_len: expected.len() as u64,
-                block_starts: seek.starts,
-                stride: seek.stride,
-                blocks: seek.blocks,
-                first_live: t.first_live,
-                next_seq: t.entries.len() as u64,
-                last_timestamp: t.entries.last().map_or(0, |&(_, ts)| ts),
-                tail: t.entries[tail_start..].to_vec(),
+                number,
+                index: writer,
+                tail,
+                spine,
+                first_live: *first_live,
                 read_cache: RefCell::new(None),
-                pending: Vec::new(),
             },
         );
     }
-    Ok(topics)
+    index.flush().await?;
+    // Recovery work is not counted in `Stats`.
+    index.fsyncs = 0;
+    Ok((index, out))
 }
 
 /// Refcounts from WAL replay (Publish +1, Release -1) must equal the number
@@ -2722,49 +2989,21 @@ fn parse_segment_name(name: &str) -> Option<u64> {
     u64::from_str_radix(hex, 16).ok()
 }
 
-fn topic_path(dir: &Path, topic: &[u8]) -> PathBuf {
-    let mut name: String = topic.iter().map(|b| format!("{b:02x}")).collect();
-    name.push_str(".idx");
-    dir.join(TOPICS_DIR).join(name)
+fn index_path(dir: &Path, id: u64) -> PathBuf {
+    dir.join(format!("idx-{id:016x}.dat"))
 }
 
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+fn parse_index_name(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("idx-")?.strip_suffix(".dat")?;
+    if hex.len() != 16 {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
-        .collect()
+    u64::from_str_radix(hex, 16).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn seek_table_is_dense_up_to_max_then_keeps_every_64th_block() {
-        let max = 100;
-        let mut t = SeekTable::default();
-        for b in 0..max as u64 {
-            t.push(b * 10, max);
-            assert!(
-                t.starts.capacity() <= max + 1,
-                "capacity {}",
-                t.starts.capacity()
-            );
-        }
-        assert_eq!((t.stride, t.starts.len()), (1, max));
-        // Block 100 makes the dense table too large: blocks 0 and 64 stay.
-        t.push(1000, max);
-        assert_eq!((t.stride, t.starts.clone()), (64, vec![0, 640]));
-        // Then one offset per 64 blocks: blocks 128, 192.
-        for b in 101..200u64 {
-            t.push(b * 10, max);
-        }
-        assert_eq!(t.starts, vec![0, 640, 1280, 1920]);
-        assert_eq!(t.blocks, 200);
-    }
 
     fn object(id: ObjectId, refs: u64) -> Object {
         Object {
@@ -3138,16 +3377,16 @@ mod tests {
     }
 
     #[test]
-    fn segment_and_topic_names_round_trip() {
+    fn segment_and_index_names_round_trip() {
         let dir = Path::new("/d");
         let p = segment_path(dir, 0xab);
         let name = p.file_name().unwrap().to_str().unwrap();
         assert_eq!(parse_segment_name(name), Some(0xab));
         assert_eq!(parse_segment_name("seg-1.dat"), None);
-        let t = topic_path(dir, &[0, 0xff, b'a']);
-        assert_eq!(t, Path::new("/d/topics/00ff61.idx"));
-        assert_eq!(unhex("00ff61"), Some(vec![0, 0xff, b'a']));
-        assert_eq!(unhex("0"), None);
-        assert_eq!(unhex("zz"), None);
+        let p = index_path(dir, 0xcd);
+        assert_eq!(p, Path::new("/d/idx-00000000000000cd.dat"));
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert_eq!(parse_index_name(name), Some(0xcd));
+        assert_eq!(parse_index_name("idx-cd.dat"), None);
     }
 }

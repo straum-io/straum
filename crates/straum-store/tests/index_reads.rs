@@ -1,12 +1,13 @@
-//! Live topic entries are read from the topic index file, not held in
-//! memory: entries of full blocks are checked against the block's CRC on
-//! every read, the entries of the last, incomplete block come from memory.
+//! Live topic entries are read from the shared index segments, not held in
+//! memory: a full block's record is checked against its CRC, topic and
+//! block number on every read, and so is every seek page on the way to it;
+//! the entries of the last, incomplete block come from memory.
 
 #![allow(clippy::unwrap_used)] // test crate: helpers outside #[test] fns panic on failure by design
 
 mod common;
 
-use common::TempDir;
+use common::{INDEX_BLOCK_RECORD, INDEX_SEEK_PAGE, TempDir, edit, find_index_record};
 use straum_store::{Config, Message, Store, StoreError};
 
 fn msg<'a>(topic: &'a [u8], payload: &'a [u8]) -> Message<'a> {
@@ -65,11 +66,9 @@ async fn a_full_block_damaged_after_open_fails_every_read_of_it() {
     drop(store);
     let mut store = Store::open(&dir.0, Config::default()).await.unwrap();
     assert!(store.recovery_report().is_empty());
-    // Flip a byte inside block 0 of the index while the store is open.
-    let index = dir.0.join("topics").join(format!("{:02x}.idx", b't'));
-    let mut bytes = std::fs::read(&index).unwrap();
-    bytes[3] ^= 0xff;
-    std::fs::write(&index, &bytes).unwrap();
+    // Flip a byte inside block 0's record while the store is open.
+    let rec = find_index_record(&dir.0, INDEX_BLOCK_RECORD, 0, 0);
+    edit(&rec.path, |b| b[rec.body.start + 3] ^= 0xff);
     let wal_before = std::fs::read(dir.0.join("wal.log")).unwrap();
 
     let corrupt = |e: StoreError| matches!(e, StoreError::TopicIndexCorrupt { block: 0, .. });
@@ -83,20 +82,19 @@ async fn a_full_block_damaged_after_open_fails_every_read_of_it() {
     assert_eq!(store.read(b"t", 129).await.unwrap(), Some(payload(129)));
 }
 
-/// A seek table dense up to 2 entries: after the third block it keeps one
-/// offset per 64 blocks, so with 20 full blocks every read walks from
-/// block 0.
-fn tiny_seek() -> Config {
+/// Two locations per seek page: 20 full blocks need pages on four levels,
+/// and a lookup of an old block reads up to four pages.
+fn tiny_pages() -> Config {
     Config {
-        seek_table_max_entries: 2,
+        seek_page_entries: 2,
         ..Config::default()
     }
 }
 
 #[compio::test]
-async fn a_bounded_seek_table_still_finds_every_entry() {
+async fn paged_seek_tables_find_every_entry() {
     let dir = TempDir::new("index-seek");
-    let mut store = Store::open(&dir.0, tiny_seek()).await.unwrap();
+    let mut store = Store::open(&dir.0, tiny_pages()).await.unwrap();
     // 20 full blocks and a tail of 5.
     fill(&mut store, 20 * 64 + 5).await;
     for round in 0..2 {
@@ -110,47 +108,90 @@ async fn a_bounded_seek_table_still_finds_every_entry() {
             assert_eq!(got, Some(payload(seq)), "round {round} seq {seq}");
         }
         drop(store);
-        store = Store::open(&dir.0, tiny_seek()).await.unwrap();
+        store = Store::open(&dir.0, tiny_pages()).await.unwrap();
+        assert!(store.recovery_report().is_empty(), "round {round}");
     }
+    // Another page size at open rewrites the pages (reported); the blocks
+    // stay.
+    drop(store);
+    let store = Store::open(&dir.0, Config::default()).await.unwrap();
+    assert!(
+        store.recovery_report().is_empty(),
+        "20 blocks: no full page of 256"
+    );
+    assert_eq!(store.read(b"t", 1000).await.unwrap(), Some(payload(1000)));
 }
 
 #[compio::test]
-async fn a_damaged_block_fails_every_walk_through_it() {
+async fn a_damaged_seek_page_fails_the_blocks_under_it() {
     let dir = TempDir::new("index-seek-corrupt");
-    let mut store = Store::open(&dir.0, tiny_seek()).await.unwrap();
+    let mut store = Store::open(&dir.0, tiny_pages()).await.unwrap();
+    // Blocks 0..20: level-0 pages hold 2 blocks each, so page 1 holds
+    // blocks 2 and 3, and the level-1 page 0 (blocks 0 to 3) points at it.
     fill(&mut store, 20 * 64 + 5).await;
     drop(store);
-    let store = Store::open(&dir.0, tiny_seek()).await.unwrap();
-    // Find block 2's start by decoding from the file start (each full
-    // block ends with a 4-byte CRC after its 64 entries).
-    let index = dir.0.join("topics").join(format!("{:02x}.idx", b't'));
-    let mut bytes = std::fs::read(&index).unwrap();
-    let mut at = 0;
-    for _ in 0..2 {
-        let mut entries = 0;
-        while entries < 2 * 64 {
-            // Two varints per entry.
-            while bytes[at] & 0x80 != 0 {
-                at += 1;
-            }
-            at += 1;
-            entries += 1;
-        }
-        at += 4;
+    let store = Store::open(&dir.0, tiny_pages()).await.unwrap();
+    let page = common::index_records(&dir.0)
+        .into_iter()
+        .find(|r| {
+            r.kind == INDEX_SEEK_PAGE
+                && r.number == 1
+                && std::fs::read(&r.path).unwrap()[r.body.start] == 0
+        })
+        .unwrap();
+    edit(&page.path, |b| b[page.body.start + 3] ^= 0xff);
+    let corrupt = |e: StoreError, want| matches!(e, StoreError::TopicIndexCorrupt { block, .. } if block == want);
+    assert!(corrupt(store.read(b"t", 2 * 64).await.unwrap_err(), 2));
+    assert!(corrupt(store.read(b"t", 3 * 64 + 9).await.unwrap_err(), 3));
+    // Blocks under other pages, and the tail, still read.
+    for seq in [0, 64 + 1, 4 * 64, 19 * 64 + 63, 20 * 64 + 4] {
+        assert_eq!(store.read(b"t", seq).await.unwrap(), Some(payload(seq)));
     }
-    bytes[at + 1] ^= 0xff;
-    std::fs::write(&index, &bytes).unwrap();
-    let corrupt = |e: StoreError| matches!(e, StoreError::TopicIndexCorrupt { block: 2, .. });
-    // Blocks 0 and 1 lie before the damage in the same span: still read.
-    assert_eq!(store.read(b"t", 64).await.unwrap(), Some(payload(64)));
-    // Block 2 itself, and block 5, whose walk passes block 2: errors.
-    assert!(corrupt(store.read(b"t", 2 * 64 + 1).await.unwrap_err()));
-    assert!(corrupt(store.read(b"t", 5 * 64).await.unwrap_err()));
-    // The tail is in memory.
+    // At open the damaged page ends what is read of the segment: it and
+    // every record after it (blocks 4 to 19, and their pages) are
+    // rewritten and reported.
+    drop(store);
+    let store = Store::open(&dir.0, tiny_pages()).await.unwrap();
     assert_eq!(
-        store.read(b"t", 20 * 64 + 4).await.unwrap(),
-        Some(payload(20 * 64 + 4))
+        store.recovery_report().actions,
+        [straum_store::RecoveryAction::TopicIndexRepaired {
+            topic: b"t".to_vec(),
+            blocks_rewritten: 16,
+            pages_rewritten: 17,
+        }]
     );
+    assert_eq!(
+        store.read(b"t", 2 * 64).await.unwrap(),
+        Some(payload(2 * 64))
+    );
+}
+
+/// With one segment per batch and at most two kept open for reads, reading
+/// every block of 20 segments never holds more than three files open.
+#[compio::test]
+async fn open_index_files_stay_bounded() {
+    let dir = TempDir::new("index-fds");
+    let config = Config {
+        index_segment_max_bytes: 1,
+        index_open_files: 2,
+        ..Config::default()
+    };
+    let mut store = Store::open(&dir.0, config).await.unwrap();
+    for b in 0..20u64 {
+        let bodies: Vec<Vec<u8>> = (b * 64..(b + 1) * 64).map(payload).collect();
+        let batch: Vec<Message> = bodies.iter().map(|p| msg(b"t", p)).collect();
+        store.put_batch(&batch, b).await.unwrap();
+    }
+    assert_eq!(common::index_segments(&dir.0).len(), 20);
+    for round in 0..2 {
+        for seq in (0..20 * 64).step_by(17) {
+            assert_eq!(store.read(b"t", seq).await.unwrap(), Some(payload(seq)));
+            assert!(store.open_index_files() <= 3, "round {round}");
+        }
+        drop(store);
+        store = Store::open(&dir.0, config).await.unwrap();
+        assert_eq!(store.open_index_files(), 0, "nothing open after open");
+    }
 }
 
 /// `release_before` stops reading entries as soon as one more release would

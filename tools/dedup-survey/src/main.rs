@@ -167,7 +167,7 @@ async fn survey(
     })
 }
 
-/// File lengths in a store directory: segments, WAL, topic indexes.
+/// File lengths in a store directory: data segments, WAL, index segments.
 fn disk_usage(dir: &Path) -> std::io::Result<(u64, u64, u64)> {
     let (mut seg, mut wal, mut idx) = (0, 0, 0);
     for entry in std::fs::read_dir(dir)? {
@@ -178,10 +178,9 @@ fn disk_usage(dir: &Path) -> std::io::Result<(u64, u64, u64)> {
             seg += entry.metadata()?.len();
         } else if name == "wal.log" {
             wal += entry.metadata()?.len();
+        } else if name.starts_with("idx-") {
+            idx += entry.metadata()?.len();
         }
-    }
-    for entry in std::fs::read_dir(dir.join("topics"))? {
-        idx += entry?.metadata()?.len();
     }
     Ok((seg, wal, idx))
 }
