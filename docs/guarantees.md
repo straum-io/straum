@@ -30,9 +30,10 @@ anything is stored.
   `producer_id` and `producer_seq`, so resending the request may store
   its messages twice, under new seqs.
 - If a write to disk fails, that group's requests get `StorageError`, and
-  so does every later Produce, CreateTopic and Fetch until the broker is
-  restarted (the store refuses all use after a failed write); at restart
-  the store is recovered from disk (section 3).
+  so does every later Produce, CreateTopic, and Fetch that reads a stored
+  message, until the broker is restarted (the store refuses all use after
+  a failed write; a Fetch with nothing to read still waits and answers
+  empty). At restart the store is recovered from disk (section 3).
 
 ### Write modes
 
@@ -40,7 +41,7 @@ The broker setting `store_write_mode` selects how a group reaches disk. All
 three modes acknowledge after both `fdatasync`s returned; they differ in
 the order of the syncs, and so in what recovery may remove.
 
-| Mode | Order before the acknowledgement | What recovery may remove |
+| Mode | Order before the acknowledgement | What recovery removes after a process crash (damage at rest: see the residual risks) |
 |---|---|---|
 | `sequential` (default) | new bodies written to a data segment and synced; then the WAL frame written and synced | only a WAL frame that was never acknowledged (a torn last frame) |
 | `parallel` (ParallelSync) | the segment sync and the WAL sync run at the same time | a torn last frame, as above; and a complete last frame whose bodies are not on disk (a crash between the two syncs): it was never acknowledged, it is dropped and reported as `FrameDropped` |
