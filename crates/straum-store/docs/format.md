@@ -414,6 +414,15 @@ up to the entry (at most 64), O(1). The table is built at open (the index is
 read in full anyway for the check against the WAL) and extended on write.
 `Store::index_entry(topic, seq)`.
 
+**Reads.** Live entries are not held in memory: every read of an entry
+(`Store::read`, `Store::entry`, `Store::index_entry`, and `release_before`
+finding the entries to release) takes it from the index file. A full block
+is used only if its CRC matches; otherwise the read fails with
+`TopicIndexCorrupt` and returns none of its entries (damage after open,
+which the check at open cannot see). The entries of the last, incomplete
+block, which has no CRC, are kept in memory (at most 63 per topic) and read
+from there. The last full block read is cached per topic.
+
 The file is derived from the WAL: written after the WAL fsync and not synced
 itself. At open the index is re-encoded from the WAL and compared with the
 file byte by byte:

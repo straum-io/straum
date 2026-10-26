@@ -368,6 +368,10 @@ struct Object {
     refs: u64,
 }
 
+/// A topic index block's number and its `(object number, timestamp)`
+/// entries.
+type CachedBlock = (u64, Vec<(u64, u64)>);
+
 struct Topic {
     /// Topic number from the topic's PutTopic record.
     number: u64,
@@ -381,11 +385,16 @@ struct Topic {
     /// index anyway to check it against the WAL.
     block_starts: Vec<u64>,
     first_live: u64,
+    /// The seq the next entry gets.
+    next_seq: u64,
     last_timestamp: u64,
-    // Every live entry is held in memory. If the live set outgrows RAM,
-    // reads can be served from the index file (`Store::index_entry`).
-    /// `(object number, timestamp)`.
-    live: VecDeque<(u64, u64)>,
+    /// `(object number, timestamp)` of the entries of the last, incomplete
+    /// index block (at most 63): that block has no CRC yet, so its entries
+    /// are read from memory. Entries of full blocks are read from the index
+    /// file and checked against the block's CRC.
+    tail: Vec<(u64, u64)>,
+    /// The last full block read from the index file.
+    read_cache: RefCell<Option<CachedBlock>>,
     /// Encoded entries of the current batch, written after the WAL fsync.
     pending: Vec<u8>,
 }
@@ -600,9 +609,10 @@ impl Store {
         let topics = open_topics(&dir, &replay, &mut report).await?;
         check_refcounts(
             &replay.objects,
-            topics
-                .values()
-                .flat_map(|t| t.live.iter().map(|(number, _)| number)),
+            replay.topics.values().flat_map(|t| {
+                let first_live = usize::try_from(t.first_live).unwrap_or(usize::MAX);
+                t.entries.iter().skip(first_live).map(|(number, _)| number)
+            }),
         )?;
 
         Ok(Self {
@@ -875,10 +885,15 @@ impl Store {
                 };
                 frame.record(&mut wal_buf, &put)?;
             }
-            let seq = topic.first_live + topic.live.len() as u64;
+            let seq = topic.next_seq;
             let timestamp = now_ms.max(topic.last_timestamp);
             topic.last_timestamp = timestamp;
-            topic.live.push_back((number, timestamp));
+            topic.next_seq += 1;
+            topic.tail.push((number, timestamp));
+            if topic.tail.len() as u64 == INDEX_BLOCK {
+                // The block is full: its CRC follows it in the file.
+                topic.tail.clear();
+            }
             let at = topic.index_len + topic.pending.len() as u64;
             if topic.index.push(&mut topic.pending, number, timestamp) {
                 topic.block_starts.push(at);
@@ -980,15 +995,23 @@ impl Store {
         cutoff_ms: u64,
     ) -> Result<u64, StoreError> {
         self.usable()?;
+        // The entries to release, oldest first, read before anything is
+        // written: a damaged index block fails the call here, not midway.
+        let mut numbers = Vec::new();
         if let Some(t) = self.topics.get(topic) {
-            let n = t.live.iter().take_while(|&&(_, ts)| ts < cutoff_ms).count();
-            self.check_frame(FRAME_HEADER + n * RECORD_RELEASE)?;
+            for seq in t.first_live..t.next_seq {
+                match self.topic_entry(topic, t, seq).await? {
+                    Some((number, ts)) if ts < cutoff_ms => numbers.push(number),
+                    _ => break,
+                }
+            }
+            self.check_frame(FRAME_HEADER + numbers.len() * RECORD_RELEASE)?;
         }
-        let res = self.release_inner(topic, cutoff_ms).await;
+        let res = self.release_inner(topic, &numbers).await;
         self.poison_on_err(res)
     }
 
-    async fn release_inner(&mut self, name: &[u8], cutoff_ms: u64) -> Result<u64, StoreError> {
+    async fn release_inner(&mut self, name: &[u8], numbers: &[u64]) -> Result<u64, StoreError> {
         self.begin_write();
         let Some(topic) = self.topics.get_mut(name) else {
             self.in_flight = false;
@@ -998,16 +1021,12 @@ impl Store {
         wal_buf.clear();
         let mut frame = FrameBuilder::begin(&mut wal_buf, self.next_object, self.next_block);
         let mut released = 0;
-        while let Some(&(number, timestamp)) = topic.live.front() {
-            if timestamp >= cutoff_ms {
-                break;
-            }
+        for &number in numbers {
             let release = Record::Release {
                 topic: topic.number,
                 seq: topic.first_live,
             };
             frame.record(&mut wal_buf, &release)?;
-            topic.live.pop_front();
             topic.first_live += 1;
             if let Some(object) = self.objects.get_mut(&number) {
                 object.refs -= 1;
@@ -1024,7 +1043,7 @@ impl Store {
     /// never published or was released. The object's hash is verified.
     pub async fn read(&self, topic: &[u8], seq: u64) -> Result<Option<Vec<u8>>, StoreError> {
         self.usable()?;
-        match self.entry_number(topic, seq) {
+        match self.entry_number(topic, seq).await? {
             Some(number) => self.read_object(number).await.map(|(_, b)| Some(b)),
             None => Ok(None),
         }
@@ -1246,9 +1265,7 @@ impl Store {
 
     /// Live topic entries: `first_live..next_seq`.
     pub fn topic_range(&self, topic: &[u8]) -> Option<(u64, u64)> {
-        self.topics
-            .get(topic)
-            .map(|t| (t.first_live, t.first_live + t.live.len() as u64))
+        self.topics.get(topic).map(|t| (t.first_live, t.next_seq))
     }
 
     pub fn topics(&self) -> impl Iterator<Item = &[u8]> {
@@ -1256,9 +1273,10 @@ impl Store {
     }
 
     /// The object a live entry points at.
-    pub fn entry(&self, topic: &[u8], seq: u64) -> Option<ObjectId> {
-        let number = self.entry_number(topic, seq)?;
-        self.objects.get(&number).map(|o| o.id)
+    pub async fn entry(&self, topic: &[u8], seq: u64) -> Result<Option<ObjectId>, StoreError> {
+        self.usable()?;
+        let number = self.entry_number(topic, seq).await?;
+        Ok(number.and_then(|n| self.objects.get(&n)).map(|o| o.id))
     }
 
     /// Entry `seq` of `topic` as stored in its index file: `(object number,
@@ -1273,14 +1291,43 @@ impl Store {
         let Some(t) = self.topics.get(topic) else {
             return Ok(None);
         };
+        self.topic_entry(topic, t, seq).await
+    }
+
+    /// Entry `seq` of topic `name` (released entries included): from the
+    /// last, incomplete block in memory, or from a full block of the index
+    /// file, which must match its CRC (`TopicIndexCorrupt` otherwise).
+    /// `None` at or past `next_seq`.
+    async fn topic_entry(
+        &self,
+        name: &[u8],
+        t: &Topic,
+        seq: u64,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        if seq >= t.next_seq {
+            return Ok(None);
+        }
+        let tail_start = t.next_seq - t.tail.len() as u64;
+        if seq >= tail_start {
+            return Ok(t.tail.get((seq - tail_start) as usize).copied());
+        }
         let block = seq / INDEX_BLOCK;
-        let Some(b) = usize::try_from(block).ok() else {
-            return Ok(None);
+        let at = (seq % INDEX_BLOCK) as usize;
+        if let Some((b, entries)) = t.read_cache.borrow().as_ref()
+            && *b == block
+        {
+            return Ok(entries.get(at).copied());
+        }
+        let b = usize::try_from(block).unwrap_or(usize::MAX);
+        let (Some(&start), Some(&end)) = (
+            t.block_starts.get(b),
+            t.block_starts.get(b + 1).or(Some(&t.index_len)),
+        ) else {
+            return Err(StoreError::TopicIndexCorrupt {
+                path: topic_path(&self.dir, name),
+                block,
+            });
         };
-        let Some(&start) = t.block_starts.get(b) else {
-            return Ok(None);
-        };
-        let end = t.block_starts.get(b + 1).copied().unwrap_or(t.index_len);
         let len = (end - start) as usize;
         let BufResult(res, buf) = t
             .file
@@ -1288,13 +1335,28 @@ impl Store {
             .await;
         res?;
         let decoded = codec::decode_index_block(&buf.into_inner(), block);
-        Ok(decoded.entries.get((seq % INDEX_BLOCK) as usize).copied())
+        if !decoded.sealed {
+            return Err(StoreError::TopicIndexCorrupt {
+                path: topic_path(&self.dir, name),
+                block,
+            });
+        }
+        let entry = decoded.entries.get(at).copied();
+        *t.read_cache.borrow_mut() = Some((block, decoded.entries));
+        Ok(entry)
     }
 
-    fn entry_number(&self, topic: &[u8], seq: u64) -> Option<u64> {
-        let t = self.topics.get(topic)?;
-        let idx = usize::try_from(seq.checked_sub(t.first_live)?).ok()?;
-        t.live.get(idx).map(|&(number, _)| number)
+    async fn entry_number(&self, topic: &[u8], seq: u64) -> Result<Option<u64>, StoreError> {
+        let Some(t) = self.topics.get(topic) else {
+            return Ok(None);
+        };
+        if seq < t.first_live {
+            return Ok(None);
+        }
+        Ok(self
+            .topic_entry(topic, t, seq)
+            .await?
+            .map(|(number, _)| number))
     }
 
     /// `None` if the object is not in the index (never stored, or reclaimed).
@@ -1699,8 +1761,10 @@ impl Store {
                     index_len: 0,
                     block_starts: Vec::new(),
                     first_live: 0,
+                    next_seq: 0,
                     last_timestamp: 0,
-                    live: VecDeque::new(),
+                    tail: Vec::new(),
+                    read_cache: RefCell::new(None),
                     pending: Vec::new(),
                 },
             );
@@ -2254,7 +2318,7 @@ async fn open_topics(
                     .0?;
             }
         }
-        let first_live = usize::try_from(t.first_live).unwrap_or(usize::MAX);
+        let tail_start = t.entries.len() - t.entries.len() % INDEX_BLOCK as usize;
         topics.insert(
             name.to_vec(),
             Topic {
@@ -2264,8 +2328,10 @@ async fn open_topics(
                 index_len: expected.len() as u64,
                 block_starts,
                 first_live: t.first_live,
+                next_seq: t.entries.len() as u64,
                 last_timestamp: t.entries.last().map_or(0, |&(_, ts)| ts),
-                live: t.entries.iter().skip(first_live).copied().collect(),
+                tail: t.entries[tail_start..].to_vec(),
+                read_cache: RefCell::new(None),
                 pending: Vec::new(),
             },
         );

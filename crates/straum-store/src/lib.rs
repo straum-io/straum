@@ -57,6 +57,10 @@ pub enum StoreError {
     UnknownObjectNumber(u64),
     #[error("topic index {path:?} disagrees with the WAL at entry {seq}")]
     TopicMismatch { path: PathBuf, seq: u64 },
+    /// A full block of a topic index, read after open, fails its CRC (or
+    /// lies outside the file): its entries are not returned.
+    #[error("topic index {path:?}: block {block} is corrupt")]
+    TopicIndexCorrupt { path: PathBuf, block: u64 },
     #[error("refcount of {id:?}: WAL replay says {wal}, topic indexes say {topics}")]
     RefcountMismatch { id: ObjectId, wal: u64, topics: u64 },
 }

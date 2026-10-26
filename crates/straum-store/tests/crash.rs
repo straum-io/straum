@@ -259,7 +259,7 @@ fn verify(
         for topic in &topics {
             let (first, next) = store.topic_range(topic).unwrap();
             for seq in first..next {
-                let id = store.entry(topic, seq).unwrap();
+                let id = store.entry(topic, seq).await.unwrap().unwrap();
                 let bytes = store.read(topic, seq).await.unwrap().unwrap();
                 assert_eq!(ObjectId::of(&bytes), id);
                 *counts.entry(id).or_default() += 1;
