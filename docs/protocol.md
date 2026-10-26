@@ -295,11 +295,12 @@ Topics by name (bytewise order), one page per request.
 
 `TopicSummary`: `name string`, `partitions u32`.
 
-The broker keeps no state between pages. In v0 a cursor is the name of
-the last topic of its page, and any `cursor` is accepted: a page holds the
-topics whose names sort after it. A topic created between two pages is
-listed on a later page only if its name sorts after the cursor. Clients
-pass `next_cursor` back unchanged and do not build cursors.
+The broker keeps no state between pages. Clients pass `next_cursor` back
+unchanged; a non-empty cursor the broker did not return gives unspecified
+results.
+A topic created between two pages may or may not appear on a later page.
+In v0 a cursor is the name of the last topic of its page; this is not part
+of the contract.
 
 ### 4.10 DescribeTopic
 
