@@ -7,13 +7,16 @@ macOS (development only). No tokio, including transitively.
 - Every message is an object addressed by the full 32-byte BLAKE3 hash of its
   bytes. The same bytes are stored once; publishing them again adds a
   reference and a new `topic_seq` entry.
-- The new objects of each batch form one block, compressed with zstd level 1
-  and, once trained, a 64 KiB dictionary (`Config::dict_train_bytes`).
-  Reads decompress the block and check its CRC and the object's BLAKE3; the
-  last blocks read are cached (`Config::block_cache_blocks`, default 16,
-  and `Config::block_cache_bytes`, default 64 MiB; a larger block is not
-  cached). The training threshold is fixed in the WAL file header when the
-  WAL is created.
+- The new objects of each batch are stored in blocks of at most
+  `Config::max_block_raw_bytes` raw bytes (default 64 KiB; a larger object
+  is a block of its own), each compressed with zstd level 1 and, once
+  trained, a 64 KiB dictionary (`Config::dict_train_bytes`). Reading one
+  object decompresses one block, so the limit bounds the cost of a read
+  whatever the batch size. Reads decompress the block and check its CRC and
+  the object's BLAKE3; the last blocks read are cached
+  (`Config::block_cache_blocks`, default 16, and `Config::block_cache_bytes`,
+  default 64 MiB; a larger block is not cached). The training threshold is
+  fixed in the WAL file header when the WAL is created.
 - Group commit: one segment `fdatasync` and one WAL `fdatasync` per batch;
   a batch is acknowledged only after both.
 - Recovery from the WAL cuts a torn tail and checks topic indexes and
@@ -21,7 +24,8 @@ macOS (development only). No tokio, including transitively.
   `Store::recovery_report()`.
 - Time-based retention, and mark-and-sweep compaction that survives a crash
   at any point: blocks whose objects are all dead are dropped, the live
-  objects of partly dead blocks are recompressed into a new block.
+  objects of partly dead blocks are recompressed into new blocks within
+  the same limit.
 
 On-disk formats and recovery rules: [docs/format.md](docs/format.md).
 
@@ -80,6 +84,7 @@ Test variables: `STRAUM_STORE_CRASH_ITERATIONS` (default 200),
 | `tests/crash.rs` | a writer in a child process killed with SIGKILL at a random moment, checked after each restart; one test per write mode; the dictionary is trained during the run |
 | `tests/wal_corruption.rs` | any flipped bit in a middle frame gives `WalCorrupted` and leaves the file unchanged; in the last frame, truncation; a lost first half of the last frame is a torn tail; truncation at every byte; a `seq` gap; an old format gives `UnsupportedFormat`; `max_frame_bytes` |
 | `tests/fault_injection.rs` | hand-built states: a missing, short or damaged block of the last frame drops the frame in ParallelSync and is an error otherwise; a missing block of an earlier frame gives `MissingObject`, a damaged one `CorruptBlock` on read; every write mode |
+| `tests/multi_block.rs` | `max_block_raw_bytes`: a batch split in order, an oversized object alone, duplicates across a batch's blocks, compaction within the limit, a frame of several blocks with one missing in every write mode; a batch mixing inline and segment blocks |
 | `tests/blocks.rs` | duplicates within one block and across blocks; compaction of partly dead blocks, before and after restart; dictionary training once, read back from the WAL; a failed training recorded once; reads without a block cache |
 | `tests/recovery_report.rs` | a clean open reports and changes nothing; a torn tail, orphan segments and lost files are reported; an old format version gives `UnsupportedFormat` |
 

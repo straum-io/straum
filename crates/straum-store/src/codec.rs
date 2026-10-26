@@ -18,7 +18,7 @@ impl ObjectId {
 /// start of `wal.log`.
 pub const WAL_FILE_HEADER: usize = 24;
 pub const WAL_MAGIC: [u8; 8] = *b"STRMWAL\0";
-pub const WAL_VERSION: u32 = 9;
+pub const WAL_VERSION: u32 = 10;
 /// Header bytes covered by the header CRC (everything before it).
 const WAL_HEADER_CRC_AT: usize = 20;
 /// `len u32 | seq u64 | count u32 | mode u8 | crc32c u32`.
@@ -212,22 +212,23 @@ pub enum Record<'a> {
         seq: u64,
     },
     /// Segment `old` was rewritten into `new`. `kept` lists every block
-    /// copied unchanged, with its offset in `new`; `rewritten` is the block
-    /// holding the live objects of the other blocks of `old`. Every other
+    /// copied unchanged, with its offset in `new`; `rewritten` are the blocks
+    /// holding, in order, the live objects of the other blocks of `old`
+    /// (several when they exceed `Config::max_block_raw_bytes`). Every other
     /// block and object of `old` is gone.
     Compact {
         old: u64,
         new: u64,
         kept: Vec<(u64, u64)>,
-        rewritten: Option<Rewritten>,
+        rewritten: Vec<Rewritten>,
     },
 }
 
 /// Upper bounds of encoded record sizes, header included, used to bound a
 /// frame before any I/O. Variable parts: + name length (PutTopic), + data
 /// length (PutInlineBlock, PutDict), + `RECORD_COMPACT_KEPT` per kept block
-/// and `RECORD_COMPACT_REWRITTEN` + `MAX_VARINT` per object of a rewritten
-/// block (Compact).
+/// and `RECORD_COMPACT_REWRITTEN` per rewritten block + `MAX_VARINT` per
+/// object of the rewritten blocks (Compact).
 pub const RECORD_PUT_OBJECT: usize = RECORD_HEADER_MAX + 32 + 3 * MAX_VARINT;
 pub const RECORD_PUT_TOPIC_BASE: usize = RECORD_HEADER_MAX + MAX_VARINT;
 pub const RECORD_PUBLISH: usize = RECORD_HEADER_MAX + 4 * MAX_VARINT;
@@ -235,7 +236,7 @@ pub const RECORD_RELEASE: usize = RECORD_HEADER_MAX + 2 * MAX_VARINT;
 pub const RECORD_PUT_BLOCK: usize = RECORD_HEADER_MAX + 6 * MAX_VARINT + 4;
 pub const RECORD_PUT_INLINE_BLOCK_BASE: usize = RECORD_HEADER_MAX + 3 * MAX_VARINT + 4;
 pub const RECORD_PUT_DICT_BASE: usize = RECORD_HEADER_MAX + MAX_VARINT;
-pub const RECORD_COMPACT_BASE: usize = RECORD_HEADER_MAX + 3 * MAX_VARINT + 1;
+pub const RECORD_COMPACT_BASE: usize = RECORD_HEADER_MAX + 4 * MAX_VARINT;
 pub const RECORD_COMPACT_KEPT: usize = 2 * MAX_VARINT;
 pub const RECORD_COMPACT_REWRITTEN: usize = 6 * MAX_VARINT + 4;
 
@@ -327,9 +328,10 @@ impl Record<'_> {
             } => {
                 RECORD_COMPACT_BASE
                     + RECORD_COMPACT_KEPT * kept.len()
-                    + rewritten.as_ref().map_or(0, |r| {
-                        RECORD_COMPACT_REWRITTEN + MAX_VARINT * r.objects.len()
-                    })
+                    + rewritten
+                        .iter()
+                        .map(|r| RECORD_COMPACT_REWRITTEN + MAX_VARINT * r.objects.len())
+                        .sum::<usize>()
             }
         }
     }
@@ -430,18 +432,15 @@ impl Record<'_> {
                     put_uvarint(&mut p, *block);
                     put_uvarint(&mut p, *offset);
                 }
-                match rewritten {
-                    None => p.push(0),
-                    Some(r) => {
-                        p.push(1);
-                        for v in [r.block, r.offset, r.len, r.raw_len, r.dict] {
-                            put_uvarint(&mut p, v);
-                        }
-                        p.extend_from_slice(&r.crc.to_le_bytes());
-                        put_uvarint(&mut p, r.objects.len() as u64);
-                        for &number in &r.objects {
-                            put_uvarint(&mut p, number);
-                        }
+                put_uvarint(&mut p, rewritten.len() as u64);
+                for r in rewritten {
+                    for v in [r.block, r.offset, r.len, r.raw_len, r.dict] {
+                        put_uvarint(&mut p, v);
+                    }
+                    p.extend_from_slice(&r.crc.to_le_bytes());
+                    put_uvarint(&mut p, r.objects.len() as u64);
+                    for &number in &r.objects {
+                        put_uvarint(&mut p, number);
                     }
                 }
                 COMPACT
@@ -685,9 +684,15 @@ fn decode_record<'a>(
             for _ in 0..count {
                 kept.push((r.uvarint()?, r.uvarint()?));
             }
-            let rewritten = match r.take(1)?[0] {
-                0 => None,
-                1 => {
+            // At least 10 bytes per rewritten block: five varints, the CRC,
+            // the object count.
+            let blocks = usize::try_from(r.uvarint()?)
+                .ok()
+                .filter(|&c| c <= r.0.len() / 10)
+                .ok_or("compact rewritten-block count exceeds payload")?;
+            let mut rewritten = Vec::with_capacity(blocks);
+            for _ in 0..blocks {
+                {
                     let block = r.uvarint()?;
                     let offset = r.uvarint()?;
                     let len = r.uvarint()?;
@@ -703,7 +708,7 @@ fn decode_record<'a>(
                     for _ in 0..count {
                         objects.push(r.uvarint()?);
                     }
-                    Some(Rewritten {
+                    rewritten.push(Rewritten {
                         block,
                         offset,
                         len,
@@ -711,10 +716,9 @@ fn decode_record<'a>(
                         dict,
                         crc,
                         objects,
-                    })
+                    });
                 }
-                _ => return Err("bad rewritten-block flag in Compact"),
-            };
+            }
             Record::Compact {
                 old,
                 new,
@@ -758,6 +762,17 @@ impl<'a> Reader<'a> {
 pub fn push_block_object(raw: &mut Vec<u8>, bytes: &[u8]) {
     put_uvarint(raw, bytes.len() as u64);
     raw.extend_from_slice(bytes);
+}
+
+/// Bytes `push_block_object` appends for an object of `bytes`.
+pub fn block_entry_len(bytes: &[u8]) -> usize {
+    let mut n = 1;
+    let mut v = bytes.len() as u64;
+    while v >= 0x80 {
+        n += 1;
+        v >>= 7;
+    }
+    n + bytes.len()
 }
 
 /// Byte ranges of the objects of a raw block, in index order. The block
@@ -948,7 +963,7 @@ mod tests {
                 old: 1,
                 new: 9,
                 kept: vec![(4, 0), (5, 1000)],
-                rewritten: Some(Rewritten {
+                rewritten: vec![Rewritten {
                     block: 13,
                     offset: 2000,
                     len: 50,
@@ -956,13 +971,13 @@ mod tests {
                     dict: 0,
                     crc: 7,
                     objects: vec![2, 300, 1 << 33],
-                }),
+                }],
             },
             Record::Compact {
                 old: 2,
                 new: NO_SEGMENT,
                 kept: vec![],
-                rewritten: None,
+                rewritten: vec![],
             },
         ]
     }
@@ -1126,7 +1141,7 @@ mod tests {
                 old: u64::MAX,
                 new: u64::MAX,
                 kept: vec![(u64::MAX, u64::MAX)],
-                rewritten: Some(Rewritten {
+                rewritten: vec![Rewritten {
                     block: u64::MAX,
                     offset: u64::MAX,
                     len: u64::MAX,
@@ -1134,7 +1149,7 @@ mod tests {
                     dict: u64::MAX,
                     crc: u32::MAX,
                     objects: vec![u64::MAX],
-                }),
+                }],
             },
         ];
         let buf = frame_of(&records, u64::MAX, 0);

@@ -44,6 +44,9 @@ fn config(mode_name: &str) -> Config {
         // The dictionary is trained early in the run, so kills also land
         // before, during and after training.
         dict_train_bytes: 32 << 10,
+        // Batches of up to 16 payloads of up to ~3 KiB: several blocks per
+        // frame, so kills also land between them.
+        max_block_raw_bytes: 4096,
         ..Config::default()
     }
 }

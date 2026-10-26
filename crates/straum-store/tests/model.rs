@@ -113,6 +113,9 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
             dict_train_bytes: 256,
             // Small, so reads also go through eviction.
             block_cache_blocks: 2,
+            // Payloads of up to 300 bytes: batches split into several
+            // blocks, and the largest payloads are blocks of their own.
+            max_block_raw_bytes: 128,
             ..Config::default()
         };
         let payloads = payloads();
@@ -128,14 +131,12 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
                             payload: &payloads[p],
                         })
                         .collect();
-                    let segment_before = store.stats().segment_bytes;
                     let seqs = store.put_batch(&batch, now).await.unwrap();
-                    // Whether the batch's block went inline depends on its
-                    // compressed size; the model reads it from the store:
-                    // only a segment block adds segment bytes.
-                    let inline = matches!(mode, WriteMode::InlineSmall { .. })
-                        && store.stats().segment_bytes == segment_before;
                     for (&(t, p), seq) in msgs.iter().zip(seqs) {
+                        // Whether an object's block went inline depends on
+                        // the block's compressed size, and a batch can have
+                        // both kinds: the model reads it from the store.
+                        let inline = store.is_inline(&ObjectId::of(&payloads[p])).unwrap();
                         model.indexed.entry(p).or_insert(inline);
                         let mt = model.topics.entry(t).or_default();
                         assert_eq!(seq, mt.entries.len() as u64, "assigned seq");

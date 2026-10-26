@@ -80,6 +80,13 @@ pub struct Config {
     /// 0: never. Recorded in a new WAL's file header; on reopen the WAL's
     /// value is used (`ConfigOverride::DictTrainBytes`).
     pub dict_train_bytes: u64,
+    /// Upper bound on a block's raw size: the new objects of a batch, and
+    /// the live objects compaction moves, are split in order into blocks
+    /// of at most this many raw bytes, so reading one object decompresses
+    /// at most this much. An object larger than the limit is a block of
+    /// its own; objects are never split. 0 is taken as 1 (every object
+    /// alone).
+    pub max_block_raw_bytes: u64,
 }
 
 impl Default for Config {
@@ -91,8 +98,32 @@ impl Default for Config {
             block_cache_blocks: 16,
             block_cache_bytes: 64 << 20,
             dict_train_bytes: 1 << 20,
+            max_block_raw_bytes: 64 << 10,
         }
     }
+}
+
+/// Splits objects, given their raw block entry lengths in order, into
+/// consecutive ranges of at most `cap` bytes each; an entry larger than
+/// `cap` is a range of its own. Greedy: a range is closed when the next
+/// entry would not fit, so two consecutive ranges together exceed `cap`
+/// and there are at most `2 * total / cap + 1` of them.
+fn block_ranges(lens: impl IntoIterator<Item = usize>, cap: u64) -> Vec<Range<usize>> {
+    let cap = cap.max(1) as usize;
+    let mut ranges = Vec::new();
+    let (mut start, mut size, mut i) = (0, 0usize, 0);
+    for len in lens {
+        if i > start && size + len > cap {
+            ranges.push(start..i);
+            (start, size) = (i, 0);
+        }
+        size += len;
+        i += 1;
+    }
+    if i > start {
+        ranges.push(start..i);
+    }
+    ranges
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -458,9 +489,11 @@ impl Store {
                     Record::PutBlock { number, .. } | Record::PutInlineBlock { number, .. } => {
                         next_block = next_block.max(number.saturating_add(1));
                     }
-                    Record::Compact {
-                        rewritten: Some(r), ..
-                    } => next_block = next_block.max(r.block.saturating_add(1)),
+                    Record::Compact { rewritten, .. } => {
+                        for r in rewritten {
+                            next_block = next_block.max(r.block.saturating_add(1));
+                        }
+                    }
                     Record::PutDict { data, .. } => dicts.push(*data),
                     _ => {}
                 }
@@ -594,16 +627,27 @@ impl Store {
             u32::try_from(m.payload.len()).map_err(|_| StoreError::ObjectTooLarge)?;
         }
         let train = !batch.is_empty() && self.should_train();
-        // Upper bound: every object counted as new. An inline block is at
-        // most the threshold and at most zstd's bound for the raw block.
-        let block = match self.config.write_mode.inline_threshold() {
-            Some(t) => {
-                let raw: usize = batch.iter().map(|m| MAX_VARINT + m.payload.len()).sum();
-                let inline = t.min(block::compress_bound(raw));
-                RECORD_PUT_BLOCK.max(RECORD_PUT_INLINE_BLOCK_BASE + inline)
-            }
-            None => RECORD_PUT_BLOCK,
-        };
+        // Upper bound: every object counted as new, so the batch's blocks
+        // are at most the ranges of all its payloads. An inline block is at
+        // most the threshold and at most zstd's bound for its raw bytes.
+        let ranges = block_ranges(
+            batch.iter().map(|m| MAX_VARINT + m.payload.len()),
+            self.config.max_block_raw_bytes,
+        );
+        let block: usize = ranges
+            .iter()
+            .map(|range| match self.config.write_mode.inline_threshold() {
+                Some(t) => {
+                    let raw: usize = batch[range.clone()]
+                        .iter()
+                        .map(|m| MAX_VARINT + m.payload.len())
+                        .sum();
+                    let inline = t.min(block::compress_bound(raw));
+                    RECORD_PUT_BLOCK.max(RECORD_PUT_INLINE_BLOCK_BASE + inline)
+                }
+                None => RECORD_PUT_BLOCK,
+            })
+            .sum();
         let dict = if train {
             RECORD_PUT_DICT_BASE + block::DICT_SIZE
         } else {
@@ -643,12 +687,13 @@ impl Store {
             None
         };
         let (frame_object, frame_block) = (self.next_object, self.next_block);
-        // New objects, in order of first appearance, form block `block`.
-        let block = self.next_block;
-        let mut raw = Vec::new();
+        // New objects, in order of first appearance, are split into blocks
+        // of at most `max_block_raw_bytes` raw bytes.
         let mut numbers = Vec::with_capacity(batch.len());
+        // Payloads of the new objects, in order.
+        let mut fresh: Vec<&[u8]> = Vec::new();
         // Added to `stats` once the batch is durable.
-        let (mut deduplicated, mut new_bytes, mut new_objects) = (0, 0, 0);
+        let (mut deduplicated, mut new_bytes) = (0, 0);
         for m in batch {
             let id = ObjectId::of(m.payload);
             if let Some(&number) = self.ids.get(&id) {
@@ -658,18 +703,45 @@ impl Store {
             }
             let number = self.next_object;
             self.next_object += 1;
-            codec::push_block_object(&mut raw, m.payload);
+            // Block and index are set below, once the blocks are known.
             let object = Object {
                 id,
-                block,
-                index: new_objects,
+                block: 0,
+                index: 0,
                 refs: 0,
             };
             self.objects.insert(number, object);
             self.ids.insert(id, number);
-            new_objects += 1;
+            fresh.push(m.payload);
             new_bytes += m.payload.len() as u64;
             numbers.push((number, true));
+        }
+        let ranges = block_ranges(
+            fresh.iter().map(|p| codec::block_entry_len(p)),
+            self.config.max_block_raw_bytes,
+        );
+        // (block number, raw block) per range; object `k` of the new ones is
+        // in the block whose range holds `k`.
+        let mut blocks: Vec<(u64, Vec<u8>, u64)> = Vec::with_capacity(ranges.len());
+        let mut placed = Vec::with_capacity(fresh.len());
+        for range in &ranges {
+            let block = self.next_block + blocks.len() as u64;
+            let mut raw = Vec::new();
+            for (index, p) in fresh[range.clone()].iter().enumerate() {
+                codec::push_block_object(&mut raw, p);
+                placed.push((block, index as u64));
+            }
+            blocks.push((block, raw, range.len() as u64));
+        }
+        let mut placed = placed.into_iter();
+        for (number, new) in &numbers {
+            if *new
+                && let (Some(o), Some((block, index))) =
+                    (self.objects.get_mut(number), placed.next())
+            {
+                o.block = block;
+                o.index = index;
+            }
         }
 
         let mut seqs = Vec::with_capacity(batch.len());
@@ -686,12 +758,12 @@ impl Store {
             self.dictionary = Some(data.len());
         }
         let mut inline_bytes = 0;
-        if new_objects > 0 {
+        for &(block, ref raw, new_objects) in &blocks {
             self.next_block += 1;
             let codecs = self.codecs.get_mut();
-            let packed = codecs.compress(&raw)?;
+            let packed = codecs.compress(raw)?;
             let dict = codecs.dict();
-            let crc = crc32c::crc32c(&raw);
+            let crc = crc32c::crc32c(raw);
             let (len, raw_len) = (packed.len() as u64, raw.len() as u64);
             let inline = self.config.write_mode.inline_threshold();
             let loc = if inline.is_some_and(|t| packed.len() <= t) {
@@ -704,7 +776,7 @@ impl Store {
                     data_at: 0,
                 };
                 frame.record(&mut wal_buf, &put)?;
-                inline_bytes = len;
+                inline_bytes += len;
                 // The block's bytes end the record just written; the frame
                 // starts at `wal_len`, at index 0 of the buffer.
                 Location::Wal {
@@ -800,8 +872,8 @@ impl Store {
         }
         self.write_topic_entries().await?;
         self.in_flight = false;
-        if new_objects > 0 {
-            // Recent objects are the likeliest reads.
+        // Recent objects are the likeliest reads.
+        for (block, raw, _) in blocks {
             let spans = codec::split_block(&raw)
                 .map_err(|reason| StoreError::CorruptBlock { block, reason })?;
             self.cache_insert(block, Rc::new(Decoded { raw, spans }));
@@ -1000,11 +1072,8 @@ impl Store {
                 objs.sort_unstable();
                 moved.extend(objs.into_iter().map(|(_, number, _)| number));
             }
-            let rewrite_bound = if moved.is_empty() {
-                0
-            } else {
-                RECORD_COMPACT_REWRITTEN + MAX_VARINT * moved.len()
-            };
+            // At most one rewritten block per moved object.
+            let rewrite_bound = (RECORD_COMPACT_REWRITTEN + MAX_VARINT) * moved.len();
             self.check_frame(
                 FRAME_HEADER
                     + RECORD_COMPACT_BASE
@@ -1013,7 +1082,7 @@ impl Store {
             )?;
             self.begin_write();
             let mut kept_at = Vec::with_capacity(kept.len());
-            let mut rewritten = None;
+            let mut rewritten = Vec::new();
             let mut new_len = 0;
             let new = if kept.is_empty() && moved.is_empty() {
                 NO_SEGMENT
@@ -1028,25 +1097,32 @@ impl Store {
                     kept_at.push((n, buf.len() as u64));
                     buf.extend_from_slice(&stored);
                 }
-                if !moved.is_empty() {
+                let mut objects = Vec::with_capacity(moved.len());
+                for &number in &moved {
+                    // Verifies the hash.
+                    objects.push(self.read_object(number).await?.1);
+                }
+                // The same limit as for new blocks.
+                for range in block_ranges(
+                    objects.iter().map(|b| codec::block_entry_len(b)),
+                    self.config.max_block_raw_bytes,
+                ) {
                     let mut raw = Vec::new();
-                    for &number in &moved {
-                        // Verifies the hash.
-                        let (_, bytes) = self.read_object(number).await?;
-                        codec::push_block_object(&mut raw, &bytes);
+                    for bytes in &objects[range.clone()] {
+                        codec::push_block_object(&mut raw, bytes);
                     }
                     let codecs = self.codecs.get_mut();
                     let packed = codecs.compress(&raw)?;
                     let block = self.next_block;
                     self.next_block += 1;
-                    rewritten = Some(Rewritten {
+                    rewritten.push(Rewritten {
                         block,
                         offset: buf.len() as u64,
                         len: packed.len() as u64,
                         raw_len: raw.len() as u64,
                         dict: codecs.dict(),
                         crc: crc32c::crc32c(&raw),
-                        objects: moved,
+                        objects: moved[range].to_vec(),
                     });
                     buf.extend_from_slice(&packed);
                 }
@@ -1090,7 +1166,7 @@ impl Store {
                     b.loc = Location::Segment { id: new, offset };
                 }
             }
-            if let Some(r) = rewritten {
+            for r in rewritten {
                 for (index, number) in (0..).zip(&r.objects) {
                     if let Some(o) = self.objects.get_mut(number) {
                         o.block = r.block;
@@ -1194,8 +1270,26 @@ impl Store {
         self.objects.len()
     }
 
+    /// Whether the object's block is stored in the WAL (InlineSmall);
+    /// `None` if the object is not in the index. Dead objects of such
+    /// blocks are never reclaimed by compaction.
+    pub fn is_inline(&self, id: &ObjectId) -> Option<bool> {
+        let number = self.ids.get(id)?;
+        let o = self.objects.get(number)?;
+        Some(matches!(
+            self.blocks.get(&o.block)?.loc,
+            Location::Wal { .. }
+        ))
+    }
+
     pub fn segment_count(&self) -> usize {
         self.segments.len()
+    }
+
+    /// Blocks the store holds (batch blocks and compaction's rewritten
+    /// blocks).
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
     }
 
     /// Length of the store's compression dictionary; `None` before training
@@ -1800,13 +1894,13 @@ impl<'a> Replay<'a> {
         old: u64,
         new: u64,
         kept: Vec<(u64, u64)>,
-        rewritten: Option<Rewritten>,
+        rewritten: Vec<Rewritten>,
     ) -> Result<(), &'static str> {
         if !self.segments.remove(&old) {
             return Err("Compact of a segment the WAL does not reference");
         }
         if new == NO_SEGMENT {
-            if !kept.is_empty() || rewritten.is_some() {
+            if !kept.is_empty() || !rewritten.is_empty() {
                 return Err("Compact keeps blocks without a new segment");
             }
         } else if !self.segments.insert(new) {
@@ -1826,16 +1920,15 @@ impl<'a> Replay<'a> {
         if kept_set.len() != kept.len() || kept.iter().any(|(n, _)| !old_blocks.contains(n)) {
             return Err("Compact keeps a block that is not in the old segment");
         }
-        let moved: HashMap<u64, u64> = rewritten
+        // Object number → (rewritten block, index in it).
+        let moved: HashMap<u64, (u64, u64)> = rewritten
             .iter()
-            .flat_map(|r| r.objects.iter().zip(0..).map(|(&n, i)| (n, i)))
+            .flat_map(|r| r.objects.iter().zip(0..).map(|(&n, i)| (n, (r.block, i))))
             .collect();
-        if let Some(r) = &rewritten
-            && (r.objects.is_empty() || moved.len() != r.objects.len())
-        {
+        let listed: usize = rewritten.iter().map(|r| r.objects.len()).sum();
+        if rewritten.iter().any(|r| r.objects.is_empty()) || moved.len() != listed {
             return Err("Compact rewrites a block with no or repeated objects");
         }
-        let new_block = rewritten.as_ref().map(|r| r.block);
         let mut relocated = 0;
         let mut bad = None;
         let ids = &mut self.ids;
@@ -1849,14 +1942,14 @@ impl<'a> Replay<'a> {
                 }
                 return true;
             }
-            match (moved.get(number), o.refs > 0, new_block) {
-                (Some(&index), true, Some(block)) => {
+            match (moved.get(number), o.refs > 0) {
+                (Some(&(block, index)), true) => {
                     o.block = block;
                     o.index = index;
                     relocated += 1;
                     true
                 }
-                (None, false, _) => {
+                (None, false) => {
                     ids.remove(&o.id);
                     false
                 }
@@ -1879,7 +1972,7 @@ impl<'a> Replay<'a> {
                 b.loc = Location::Segment { id: new, offset };
             }
         }
-        if let Some(r) = rewritten {
+        for r in rewritten {
             let block = Block {
                 loc: Location::Segment {
                     id: new,
@@ -2572,7 +2665,7 @@ mod tests {
             old: 0,
             new: 1,
             kept: vec![(0, 0)],
-            rewritten: None,
+            rewritten: vec![],
         };
         assert!(r.apply(keep, 0).is_err());
 
@@ -2614,8 +2707,8 @@ mod tests {
         (r, ids)
     }
 
-    fn rewritten(objects: Vec<u64>) -> Option<Rewritten> {
-        Some(Rewritten {
+    fn rewritten(objects: Vec<u64>) -> Vec<Rewritten> {
+        vec![Rewritten {
             block: 3,
             offset: 1,
             len: 1,
@@ -2623,7 +2716,7 @@ mod tests {
             dict: NO_DICT,
             crc: 0,
             objects,
-        })
+        }]
     }
 
     #[test]
@@ -2664,14 +2757,14 @@ mod tests {
             rewritten,
         };
         for (what, rec) in [
-            ("live object left behind", compact(vec![(1, 0)], None)),
+            ("live object left behind", compact(vec![(1, 0)], vec![])),
             (
                 "dead object moved",
                 compact(vec![(1, 0)], rewritten(vec![0, 1])),
             ),
             (
                 "block with a dead object kept",
-                compact(vec![(0, 0), (1, 0)], None),
+                compact(vec![(0, 0), (1, 0)], vec![]),
             ),
             (
                 "block of another segment",
@@ -2750,6 +2843,35 @@ mod tests {
         none.insert(1, decoded(10));
         assert!(none.get(1).is_none());
         assert_eq!(none.bytes, 0);
+    }
+
+    #[test]
+    fn block_ranges_fill_up_to_the_cap_and_isolate_oversized_objects() {
+        assert_eq!(block_ranges([], 10), Vec::<Range<usize>>::new());
+        assert_eq!(block_ranges([3, 3, 3, 3], 10), [0..3, 3..4]);
+        assert_eq!(
+            block_ranges([10, 1], 10),
+            [0..1, 1..2],
+            "exactly the cap fits"
+        );
+        assert_eq!(
+            block_ranges([1, 25, 1, 1], 10),
+            [0..1, 1..2, 2..4],
+            "oversized alone"
+        );
+        assert_eq!(block_ranges([25], 10), vec![0..1]);
+        assert_eq!(
+            block_ranges([1, 1, 1], 0),
+            [0..1, 1..2, 2..3],
+            "0 is taken as 1"
+        );
+        // Two consecutive ranges together exceed the cap.
+        let lens = [4, 7, 4, 7, 4, 7];
+        let r = block_ranges(lens, 10);
+        for w in r.windows(2) {
+            let size = |x: &Range<usize>| lens[x.clone()].iter().sum::<usize>();
+            assert!(size(&w[0]) + size(&w[1]) > 10, "{r:?}");
+        }
     }
 
     #[test]

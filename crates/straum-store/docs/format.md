@@ -23,10 +23,18 @@ next id is the highest seen in the WAL or on disk plus one.
 
 ## Blocks
 
-Objects are stored in blocks. The new objects of one batch (`put_batch`), in
-order of first appearance in the batch, form one block; compaction forms one
-block from the live objects of partly dead blocks. A batch whose objects are
-all known makes no block.
+Objects are stored in blocks of at most `Config::max_block_raw_bytes` raw
+bytes (default 64 KiB). The new objects of one batch (`put_batch`), in order
+of first appearance in the batch, are split in that order into blocks: a
+block is closed when the next object's entry would take it over the limit,
+and an object whose entry alone is over the limit is a block of its own
+(objects are never split). Compaction moves the live objects of partly dead
+blocks into blocks under the same limit. A batch whose objects are all known
+makes no block. All blocks of a batch are in its one WAL frame and follow
+the frame's durability order and recovery rules, as a single block does.
+
+The limit bounds the work of reading one object: a read decompresses one
+block. It is not recorded in the WAL; changing it affects new blocks only.
 
 Raw block: every object as `len varint | bytes`, concatenated; object `i` of
 the block is the `i`-th. A zero-length object takes one byte.
@@ -84,7 +92,7 @@ rewritten segment).
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 9 |
+| 8 | 4 | `version` u32 = 10 |
 | 12 | 8 | `dict_train_bytes` u64: the dictionary training threshold |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -103,7 +111,8 @@ frame, 2 full ids in Publish and in the topic index, 3 `topic_seq` in topic
 index entries, 4 fixed-width Publish and Release with the topic name, 5
 fixed-width PutObject and PutInline, 6 a topic index of 20-byte entries, 7
 uncompressed objects located by segment offset (PutObject type 1, PutInline
-type 5, Compact type 4), 8 a 16-byte header without `dict_train_bytes`.
+type 5, Compact type 4), 8 a 16-byte header without `dict_train_bytes`, 9
+at most one rewritten block per Compact record.
 
 ### Frame
 
@@ -271,7 +280,7 @@ old object gives a negative number delta.
 | `topic_number` varint | 1–10 |
 | `topic_seq` varint: always the topic's first live entry | 1–10 |
 
-### 11 — Compact (payload 4–31, + 2–20 per kept block, + a rewritten block)
+### 11 — Compact (payload 4–31, + 2–20 per kept block, + per rewritten block)
 
 | Field | Size |
 |---|---|
@@ -279,13 +288,14 @@ old object gives a negative number delta.
 | `new` varint: the new segment; `u64::MAX` = none | 1–10 |
 | `kept` varint: number of blocks copied unchanged | 1–10 |
 | per kept block: `block_number` varint, `offset` varint in `new` | 2–20 each |
-| `rewritten` u8: 0 none, 1 follows | 1 |
-| if 1: `block_number`, `offset`, `len`, `raw_len`, `dict` varints, `crc` u32 | 9–54 |
-| if 1: `count` varint, then `count` object numbers, varints, in index order | 1–10 + 1–10 each |
+| `rewritten` varint: number of rewritten blocks | 1–10 |
+| per rewritten block: `block_number`, `offset`, `len`, `raw_len`, `dict` varints, `crc` u32 | 9–54 |
+| per rewritten block: `count` varint, then `count` object numbers, varints, in index order | 1–10 + 1–10 each |
 
 On replay, with `B` the blocks of `old`: every kept block is in `B` and holds
-only live objects (refcount > 0); the rewritten block's objects are exactly
-the live objects of the other blocks of `B`; every other object of `B` is
+only live objects (refcount > 0); the objects of the rewritten blocks
+together, each listed once, are exactly the live objects of the other blocks
+of `B`, and no rewritten block is empty; every other object of `B` is
 dead and is removed with its id. Blocks of `B` not kept are removed. Any
 other combination is `CorruptWal`. With `new` = `u64::MAX` there are no kept
 or rewritten blocks.
