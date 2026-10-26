@@ -138,7 +138,7 @@ before `Hello`, for health checks.
 
 | Field | Type | |
 |---|---|---|
-| `topics` | `array<string>` | empty: every topic |
+| `topics` | `array<string>` | at most 1000; more is `MalformedRequest`. Empty: no topics, only the cluster and its nodes |
 
 `MetadataOk`:
 
@@ -147,7 +147,7 @@ before `Hello`, for health checks.
 | `cluster_id` | `string` | |
 | `controller_node_id` | `u32` | reserved: v0 sends its own node id |
 | `nodes` | `array<Node>` | every node of the cluster; v0: itself |
-| `topics` | `array<TopicMetadata>` | in request order; all topics by name when the request was empty |
+| `topics` | `array<TopicMetadata>` | in request order |
 
 `Node`: `node_id u32`, `host string`, `port u16`, `rack string` (reserved:
 empty).
@@ -279,12 +279,32 @@ Message (section 4.6).
 
 ### 4.9 ListTopics
 
-Empty request body. `ListTopicsOk`: `topics array<TopicSummary>` by name;
+Topics by name (bytewise order), one page per request.
+
+| Field | Type | |
+|---|---|---|
+| `cursor` | `string` | empty: the first page; otherwise the `next_cursor` of the previous page |
+| `limit` | `u32` | the most topics to return; 0 is `MalformedRequest`, more than 1000 is taken as 1000 |
+
+`ListTopicsOk`:
+
+| Field | Type | |
+|---|---|---|
+| `topics` | `array<TopicSummary>` | the topics whose names sort after `cursor`, at most `limit` |
+| `next_cursor` | `string` | empty if no topic follows this page; otherwise pass it as the next request's `cursor` |
+
 `TopicSummary`: `name string`, `partitions u32`.
+
+The broker keeps no state between pages. In v0 a cursor is the name of
+the last topic of its page, and any `cursor` is accepted: a page holds the
+topics whose names sort after it. A topic created between two pages is
+listed on a later page only if its name sorts after the cursor. Clients
+pass `next_cursor` back unchanged and do not build cursors.
 
 ### 4.10 DescribeTopic
 
-`DescribeTopic { name string }` → `DescribeTopicOk`:
+`DescribeTopic { name string }` names one topic; for several, send one
+request each. `DescribeTopicOk`:
 
 | Field | Type | |
 |---|---|---|

@@ -302,9 +302,22 @@ impl Client {
         }
     }
 
-    pub fn list_topics(&mut self) -> Result<Vec<TopicSummary>, ClientError> {
-        match self.retrying(None, |_| Request::ListTopics)? {
-            Response::ListTopicsOk { topics } => Ok(topics),
+    /// One page of at most `limit` topics after `cursor` ("" for the first
+    /// page), and the cursor of the next page ("" after the last).
+    pub fn list_topics(
+        &mut self,
+        cursor: &str,
+        limit: u32,
+    ) -> Result<(Vec<TopicSummary>, String), ClientError> {
+        let req = Request::ListTopics {
+            cursor: cursor.into(),
+            limit,
+        };
+        match self.retrying(None, |_| req.clone())? {
+            Response::ListTopicsOk {
+                topics,
+                next_cursor,
+            } => Ok((topics, next_cursor)),
             r => Err(unexpected(&r)),
         }
     }

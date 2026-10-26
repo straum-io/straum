@@ -249,7 +249,9 @@
       "request": {
         "type": "Metadata",
         "body": {
-          "topics": []
+          "topics": [
+            "orders"
+          ]
         }
       }
     },

@@ -20,6 +20,9 @@ pub const MIN_FRAME_LENGTH: u32 = 10;
 pub const ERROR_TYPE: u16 = 0xffff;
 /// Bit set in a success response's type.
 pub const RESPONSE_BIT: u16 = 0x8000;
+/// The most topics a Metadata request may name, and the most a ListTopics
+/// page holds (sections 4.3 and 4.9).
+pub const MAX_REQUEST_TOPICS: u32 = 1000;
 
 const FLAG_KEY: u8 = 1;
 const FLAG_HEADERS: u8 = 2;
@@ -303,7 +306,7 @@ pub enum Request {
     DeleteTopic { name: String },
     Produce(Produce),
     Fetch(Fetch),
-    ListTopics,
+    ListTopics { cursor: String, limit: u32 },
     DescribeTopic { name: String },
     BrokerStats,
 }
@@ -332,7 +335,7 @@ impl Request {
             Self::DeleteTopic { .. } => DELETE_TOPIC,
             Self::Produce(_) => PRODUCE,
             Self::Fetch(_) => FETCH,
-            Self::ListTopics => LIST_TOPICS,
+            Self::ListTopics { .. } => LIST_TOPICS,
             Self::DescribeTopic { .. } => DESCRIBE_TOPIC,
             Self::BrokerStats => BROKER_STATS,
         }
@@ -347,7 +350,7 @@ impl Request {
             Self::DeleteTopic { .. } => "DeleteTopic",
             Self::Produce(_) => "Produce",
             Self::Fetch(_) => "Fetch",
-            Self::ListTopics => "ListTopics",
+            Self::ListTopics { .. } => "ListTopics",
             Self::DescribeTopic { .. } => "DescribeTopic",
             Self::BrokerStats => "BrokerStats",
         }
@@ -397,7 +400,11 @@ impl Request {
                 put_u32(out, f.max_wait_ms);
                 put_u32(out, f.expected_leader_epoch);
             }
-            Self::ListTopics | Self::BrokerStats => {}
+            Self::ListTopics { cursor, limit } => {
+                put_string(out, cursor);
+                put_u32(out, *limit);
+            }
+            Self::BrokerStats => {}
         }
     }
 
@@ -460,7 +467,10 @@ impl Request {
                 max_wait_ms: r.u32()?,
                 expected_leader_epoch: r.u32()?,
             }),
-            LIST_TOPICS => Self::ListTopics,
+            LIST_TOPICS => Self::ListTopics {
+                cursor: r.string()?,
+                limit: r.u32()?,
+            },
             DESCRIBE_TOPIC => Self::DescribeTopic { name: r.string()? },
             BROKER_STATS => Self::BrokerStats,
             t => return Err(DecodeError::UnknownType(t)),
@@ -609,13 +619,18 @@ impl ErrorBody {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Response {
     HelloOk(HelloOk),
-    Pong { nonce: u64 },
+    Pong {
+        nonce: u64,
+    },
     MetadataOk(MetadataOk),
     CreateTopicOk,
     DeleteTopicOk,
     ProduceOk(ProduceOk),
     FetchOk(FetchOk),
-    ListTopicsOk { topics: Vec<TopicSummary> },
+    ListTopicsOk {
+        topics: Vec<TopicSummary>,
+        next_cursor: String,
+    },
     DescribeTopicOk(DescribeTopicOk),
     BrokerStatsOk(BrokerStatsOk),
     Error(ErrorBody),
@@ -729,12 +744,16 @@ impl Response {
                     m.message.encode(out);
                 }
             }
-            Self::ListTopicsOk { topics } => {
+            Self::ListTopicsOk {
+                topics,
+                next_cursor,
+            } => {
                 put_count(out, topics.len());
                 for t in topics {
                     put_string(out, &t.name);
                     put_u32(out, t.partitions);
                 }
+                put_string(out, next_cursor);
             }
             Self::DescribeTopicOk(d) => {
                 put_string(out, &d.name);
@@ -895,7 +914,10 @@ impl Response {
                         partitions: r.u32()?,
                     });
                 }
-                Self::ListTopicsOk { topics }
+                Self::ListTopicsOk {
+                    topics,
+                    next_cursor: r.string()?,
+                }
             }
             DESCRIBE_TOPIC => {
                 let name = r.string()?;

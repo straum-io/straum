@@ -1,6 +1,6 @@
 {
   "name": "admin",
-  "description": "ListTopics, DescribeTopic and BrokerStats agree with what was produced; DeleteTopic is Unsupported.",
+  "description": "ListTopics (by pages), DescribeTopic and BrokerStats agree with what was produced; DeleteTopic is Unsupported.",
   "steps": [
     {
       "connect": "a"
@@ -118,7 +118,11 @@
       "send": "a",
       "id": "l",
       "request": {
-        "type": "ListTopics"
+        "type": "ListTopics",
+        "body": {
+          "cursor": "",
+          "limit": 1000
+        }
       }
     },
     {
@@ -136,7 +140,84 @@
               "name": "beta",
               "partitions": 1
             }
-          ]
+          ],
+          "next_cursor": ""
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "l1",
+      "request": {
+        "type": "ListTopics",
+        "body": {
+          "cursor": "",
+          "limit": 1
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "l1",
+      "response": {
+        "type": "ListTopicsOk",
+        "body": {
+          "topics": [
+            {
+              "name": "alpha",
+              "partitions": 1
+            }
+          ],
+          "next_cursor": "alpha"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "l2",
+      "request": {
+        "type": "ListTopics",
+        "body": {
+          "cursor": "alpha",
+          "limit": 4294967295
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "l2",
+      "response": {
+        "type": "ListTopicsOk",
+        "body": {
+          "topics": [
+            {
+              "name": "beta",
+              "partitions": 1
+            }
+          ],
+          "next_cursor": ""
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "l3",
+      "request": {
+        "type": "ListTopics",
+        "body": {
+          "cursor": "beta",
+          "limit": 1
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "l3",
+      "response": {
+        "type": "ListTopicsOk",
+        "body": {
+          "topics": [],
+          "next_cursor": ""
         }
       }
     },

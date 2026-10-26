@@ -1,6 +1,6 @@
 {
-  "name": "metadata_all",
-  "note": "empty list: every topic",
+  "name": "metadata_no_topics",
+  "note": "empty list: the cluster and its nodes, no topics",
   "direction": "request",
   "type_code": 3,
   "correlation_id": "5",
