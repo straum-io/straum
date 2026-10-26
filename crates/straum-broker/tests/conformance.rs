@@ -6,6 +6,7 @@
 use std::path::Path;
 
 #[test]
+#[ignore = "long: every scenario against a fresh broker process"]
 fn broker_scenarios_pass() {
     let bin = Path::new(env!("CARGO_BIN_EXE_straum-broker"));
     let scenarios =

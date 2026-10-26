@@ -32,6 +32,8 @@ and release setup:
 - `scripts/linux.sh`: runs cargo in a Linux container on macOS.
 - `scripts/container/`: runs cargo in a Linux container with io_uring
   enabled, on a dedicated Podman machine.
+- `scripts/validate.sh quick|push|pr`: the validation levels (quick tests
+  on macOS; macOS and the io_uring container with the long tests).
 
 The release pipeline runs only on version tags.
 

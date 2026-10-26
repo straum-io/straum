@@ -40,8 +40,10 @@ jobs:
       # Benches are built, not run (D-4).
       - if: steps.ws.outputs.crates == 'true'
         run: cargo test --workspace --all-targets --no-run
+      # Long tests are #[ignore = "long: ..."]; a PR runs them at their full
+      # iteration counts.
       - if: steps.ws.outputs.crates == 'true'
-        run: cargo test --workspace --tests -- --skip linux_runtime_uses_io_uring
+        run: cargo test --workspace --tests -- --include-ignored --skip linux_runtime_uses_io_uring
 
   # Line, region and function coverage, reported, not gated (ECO-D-7).
   coverage:
@@ -68,6 +70,6 @@ jobs:
         run: |
           {
             echo '```text'
-            cargo llvm-cov --workspace --tests --summary-only -- --skip linux_runtime_uses_io_uring | tail -1
+            cargo llvm-cov --workspace --tests --summary-only -- --include-ignored --skip linux_runtime_uses_io_uring | tail -1
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
