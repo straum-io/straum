@@ -9,7 +9,8 @@ and release setup:
 
 - `crates/straum-broker`: the broker, version 0: one node, one shard, the
   binary protocol of [docs/protocol.md](docs/protocol.md) over TCP
-  ([README](crates/straum-broker/README.md)).
+  ([README](crates/straum-broker/README.md)). What it guarantees, and
+  what it does not yet: [docs/guarantees.md](docs/guarantees.md).
 - `crates/straum-proto`: the protocol's encoding, no I/O.
   `crates/straum-client`: the reference client (blocking, `std::net`).
 - `conformance/`: the language-independent conformance suite (golden
