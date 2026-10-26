@@ -17,6 +17,11 @@ macOS (development only). No tokio, including transitively.
   (`Config::block_cache_blocks`, default 16, and `Config::block_cache_bytes`,
   default 64 MiB; a larger block is not cached). The training threshold is
   fixed in the WAL file header when the WAL is created.
+- Topic entries are read from the topic index files, not held in memory:
+  per topic the store keeps the entries of the last, incomplete index block
+  (at most 63) and a seek table bounded by `Config::seek_table_max_entries`
+  (default 65 536 offsets, 512 KiB). The object index (id → number → block)
+  is still in memory (ADR-0014 moves it to disk).
 - Group commit: one segment `fdatasync` and one WAL `fdatasync` per batch;
   a batch is acknowledged only after both.
 - Recovery from the WAL cuts a torn tail and checks topic indexes and
@@ -82,7 +87,7 @@ Test variables: `STRAUM_STORE_CRASH_ITERATIONS` (default 200),
 | `src/codec.rs` | BLAKE3; WAL record encoding, one-byte deltas in batch records; rejection of every flipped bit and every truncated prefix; raw block layout; topic index entries |
 | `src/block.rs` | compression round trip with and without a dictionary; deterministic training; a damaged block, a wrong length or CRC is rejected |
 | `src/store.rs` | reference count reconciliation; replay rejecting an inconsistent WAL (block and object order, dictionaries); applying and rejecting Compact; file names |
-| `tests/index_reads.rs` | live entries read from the index file: reads across full blocks and the in-memory tail, before and after reopen; release across a block boundary; a full block damaged after open fails `read`, `entry`, `index_entry` and `release_before` with `TopicIndexCorrupt`, writing nothing |
+| `tests/index_reads.rs` | live entries read from the index file: reads across full blocks and the in-memory tail, before and after reopen; release across a block boundary; a full block damaged after open fails `read`, `entry`, `index_entry` and `release_before` with `TopicIndexCorrupt`, writing nothing; a seek table of 2 entries (stride 16) still finds every entry, and a damaged block fails every walk through it |
 | `tests/store.rs` | deduplication; one fsync per file per batch; restart; rotation; compaction; orphans; a corrupted block fails the read; corrupted indexes; WAL truncation at every byte of the last record (Publish, Release, Compact) |
 | `tests/model.rs` | proptest: random publish, release, compact and restart against an in-memory model, 128 cases per write mode, with dictionary training and a two-block cache |
 | `tests/crash.rs` | a writer in a child process killed with SIGKILL at a random moment, checked after each restart; one test per write mode; the dictionary is trained during the run |

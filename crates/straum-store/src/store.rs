@@ -76,6 +76,13 @@ pub struct Config {
     /// kept; the least recently used blocks are evicted once either this or
     /// `block_cache_blocks` would be exceeded.
     pub block_cache_bytes: usize,
+    /// Most entries in a topic's seek table (file offsets of index blocks).
+    /// Up to this many blocks every block's offset is kept; beyond it every
+    /// other offset is dropped and the stride between kept offsets doubles,
+    /// so a read walks up to `stride` blocks from the nearest kept offset.
+    /// Bounds a topic's seek table to 8 bytes times this, whatever its
+    /// length. 0 is taken as 1.
+    pub seek_table_max_entries: usize,
     /// Raw bytes of new objects stored without a dictionary after which the
     /// store trains its dictionary, once, on the objects of those blocks.
     /// 0: never. Recorded in a new WAL's file header; on reopen the WAL's
@@ -98,6 +105,7 @@ impl Default for Config {
             write_mode: WriteMode::Sequential,
             block_cache_blocks: 16,
             block_cache_bytes: 64 << 20,
+            seek_table_max_entries: 1 << 16,
             dict_train_bytes: 1 << 20,
             max_block_raw_bytes: 64 << 10,
         }
@@ -372,6 +380,53 @@ struct Object {
 /// entries.
 type CachedBlock = (u64, Vec<(u64, u64)>);
 
+/// A topic's seek table while it is built at open.
+struct SeekTable {
+    starts: Vec<u64>,
+    stride: u64,
+    blocks: u64,
+}
+
+impl Default for SeekTable {
+    fn default() -> Self {
+        Self {
+            starts: Vec::new(),
+            stride: 1,
+            blocks: 0,
+        }
+    }
+}
+
+impl SeekTable {
+    fn push(&mut self, at: u64, max: usize) {
+        seek_push(
+            &mut self.starts,
+            &mut self.stride,
+            &mut self.blocks,
+            at,
+            max,
+        );
+    }
+}
+
+/// Records that index block number `*blocks` starts at file offset `at`:
+/// kept if it falls on the stride; when the table would exceed `max`
+/// entries, every other kept offset is dropped and the stride doubles.
+fn seek_push(starts: &mut Vec<u64>, stride: &mut u64, blocks: &mut u64, at: u64, max: usize) {
+    if (*blocks).is_multiple_of(*stride) {
+        starts.push(at);
+        if starts.len() > max.max(1) {
+            let mut i = 0;
+            starts.retain(|_| {
+                i += 1;
+                i % 2 == 1
+            });
+            *stride *= 2;
+        }
+    }
+    *blocks += 1;
+}
+
 struct Topic {
     /// Topic number from the topic's PutTopic record.
     number: u64,
@@ -380,10 +435,16 @@ struct Topic {
     index: IndexWriter,
     /// Bytes in the index file.
     index_len: u64,
-    /// File offset of every block, so entry `seq` is found by reading one
-    /// block (`Store::index_entry`). Rebuilt at open, which reads the whole
-    /// index anyway to check it against the WAL.
+    /// Seek table: file offsets of index blocks 0, `stride`, 2 × `stride`,
+    /// …, so entry `seq` is found by reading from the nearest kept block
+    /// (`Store::index_entry`). Rebuilt at open, which reads the whole index
+    /// anyway to check it against the WAL.
     block_starts: Vec<u64>,
+    /// Blocks between kept offsets: 1, then doubled whenever the table
+    /// would exceed `Config::seek_table_max_entries`.
+    stride: u64,
+    /// Index blocks started so far.
+    blocks: u64,
     first_live: u64,
     /// The seq the next entry gets.
     next_seq: u64,
@@ -397,6 +458,18 @@ struct Topic {
     read_cache: RefCell<Option<CachedBlock>>,
     /// Encoded entries of the current batch, written after the WAL fsync.
     pending: Vec<u8>,
+}
+
+impl Topic {
+    fn seek_push(&mut self, at: u64, max: usize) {
+        seek_push(
+            &mut self.block_starts,
+            &mut self.stride,
+            &mut self.blocks,
+            at,
+            max,
+        );
+    }
 }
 
 struct Active {
@@ -606,7 +679,7 @@ impl Store {
         let dictionary = replay.dicts.last().map(|d| d.len());
 
         let segments = open_segments(&dir, &mut replay, &mut report).await?;
-        let topics = open_topics(&dir, &replay, &mut report).await?;
+        let topics = open_topics(&dir, &replay, config.seek_table_max_entries, &mut report).await?;
         check_refcounts(
             &replay.objects,
             replay.topics.values().flat_map(|t| {
@@ -877,6 +950,7 @@ impl Store {
             }
 
             let new_topic = !self.topics.contains_key(m.topic);
+            let seek_max = self.config.seek_table_max_entries;
             let topic = self.topic_mut(m.topic).await?;
             if new_topic {
                 let put = Record::PutTopic {
@@ -896,7 +970,7 @@ impl Store {
             }
             let at = topic.index_len + topic.pending.len() as u64;
             if topic.index.push(&mut topic.pending, number, timestamp) {
-                topic.block_starts.push(at);
+                topic.seek_push(at, seek_max);
             }
             let publish = Record::Publish {
                 topic: topic.number,
@@ -1318,32 +1392,42 @@ impl Store {
         {
             return Ok(entries.get(at).copied());
         }
-        let b = usize::try_from(block).unwrap_or(usize::MAX);
-        let (Some(&start), Some(&end)) = (
-            t.block_starts.get(b),
-            t.block_starts.get(b + 1).or(Some(&t.index_len)),
-        ) else {
-            return Err(StoreError::TopicIndexCorrupt {
-                path: topic_path(&self.dir, name),
-                block,
-            });
+        let corrupt = |block| StoreError::TopicIndexCorrupt {
+            path: topic_path(&self.dir, name),
+            block,
         };
-        let len = (end - start) as usize;
+        // Read from the nearest kept offset to the next one (or the end of
+        // the file) and walk the full blocks up to `block`.
+        let slot = usize::try_from(block / t.stride).unwrap_or(usize::MAX);
+        let (Some(&start), Some(&end)) = (
+            t.block_starts.get(slot),
+            t.block_starts.get(slot + 1).or(Some(&t.index_len)),
+        ) else {
+            return Err(corrupt(block));
+        };
+        let len = usize::try_from(end - start).map_err(|_| corrupt(block))?;
         let BufResult(res, buf) = t
             .file
             .read_exact_at(Vec::with_capacity(len).slice(..len), start)
             .await;
         res?;
-        let decoded = codec::decode_index_block(&buf.into_inner(), block);
-        if !decoded.sealed {
-            return Err(StoreError::TopicIndexCorrupt {
-                path: topic_path(&self.dir, name),
-                block,
-            });
+        let buf = buf.into_inner();
+        let mut off = 0;
+        let mut b = slot as u64 * t.stride;
+        loop {
+            let decoded = codec::decode_index_block(buf.get(off..).unwrap_or_default(), b);
+            // Every block before the tail is full and must match its CRC.
+            if !decoded.sealed {
+                return Err(corrupt(b));
+            }
+            if b == block {
+                let entry = decoded.entries.get(at).copied();
+                *t.read_cache.borrow_mut() = Some((block, decoded.entries));
+                return Ok(entry);
+            }
+            off += decoded.ends.last().copied().unwrap_or(0) + 4;
+            b += 1;
         }
-        let entry = decoded.entries.get(at).copied();
-        *t.read_cache.borrow_mut() = Some((block, decoded.entries));
-        Ok(entry)
     }
 
     async fn entry_number(&self, topic: &[u8], seq: u64) -> Result<Option<u64>, StoreError> {
@@ -1760,6 +1844,8 @@ impl Store {
                     index: IndexWriter::default(),
                     index_len: 0,
                     block_starts: Vec::new(),
+                    stride: 1,
+                    blocks: 0,
                     first_live: 0,
                     next_seq: 0,
                     last_timestamp: 0,
@@ -2209,6 +2295,7 @@ async fn open_segments(
 async fn open_topics(
     dir: &Path,
     replay: &Replay<'_>,
+    seek_max: usize,
     report: &mut RecoveryReport,
 ) -> Result<HashMap<Vec<u8>, Topic>, StoreError> {
     for entry in std::fs::read_dir(dir.join(TOPICS_DIR))? {
@@ -2240,11 +2327,15 @@ async fn open_topics(
         // and compare bytes. The file must equal a prefix of it.
         let mut index = IndexWriter::default();
         let mut expected = Vec::new();
+        // Every block's start, for locating a difference below; open holds
+        // all replayed entries anyway. The kept seek table is bounded.
         let mut block_starts = Vec::new();
+        let mut seek = SeekTable::default();
         for &(number, timestamp) in &t.entries {
             let at = expected.len();
             if index.push(&mut expected, number, timestamp) {
                 block_starts.push(at as u64);
+                seek.push(at as u64, seek_max);
             }
         }
         let differ = bytes
@@ -2326,7 +2417,9 @@ async fn open_topics(
                 file,
                 index,
                 index_len: expected.len() as u64,
-                block_starts,
+                block_starts: seek.starts,
+                stride: seek.stride,
+                blocks: seek.blocks,
                 first_live: t.first_live,
                 next_seq: t.entries.len() as u64,
                 last_timestamp: t.entries.last().map_or(0, |&(_, ts)| ts),

@@ -82,3 +82,72 @@ async fn a_full_block_damaged_after_open_fails_every_read_of_it() {
     assert_eq!(store.read(b"t", 100).await.unwrap(), Some(payload(100)));
     assert_eq!(store.read(b"t", 129).await.unwrap(), Some(payload(129)));
 }
+
+/// A seek table of at most 2 entries: with 20 full blocks the stride grows
+/// to 16, so reads walk up to 15 blocks from the nearest kept offset.
+fn tiny_seek() -> Config {
+    Config {
+        seek_table_max_entries: 2,
+        ..Config::default()
+    }
+}
+
+#[compio::test]
+async fn a_bounded_seek_table_still_finds_every_entry() {
+    let dir = TempDir::new("index-seek");
+    let mut store = Store::open(&dir.0, tiny_seek()).await.unwrap();
+    // 20 full blocks and a tail of 5.
+    fill(&mut store, 20 * 64 + 5).await;
+    for round in 0..2 {
+        for seq in 0..20 * 64 + 5 {
+            let got = store.read(b"t", seq).await.unwrap();
+            assert_eq!(got, Some(payload(seq)), "round {round} seq {seq}");
+        }
+        // Backwards too, so the per-topic block cache never helps.
+        for seq in (0..20 * 64).rev().step_by(37) {
+            let got = store.read(b"t", seq).await.unwrap();
+            assert_eq!(got, Some(payload(seq)), "round {round} seq {seq}");
+        }
+        drop(store);
+        store = Store::open(&dir.0, tiny_seek()).await.unwrap();
+    }
+}
+
+#[compio::test]
+async fn a_damaged_block_fails_every_walk_through_it() {
+    let dir = TempDir::new("index-seek-corrupt");
+    let mut store = Store::open(&dir.0, tiny_seek()).await.unwrap();
+    fill(&mut store, 20 * 64 + 5).await;
+    drop(store);
+    let store = Store::open(&dir.0, tiny_seek()).await.unwrap();
+    // Find block 2's start by decoding from the file start (each full
+    // block ends with a 4-byte CRC after its 64 entries).
+    let index = dir.0.join("topics").join(format!("{:02x}.idx", b't'));
+    let mut bytes = std::fs::read(&index).unwrap();
+    let mut at = 0;
+    for _ in 0..2 {
+        let mut entries = 0;
+        while entries < 2 * 64 {
+            // Two varints per entry.
+            while bytes[at] & 0x80 != 0 {
+                at += 1;
+            }
+            at += 1;
+            entries += 1;
+        }
+        at += 4;
+    }
+    bytes[at + 1] ^= 0xff;
+    std::fs::write(&index, &bytes).unwrap();
+    let corrupt = |e: StoreError| matches!(e, StoreError::TopicIndexCorrupt { block: 2, .. });
+    // Blocks 0 and 1 lie before the damage in the same span: still read.
+    assert_eq!(store.read(b"t", 64).await.unwrap(), Some(payload(64)));
+    // Block 2 itself, and block 5, whose walk passes block 2: errors.
+    assert!(corrupt(store.read(b"t", 2 * 64 + 1).await.unwrap_err()));
+    assert!(corrupt(store.read(b"t", 5 * 64).await.unwrap_err()));
+    // The tail is in memory.
+    assert_eq!(
+        store.read(b"t", 20 * 64 + 4).await.unwrap(),
+        Some(payload(20 * 64 + 4))
+    );
+}

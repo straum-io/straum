@@ -408,11 +408,18 @@ The block number is part of the CRC, so a block at the wrong position fails
 the check. The encoding is deterministic: the same entries always give the
 same bytes.
 
-**Lookup by `topic_seq`.** Block start offsets are kept in memory (8 bytes per
-block): block `topic_seq div 64` is read with one positional read and decoded
-up to the entry (at most 64), O(1). The table is built at open (the index is
-read in full anyway for the check against the WAL) and extended on write.
-`Store::index_entry(topic, seq)`.
+**Lookup by `topic_seq`.** A seek table in memory holds the file offsets of
+blocks 0, `stride`, 2 × `stride`, … (8 bytes each): block `topic_seq div 64`
+is found by one positional read from the nearest kept offset to the next
+one, walking the full blocks in between (each checked against its CRC).
+`stride` starts at 1, so up to `Config::seek_table_max_entries` blocks
+(default 65 536) every block's offset is kept and a lookup reads one block;
+when the table would grow past that, every other offset is dropped and the
+stride doubles. A topic's seek table therefore stays within 8 bytes times
+`seek_table_max_entries` (512 KiB by default) whatever its length, and a
+lookup reads at most `stride` blocks. The table is built at open (the index
+is read in full anyway for the check against the WAL) and extended on
+write. `Store::index_entry(topic, seq)`.
 
 **Reads.** Live entries are not held in memory: every read of an entry
 (`Store::read`, `Store::entry`, `Store::index_entry`, and `release_before`
