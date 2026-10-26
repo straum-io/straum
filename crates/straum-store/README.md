@@ -142,32 +142,47 @@ Payloads (`--payload`): `pattern` (the default: the message index, then a
 fixed fill), `random` (a xorshift64* stream from `--seed`, incompressible)
 or `file:<path>` (consecutive windows of the file; after its end the windows
 start one byte further in, so payloads repeat only where the file does).
-`--reads N` reopens the store after the writes and reads it twice, in
-`topic_seq` order and at random `topic_seq`s, up to N reads or
-`--read-seconds` each, once per `--read-cache` setting (`default`, or `off`:
-`block_cache_blocks = 0`); rows go to `--reads-out`. Reads come from the
-page cache. The `blocks` feature (default) builds the bench for an engine
-with a block cache; without it the bench builds against WAL format 7, which
-has none (`cache` is `none` in its rows).
+`--reads N` first writes, untimed, a second topic of up to N messages in
+which each message repeats, with probability one half, the body of a random
+earlier message of the measured topic; then it reopens the store and runs
+four read workloads, up to N reads or `--read-seconds` each, once per
+`--read-cache` setting (`default`, or `off`: `block_cache_blocks = 0`):
+`scan` (the measured topic in `topic_seq` order), `random` (random
+`topic_seq`s), `dedup_scan` (the second topic in order, so the repeated
+bodies come from old blocks) and `multi` (4 cursors starting at even
+fractions of the topic, read in turn). Rows go to `--reads-out`. Reads come
+from the page cache. Features: `blocks` builds the bench for an engine with
+compressed blocks and a block cache; without it the bench builds against
+WAL format 7, which has none (`cache` is `none` in its rows). `cap`
+(default, implies `blocks`) adds `--max-block-raw-bytes N`, which sets
+`Config::max_block_raw_bytes` and makes InlineSmall's threshold N, so a
+capped block can go inline.
 
 CSV columns: `label, payload, mode, msg_size, batch, rep, messages, batches,
 elapsed_ns, msgs_per_s, fsyncs, fsyncs_per_batch, bytes_written,
 bytes_per_msg, wal_bytes_per_msg, disk_bytes_per_msg, batch_p50_ns,
 batch_p99_ns, cpu_ns_per_msg, peak_rss_bytes, rep_min_msgs_per_s,
-rep_max_msgs_per_s, spread_pct, dedup_msgs, bytes_saved,
-meta_bytes_per_msg`. `rep_min_msgs_per_s`, `rep_max_msgs_per_s` and
-`spread_pct` (max − min over median msgs/s, in percent) are filled in the
-`median` row only. `dedup_msgs`, `bytes_saved` and `meta_bytes_per_msg` come
-from `Store::stats()` and are 0 for `raw` and `hashcopy`. `elapsed_ns` sums
-the batch write calls only. `bytes_written` for store modes is segments plus
-WAL plus indexes; `disk_bytes_per_msg` is what the files allocate
-(`st_blocks`). `cpu_ns_per_msg` is user plus system time of the process over
-the write loop, payload preparation included, from `/proc/self/stat` (the
-accounting `getrusage` reports; calling `getrusage` itself needs `unsafe`
-or the libc crate); `peak_rss_bytes` is `VmHWM` after the write loop, reset
-before it. Both are Linux only. Read rows: `label, payload, mode, msg_size,
-batch, rep, workload, cache, messages, reads, elapsed_ns, msgs_per_s,
-read_p50_ns, read_p99_ns, cpu_ns_per_read`.
+rep_max_msgs_per_s, spread_pct, dedup_msgs, bytes_saved, meta_bytes_per_msg,
+seg_sync_p50_ns, seg_sync_p99_ns, wal_sync_p50_ns, wal_sync_p99_ns,
+overlap_pct, max_block_raw_bytes`. `rep_min_msgs_per_s`,
+`rep_max_msgs_per_s` and `spread_pct` (max − min over median msgs/s, in
+percent) are filled in the `median` row only. `dedup_msgs`, `bytes_saved`
+and `meta_bytes_per_msg` come from `Store::stats()` and are 0 for `raw` and
+`hashcopy`. `elapsed_ns` sums the batch write calls only. `bytes_written`
+for store modes is segments plus WAL plus indexes; `disk_bytes_per_msg` is
+what the files allocate (`st_blocks`). `cpu_ns_per_msg` is user plus system
+time of the process over the write loop, payload preparation included, from
+`/proc/self/stat` (the accounting `getrusage` reports; calling `getrusage`
+itself needs `unsafe` or the libc crate); `peak_rss_bytes` is `VmHWM` after
+the write loop, reset before it. Both are Linux only. The sync columns come
+from `Store::last_commit_timing()` after each batch (feature `cap`; `NaN`
+without it, for `raw` and `hashcopy`, and where no batch had that sync): the
+span of the segment `fdatasync`s and of the WAL `fdatasync`, p50 and p99,
+and `overlap_pct`, the share of batches with both syncs whose two spans
+intersect. `max_block_raw_bytes` is the configured cap, empty without
+`--max-block-raw-bytes`. Read rows: `label, payload, mode, msg_size, batch,
+rep, workload, cache, messages, reads, elapsed_ns, msgs_per_s, read_p50_ns,
+read_p99_ns, cpu_ns_per_read`.
 
 Results from macOS, or from a container on macOS, show direction only.
 
@@ -237,6 +252,36 @@ on a bare-metal machine has not been measured.
 
 The datasets are Loghub (Jieming Zhu et al., ISSRE 2023), CC BY 4.0 on
 Zenodo; they stay under `<dir>/work` and are deleted with it.
+
+### The block cap on a Linux machine
+
+`scripts/bench/block-cap.sh` compares five variants on one machine: format
+7 (commit `7d298a2`), uncapped blocks (commit `cfca176`, one block per
+batch) and the checked-out commit with `max_block_raw_bytes` 16, 64 and 256
+KiB. It is `format7-vs-8.sh` with these differences:
+
+- Three worktrees and builds: the checked-out commit's bench is built
+  against `7d298a2` without features, against `cfca176` with `blocks` only,
+  and against the checked-out commit with its defaults.
+- Variants `format7`, `format8`, `cap16k`, `cap64k`, `cap256k`; in each
+  repetition the first variant moves one place, so each variant runs first
+  once in five repetitions. The capped variants run InlineSmall with the cap
+  as threshold; `format7` and `format8` keep 4096 bytes.
+- Matrix: sizes {100, 1024, 10240} × batches {1, 64, 512}, payloads SSH,
+  BGL and `random`, modes `sequential`, `parallel`, `inline`, 5
+  repetitions; the four read workloads; the block variants with the
+  default block cache and with it off.
+- Before the runs it prints the number of steps (each a line with its exit
+  status in `commands.log`), of benchmark runs, and the bodies it will
+  write in total, and records them in `env.md`.
+
+```bash
+scripts/bench/block-cap.sh --out ~/block-cap
+```
+
+`--quick`, `--keep`, the preconditions, the outputs and the cleanup are
+those of `format7-vs-8.sh`. Its duration on a bare-metal machine has not
+been measured.
 
 ## Dependencies
 

@@ -62,15 +62,20 @@ use compio::fs::OpenOptions;
 use compio::io::AsyncWriteAtExt;
 use straum_store::{Config, Message, ObjectId, Store, WriteMode};
 
-const HEADER: &str = "label,payload,mode,msg_size,batch,rep,messages,batches,elapsed_ns,msgs_per_s,fsyncs,fsyncs_per_batch,bytes_written,bytes_per_msg,wal_bytes_per_msg,disk_bytes_per_msg,batch_p50_ns,batch_p99_ns,cpu_ns_per_msg,peak_rss_bytes,rep_min_msgs_per_s,rep_max_msgs_per_s,spread_pct,dedup_msgs,bytes_saved,meta_bytes_per_msg";
+const HEADER: &str = "label,payload,mode,msg_size,batch,rep,messages,batches,elapsed_ns,msgs_per_s,fsyncs,fsyncs_per_batch,bytes_written,bytes_per_msg,wal_bytes_per_msg,disk_bytes_per_msg,batch_p50_ns,batch_p99_ns,cpu_ns_per_msg,peak_rss_bytes,rep_min_msgs_per_s,rep_max_msgs_per_s,spread_pct,dedup_msgs,bytes_saved,meta_bytes_per_msg,seg_sync_p50_ns,seg_sync_p99_ns,wal_sync_p50_ns,wal_sync_p99_ns,overlap_pct,max_block_raw_bytes";
 const READ_HEADER: &str = "label,payload,mode,msg_size,batch,rep,workload,cache,messages,reads,elapsed_ns,msgs_per_s,read_p50_ns,read_p99_ns,cpu_ns_per_read";
 /// Columns of `Run::columns`.
-const COLUMNS: usize = 17;
+const COLUMNS: usize = 22;
 /// Planned bytes per message on top of the payload, for the free-space
 /// check: above the store's metadata (WAL records, frame header share,
 /// topic index entry) for every mode.
 const OVERHEAD_PER_MSG: u64 = 512;
 const TOPIC: &[u8] = b"bench";
+/// The topic of the dedup scan: half of its messages repeat the bodies of
+/// random earlier messages of `TOPIC`.
+const DEDUP_TOPIC: &[u8] = b"dedup";
+/// Cursors of the multiple-consumer workload.
+const CONSUMERS: u64 = 4;
 const MODES: [&str; 5] = ["raw", "hashcopy", "sequential", "parallel", "inline"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,17 +97,65 @@ impl ReadCache {
         }
     }
 
-    fn config(self, write_mode: WriteMode) -> Config {
+    fn config(self, write_mode: WriteMode, args: &Args) -> Config {
         #[cfg_attr(not(feature = "blocks"), allow(unused_mut))]
-        let mut config = Config {
-            write_mode,
-            ..Config::default()
-        };
+        let mut config = store_config(write_mode, args);
         #[cfg(feature = "blocks")]
         if self == Self::Off {
             config.block_cache_blocks = 0;
         }
         config
+    }
+}
+
+/// The store configuration of a run: the write mode and, with the `cap`
+/// feature, `--max-block-raw-bytes`.
+#[cfg_attr(not(feature = "cap"), allow(unused_variables))]
+fn store_config(write_mode: WriteMode, args: &Args) -> Config {
+    #[cfg_attr(not(feature = "cap"), allow(unused_mut))]
+    let mut config = Config {
+        write_mode,
+        ..Config::default()
+    };
+    #[cfg(feature = "cap")]
+    if let Some(cap) = args.max_block_raw_bytes {
+        config.max_block_raw_bytes = cap;
+    }
+    config
+}
+
+/// InlineSmall's threshold: with `--max-block-raw-bytes` (feature `cap`),
+/// the cap, so any capped block can go inline; otherwise the engine's
+/// default (4096 bytes).
+#[cfg_attr(not(feature = "cap"), allow(unused_variables))]
+fn inline_mode(args: &Args) -> WriteMode {
+    #[cfg(feature = "cap")]
+    if let Some(cap) = args.max_block_raw_bytes {
+        return WriteMode::InlineSmall {
+            threshold: u32::try_from(cap).unwrap_or(u32::MAX),
+        };
+    }
+    WriteMode::INLINE_SMALL
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Workload {
+    Scan,
+    Random,
+    DedupScan,
+    Multi,
+}
+
+impl Workload {
+    const ALL: [Self; 4] = [Self::Scan, Self::Random, Self::DedupScan, Self::Multi];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Scan => "scan",
+            Self::Random => "random",
+            Self::DedupScan => "dedup_scan",
+            Self::Multi => "multi",
+        }
     }
 }
 
@@ -229,6 +282,9 @@ struct Args {
     read_caches: Vec<ReadCache>,
     reads_out: Option<PathBuf>,
     clk_tck: u64,
+    /// `Config::max_block_raw_bytes` (feature `cap`); `None`: the engine's
+    /// default.
+    max_block_raw_bytes: Option<u64>,
 }
 
 impl Args {
@@ -259,6 +315,9 @@ struct Run {
     dedup_msgs: u64,
     bytes_saved: u64,
     meta_bytes: u64,
+    /// Per-batch sync durations (feature `cap`): segment p50, p99, WAL p50,
+    /// p99 (ns), and the percentage of batches whose two syncs overlapped.
+    syncs: Option<[f64; 5]>,
 }
 
 impl Run {
@@ -282,6 +341,11 @@ impl Run {
             self.dedup_msgs as f64,
             self.bytes_saved as f64,
             self.meta_bytes as f64 / msgs,
+            self.syncs.map_or(f64::NAN, |s| s[0]),
+            self.syncs.map_or(f64::NAN, |s| s[1]),
+            self.syncs.map_or(f64::NAN, |s| s[2]),
+            self.syncs.map_or(f64::NAN, |s| s[3]),
+            self.syncs.map_or(f64::NAN, |s| s[4]),
         ]
     }
 }
@@ -342,6 +406,9 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let rt = compio::runtime::Runtime::new()?;
     eprintln!("compio driver: {:?}", rt.driver_type());
     let payload = args.payload.name();
+    let cap = args
+        .max_block_raw_bytes
+        .map_or_else(String::new, |c| c.to_string());
     for mode in &args.modes {
         for &size in &args.sizes {
             for &batch in &args.batches {
@@ -356,14 +423,14 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     let write_mode = match mode.as_str() {
                         "sequential" => Some(WriteMode::Sequential),
                         "parallel" => Some(WriteMode::ParallelSync),
-                        "inline" => Some(WriteMode::INLINE_SMALL),
+                        "inline" => Some(inline_mode(args)),
                         _ => None,
                     };
                     let mut source = Source::new(&args.payload, size, args.seed);
                     let mut r = rt.block_on(async {
                         match (mode.as_str(), write_mode) {
                             (_, Some(m)) => {
-                                run_store(&dir, &mut source, batch, batches, m, args.clk_tck).await
+                                run_store(&dir, &mut source, batch, batches, m, args).await
                             }
                             ("raw", _) => {
                                 run_raw(&dir, &mut source, batch, batches, false, args.clk_tck)
@@ -376,10 +443,11 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     })?;
                     r.disk_bytes = disk_bytes(&dir)?;
                     if let (Some(m), Some(rout)) = (write_mode, reads_out.as_mut()) {
+                        rt.block_on(prepare_dedup(&dir, m, &mut source, batch, args))?;
                         for &cache in &args.read_caches {
-                            for random in [false, true] {
+                            for workload in Workload::ALL {
                                 let rd =
-                                    rt.block_on(run_reads(&dir, m, cache, random, size, args))?;
+                                    rt.block_on(run_reads(&dir, m, cache, workload, size, args))?;
                                 writeln!(
                                     rout,
                                     "{},{payload},{mode},{size},{batch},{rep},{},{},{},{},{},{:.1},{},{},{}",
@@ -412,6 +480,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         &rep.to_string(),
                         &r.columns(),
                         None,
+                        &cap,
                     )?;
                     out.flush()?;
                     runs.push(r);
@@ -434,6 +503,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         "median",
                         &median,
                         Some((lo, hi, spread)),
+                        &cap,
                     )?;
                     out.flush()?;
                 }
@@ -527,19 +597,18 @@ async fn run_store(
     batch: usize,
     batches: u64,
     write_mode: WriteMode,
-    clk_tck: u64,
+    args: &Args,
 ) -> std::io::Result<Run> {
+    let clk_tck = args.clk_tck;
     let messages = batches as usize * batch;
-    let config = Config {
-        write_mode,
-        ..Config::default()
-    };
-    let mut store = Store::open(dir, config)
+    let mut store = Store::open(dir, store_config(write_mode, args))
         .await
         .map_err(std::io::Error::other)?;
     let mut bufs = vec![Vec::new(); batch];
     let mut lat = Vec::with_capacity(batches as usize);
     let mut sent = 0;
+    #[cfg(feature = "cap")]
+    let mut timings = Vec::with_capacity(batches as usize);
     reset_peak_rss();
     let cpu_start = cpu_ns(clk_tck);
     while sent < messages {
@@ -558,6 +627,8 @@ async fn run_store(
             .await
             .map_err(std::io::Error::other)?;
         lat.push(start.elapsed().as_nanos() as u64);
+        #[cfg(feature = "cap")]
+        timings.push(store.last_commit_timing());
         sent += n;
     }
     let cpu = cpu_ns(clk_tck).zip(cpu_start).map(|(b, a)| b - a);
@@ -577,6 +648,37 @@ async fn run_store(
     );
     run.cpu_ns = cpu;
     run.peak_rss = rss;
+    #[cfg(feature = "cap")]
+    {
+        let dur = |s: Option<(u64, u64)>| s.map(|(a, b)| b - a);
+        let mut seg: Vec<u64> = timings.iter().filter_map(|t| dur(t.segment_sync)).collect();
+        let mut wal: Vec<u64> = timings.iter().filter_map(|t| dur(t.wal_sync)).collect();
+        seg.sort_unstable();
+        wal.sort_unstable();
+        let both = timings
+            .iter()
+            .filter(|t| t.segment_sync.is_some() && t.wal_sync.is_some())
+            .count();
+        let overlapped = timings.iter().filter(|t| t.overlapped()).count();
+        let pct = |v: &[u64], p| {
+            if v.is_empty() {
+                f64::NAN
+            } else {
+                percentile(v, p) as f64
+            }
+        };
+        run.syncs = Some([
+            pct(&seg, 0.50),
+            pct(&seg, 0.99),
+            pct(&wal, 0.50),
+            pct(&wal, 0.99),
+            if both == 0 {
+                f64::NAN
+            } else {
+                overlapped as f64 * 100.0 / both as f64
+            },
+        ]);
+    }
     Ok(run)
 }
 
@@ -634,25 +736,90 @@ async fn run_raw(
     Ok(run)
 }
 
-/// Reopens the store in `dir` and reads its topic: in `topic_seq` order
-/// from the first, or at random `topic_seq`s. Every read must return a
-/// payload of `size` bytes.
-async fn run_reads(
+/// Writes `DEDUP_TOPIC` next to the measured topic, untimed: as many
+/// messages as a read workload makes at most, in batches of `batch`; each
+/// with probability one half repeats the body of a random earlier message
+/// of `TOPIC` (stored once, in an old block), otherwise a fresh payload of
+/// the run's source. Its sequential scan touches old blocks at random.
+async fn prepare_dedup(
     dir: &Path,
     write_mode: WriteMode,
-    cache: ReadCache,
-    random: bool,
-    size: usize,
+    source: &mut Source<'_>,
+    batch: usize,
     args: &Args,
-) -> std::io::Result<Reads> {
-    let store = Store::open(dir, cache.config(write_mode))
+) -> std::io::Result<()> {
+    let mut store = Store::open(dir, store_config(write_mode, args))
         .await
         .map_err(std::io::Error::other)?;
     let (first, next) = store
         .topic_range(TOPIC)
+        .ok_or_else(|| std::io::Error::other("no topic to repeat"))?;
+    let n = args.reads.min(next - first) as usize;
+    let mut rng = XorShift::new(args.seed ^ 0xd5d5);
+    let mut fresh = vec![Vec::new(); 1];
+    let mut written = 0;
+    while written < n {
+        let mut bodies = Vec::with_capacity(batch);
+        for _ in 0..batch.min(n - written) {
+            if rng.next().is_multiple_of(2) {
+                let seq = first + rng.below(next - first);
+                let body = store
+                    .read(TOPIC, seq)
+                    .await
+                    .map_err(std::io::Error::other)?
+                    .ok_or_else(|| std::io::Error::other("a repeated message is gone"))?;
+                bodies.push(body);
+            } else {
+                source.fill(&mut fresh)?;
+                bodies.push(fresh[0].clone());
+            }
+        }
+        let msgs: Vec<Message> = bodies
+            .iter()
+            .map(|p| Message {
+                topic: DEDUP_TOPIC,
+                payload: p,
+            })
+            .collect();
+        store
+            .put_batch(&msgs, written as u64)
+            .await
+            .map_err(std::io::Error::other)?;
+        written += msgs.len();
+    }
+    Ok(())
+}
+
+/// Reopens the store in `dir` and runs one read workload, up to `--reads`
+/// reads or `--read-seconds`: `scan` reads `TOPIC` in `topic_seq` order;
+/// `random` reads random `topic_seq`s; `dedup_scan` reads `DEDUP_TOPIC` in
+/// order; `multi` reads `TOPIC` with `CONSUMERS` cursors starting at even
+/// intervals, one read each in turn. Every read must return a payload of
+/// `size` bytes.
+async fn run_reads(
+    dir: &Path,
+    write_mode: WriteMode,
+    cache: ReadCache,
+    workload: Workload,
+    size: usize,
+    args: &Args,
+) -> std::io::Result<Reads> {
+    let store = Store::open(dir, cache.config(write_mode, args))
+        .await
+        .map_err(std::io::Error::other)?;
+    let topic = if workload == Workload::DedupScan {
+        DEDUP_TOPIC
+    } else {
+        TOPIC
+    };
+    let (first, next) = store
+        .topic_range(topic)
         .ok_or_else(|| std::io::Error::other("no topic to read"))?;
     let messages = next - first;
     let mut rng = XorShift::new(args.seed);
+    let mut cursors: Vec<u64> = (0..CONSUMERS)
+        .map(|k| first + messages * k / CONSUMERS)
+        .collect();
     let mut lat = Vec::with_capacity(args.reads.min(messages) as usize);
     let cpu_start = cpu_ns(args.clk_tck);
     let began = Instant::now();
@@ -660,14 +827,19 @@ async fn run_reads(
         if began.elapsed() >= args.read_time {
             break;
         }
-        let seq = if random {
-            first + rng.below(messages)
-        } else {
-            first + i
+        let seq = match workload {
+            Workload::Random => first + rng.below(messages),
+            Workload::Multi => {
+                let c = &mut cursors[(i % CONSUMERS) as usize];
+                let seq = *c;
+                *c = if *c + 1 >= next { first } else { *c + 1 };
+                seq
+            }
+            Workload::Scan | Workload::DedupScan => first + i,
         };
         let start = Instant::now();
         let got = store
-            .read(TOPIC, std::hint::black_box(seq))
+            .read(topic, std::hint::black_box(seq))
             .await
             .map_err(std::io::Error::other)?;
         lat.push(start.elapsed().as_nanos() as u64);
@@ -683,7 +855,7 @@ async fn run_reads(
     let elapsed_ns = lat.iter().sum();
     lat.sort_unstable();
     Ok(Reads {
-        workload: if random { "random" } else { "scan" },
+        workload: workload.name(),
         cache: cache.name(),
         messages,
         reads,
@@ -752,6 +924,7 @@ fn write_row(
     rep: &str,
     c: &[f64],
     spread: Option<(f64, f64, f64)>,
+    cap: &str,
 ) -> std::io::Result<()> {
     let spread = match spread {
         Some((lo, hi, pct)) => format!("{lo:.1},{hi:.1},{pct:.1}"),
@@ -759,7 +932,7 @@ fn write_row(
     };
     writeln!(
         out,
-        "{label},{payload},{mode},{size},{batch},{rep},{:.0},{:.0},{:.0},{:.1},{:.0},{:.3},{:.0},{:.1},{:.1},{:.1},{:.0},{:.0},{:.0},{:.0},{spread},{:.0},{:.0},{:.1}",
+        "{label},{payload},{mode},{size},{batch},{rep},{:.0},{:.0},{:.0},{:.1},{:.0},{:.3},{:.0},{:.1},{:.1},{:.1},{:.0},{:.0},{:.0},{:.0},{spread},{:.0},{:.0},{:.1},{:.0},{:.0},{:.0},{:.0},{:.1},{cap}",
         c[0],
         c[1],
         c[2],
@@ -776,7 +949,12 @@ fn write_row(
         c[13],
         c[14],
         c[15],
-        c[16]
+        c[16],
+        c[17],
+        c[18],
+        c[19],
+        c[20],
+        c[21]
     )
 }
 
@@ -801,6 +979,7 @@ fn parse_args() -> Result<Args, String> {
         read_caches: vec![ReadCache::Default],
         reads_out: None,
         clk_tck: 100,
+        max_block_raw_bytes: None,
     };
     let list = |v: &str| -> Result<Vec<usize>, String> {
         v.split(',')
@@ -866,6 +1045,11 @@ fn parse_args() -> Result<Args, String> {
             }
             "--reads-out" => args.reads_out = Some(value.into()),
             "--clk-tck" => args.clk_tck = value.parse().map_err(|_| "bad --clk-tck")?,
+            #[cfg(feature = "cap")]
+            "--max-block-raw-bytes" => {
+                args.max_block_raw_bytes =
+                    Some(value.parse().map_err(|_| "bad --max-block-raw-bytes")?)
+            }
             _ => return Err(format!("unknown flag {flag}")),
         }
     }
