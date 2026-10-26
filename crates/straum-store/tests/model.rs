@@ -214,11 +214,13 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
 
     #[test]
+    #[ignore = "long: 128 proptest cases"]
     fn sequential_matches_model(ops in prop::collection::vec(op(), 1..40)) {
         store_matches_model(ops, WriteMode::Sequential);
     }
 
     #[test]
+    #[ignore = "long: 128 proptest cases"]
     fn parallel_sync_matches_model(ops in prop::collection::vec(op(), 1..40)) {
         store_matches_model(ops, WriteMode::ParallelSync);
     }
@@ -226,6 +228,7 @@ proptest! {
     /// Threshold 64: payloads of 0, 1, 7 and 33 bytes go inline, 100 and 300
     /// to segments.
     #[test]
+    #[ignore = "long: 128 proptest cases"]
     fn inline_small_matches_model(ops in prop::collection::vec(op(), 1..40)) {
         store_matches_model(ops, WriteMode::InlineSmall { threshold: 64 });
     }

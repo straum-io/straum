@@ -82,6 +82,7 @@ fn message(n: u64) -> Message {
 }
 
 #[test]
+#[ignore = "long: SIGKILL loop, STRAUM_BROKER_CRASH_ITERATIONS (default 200) iterations"]
 fn every_acknowledged_message_survives_sigkill() {
     let iterations: u64 = std::env::var("STRAUM_BROKER_CRASH_ITERATIONS")
         .ok()

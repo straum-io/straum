@@ -135,16 +135,19 @@ fn crash_child() {
 }
 
 #[test]
+#[ignore = "long: SIGKILL loop, STRAUM_STORE_CRASH_ITERATIONS (default 200) iterations"]
 fn sigkill_sequential() {
     sigkill_at_random_points("sequential");
 }
 
 #[test]
+#[ignore = "long: SIGKILL loop, STRAUM_STORE_CRASH_ITERATIONS (default 200) iterations"]
 fn sigkill_parallel_sync() {
     sigkill_at_random_points("parallel");
 }
 
 #[test]
+#[ignore = "long: SIGKILL loop, STRAUM_STORE_CRASH_ITERATIONS (default 200) iterations"]
 fn sigkill_inline_small() {
     sigkill_at_random_points("inline");
 }

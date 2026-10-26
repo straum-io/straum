@@ -92,8 +92,12 @@ also a flag, `--key value`, with `-` or `_`; flags win.
 | `tests/broker.rs` | produce and fetch with keys and headers; concurrent producers get distinct contiguous seqs; fetch waiting and timeout; admin requests agree; a restart keeps topics, messages and timestamps; another identity refuses to start |
 | `tests/errors.rs` | every error code version 0 sends, each from a request; `StorageError` from damaged object bytes |
 | `tests/backpressure.rs` | a client that never reads: pending bytes within the bound (from BrokerStats), reading stops, other connections served |
-| `tests/durability.rs` | the binary as a child process, killed with SIGKILL at random moments while producing, restarted: every acknowledged message is fetched with its seq, timestamp, key, headers and body; `STRAUM_BROKER_CRASH_ITERATIONS` (200), `STRAUM_BROKER_CRASH_SEED` (24301) |
-| `tests/conformance.rs` | every scenario of `conformance/scenarios/`, each against a fresh broker process |
+| `tests/durability.rs` (long) | the binary as a child process, killed with SIGKILL at random moments while producing, restarted: every acknowledged message is fetched with its seq, timestamp, key, headers and body; `STRAUM_BROKER_CRASH_ITERATIONS` (200), `STRAUM_BROKER_CRASH_SEED` (24301) |
+| `tests/conformance.rs` (long) | every scenario of `conformance/scenarios/`, each against a fresh broker process |
+
+Long tests are `#[ignore = "long: ..."]` and run with
+`cargo test --workspace -- --include-ignored` (`scripts/validate.sh push`
+or `pr`, and CI on every PR).
 
 ## Benchmark
 
