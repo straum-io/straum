@@ -57,7 +57,10 @@ Without block compression the same store was 1.162–1.415 times the plain
 log and 14.4–20.2 times the compressed one. The remaining gap to the
 compressed log is mostly the per-message metadata, which compression does
 not touch. These logs are a proxy; they say nothing about the duplicate
-share of real traffic.
+share of real traffic. The default block limit (64 KiB) changes none of
+these sizes at batch 64; at batch 512 it adds 0.0 % (SSH), 0.3–0.6 % (BGL)
+and 2.5–2.6 % (OpenStack) to the store against one block per batch
+(`dedup-survey --batch 512 --max-block-raw-bytes`).
 
 ## Build and test
 
@@ -115,9 +118,11 @@ fsyncs and bytes per file (segment bytes are compressed blocks).
 only, reset on every open, and count a message once its batch is
 acknowledged. Nothing is logged or formatted per message.
 
-`cargo run --release -p straum-store --example meta_bytes -- <empty dir>`
-prints metadata bytes per message from these counters as CSV, for every
-write mode, sizes {100, 1024, 10240} and batches {1, 64}.
+`cargo run --release -p straum-store --example meta_bytes -- <empty dir>
+[max_block_raw_bytes]` prints metadata bytes per message from these
+counters as CSV, for every write mode, sizes {100, 1024, 10240} and batches
+{1, 64, 512}; `18446744073709551615` as the limit gives one block per
+batch.
 
 ## Benchmark
 

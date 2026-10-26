@@ -3,15 +3,17 @@
 //! log.
 //!
 //! ```text
-//! dedup-survey --work <empty dir> --out <file.csv> \
-//!     --dataset <name>:<format>:<file>[,<file>...] [--dataset ...]
+//! dedup-survey --work <empty dir> --out <file.csv> [--batch 64] \
+//!     [--max-block-raw-bytes <n>] --dataset <name>:<format>:<file>[,<file>...] [--dataset ...]
 //! ```
 //!
 //! `format` is `openstack`, `ssh` or `bgl` and selects the timestamp
 //! stripping of the secondary measurement (see `strip_timestamp`). Each log
 //! line, without its newline, is one message; one topic per dataset;
-//! batches of 64; write mode Sequential; the timestamp passed to the store
-//! is the index of the batch's first line (`put_batch` takes one per batch).
+//! batches of `--batch` lines (64); `Config::max_block_raw_bytes` from
+//! `--max-block-raw-bytes` (the engine's default otherwise); write mode
+//! Sequential; the timestamp passed to the store is the index of the
+//! batch's first line (`put_batch` takes one per batch).
 //! Every dataset is surveyed twice: `raw` (the lines as they are) and
 //! `stripped` (leading timestamp removed). Stores are created under
 //! `<work>/stores/`.
@@ -20,8 +22,7 @@ use std::path::{Path, PathBuf};
 
 use straum_store::{Config, Message, Store};
 
-const HEADER: &str = "dataset,variant,files,messages,distinct_payloads,dup_messages,dup_share,payload_bytes,store_bytes,segment_bytes,wal_bytes,index_bytes,plain_bytes,zstd_plain_bytes,store_over_plain,store_over_zstd,unstripped_lines";
-const BATCH: usize = 64;
+const HEADER: &str = "dataset,variant,files,messages,distinct_payloads,dup_messages,dup_share,payload_bytes,store_bytes,segment_bytes,wal_bytes,index_bytes,plain_bytes,zstd_plain_bytes,store_over_plain,store_over_zstd,unstripped_lines,batch,max_block_raw_bytes";
 const ZSTD_LEVEL: i32 = 3;
 const ZSTD_CHUNK: usize = 1 << 20;
 
@@ -45,8 +46,14 @@ fn main() {
     }
 }
 
+/// Store settings of one survey run.
+struct Run {
+    batch: usize,
+    max_block_raw_bytes: u64,
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let (work, out, datasets) = parse_args()?;
+    let (work, out, datasets, run) = parse_args()?;
     let mut csv = String::from(HEADER);
     csv.push('\n');
     let rt = compio::runtime::Runtime::new()?;
@@ -72,12 +79,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let stripped: Vec<&[u8]> = stripped_owned.iter().map(Vec::as_slice).collect();
         for (variant, msgs, unmatched) in [("raw", &raw, 0), ("stripped", &stripped, unstripped)] {
             let dir = work.join("stores").join(format!("{}-{variant}", ds.name));
-            let r = rt.block_on(survey(&dir, ds.name.as_bytes(), msgs))?;
+            let r = rt.block_on(survey(&dir, ds.name.as_bytes(), msgs, &run))?;
             let plain = plain_bytes(msgs);
             let zstd_plain = zstd_plain_bytes(msgs)?;
             let store = r.segment_bytes + r.wal_bytes + r.index_bytes;
             csv.push_str(&format!(
-                "{},{variant},{},{},{},{},{:.6},{},{store},{},{},{},{plain},{zstd_plain},{:.4},{:.4},{unmatched}\n",
+                "{},{variant},{},{},{},{},{:.6},{},{store},{},{},{},{plain},{zstd_plain},{:.4},{:.4},{unmatched},{},{}\n",
                 ds.name,
                 ds.files.len(),
                 r.messages,
@@ -90,6 +97,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 r.index_bytes,
                 store as f64 / plain as f64,
                 store as f64 / zstd_plain as f64,
+                run.batch,
+                run.max_block_raw_bytes,
             ));
             eprintln!(
                 "{} {variant}: {} messages, {:.2}% duplicates, store/plain {:.3}, store/zstd {:.3}",
@@ -127,16 +136,21 @@ async fn survey(
     dir: &Path,
     topic: &[u8],
     msgs: &[&[u8]],
+    run: &Run,
 ) -> Result<Survey, Box<dyn std::error::Error>> {
     if dir.exists() {
         return Err(format!("{} already exists; use an empty --work dir", dir.display()).into());
     }
-    let mut store = Store::open(dir, Config::default()).await?;
-    let mut batch = Vec::with_capacity(BATCH);
-    for (i, chunk) in msgs.chunks(BATCH).enumerate() {
+    let config = Config {
+        max_block_raw_bytes: run.max_block_raw_bytes,
+        ..Config::default()
+    };
+    let mut store = Store::open(dir, config).await?;
+    let mut batch = Vec::with_capacity(run.batch);
+    for (i, chunk) in msgs.chunks(run.batch).enumerate() {
         batch.clear();
         batch.extend(chunk.iter().map(|&payload| Message { topic, payload }));
-        store.put_batch(&batch, (i * BATCH) as u64).await?;
+        store.put_batch(&batch, (i * run.batch) as u64).await?;
     }
     let s = store.stats();
     let distinct = store.object_count() as u64;
@@ -264,9 +278,13 @@ fn shape(s: &[u8], pattern: &[u8]) -> bool {
         })
 }
 
-fn parse_args() -> Result<(PathBuf, PathBuf, Vec<Dataset>), String> {
-    let usage = "usage: dedup-survey --work <dir> --out <file.csv> --dataset <name>:<openstack|ssh|bgl>:<file>[,<file>...] ...";
+fn parse_args() -> Result<(PathBuf, PathBuf, Vec<Dataset>, Run), String> {
+    let usage = "usage: dedup-survey --work <dir> --out <file.csv> [--batch 64] [--max-block-raw-bytes <n>] --dataset <name>:<openstack|ssh|bgl>:<file>[,<file>...] ...";
     let (mut work, mut out, mut datasets) = (None, None, Vec::new());
+    let mut run = Run {
+        batch: 64,
+        max_block_raw_bytes: Config::default().max_block_raw_bytes,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let value = it
@@ -275,6 +293,18 @@ fn parse_args() -> Result<(PathBuf, PathBuf, Vec<Dataset>), String> {
         match flag.as_str() {
             "--work" => work = Some(PathBuf::from(value)),
             "--out" => out = Some(PathBuf::from(value)),
+            "--batch" => {
+                run.batch = value
+                    .parse()
+                    .ok()
+                    .filter(|&b| b > 0)
+                    .ok_or_else(|| format!("bad --batch {value}\n{usage}"))?
+            }
+            "--max-block-raw-bytes" => {
+                run.max_block_raw_bytes = value
+                    .parse()
+                    .map_err(|_| format!("bad --max-block-raw-bytes {value}\n{usage}"))?
+            }
             "--dataset" => {
                 let mut parts = value.splitn(3, ':');
                 let (Some(name), Some(format), Some(files)) =
@@ -299,7 +329,7 @@ fn parse_args() -> Result<(PathBuf, PathBuf, Vec<Dataset>), String> {
         }
     }
     match (work, out) {
-        (Some(w), Some(o)) if !datasets.is_empty() => Ok((w, o, datasets)),
+        (Some(w), Some(o)) if !datasets.is_empty() => Ok((w, o, datasets, run)),
         _ => Err(usage.to_owned()),
     }
 }

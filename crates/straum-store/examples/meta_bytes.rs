@@ -7,7 +7,11 @@
 //! `block_bytes` is the compressed new objects: segment bytes plus inline
 //! blocks in the WAL.
 //!
-//!   cargo run --release --example meta_bytes -- <empty scratch dir>
+//! An optional second argument sets `Config::max_block_raw_bytes` (the
+//! engine's default otherwise); `18446744073709551615` puts each batch's new
+//! objects in one block, as format 8 did before the limit.
+//!
+//!   cargo run --release --example meta_bytes -- <empty scratch dir> [max_block_raw_bytes]
 
 use straum_store::{Config, Message, Store, WriteMode};
 
@@ -17,19 +21,27 @@ const BATCHES: usize = 16;
 const NOW_MS: u64 = 1_700_000_000_000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = std::path::PathBuf::from(std::env::args().nth(1).ok_or("usage: meta_bytes <dir>")?);
+    let root = std::path::PathBuf::from(
+        std::env::args()
+            .nth(1)
+            .ok_or("usage: meta_bytes <dir> [max_block_raw_bytes]")?,
+    );
+    let cap = match std::env::args().nth(2) {
+        Some(v) => v.parse()?,
+        None => Config::default().max_block_raw_bytes,
+    };
     let modes = [
         ("sequential", WriteMode::Sequential),
         ("parallel", WriteMode::ParallelSync),
         ("inline", WriteMode::INLINE_SMALL),
     ];
     println!(
-        "mode,msg_size,batch,kind,messages,wal_bytes,topic_bytes,block_bytes,meta_bytes_per_msg"
+        "mode,msg_size,batch,kind,messages,wal_bytes,topic_bytes,block_bytes,meta_bytes_per_msg,max_block_raw_bytes"
     );
     let rt = compio::runtime::Runtime::new()?;
     for (name, mode) in modes {
         for size in [100usize, 1024, 10240] {
-            for batch in [1usize, 64] {
+            for batch in [1usize, 64, 512] {
                 let dir = root.join(format!("{name}-{size}-{batch}"));
                 let _ = std::fs::remove_dir_all(&dir);
                 let payloads: Vec<Vec<u8>> = (0..BATCHES * batch)
@@ -42,6 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rt.block_on(async {
                     let config = Config {
                         write_mode: mode,
+                        max_block_raw_bytes: cap,
                         ..Config::default()
                     };
                     let mut store = Store::open(&dir, config).await?;
@@ -70,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let n = payloads.len() as u64;
                         let meta = meta as f64 / n as f64;
                         println!(
-                            "{name},{size},{batch},{kind},{n},{wal},{topic},{blocks},{meta:.3}"
+                            "{name},{size},{batch},{kind},{n},{wal},{topic},{blocks},{meta:.3},{cap}"
                         );
                     }
                     Ok::<_, Box<dyn std::error::Error>>(())
