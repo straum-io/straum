@@ -39,14 +39,16 @@ Write modes (`Config::write_mode`):
 ## Build and test
 
 ```bash
-cargo build
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-scripts/container/linux.sh --switch-machine test --workspace   # Linux, io_uring
+scripts/validate.sh quick   # fmt, clippy, the quick tests on macOS
+scripts/validate.sh push    # macOS and the io_uring container, long tests, 50 crash iterations
+scripts/validate.sh pr      # as push, 200 crash iterations
 ```
 
-The container script and its Podman machine setup are described in
-`scripts/container/README.md`.
+The long tests (the crash test and the proptest model) are
+`#[ignore = "long: ..."]`: `cargo test --workspace` skips them,
+`cargo test --workspace -- --include-ignored` runs them. CI runs them on
+every PR. The container script and its Podman machine setup are described
+in `scripts/container/README.md`.
 
 Test variables: `STRAUM_STORE_CRASH_ITERATIONS` (default 200),
 `STRAUM_STORE_CRASH_SEED` (default 24301), `PROPTEST_CASES` (default 128).
