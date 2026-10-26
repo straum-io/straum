@@ -1,0 +1,12 @@
+{
+  "name": "broker_stats",
+  "note": "empty body",
+  "direction": "request",
+  "type_code": 10,
+  "correlation_id": "23",
+  "frame_bytes": 14,
+  "message": {
+    "type": "BrokerStats",
+    "body": {}
+  }
+}

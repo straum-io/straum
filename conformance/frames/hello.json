@@ -1,0 +1,18 @@
+{
+  "name": "hello",
+  "note": "the v0 handshake",
+  "direction": "request",
+  "type_code": 1,
+  "correlation_id": "1",
+  "frame_bytes": 43,
+  "message": {
+    "type": "Hello",
+    "body": {
+      "min_version": 0,
+      "max_version": 0,
+      "client_name": "straum-client",
+      "auth_mechanism": "none",
+      "auth_payload": ""
+    }
+  }
+}

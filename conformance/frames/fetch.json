@@ -1,0 +1,19 @@
+{
+  "name": "fetch",
+  "note": "",
+  "direction": "request",
+  "type_code": 7,
+  "correlation_id": "19",
+  "frame_bytes": 46,
+  "message": {
+    "type": "Fetch",
+    "body": {
+      "topic": "orders",
+      "partition": 0,
+      "from_seq": "0",
+      "max_bytes": 1048576,
+      "max_wait_ms": 500,
+      "expected_leader_epoch": 0
+    }
+  }
+}

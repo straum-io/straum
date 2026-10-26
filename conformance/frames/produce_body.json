@@ -1,0 +1,27 @@
+{
+  "name": "produce_body",
+  "note": "no key, no headers: flags 0",
+  "direction": "request",
+  "type_code": 6,
+  "correlation_id": "10",
+  "frame_bytes": 65,
+  "message": {
+    "type": "Produce",
+    "body": {
+      "topic": "orders",
+      "partition": 0,
+      "producer_id": "7",
+      "producer_seq": "1",
+      "ack_level": 1,
+      "expected_leader_epoch": 0,
+      "timeout_ms": 0,
+      "messages": [
+        {
+          "key": null,
+          "headers": [],
+          "body": "68656c6c6f"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "ping_max",
+  "note": "largest correlation id and nonce",
+  "direction": "request",
+  "type_code": 2,
+  "correlation_id": "18446744073709551615",
+  "frame_bytes": 22,
+  "message": {
+    "type": "Ping",
+    "body": {
+      "nonce": "18446744073709551615"
+    }
+  }
+}

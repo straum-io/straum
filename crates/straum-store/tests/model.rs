@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use common::TempDir;
 use proptest::prelude::*;
-use straum_store::{Config, Message, ObjectId, Store, WriteMode};
+use straum_store::{Config, Entry, Message, ObjectId, Store, WriteMode};
 
 const TOPICS: [&[u8]; 3] = [b"a", b"b", b"c"];
 
@@ -25,26 +25,44 @@ fn payloads() -> Vec<Vec<u8>> {
 
 #[derive(Clone, Debug)]
 enum Op {
-    Put(Vec<(usize, usize)>),
-    Release { topic: usize, age: u64 },
+    /// (topic, payload, attributes) per message: `ATTRS[attributes]`.
+    Put(Vec<(usize, usize, usize)>),
+    Release {
+        topic: usize,
+        age: u64,
+    },
     Compact,
     Restart,
 }
 
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        4 => prop::collection::vec((0..TOPICS.len(), 0..6usize), 0..8).prop_map(Op::Put),
+        4 => prop::collection::vec((0..TOPICS.len(), 0..6usize, 0..ATTRS.len()), 0..8).prop_map(Op::Put),
         2 => (0..TOPICS.len(), 0..6u64).prop_map(|(topic, age)| Op::Release { topic, age }),
         1 => Just(Op::Compact),
         1 => Just(Op::Restart),
     ]
 }
 
+type Attrs = (
+    Option<&'static [u8]>,
+    &'static [(&'static [u8], &'static [u8])],
+);
+
+/// A publication's key and headers: none, an empty key, a key and two
+/// headers with a repeated name. The same payload under different ones is
+/// still one object.
+const ATTRS: [Attrs; 3] = [
+    (None, &[]),
+    (Some(b""), &[]),
+    (Some(b"k"), &[(b"h", b"1"), (b"h", b"")]),
+];
+
 #[derive(Default)]
 struct ModelTopic {
     first_live: u64,
-    /// Every entry ever published: (payload index, timestamp).
-    entries: Vec<(usize, u64)>,
+    /// Every entry ever published: (payload index, timestamp, attributes).
+    entries: Vec<(usize, u64, usize)>,
 }
 
 #[derive(Default)]
@@ -60,7 +78,7 @@ impl Model {
     fn live_counts(&self) -> HashMap<usize, u64> {
         let mut counts = HashMap::new();
         for t in self.topics.values() {
-            for &(p, _) in &t.entries[t.first_live as usize..] {
+            for &(p, _, _) in &t.entries[t.first_live as usize..] {
                 *counts.entry(p).or_default() += 1;
             }
         }
@@ -83,6 +101,24 @@ async fn check(store: &Store, model: &Model, payloads: &[Vec<u8>]) {
                 store.read(name, seq).await.unwrap(),
                 want,
                 "topic {ti} seq {seq}"
+            );
+            let want = (seq >= t.first_live && seq < next).then(|| {
+                let (p, timestamp, a) = t.entries[seq as usize];
+                let (key, headers) = ATTRS[a];
+                Entry {
+                    timestamp,
+                    key: key.map(<[u8]>::to_vec),
+                    headers: headers
+                        .iter()
+                        .map(|(n, v)| (n.to_vec(), v.to_vec()))
+                        .collect(),
+                    payload: payloads[p].clone(),
+                }
+            });
+            assert_eq!(
+                store.read_entry(name, seq).await.unwrap(),
+                want,
+                "entry {ti}/{seq}"
             );
         }
     }
@@ -124,21 +160,23 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
                 Op::Put(msgs) => {
                     let batch: Vec<Message> = msgs
                         .iter()
-                        .map(|&(t, p)| Message {
+                        .map(|&(t, p, a)| Message {
                             topic: TOPICS[t],
                             payload: &payloads[p],
+                            key: ATTRS[a].0,
+                            headers: ATTRS[a].1,
                         })
                         .collect();
                     let seqs = store.put_batch(&batch, now).await.unwrap();
-                    for (&(t, p), seq) in msgs.iter().zip(seqs) {
+                    for (&(t, p, a), seq) in msgs.iter().zip(seqs) {
                         let inline = model
                             .inline_threshold
                             .is_some_and(|th| payloads[p].len() <= th);
                         model.indexed.entry(p).or_insert(inline);
                         let mt = model.topics.entry(t).or_default();
                         assert_eq!(seq, mt.entries.len() as u64, "assigned seq");
-                        let ts = mt.entries.last().map_or(now, |&(_, ts)| ts.max(now));
-                        mt.entries.push((p, ts));
+                        let ts = mt.entries.last().map_or(now, |&(_, ts, _)| ts.max(now));
+                        mt.entries.push((p, ts, a));
                     }
                 }
                 Op::Release { topic, age } => {

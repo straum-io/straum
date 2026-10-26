@@ -1,0 +1,20 @@
+{
+  "name": "error_overloaded",
+  "note": "with a retry hint",
+  "direction": "response",
+  "type_code": 65535,
+  "correlation_id": "19",
+  "frame_bytes": 58,
+  "message": {
+    "type": "Error",
+    "body": {
+      "code": "Overloaded",
+      "message": "too many waiting fetches",
+      "leader_node_id": 0,
+      "leader_epoch": 0,
+      "retry_after_ms": 100,
+      "min_version": 0,
+      "max_version": 0
+    }
+  }
+}

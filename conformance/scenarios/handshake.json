@@ -1,0 +1,172 @@
+{
+  "name": "handshake",
+  "description": "Hello and version negotiation; requests before Hello; Ping without Hello.",
+  "steps": [
+    {
+      "connect": "a"
+    },
+    {
+      "send": "a",
+      "id": "ping",
+      "request": {
+        "type": "Ping",
+        "body": {
+          "nonce": "42"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "ping",
+      "response": {
+        "type": "Pong",
+        "body": {
+          "nonce": "42"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "early",
+      "request": {
+        "type": "ListTopics"
+      }
+    },
+    {
+      "expect": "a",
+      "id": "early",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "Unauthenticated"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "future",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 1,
+          "max_version": 5,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "future",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "UnsupportedVersion",
+          "min_version": 0,
+          "max_version": 0
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "inverted",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 3,
+          "max_version": 1,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "inverted",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "MalformedRequest"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "auth",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 0,
+          "client_name": "conformance",
+          "auth_mechanism": "plain",
+          "auth_payload": "757365720070617373"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "auth",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "Unauthenticated"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "range",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 9,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "range",
+      "response": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "conformance",
+          "node_id": 1,
+          "max_frame_bytes": 8388608,
+          "max_message_bytes": 1048576
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "again",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 0,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "again",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "Unsupported"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "delete_topic_ok",
+  "note": "empty body; never sent by v0",
+  "direction": "response",
+  "type_code": 32773,
+  "correlation_id": "9",
+  "frame_bytes": 14,
+  "message": {
+    "type": "DeleteTopicOk",
+    "body": {}
+  }
+}

@@ -17,7 +17,7 @@ impl ObjectId {
 /// `magic [8] | version u32 | crc32c u32` at the start of `wal.log`.
 pub const WAL_FILE_HEADER: usize = 16;
 pub const WAL_MAGIC: [u8; 8] = *b"STRMWAL\0";
-pub const WAL_VERSION: u32 = 7;
+pub const WAL_VERSION: u32 = 8;
 /// `len u32 | seq u64 | count u32 | mode u8 | crc32c u32`.
 pub const FRAME_HEADER: usize = 21;
 /// Header bytes covered by the frame CRC (everything before it).
@@ -148,6 +148,11 @@ pub enum Record<'a> {
         /// Object number from the object's PutObject or PutInline.
         number: u64,
         timestamp: u64,
+        /// The publication's key and headers (`encode_attrs`); empty when
+        /// it has neither. `attrs_at` is where they start within the frame
+        /// body; set by `decode_records`, ignored by `encode`.
+        attrs: &'a [u8],
+        attrs_at: usize,
     },
     Release {
         topic: u64,
@@ -176,6 +181,7 @@ pub enum Record<'a> {
 /// kept object (Compact), + object length (PutInline).
 pub const RECORD_PUT_OBJECT: usize = RECORD_HEADER_MAX + 32 + 4 * MAX_VARINT;
 pub const RECORD_PUT_TOPIC_BASE: usize = RECORD_HEADER_MAX + MAX_VARINT;
+/// Without its attributes (`attrs_len`).
 pub const RECORD_PUBLISH: usize = RECORD_HEADER_MAX + 4 * MAX_VARINT;
 pub const RECORD_RELEASE: usize = RECORD_HEADER_MAX + 2 * MAX_VARINT;
 pub const RECORD_COMPACT_BASE: usize = RECORD_HEADER_MAX + 20;
@@ -223,7 +229,7 @@ impl Record<'_> {
         match self {
             Record::PutObject { .. } => RECORD_PUT_OBJECT,
             Record::PutTopic { name, .. } => RECORD_PUT_TOPIC_BASE + name.len(),
-            Record::Publish { .. } => RECORD_PUBLISH,
+            Record::Publish { attrs, .. } => RECORD_PUBLISH + attrs.len(),
             Record::Release { .. } => RECORD_RELEASE,
             Record::Compact { kept, .. } => RECORD_COMPACT_BASE + 40 * kept.len(),
             Record::PutInline { data, .. } => RECORD_PUT_INLINE_BASE + data.len(),
@@ -261,11 +267,14 @@ impl Record<'_> {
                 seq,
                 number,
                 timestamp,
+                attrs,
+                ..
             } => {
                 put_uvarint(&mut p, *topic);
                 put_uvarint(&mut p, *seq);
                 put_uvarint(&mut p, zigzag(number.wrapping_sub(ctx.number) as i64));
                 put_uvarint(&mut p, zigzag(timestamp.wrapping_sub(ctx.timestamp) as i64));
+                p.extend_from_slice(attrs);
                 ctx.number = *number;
                 ctx.timestamp = *timestamp;
                 PUBLISH
@@ -472,11 +481,16 @@ fn decode_record<'a>(
             let timestamp = ctx.timestamp.wrapping_add(unzigzag(r.uvarint()?) as u64);
             ctx.number = number;
             ctx.timestamp = timestamp;
+            let attrs_at = payload_at + payload.len() - r.0.len();
+            let attrs = std::mem::take(&mut r.0);
+            decode_attrs(attrs)?;
             Record::Publish {
                 topic,
                 seq,
                 number,
                 timestamp,
+                attrs,
+                attrs_at,
             }
         }
         RELEASE => Record::Release {
@@ -514,6 +528,93 @@ fn decode_record<'a>(
         return Err("trailing bytes in record");
     }
     Ok(rec)
+}
+
+/// A publication's key and headers, as stored after a Publish record's
+/// timestamp: `key` (varint length + 1, 0 = no key) and its bytes, `count`
+/// varint, then per header `name` and `value`, each a varint length and the
+/// bytes. A publication with neither stores nothing at all.
+pub fn encode_attrs(out: &mut Vec<u8>, key: Option<&[u8]>, headers: &[(&[u8], &[u8])]) {
+    if key.is_none() && headers.is_empty() {
+        return;
+    }
+    match key {
+        Some(k) => {
+            put_uvarint(out, k.len() as u64 + 1);
+            out.extend_from_slice(k);
+        }
+        None => out.push(0),
+    }
+    put_uvarint(out, headers.len() as u64);
+    for (name, value) in headers {
+        put_uvarint(out, name.len() as u64);
+        out.extend_from_slice(name);
+        put_uvarint(out, value.len() as u64);
+        out.extend_from_slice(value);
+    }
+}
+
+/// Exact length of `encode_attrs`'s output.
+pub fn attrs_len(key: Option<&[u8]>, headers: &[(&[u8], &[u8])]) -> usize {
+    if key.is_none() && headers.is_empty() {
+        return 0;
+    }
+    let field = |len: usize| varint_len(len as u64) + len;
+    let key = match key {
+        Some(k) => varint_len(k.len() as u64 + 1) + k.len(),
+        None => 1,
+    };
+    key + varint_len(headers.len() as u64)
+        + headers
+            .iter()
+            .map(|(n, v)| field(n.len()) + field(v.len()))
+            .sum::<usize>()
+}
+
+fn varint_len(mut v: u64) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        n += 1;
+        v >>= 7;
+    }
+    n
+}
+
+/// A publication's key and headers.
+pub type Attrs = (Option<Vec<u8>>, Vec<(Vec<u8>, Vec<u8>)>);
+
+/// Decodes `encode_attrs`'s output; empty input is no key and no headers.
+pub fn decode_attrs(buf: &[u8]) -> Result<Attrs, &'static str> {
+    if buf.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    let mut r = Reader(buf);
+    let key = match r.uvarint()? {
+        0 => None,
+        n => Some(
+            r.take(usize::try_from(n - 1).map_err(|_| "key too long")?)?
+                .to_vec(),
+        ),
+    };
+    let count = r.uvarint()?;
+    // Every header takes at least 2 bytes.
+    if count > r.0.len() as u64 / 2 {
+        return Err("header count exceeds attributes");
+    }
+    let mut headers = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let n = usize::try_from(r.uvarint()?).map_err(|_| "header name too long")?;
+        let name = r.take(n)?.to_vec();
+        let n = usize::try_from(r.uvarint()?).map_err(|_| "header value too long")?;
+        headers.push((name, r.take(n)?.to_vec()));
+    }
+    if key.is_none() && headers.is_empty() {
+        return Err("empty attributes are stored as nothing");
+    }
+    if !r.0.is_empty() {
+        return Err("trailing bytes in attributes");
+    }
+    Ok((key, headers))
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -673,6 +774,8 @@ mod tests {
                 seq: 42,
                 number: 77,
                 timestamp: 1_700_000_000_000,
+                attrs: &[],
+                attrs_at: 0,
             },
             // A deduplicated object far back, and a timestamp going down
             // (another topic): negative deltas.
@@ -681,6 +784,8 @@ mod tests {
                 seq: 1 << 40,
                 number: 3,
                 timestamp: 1_699_999_999_000,
+                attrs: &[],
+                attrs_at: 0,
             },
             Record::Release { topic: 4, seq: 0 },
             Record::Compact {
@@ -795,8 +900,24 @@ mod tests {
             let frame = decode_frame(&buf).unwrap();
             assert_eq!((frame.seq, frame.count, frame.size()), (7, 7, buf.len()));
             assert_eq!(frame_mode(&frame), Ok(FrameMode::ParallelSync));
-            assert_eq!(decode_records(&frame, next_object).unwrap(), records);
+            assert_eq!(
+                positionless(decode_records(&frame, next_object).unwrap()),
+                records
+            );
         }
+    }
+
+    /// Clears the positions the decoder fills in (`data_at`, `attrs_at`), so
+    /// decoded records compare equal to the ones encoded.
+    fn positionless(mut recs: Vec<Record<'_>>) -> Vec<Record<'_>> {
+        for r in &mut recs {
+            match r {
+                Record::PutInline { data_at, .. } => *data_at = 0,
+                Record::Publish { attrs_at, .. } => *attrs_at = 0,
+                _ => {}
+            }
+        }
+        recs
     }
 
     #[test]
@@ -811,12 +932,16 @@ mod tests {
                 seq: u64::MAX,
                 number: u64::MAX,
                 timestamp: u64::MAX,
+                attrs: &[],
+                attrs_at: 0,
             },
             Record::Publish {
                 topic: 0,
                 seq: 0,
                 number: 0,
                 timestamp: 0,
+                attrs: &[],
+                attrs_at: 0,
             },
             Record::Release {
                 topic: u64::MAX,
@@ -838,12 +963,8 @@ mod tests {
         ];
         let buf = frame_of(&records, u64::MAX, 0);
         let frame = decode_frame(&buf).unwrap();
-        let mut decoded = decode_records(&frame, 0).unwrap();
-        // `data_at` is filled in by the decoder.
-        if let Some(Record::PutInline { data_at, .. }) = decoded.last_mut() {
-            *data_at = 0;
-        }
-        assert_eq!(decoded, records);
+        let decoded = decode_records(&frame, 0).unwrap();
+        assert_eq!(positionless(decoded), records);
     }
 
     #[test]
@@ -858,12 +979,16 @@ mod tests {
                 seq: 1,
                 number: 300,
                 timestamp: 2,
+                attrs: &[],
+                attrs_at: 0,
             },
             Record::Publish {
                 topic: 0,
                 seq: 2,
                 number: 301,
                 timestamp: 2,
+                attrs: &[],
+                attrs_at: 0,
             },
         ];
         // next object number 300 when the frame starts
@@ -1060,5 +1185,74 @@ mod tests {
         ];
         let (bytes, _) = index_of(&entries);
         assert_eq!(decode_index_block(&bytes, 0).entries, entries);
+    }
+
+    #[test]
+    fn attrs_round_trip_and_cost_nothing_when_empty() {
+        let mut out = Vec::new();
+        encode_attrs(&mut out, None, &[]);
+        assert!(out.is_empty(), "no key and no headers store nothing");
+        assert_eq!(attrs_len(None, &[]), 0);
+        assert_eq!(decode_attrs(&[]), Ok((None, Vec::new())));
+        let big = vec![7u8; 300];
+        let headers: [(&[u8], &[u8]); 2] = [(b"a", b""), (b"", &big)];
+        for (key, headers) in [
+            (Some(&b""[..]), &headers[..0]),
+            (Some(&b"user-42"[..]), &headers[..]),
+            (None, &headers[..1]),
+            (Some(&big[..]), &headers[..]),
+        ] {
+            out.clear();
+            encode_attrs(&mut out, key, headers);
+            assert_eq!(out.len(), attrs_len(key, headers));
+            let (k, h) = decode_attrs(&out).unwrap();
+            assert_eq!(k.as_deref(), key);
+            let h: Vec<(&[u8], &[u8])> = h.iter().map(|(n, v)| (&n[..], &v[..])).collect();
+            assert_eq!(h, headers);
+        }
+        // An empty key costs 2 bytes: key length 0 + 1, no headers.
+        assert_eq!(attrs_len(Some(b""), &[]), 2);
+    }
+
+    #[test]
+    fn malformed_attrs_are_rejected() {
+        for (bad, why) in [
+            (&[0u8, 0][..], "empty attributes are stored as nothing"),
+            (&[3, b'a'][..], "truncated"),
+            (&[0, 5, 0][..], "header count exceeds attributes"),
+            (&[1, 0, 9][..], "trailing bytes in attributes"),
+        ] {
+            assert!(decode_attrs(bad).is_err(), "{why}: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn publish_attributes_are_located_in_the_frame() {
+        let mut attrs = Vec::new();
+        encode_attrs(&mut attrs, Some(b"k"), &[(b"h", b"v")]);
+        let mut buf = Vec::new();
+        let mut frame = FrameBuilder::begin(&mut buf, 0);
+        let rec = Record::Publish {
+            topic: 0,
+            seq: 0,
+            number: 0,
+            timestamp: 9,
+            attrs: &attrs,
+            attrs_at: 0,
+        };
+        frame.record(&mut buf, &rec).unwrap();
+        frame.finish(&mut buf, 0, FrameMode::Sequential).unwrap();
+        let f = decode_frame(&buf).unwrap();
+        let recs = decode_records(&f, 0).unwrap();
+        let Record::Publish {
+            attrs: got,
+            attrs_at,
+            ..
+        } = recs[0]
+        else {
+            panic!("not a Publish")
+        };
+        assert_eq!(got, &attrs[..]);
+        assert_eq!(&f.body[attrs_at..attrs_at + attrs.len()], &attrs[..]);
     }
 }

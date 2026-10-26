@@ -44,7 +44,7 @@ rewritten segment).
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 7 |
+| 8 | 4 | `version` u32 = 8 |
 | 12 | 4 | `crc` u32: CRC32C of bytes `[0..12)` |
 
 A new WAL is written to `wal.log.tmp`, synced (`fsync`), renamed to `wal.log`,
@@ -54,7 +54,8 @@ a header, an empty file, another version) is `UnsupportedFormat`, and the file
 is not changed. Earlier versions are not supported: 1 had no mode byte in the
 frame, 2 full ids in Publish and in the topic index, 3 `topic_seq` in topic
 index entries, 4 fixed-width Publish and Release with the topic name, 5
-fixed-width PutObject and PutInline, 6 a topic index of 20-byte entries.
+fixed-width PutObject and PutInline, 6 a topic index of 20-byte entries, 7
+Publish without the publication's key and headers.
 
 ### Frame
 
@@ -141,7 +142,7 @@ Publish. A number is never repeated, and a name gets a number once. Recovery
 builds the number → name table from these records; a Publish or Release with
 a number that has no PutTopic is `CorruptWal`.
 
-### 2 — Publish (payload 4–40 bytes)
+### 2 — Publish (payload 4–40 bytes + attributes)
 
 | Field | Size |
 |---|---|
@@ -149,6 +150,23 @@ a number that has no PutTopic is `CorruptWal`.
 | `topic_seq` varint | 1–10 |
 | Δ`object_number`, zigzag varint | 1–10 |
 | Δ`timestamp`, zigzag varint (ms, given by the caller; does not decrease within a topic) | 1–10 |
+| attributes: the publication's key and headers, to the end of the payload | 0 if neither |
+
+Attributes (`codec::encode_attrs`), present only if the publication has a
+key or at least one header:
+
+| Field | Encoding |
+|---|---|
+| `key` | varint `length + 1`, then the bytes; `0`: no key (a present empty key is `1`) |
+| `count` | varint, the number of headers |
+| per header | `name`: varint length, bytes; `value`: varint length, bytes |
+
+A key and headers belong to the publication, not to the object: the object
+is the payload alone, identified by its BLAKE3 id and stored once. The same
+payload published with different keys or headers is one object with one
+Publish per publication, each with its own attributes. Attributes are
+neither deduplicated nor compressed. Present-but-empty attributes (`00 00`)
+are `CorruptWal`: they are stored as nothing.
 
 Deltas are taken within the frame, from the previous Publish of the same
 frame. For a frame's first Publish, the object number base is the next object
@@ -299,6 +317,12 @@ The block number is part of the CRC, so a block at the wrong position fails
 the check. The encoding is deterministic: the same entries always give the
 same bytes.
 
+The index holds no key or headers. In memory each live entry keeps the WAL
+offset and length of its Publish record's attributes (16 bytes more per
+live entry than without them); `Store::read_entry` reads them from
+`wal.log`, which is never rewritten. Replay rebuilds those offsets from the
+WAL.
+
 **Lookup by `topic_seq`.** Block start offsets are kept in memory (8 bytes per
 block): block `topic_seq div 64` is read with one positional read and decoded
 up to the entry (at most 64), O(1). The table is built at open (the index is
@@ -367,7 +391,7 @@ For a batch of `b` messages:
 | Part | Bytes |
 |---|---|
 | PutObject (new object only) | 2 + 32 + Δnumber 1 + segment 1 + offset 1–4 (segments up to 64 MiB) + length 1–5 |
-| Publish | 2 + 4…40: topic number and seq 1–10 each; number and time deltas usually 1 byte each; the time of a frame's first Publish about 6 bytes for millisecond time |
+| Publish | 2 + 4…40: topic number and seq 1–10 each; number and time deltas usually 1 byte each; the time of a frame's first Publish about 6 bytes for millisecond time; plus the attributes: 0 bytes without key and headers, 2 for an empty key, `1 + key` + 1 for a key below 127 bytes and no headers |
 | frame header | 21 / `b` |
 | topic index entry | ~2 (+ ~9 for a block's first entry and a 4-byte CRC per 64 entries) |
 | PutTopic | once per topic |

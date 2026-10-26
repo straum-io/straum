@@ -1,0 +1,17 @@
+{
+  "name": "create_topic",
+  "note": "",
+  "direction": "request",
+  "type_code": 4,
+  "correlation_id": "7",
+  "frame_bytes": 36,
+  "message": {
+    "type": "CreateTopic",
+    "body": {
+      "name": "orders",
+      "partitions": 1,
+      "replication_factor": 1,
+      "retention_ms": "0"
+    }
+  }
+}

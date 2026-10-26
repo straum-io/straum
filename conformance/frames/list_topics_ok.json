@@ -1,0 +1,23 @@
+{
+  "name": "list_topics_ok",
+  "note": "",
+  "direction": "response",
+  "type_code": 32776,
+  "correlation_id": "21",
+  "frame_bytes": 116,
+  "message": {
+    "type": "ListTopicsOk",
+    "body": {
+      "topics": [
+        {
+          "name": "orders",
+          "partitions": 1
+        },
+        {
+          "name": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+          "partitions": 1
+        }
+      ]
+    }
+  }
+}

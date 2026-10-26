@@ -73,10 +73,36 @@ impl Default for Config {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Message<'a> {
     pub topic: &'a [u8],
     pub payload: &'a [u8],
+    /// The publication's key; `Some(&[])` is a present, empty key. Key and
+    /// headers belong to the publication, not to the object: the object is
+    /// the payload alone (its BLAKE3 id), stored once.
+    pub key: Option<&'a [u8]>,
+    /// The publication's headers `(name, value)`, in order.
+    pub headers: &'a [(&'a [u8], &'a [u8])],
+}
+
+/// One live entry as `Store::read_entry` returns it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Entry {
+    pub timestamp: u64,
+    pub key: Option<Vec<u8>>,
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub payload: Vec<u8>,
+}
+
+/// One topic's counters, from memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TopicStats {
+    /// The first live seq.
+    pub first_live: u64,
+    /// The seq the next entry gets.
+    pub next_seq: u64,
+    /// Bytes of the topic's index file.
+    pub index_bytes: u64,
 }
 
 /// Counters since `open`, in memory only: they start at zero on every open
@@ -203,10 +229,21 @@ struct Topic {
     last_timestamp: u64,
     // Every live entry is held in memory. If the live set outgrows RAM,
     // reads can be served from the index file (`Store::index_entry`).
-    /// `(object number, timestamp)`.
-    live: VecDeque<(u64, u64)>,
+    live: VecDeque<Live>,
     /// Encoded entries of the current batch, written after the WAL fsync.
     pending: Vec<u8>,
+}
+
+/// A topic entry in memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Live {
+    number: u64,
+    timestamp: u64,
+    /// Absolute offset and length of the publication's key and headers in
+    /// `wal.log` (a Publish record's tail); length 0: neither. The WAL is
+    /// never rewritten, so the offset stays valid.
+    attrs_at: u64,
+    attrs_len: u32,
 }
 
 struct Active {
@@ -377,7 +414,7 @@ impl Store {
             &replay.objects,
             topics
                 .values()
-                .flat_map(|t| t.live.iter().map(|(number, _)| number)),
+                .flat_map(|t| t.live.iter().map(|e| &e.number)),
         )?;
 
         Ok(Self {
@@ -425,25 +462,7 @@ impl Store {
             u32::try_from(m.payload.len()).map_err(|_| StoreError::ObjectTooLarge)?;
         }
         // Upper bound: every object counted as new.
-        let inline = self.config.write_mode.inline_threshold();
-        let frame: usize = FRAME_HEADER
-            + batch
-                .iter()
-                .map(|m| {
-                    let put = match inline {
-                        Some(t) if m.payload.len() <= t => RECORD_PUT_INLINE_BASE + m.payload.len(),
-                        _ => RECORD_PUT_OBJECT,
-                    };
-                    // A new topic adds its PutTopic (counted per message: an
-                    // upper bound).
-                    let topic = if self.topics.contains_key(m.topic) {
-                        0
-                    } else {
-                        RECORD_PUT_TOPIC_BASE + m.topic.len()
-                    };
-                    put + RECORD_PUBLISH + topic
-                })
-                .sum::<usize>();
+        let frame = self.batch_frame_bytes(batch);
         self.check_frame(frame)?;
         let res = self.put_batch_inner(batch, now_ms).await;
         self.poison_on_err(res)
@@ -459,6 +478,8 @@ impl Store {
         let mut wal_buf = std::mem::take(&mut self.wal_buf);
         wal_buf.clear();
         let mut frame = FrameBuilder::begin(&mut wal_buf, self.next_object);
+        let mut attrs = Vec::new();
+        let wal_len = self.wal_len;
         // Added to `stats` once the batch is durable.
         let (mut deduplicated, mut new_bytes, mut inline_bytes) = (0, 0, 0);
         for m in batch {
@@ -533,18 +554,30 @@ impl Store {
             let seq = topic.first_live + topic.live.len() as u64;
             let timestamp = now_ms.max(topic.last_timestamp);
             topic.last_timestamp = timestamp;
-            topic.live.push_back((number, timestamp));
             let at = topic.index_len + topic.pending.len() as u64;
             if topic.index.push(&mut topic.pending, number, timestamp) {
                 topic.block_starts.push(at);
             }
+            attrs.clear();
+            codec::encode_attrs(&mut attrs, m.key, m.headers);
             let publish = Record::Publish {
                 topic: topic.number,
                 seq,
                 number,
                 timestamp,
+                attrs: &attrs,
+                attrs_at: 0,
             };
             frame.record(&mut wal_buf, &publish)?;
+            // The attributes end the record just written; the frame starts
+            // at `wal_len`, at index 0 of the buffer.
+            let attrs_len = u32::try_from(attrs.len()).map_err(|_| StoreError::FrameTooLarge)?;
+            topic.live.push_back(Live {
+                number,
+                timestamp,
+                attrs_at: wal_len + (wal_buf.len() - attrs.len()) as u64,
+                attrs_len,
+            });
             seqs.push(seq);
         }
         match self.config.write_mode {
@@ -588,7 +621,11 @@ impl Store {
     ) -> Result<u64, StoreError> {
         self.usable()?;
         if let Some(t) = self.topics.get(topic) {
-            let n = t.live.iter().take_while(|&&(_, ts)| ts < cutoff_ms).count();
+            let n = t
+                .live
+                .iter()
+                .take_while(|e| e.timestamp < cutoff_ms)
+                .count();
             self.check_frame(FRAME_HEADER + n * RECORD_RELEASE)?;
         }
         let res = self.release_inner(topic, cutoff_ms).await;
@@ -605,7 +642,10 @@ impl Store {
         wal_buf.clear();
         let mut frame = FrameBuilder::begin(&mut wal_buf, self.next_object);
         let mut released = 0;
-        while let Some(&(number, timestamp)) = topic.live.front() {
+        while let Some(&Live {
+            number, timestamp, ..
+        }) = topic.live.front()
+        {
             if timestamp >= cutoff_ms {
                 break;
             }
@@ -807,9 +847,84 @@ impl Store {
     }
 
     fn entry_number(&self, topic: &[u8], seq: u64) -> Option<u64> {
+        self.live(topic, seq).map(|e| e.number)
+    }
+
+    fn live(&self, topic: &[u8], seq: u64) -> Option<Live> {
         let t = self.topics.get(topic)?;
         let idx = usize::try_from(seq.checked_sub(t.first_live)?).ok()?;
-        t.live.get(idx).map(|&(number, _)| number)
+        t.live.get(idx).copied()
+    }
+
+    /// Entry `seq` of `topic` with its timestamp, key and headers; `None` if
+    /// the entry was never published or was released. The payload's hash
+    /// is verified. Key and headers are read from the WAL.
+    pub async fn read_entry(&self, topic: &[u8], seq: u64) -> Result<Option<Entry>, StoreError> {
+        self.usable()?;
+        let Some(e) = self.live(topic, seq) else {
+            return Ok(None);
+        };
+        let (_, payload) = self.read_object(e.number).await?;
+        let (key, headers) = if e.attrs_len == 0 {
+            (None, Vec::new())
+        } else {
+            let len = e.attrs_len as usize;
+            let BufResult(res, buf) = self
+                .wal
+                .read_exact_at(Vec::with_capacity(len).slice(..len), e.attrs_at)
+                .await;
+            res?;
+            codec::decode_attrs(&buf.into_inner()).map_err(|reason| StoreError::CorruptWal {
+                offset: e.attrs_at,
+                reason,
+            })?
+        };
+        Ok(Some(Entry {
+            timestamp: e.timestamp,
+            key,
+            headers,
+            payload,
+        }))
+    }
+
+    /// Counters of `topic`; `None` if it has no entry.
+    pub fn topic_stats(&self, topic: &[u8]) -> Option<TopicStats> {
+        self.topics.get(topic).map(|t| TopicStats {
+            first_live: t.first_live,
+            next_seq: t.first_live + t.live.len() as u64,
+            index_bytes: t.index_len,
+        })
+    }
+
+    /// The upper bound of the WAL frame `put_batch` checks against
+    /// `Config::max_frame_bytes` before any I/O. Additive over messages:
+    /// the bound of two batches together is the sum of their bounds minus
+    /// the bound of an empty batch, so a caller can grow a batch message by
+    /// message. A batch over the limit fails with `FrameTooLarge`.
+    pub fn batch_frame_bytes(&self, batch: &[Message<'_>]) -> usize {
+        let inline = self.config.write_mode.inline_threshold();
+        FRAME_HEADER
+            + batch
+                .iter()
+                .map(|m| {
+                    let put = match inline {
+                        Some(t) if m.payload.len() <= t => RECORD_PUT_INLINE_BASE + m.payload.len(),
+                        _ => RECORD_PUT_OBJECT,
+                    };
+                    // A new topic adds its PutTopic (counted per message: an
+                    // upper bound).
+                    let topic = if self.topics.contains_key(m.topic) {
+                        0
+                    } else {
+                        RECORD_PUT_TOPIC_BASE + m.topic.len()
+                    };
+                    put + RECORD_PUBLISH + codec::attrs_len(m.key, m.headers) + topic
+                })
+                .sum::<usize>()
+    }
+
+    pub fn max_frame_bytes(&self) -> u32 {
+        self.config.max_frame_bytes
     }
 
     /// `None` if the object is not in the index (never stored, or reclaimed).
@@ -1121,9 +1236,8 @@ struct Replay<'a> {
 #[derive(Default)]
 struct ReplayTopic {
     number: u64,
-    /// Every published entry, released ones included:
-    /// `(object number, timestamp)`.
-    entries: Vec<(u64, u64)>,
+    /// Every published entry, released ones included.
+    entries: Vec<Live>,
     first_live: u64,
 }
 
@@ -1211,6 +1325,8 @@ impl<'a> Replay<'a> {
                 seq,
                 number,
                 timestamp,
+                attrs,
+                attrs_at,
             } => {
                 let name = self.topic_name(topic)?;
                 let t = self.topics.entry(name).or_default();
@@ -1223,7 +1339,12 @@ impl<'a> Replay<'a> {
                     .get_mut(&number)
                     .ok_or("Publish references an object not in the index")?;
                 object.refs += 1;
-                t.entries.push((number, timestamp));
+                t.entries.push(Live {
+                    number,
+                    timestamp,
+                    attrs_at: body_at + attrs_at as u64,
+                    attrs_len: u32::try_from(attrs.len()).map_err(|_| "attributes too long")?,
+                });
             }
             Record::Release { topic, seq } => {
                 let topic = self.topic_name(topic)?;
@@ -1231,7 +1352,7 @@ impl<'a> Replay<'a> {
                     .topics
                     .get_mut(topic)
                     .ok_or("Release of an unknown topic")?;
-                let &(number, _) = usize::try_from(seq)
+                let &Live { number, .. } = usize::try_from(seq)
                     .ok()
                     .and_then(|i| t.entries.get(i))
                     .filter(|_| seq == t.first_live)
@@ -1403,7 +1524,10 @@ async fn open_topics(
         let mut index = IndexWriter::default();
         let mut expected = Vec::new();
         let mut block_starts = Vec::new();
-        for &(number, timestamp) in &t.entries {
+        for &Live {
+            number, timestamp, ..
+        } in &t.entries
+        {
             let at = expected.len();
             if index.push(&mut expected, number, timestamp) {
                 block_starts.push(at as u64);
@@ -1490,7 +1614,7 @@ async fn open_topics(
                 index_len: expected.len() as u64,
                 block_starts,
                 first_live: t.first_live,
-                last_timestamp: t.entries.last().map_or(0, |&(_, ts)| ts),
+                last_timestamp: t.entries.last().map_or(0, |e| e.timestamp),
                 live: t.entries.iter().skip(first_live).copied().collect(),
                 pending: Vec::new(),
             },
@@ -1738,6 +1862,8 @@ mod tests {
             seq,
             number,
             timestamp: 0,
+            attrs: &[],
+            attrs_at: 0,
         }
     }
 

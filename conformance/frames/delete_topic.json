@@ -1,0 +1,14 @@
+{
+  "name": "delete_topic",
+  "note": "v0 answers Unsupported",
+  "direction": "request",
+  "type_code": 5,
+  "correlation_id": "9",
+  "frame_bytes": 22,
+  "message": {
+    "type": "DeleteTopic",
+    "body": {
+      "name": "orders"
+    }
+  }
+}

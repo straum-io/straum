@@ -1,0 +1,20 @@
+{
+  "name": "error_fenced_plain",
+  "note": "every error code, plain",
+  "direction": "response",
+  "type_code": 65535,
+  "correlation_id": "114",
+  "frame_bytes": 51,
+  "message": {
+    "type": "Error",
+    "body": {
+      "code": "FencedLeaderEpoch",
+      "message": "FencedLeaderEpoch",
+      "leader_node_id": 0,
+      "leader_epoch": 0,
+      "retry_after_ms": 0,
+      "min_version": 0,
+      "max_version": 0
+    }
+  }
+}

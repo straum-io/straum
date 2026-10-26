@@ -1,0 +1,106 @@
+{
+  "name": "fatal_frames",
+  "description": "A frame over max_frame_bytes gets FrameTooLarge with its correlation id and the connection is closed; a frame length below 10 gets MalformedRequest with correlation id 0 and a close.",
+  "broker": {
+    "max_frame_bytes": 4096,
+    "max_message_bytes": 2048
+  },
+  "steps": [
+    {
+      "connect": "a"
+    },
+    {
+      "send": "a",
+      "id": "hello",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 0,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "hello",
+      "response": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "conformance",
+          "node_id": 1
+        }
+      }
+    },
+    {
+      "send_raw": "a",
+      "id": "big",
+      "correlation_id": "77",
+      "hex": "0000100002004d00000000000000"
+    },
+    {
+      "expect": "a",
+      "id": "big",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "FrameTooLarge"
+        }
+      }
+    },
+    {
+      "expect_closed": "a"
+    },
+    {
+      "connect": "b"
+    },
+    {
+      "send": "b",
+      "id": "hello-b",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 0,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "b",
+      "id": "hello-b",
+      "response": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "conformance",
+          "node_id": 1
+        }
+      }
+    },
+    {
+      "send_raw": "b",
+      "id": "short",
+      "correlation_id": "0",
+      "hex": "0500000002000000000000000000"
+    },
+    {
+      "expect": "b",
+      "id": "short",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "MalformedRequest"
+        }
+      }
+    },
+    {
+      "expect_closed": "b"
+    }
+  ]
+}

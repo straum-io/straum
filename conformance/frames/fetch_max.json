@@ -1,0 +1,19 @@
+{
+  "name": "fetch_max",
+  "note": "largest values",
+  "direction": "request",
+  "type_code": 7,
+  "correlation_id": "20",
+  "frame_bytes": 46,
+  "message": {
+    "type": "Fetch",
+    "body": {
+      "topic": "orders",
+      "partition": 4294967295,
+      "from_seq": "18446744073709551615",
+      "max_bytes": 4294967295,
+      "max_wait_ms": 4294967295,
+      "expected_leader_epoch": 4294967295
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "fetch_ok_empty",
+  "note": "a wait that timed out",
+  "direction": "response",
+  "type_code": 32775,
+  "correlation_id": "19",
+  "frame_bytes": 38,
+  "message": {
+    "type": "FetchOk",
+    "body": {
+      "leader_epoch": 1,
+      "start_seq": "5",
+      "next_seq": "5",
+      "messages": []
+    }
+  }
+}

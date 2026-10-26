@@ -1,0 +1,16 @@
+[package]
+name = "straum-conformance"
+version = "0.1.0"
+description = "Runners of the Straum conformance scenarios, and the scripted fake server for client SDKs"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+straum-proto = { path = "../straum-proto" }
+straum-client = { path = "../straum-client" }
+
+[lints]
+workspace = true

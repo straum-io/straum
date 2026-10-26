@@ -1,0 +1,18 @@
+[package]
+name = "straum-proto"
+version = "0.1.0"
+description = "The Straum protocol: frame and message encoding, no I/O"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+crc32c.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

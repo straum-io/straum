@@ -1,0 +1,210 @@
+{
+  "name": "fetch_wait",
+  "description": "A Fetch with no data waits for a commit and wakes on it; without one it answers empty after max_wait_ms.",
+  "steps": [
+    {
+      "connect": "a"
+    },
+    {
+      "send": "a",
+      "id": "hello",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 0,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "hello",
+      "response": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "conformance",
+          "node_id": 1
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "create",
+      "request": {
+        "type": "CreateTopic",
+        "body": {
+          "name": "w",
+          "partitions": 1,
+          "replication_factor": 1,
+          "retention_ms": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "create",
+      "response": {
+        "type": "CreateTopicOk"
+      }
+    },
+    {
+      "connect": "b"
+    },
+    {
+      "send": "b",
+      "id": "hello-b",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 0,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "b",
+      "id": "hello-b",
+      "response": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "conformance",
+          "node_id": 1
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "wait",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "w",
+          "partition": 0,
+          "from_seq": "0",
+          "max_bytes": 1048576,
+          "max_wait_ms": 5000,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "sleep_ms": 400
+    },
+    {
+      "send": "b",
+      "id": "p",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "w",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": "6c617465"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "b",
+      "id": "p",
+      "response": {
+        "type": "ProduceOk",
+        "body": {
+          "base_seq": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "wait",
+      "response": {
+        "type": "FetchOk",
+        "body": {
+          "next_seq": "1",
+          "messages": [
+            {
+              "seq": "0",
+              "timestamp_ms": "*",
+              "key": null,
+              "headers": [],
+              "body": "6c617465"
+            }
+          ]
+        }
+      },
+      "within_ms": 3000,
+      "not_before_ms": 350
+    },
+    {
+      "send": "a",
+      "id": "timeout",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "w",
+          "partition": 0,
+          "from_seq": "1",
+          "max_bytes": 1048576,
+          "max_wait_ms": 300,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "timeout",
+      "response": {
+        "type": "FetchOk",
+        "body": {
+          "next_seq": "1",
+          "messages": []
+        }
+      },
+      "within_ms": 3000,
+      "not_before_ms": 250
+    },
+    {
+      "send": "a",
+      "id": "past",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "w",
+          "partition": 0,
+          "from_seq": "5",
+          "max_bytes": 1048576,
+          "max_wait_ms": 200,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "past",
+      "response": {
+        "type": "FetchOk",
+        "body": {
+          "messages": []
+        }
+      },
+      "not_before_ms": 150
+    }
+  ]
+}

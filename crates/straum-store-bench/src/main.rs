@@ -260,6 +260,7 @@ async fn run_store(
             .map(|p| Message {
                 topic: TOPIC,
                 payload: p,
+                ..Default::default()
             })
             .collect();
         let start = Instant::now();

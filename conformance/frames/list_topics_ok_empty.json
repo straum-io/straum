@@ -1,0 +1,14 @@
+{
+  "name": "list_topics_ok_empty",
+  "note": "",
+  "direction": "response",
+  "type_code": 32776,
+  "correlation_id": "21",
+  "frame_bytes": 18,
+  "message": {
+    "type": "ListTopicsOk",
+    "body": {
+      "topics": []
+    }
+  }
+}
