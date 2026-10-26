@@ -291,6 +291,26 @@ scripts/bench/block-cap.sh --out ~/block-cap
 those of `format7-vs-8.sh`. Its duration on a bare-metal machine has not
 been measured.
 
+
+### Step 1 against 540c887 on a Linux machine
+
+`scripts/bench/step1-compare.sh` compares the engine before ADR-0014 step 1
+(commit `540c887`, live topic entries in memory) with the checked-out commit
+(live entries read from the topic index files, the bounded seek table). It
+is `block-cap.sh` with two variants, `before` and `after`, each built from
+its own commit with default features and engine defaults; the same matrix
+(SSH, BGL and `random` payloads; sizes 100, 1024, 10240; batches 1, 64,
+512; the three write modes; 5 repetitions with the first variant
+alternating; the four read workloads with the block cache on and off).
+Peak RSS per write run is in `writes.csv` (`peak_rss_bytes`).
+
+```bash
+scripts/bench/step1-compare.sh --out ~/step1-compare
+```
+
+`--quick`, `--keep`, the preconditions, the outputs and the cleanup are
+those of `format7-vs-8.sh`. Its duration on a bare-metal machine has not
+been measured.
 ## Dependencies
 
 | Crate | Why |
