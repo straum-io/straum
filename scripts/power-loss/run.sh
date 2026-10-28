@@ -105,7 +105,11 @@ BROKER="$ROOT/target/release/straum-broker"
     echo "command: $0 --out $OUT --iterations $ITERATIONS --seed $SEED --scenarios $SCENARIOS --modes $MODES"
     # STRAUM_COMMIT: for a tree whose git metadata is not reachable (a
     # worktree mounted into a container).
-    echo "straum_commit: $(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "${STRAUM_COMMIT:-unknown}") ($(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ') uncommitted changes)"
+    if commit="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"; then
+        echo "straum_commit: $commit ($(git -C "$ROOT" status --porcelain | wc -l | tr -d ' ') uncommitted changes)"
+    else
+        echo "straum_commit: ${STRAUM_COMMIT:-unknown} (uncommitted changes: unknown)"
+    fi
     echo "binaries_sha256: $(sha256sum "$BIN" "$BROKER" 2>/dev/null | awk '{printf "%s %s; ", $1, $2}')"
     echo "lazyfs: $LAZYFS_TAG, commit $(git -C "$LAZYFS" rev-parse HEAD), $LAZYFS_BIN"
     echo "lazyfs_options: single-threaded (-s), cache simple 1gb, apply_eviction=false"
