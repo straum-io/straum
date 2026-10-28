@@ -6,8 +6,8 @@ mod common;
 
 use common::{TempDir, client, config};
 use straum_broker::Broker;
-use straum_client::ProduceOptions;
-use straum_client::proto::{Header, Message};
+use straum_client::proto::{ErrorCode, Header, MAX_REQUEST_TOPICS, Message};
+use straum_client::{ClientError, ProduceOptions};
 
 #[test]
 fn produce_then_fetch_keeps_order_keys_and_headers() {
@@ -148,13 +148,23 @@ fn admin_requests_agree_with_what_was_produced() {
         c.produce("alpha", 0, msgs, ProduceOptions::default())
             .unwrap();
     }
-    let names: Vec<_> = c
-        .list_topics()
-        .unwrap()
-        .into_iter()
-        .map(|t| (t.name, t.partitions))
-        .collect();
+    let (page, next) = c.list_topics("", 1000).unwrap();
+    let names: Vec<_> = page.into_iter().map(|t| (t.name, t.partitions)).collect();
     assert_eq!(names, [("alpha".to_owned(), 1), ("zeta".to_owned(), 1)]);
+    assert_eq!(next, "");
+    let (page, next) = c.list_topics("", 1).unwrap();
+    assert_eq!((page[0].name.as_str(), next.as_str()), ("alpha", "alpha"));
+    let (page, next) = c.list_topics(&next, u32::MAX).unwrap();
+    assert_eq!((page[0].name.as_str(), next.as_str()), ("zeta", ""));
+    assert!(c.list_topics("zeta", 1).unwrap().0.is_empty());
+    let malformed = |r: Result<_, ClientError>| matches!(r, Err(ClientError::Broker(e)) if e.code == ErrorCode::MalformedRequest as u16);
+    assert!(malformed(c.list_topics("", 0).map(|_| ())));
+    let many: Vec<String> = (0..=MAX_REQUEST_TOPICS).map(|i| format!("t{i}")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    assert!(malformed(c.metadata(&many).map(|_| ())));
+    let m = c.metadata(&many[1..]).unwrap();
+    assert_eq!(m.topics.len(), 1000);
+    assert!(c.metadata(&[]).unwrap().topics.is_empty());
     let d = c.describe_topic("alpha").unwrap();
     assert_eq!((d.retention_ms, d.replication_factor), (3_600_000, 1));
     let p = &d.partitions[0];

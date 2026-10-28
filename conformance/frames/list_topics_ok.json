@@ -1,10 +1,10 @@
 {
   "name": "list_topics_ok",
-  "note": "",
+  "note": "a page with more topics after it",
   "direction": "response",
   "type_code": 32776,
   "correlation_id": "21",
-  "frame_bytes": 116,
+  "frame_bytes": 198,
   "message": {
     "type": "ListTopicsOk",
     "body": {
@@ -17,7 +17,8 @@
           "name": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
           "partitions": 1
         }
-      ]
+      ],
+      "next_cursor": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt"
     }
   }
 }

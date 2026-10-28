@@ -511,20 +511,26 @@ fn handle(
         }
         Request::Ping { nonce } => conn.respond(sh, corr, &Response::Pong { nonce }, charge),
         Request::Metadata { topics } => {
-            let resp = metadata(sh, &topics);
+            let resp = if topics.len() > proto::MAX_REQUEST_TOPICS as usize {
+                Response::error(
+                    ErrorCode::MalformedRequest,
+                    format!(
+                        "Metadata names more than {} topics",
+                        proto::MAX_REQUEST_TOPICS
+                    ),
+                )
+            } else {
+                metadata(sh, topics)
+            };
             conn.respond(sh, corr, &resp, charge);
         }
-        Request::ListTopics => {
-            let topics = sh
-                .catalog
-                .borrow()
-                .topics()
-                .map(|t| TopicSummary {
-                    name: t.name.clone(),
-                    partitions: t.partitions,
-                })
-                .collect();
-            conn.respond(sh, corr, &Response::ListTopicsOk { topics }, charge);
+        Request::ListTopics { cursor, limit } => {
+            let resp = if limit == 0 {
+                Response::error(ErrorCode::MalformedRequest, "ListTopics limit 0")
+            } else {
+                list_topics(sh, &cursor, limit.min(proto::MAX_REQUEST_TOPICS))
+            };
+            conn.respond(sh, corr, &resp, charge);
         }
         Request::DeleteTopic { .. } => conn.error(
             sh,
@@ -551,14 +557,32 @@ fn handle(
     }
 }
 
-fn metadata(sh: &Shared, requested: &[String]) -> Response {
+/// One page of topics after `cursor`; `next_cursor` is the page's last
+/// name if more topics follow it, else empty.
+fn list_topics(sh: &Shared, cursor: &str, limit: u32) -> Response {
     let catalog = sh.catalog.borrow();
-    let names: Vec<String> = if requested.is_empty() {
-        catalog.topics().map(|t| t.name.clone()).collect()
-    } else {
-        requested.to_vec()
+    let mut rest = catalog.topics_after(cursor);
+    let topics: Vec<TopicSummary> = rest
+        .by_ref()
+        .take(limit as usize)
+        .map(|t| TopicSummary {
+            name: t.name.clone(),
+            partitions: t.partitions,
+        })
+        .collect();
+    let next_cursor = match (rest.next(), topics.last()) {
+        (Some(_), Some(last)) => last.name.clone(),
+        _ => String::new(),
     };
-    let topics = names
+    Response::ListTopicsOk {
+        topics,
+        next_cursor,
+    }
+}
+
+fn metadata(sh: &Shared, requested: Vec<String>) -> Response {
+    let catalog = sh.catalog.borrow();
+    let topics = requested
         .into_iter()
         .map(|name| match catalog.topic(&name) {
             None => TopicMetadata {

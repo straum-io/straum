@@ -482,7 +482,10 @@ pub fn request_to_json(r: &Request) -> Value {
             ("max_wait_ms", n(f.max_wait_ms)),
             ("expected_leader_epoch", n(f.expected_leader_epoch)),
         ]),
-        Request::ListTopics | Request::BrokerStats => obj(vec![]),
+        Request::ListTopics { cursor, limit } => {
+            obj(vec![("cursor", s(cursor)), ("limit", n(*limit))])
+        }
+        Request::BrokerStats => obj(vec![]),
     };
     obj(vec![("type", s(r.name())), ("body", body)])
 }
@@ -546,7 +549,10 @@ pub fn request_from_json(v: &Value) -> Result<Request, String> {
             max_wait_ms: f.num("max_wait_ms")?,
             expected_leader_epoch: f.num("expected_leader_epoch")?,
         }),
-        "ListTopics" => Request::ListTopics,
+        "ListTopics" => Request::ListTopics {
+            cursor: f.str("cursor")?,
+            limit: f.num("limit")?,
+        },
         "DescribeTopic" => Request::DescribeTopic {
             name: f.str("name")?,
         },
@@ -672,15 +678,21 @@ pub fn response_to_json(r: &Response) -> Value {
                 ),
             ),
         ]),
-        Response::ListTopicsOk { topics } => obj(vec![(
-            "topics",
-            Value::Arr(
-                topics
-                    .iter()
-                    .map(|t| obj(vec![("name", s(&t.name)), ("partitions", n(t.partitions))]))
-                    .collect(),
+        Response::ListTopicsOk {
+            topics,
+            next_cursor,
+        } => obj(vec![
+            (
+                "topics",
+                Value::Arr(
+                    topics
+                        .iter()
+                        .map(|t| obj(vec![("name", s(&t.name)), ("partitions", n(t.partitions))]))
+                        .collect(),
+                ),
             ),
-        )]),
+            ("next_cursor", s(next_cursor)),
+        ]),
         Response::DescribeTopicOk(d) => obj(vec![
             ("name", s(&d.name)),
             ("replication_factor", n(d.replication_factor)),
@@ -832,6 +844,7 @@ pub fn response_from_json(v: &Value) -> Result<Response, String> {
                     })
                 })
                 .collect::<Result<_, String>>()?,
+            next_cursor: f.str("next_cursor")?,
         },
         "DescribeTopicOk" => Response::DescribeTopicOk(DescribeTopicOk {
             name: f.str("name")?,

@@ -125,10 +125,10 @@ pub fn samples() -> Vec<Sample> {
             "largest correlation id and nonce",
         ),
         req(
-            "metadata_all",
+            "metadata_no_topics",
             5,
             Request::Metadata { topics: vec![] },
-            "empty list: every topic",
+            "empty list: the cluster and its nodes, no topics",
         ),
         req(
             "metadata_topics",
@@ -294,7 +294,24 @@ pub fn samples() -> Vec<Sample> {
             }),
             "largest values",
         ),
-        req("list_topics", 21, Request::ListTopics, "empty body"),
+        req(
+            "list_topics",
+            21,
+            Request::ListTopics {
+                cursor: String::new(),
+                limit: 100,
+            },
+            "the first page",
+        ),
+        req(
+            "list_topics_next",
+            24,
+            Request::ListTopics {
+                cursor: max_name.clone(),
+                limit: u32::MAX,
+            },
+            "a later page; a limit over the maximum is capped by the broker",
+        ),
         req(
             "describe_topic",
             22,
@@ -455,14 +472,18 @@ pub fn samples() -> Vec<Sample> {
                         partitions: 1,
                     },
                 ],
+                next_cursor: max_name.clone(),
             },
-            "",
+            "a page with more topics after it",
         ),
         resp(
             "list_topics_ok_empty",
             21,
-            Response::ListTopicsOk { topics: vec![] },
-            "",
+            Response::ListTopicsOk {
+                topics: vec![],
+                next_cursor: String::new(),
+            },
+            "the last page: an empty next_cursor",
         ),
         resp(
             "describe_topic_ok",

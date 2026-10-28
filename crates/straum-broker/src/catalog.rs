@@ -139,8 +139,12 @@ impl Catalog {
         self.topics.get(name)
     }
 
-    pub fn topics(&self) -> impl Iterator<Item = &TopicRecord> {
-        self.topics.values()
+    /// Topics whose names sort after `cursor` (all for an empty one), by name.
+    pub fn topics_after(&self, cursor: &str) -> impl Iterator<Item = &TopicRecord> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.topics
+            .range::<str, _>((Excluded(cursor), Unbounded))
+            .map(|(_, t)| t)
     }
 
     /// Adds a recorded topic and places its partitions on this node.

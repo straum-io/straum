@@ -85,7 +85,7 @@ fn every_v0_error_code_is_sent() {
 
     let mut c = conn(&b, false);
     check(
-        code(c.call(&Request::ListTopics).unwrap()),
+        code(c.call(&Request::BrokerStats).unwrap()),
         ErrorCode::Unauthenticated,
     );
     check(

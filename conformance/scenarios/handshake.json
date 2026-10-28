@@ -29,7 +29,11 @@
       "send": "a",
       "id": "early",
       "request": {
-        "type": "ListTopics"
+        "type": "ListTopics",
+        "body": {
+          "cursor": "",
+          "limit": 100
+        }
       }
     },
     {

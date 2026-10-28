@@ -1,12 +1,15 @@
 {
   "name": "list_topics",
-  "note": "empty body",
+  "note": "the first page",
   "direction": "request",
   "type_code": 8,
   "correlation_id": "21",
-  "frame_bytes": 14,
+  "frame_bytes": 20,
   "message": {
     "type": "ListTopics",
-    "body": {}
+    "body": {
+      "cursor": "",
+      "limit": 100
+    }
   }
 }
