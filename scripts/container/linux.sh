@@ -32,13 +32,17 @@
 # The configuration of machines other than `straum-test` is never changed.
 #
 # Build artifacts go to a named volume, not ./target: macOS and Linux
-# artifacts must never share a target directory.
+# artifacts must never share a target directory. The volume is one per
+# source tree (named after a checksum of its path): every tree is mounted
+# at /src, so a shared volume let one worktree's artifacts look up to date
+# in another.
 set -eu
 
 MACHINE="${CONTAINER_CONNECTION:-straum-test}"
 # rust:1-bookworm, rustc 1.99.1, pinned by digest.
 IMAGE="${STORE_LINUX_IMAGE:-docker.io/library/rust@sha256:8a2a102d089fbd151137b9473c01b1ed4519a64fb9c032a03609b815701615c8}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+TARGET_VOLUME="straum-container-target-$(printf '%s' "$ROOT" | cksum | cut -d ' ' -f 1)"
 
 SWITCH=0
 SESSION=0
@@ -142,7 +146,7 @@ fi
 podman --connection "$MACHINE" run --rm --name "$NAME" \
     -v "$ROOT":/src -w /src \
     -v straum-container-registry:/usr/local/cargo/registry \
-    -v straum-container-target:/src/target \
+    -v "$TARGET_VOLUME":/src/target \
     ${STORE_CONTAINER_ARGS:-} \
     "$IMAGE" \
     sh -c 'rustup component add clippy rustfmt >/dev/null 2>&1 || true

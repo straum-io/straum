@@ -73,5 +73,11 @@ machine on its own:
   this mode.
 
 The container image is pinned by digest. Cargo's registry and target
-directory live in named volumes (`straum-container-registry`,
-`straum-container-target`), so macOS and Linux build artifacts never mix.
+directory live in named volumes, so macOS and Linux build artifacts never
+mix: one registry volume (`straum-container-registry`) and one target
+volume per source tree (`straum-container-target-<checksum of the tree's
+path>`), because every tree is mounted at `/src` and a shared target volume
+let artifacts built from one worktree pass as up to date in another. Target
+volumes of deleted worktrees stay until removed:
+`podman --connection straum-test volume ls` lists them, `podman
+--connection straum-test volume rm <name>` removes one.
