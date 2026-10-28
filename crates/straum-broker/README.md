@@ -80,7 +80,7 @@ also a flag, `--key value`, with `-` or `_`; flags win.
 | `max_fetch_waiters` | 1024 | more waiting fetches: `Overloaded` |
 | `max_connections` | 1024 | more are accepted and closed |
 | `shutdown_timeout_ms` | 5000 | |
-| `store_write_mode` | `sequential` | `sequential`, `parallel` (ParallelSync), `inline` (InlineSmall, experimental) |
+| `store_write_mode` | `sequential` | `sequential`, `parallel` (ParallelSync; not recommended on disks without power-loss protection, see the store's README), `inline` (InlineSmall, experimental) |
 | `store_segment_max_bytes` | 64 MiB | |
 | `store_max_frame_bytes` | 64 MiB | the store's WAL frame limit; at least `max_frame_bytes` |
 
