@@ -1041,6 +1041,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "straum-power-loss"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "compio",
+ "straum-client",
+ "straum-store",
+]
+
+[[package]]
 name = "straum-proto"
 version = "0.1.0"
 dependencies = [

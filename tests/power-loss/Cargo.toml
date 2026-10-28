@@ -1,0 +1,18 @@
+[package]
+name = "straum-power-loss"
+version = "0.1.0"
+description = "Writer and verifier processes of the LazyFS power-loss harness (scripts/power-loss/run.sh)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+straum-store = { path = "../../crates/straum-store" }
+straum-client = { path = "../../crates/straum-client" }
+compio.workspace = true
+blake3.workspace = true
+
+[lints]
+workspace = true
