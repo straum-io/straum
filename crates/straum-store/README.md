@@ -31,7 +31,13 @@ Write modes (`Config::write_mode`):
 - `Sequential` (default): the segment is synced before the WAL frame is
   written.
 - `ParallelSync`: the segment and WAL syncs run concurrently. Recovery drops
-  a last frame whose object bytes did not reach disk.
+  a last frame whose object bytes did not reach disk. Not recommended on
+  disks without power-loss protection: there concurrent fdatasyncs
+  serialize, so the mode gains little. Measured on a Samsung 860 EVO (SATA,
+  ext4, io_uring): the segment fdatasync took 6.0 ms at the median alone
+  and 11.5 ms when it overlapped the WAL fdatasync, and `ParallelSync`
+  wrote at a median 1.11× `Sequential` (0.51–1.97× across 27
+  configurations of payload, message size and batch size).
 - `InlineSmall`: experimental, for benchmarks only, never a default. Small
   objects are written into the WAL and never reclaimed, because there is no
   WAL checkpoint yet.
