@@ -103,7 +103,10 @@ BROKER="$ROOT/target/release/straum-broker"
 {
     echo "date_utc: $(date -u +%FT%TZ)"
     echo "command: $0 --out $OUT --iterations $ITERATIONS --seed $SEED --scenarios $SCENARIOS --modes $MODES"
-    echo "straum_commit: $(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown) ($(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ') uncommitted changes)"
+    # STRAUM_COMMIT: for a tree whose git metadata is not reachable (a
+    # worktree mounted into a container).
+    echo "straum_commit: $(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "${STRAUM_COMMIT:-unknown}") ($(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ') uncommitted changes)"
+    echo "binaries_sha256: $(sha256sum "$BIN" "$BROKER" 2>/dev/null | awk '{printf "%s %s; ", $1, $2}')"
     echo "lazyfs: $LAZYFS_TAG, commit $(git -C "$LAZYFS" rev-parse HEAD), $LAZYFS_BIN"
     echo "lazyfs_options: single-threaded (-s), cache simple 1gb, apply_eviction=false"
     echo "fuse: $(fusermount3 --version 2>&1 | head -1); libfuse3 $(pkg-config --modversion fuse3 2>/dev/null || echo unknown)"
