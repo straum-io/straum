@@ -7,7 +7,7 @@ keeps written data in its own cache until the program calls `fsync` or
 `fdatasync`, and a fault drops that cache, which is what a power loss does
 to the page cache.
 
-`run.sh` drives the run; `tests/power-loss` is the binary that writes and
+`run.sh` drives the run; `tools/power-loss` is the binary that writes and
 verifies. Neither changes the store or the broker.
 
 ## Requirements
@@ -63,7 +63,9 @@ summary.txt        the table of all scenarios and the overall result
   iter-NNNNNN/     writer.log (TRY/ACK lines), writer.err, verify.log,
                    lazyfs.log; broker: broker.log, producer.log,
                    verify-broker.log
-  root/            the store's files (removed after a passing run)
+  root/            the store's files after the last recovery
+  pre-recovery/    a copy of root/ taken after the last fault, before
+                   recovery (both removed after a passing run)
 ```
 
 ## An iteration
@@ -111,7 +113,7 @@ iterations also recover stores that were recovered before.
 
 | Scenario | Writer | Fault |
 |---|---|---|
-| `store` | batches of 1–16 messages to three topics, one released and compacted every 3rd round; segments of 64 KiB | `clear`, `crash` or `torn` at a random moment |
+| `store` | batches of 1–16 messages to three topics, one released and compacted every 3rd round; segments of 64 KiB; `inline` stores bodies up to 1024 bytes in the WAL (the broker's `inline`: 4096), so both kinds of object occur | `clear`, `crash` or `torn` at a random moment |
 | `broker` | `straum-broker` with `store_write_mode` set to the mode and 64 KiB segments; two producers with keys, headers and repeated bodies, 10 ms apart between requests | as `store` |
 | `compaction` | as `store`, compacting after every round | the writer sends a `crash` or `torn` (WAL) fault just before its 1st–4th compaction; the summary counts the iterations whose writer died inside the compaction |
 | `dictionary` | — | not applicable: main has no dictionary training |
@@ -131,12 +133,17 @@ run after the merge cannot pass without it.
 
 ## Reproducing a failure
 
-`iterations.log` names the seed and the iteration. Iterations depend on the
-store state left by the earlier ones, so rerun with the same seed and
-`--iterations` one past the failing one, or open the kept store directly:
-`<scenario>-<mode>/root` is the state LazyFS left after the fault, and
-`straum-power-loss store-verify --dir <root>/store --mode <mode> --logs
-<scenario>-<mode>` repeats the check without LazyFS.
+`iterations.log` names the seed and the iteration. The seed reproduces
+the plan (fault, delay, writer seed), not the exact moment the fault hits:
+that depends on timing. A failed scenario keeps its directory:
+`pre-recovery/` is the store as the power loss left it, before the
+verifier's recovery changed it, and `root/` is the state after that
+recovery. To repeat the check on a copy, without LazyFS:
+
+```bash
+cp -a <scenario>-<mode>/pre-recovery /tmp/repro
+straum-power-loss store-verify --dir /tmp/repro/store --mode <mode> --logs <scenario>-<mode>
+```
 
 ## What LazyFS does not model
 

@@ -20,8 +20,6 @@
 //! Verifiers exit 0 when every check passed, 1 otherwise, and print one
 //! `RESULT` line.
 
-#![allow(clippy::unwrap_used)] // harness binary: a failed write after a fault ends the writer by design
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -235,6 +233,10 @@ fn now_ms() -> u64 {
 
 /// Writes batches until killed. `--arm-at-compaction K` writes `--fault`
 /// to the LazyFS fault FIFO just before the K-th compaction.
+#[expect(
+    clippy::unwrap_used,
+    reason = "a store error after the fault ends the writer; the verifier judges the state"
+)]
 fn store_write(opts: &HashMap<&str, &str>) -> Result<String, String> {
     let dir = opt(opts, "dir")?;
     let mode = opt(opts, "mode")?;
@@ -252,7 +254,9 @@ fn store_write(opts: &HashMap<&str, &str>) -> Result<String, String> {
         let mut store = Store::open(dir, config).await.unwrap();
         println!("READY END");
         let mut compactions = 0;
-        for round in 1.. {
+        let mut round = 0;
+        loop {
+            round += 1;
             let msgs: Vec<_> = (0..batch_len(seed, round))
                 .map(|j| store_message(seed, round, j))
                 .collect();

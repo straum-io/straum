@@ -46,6 +46,7 @@ if [ -z "$OUT" ]; then
     exit 2
 fi
 case "$ITERATIONS$SEED" in *[!0-9]*) echo "--iterations and --seed take numbers" >&2; exit 2 ;; esac
+[ "$ITERATIONS" -gt 0 ] || { echo "--iterations must be at least 1" >&2; exit 2; }
 
 # ---------------------------------------------------------------- preconditions
 
@@ -328,8 +329,14 @@ run_scenario() {
         return
     fi
     mkdir -p "$run/root" "$run/mnt" "$run/initial"
-    "$BIN" plan --scenario "$scenario" --seed "$SEED" --iterations "$ITERATIONS" \
-        --store-root "$store_root" | grep -v '^RESULT' >"$run/plan.txt"
+    if ! "$BIN" plan --scenario "$scenario" --seed "$SEED" --iterations "$ITERATIONS" \
+        --store-root "$store_root" >"$run/plan.out" ||
+        [ "$(grep -vc '^RESULT' "$run/plan.out")" -ne "$ITERATIONS" ]; then
+        echo "$name: plan failed ($run/plan.out)"
+        FAILED=1
+        return
+    fi
+    grep -v '^RESULT' "$run/plan.out" >"$run/plan.txt"
 
     local pass=0 fail=0 clear=0 crash=0 torn=0 fallback=0 incompaction=0 result="" status=ok
     mount_lazyfs "$run" "$run/initial/lazyfs.log" || { FAILED=1; return; }
@@ -364,6 +371,10 @@ run_scenario() {
         if [ -n "$ERR" ]; then
             result="RESULT FAIL $ERR"
         else
+            # The files as the power loss left them, before recovery changes
+            # them: the reproduction if this iteration fails.
+            rm -rf -- "${run:?}/pre-recovery"
+            cp -a "$run/root" "$run/pre-recovery"
             mount_lazyfs "$run" "$it/lazyfs.log" || { result="RESULT FAIL remount"; }
             [ -n "$MOUNTED" ] && result="$(verify "$scenario" "$mode" "$run" "$it")"
         fi
@@ -382,11 +393,11 @@ run_scenario() {
     local acked
     acked="$(grep -h '^RESULT ok' "$run"/*/verify.log 2>/dev/null | tail -1 | sed -n 's/.*acked=\([0-9]*\).*/\1/p')"
     echo "$name $ITERATIONS $pass $fail $clear $crash $torn $fallback $incompaction ${acked:-0} ${actions:--}" >>"$OUT/summary.rows"
-    if [ "$fail" -gt 0 ] || [ "$status" != ok ]; then
+    if [ "$fail" -gt 0 ] || [ "$status" != ok ] || [ "$pass" -ne "$ITERATIONS" ]; then
         FAILED=1
-        echo "$name: FAILED, data kept in $run"
+        echo "$name: FAILED, data kept in $run (pre-recovery/: the files after the failing fault)"
     elif [ "$KEEP" -eq 0 ]; then
-        rm -rf -- "${run:?}/root"
+        rm -rf -- "${run:?}/root" "${run:?}/pre-recovery"
     fi
 }
 
