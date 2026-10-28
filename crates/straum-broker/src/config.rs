@@ -29,6 +29,7 @@ pub struct Config {
     pub max_fetch_bytes: u32,
     pub max_fetch_wait_ms: u32,
     pub max_fetch_waiters: u32,
+    pub max_fetch_messages: u32,
     pub max_connections: u32,
     pub shutdown_timeout_ms: u32,
     pub store_write_mode: WriteMode,
@@ -58,6 +59,7 @@ impl Default for Config {
             max_fetch_bytes: 4 << 20,
             max_fetch_wait_ms: 30_000,
             max_fetch_waiters: 1024,
+            max_fetch_messages: 10_000,
             max_connections: 1024,
             shutdown_timeout_ms: 5000,
             store_write_mode: WriteMode::Sequential,
@@ -100,6 +102,7 @@ impl Config {
             "max_fetch_bytes" => self.max_fetch_bytes = num(&key, value)?,
             "max_fetch_wait_ms" => self.max_fetch_wait_ms = num(&key, value)?,
             "max_fetch_waiters" => self.max_fetch_waiters = num(&key, value)?,
+            "max_fetch_messages" => self.max_fetch_messages = num(&key, value)?,
             "max_connections" => self.max_connections = num(&key, value)?,
             "shutdown_timeout_ms" => self.shutdown_timeout_ms = num(&key, value)?,
             "store_write_mode" => {
@@ -212,6 +215,10 @@ impl Config {
                 "max_group_messages is at least 1",
             ),
             (self.max_connections >= 1, "max_connections is at least 1"),
+            (
+                self.max_fetch_messages >= 1,
+                "max_fetch_messages is at least 1",
+            ),
             (
                 u64::from(self.store_max_frame_bytes) >= frame,
                 "store_max_frame_bytes is at least max_frame_bytes",

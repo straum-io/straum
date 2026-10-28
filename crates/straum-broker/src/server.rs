@@ -996,14 +996,16 @@ async fn fetch(sh: &Shared, f: proto::Fetch) -> Response {
         Err(e) => return Response::Error(e),
     };
     let max_bytes = f.max_bytes.min(sh.config.max_fetch_bytes) as usize;
+    let max_messages = sh.config.max_fetch_messages as usize;
     let wait = Duration::from_millis(u64::from(f.max_wait_ms.min(sh.config.max_fetch_wait_ms)));
     let deadline = Instant::now() + wait;
     loop {
         let g = partition.committed.generation();
-        let messages = match read_messages(sh, &partition, f.from_seq, max_bytes).await {
-            Ok(m) => m,
-            Err(e) => return Response::error(ErrorCode::StorageError, e.to_string()),
-        };
+        let messages =
+            match read_messages(sh, &partition, f.from_seq, max_bytes, max_messages).await {
+                Ok(m) => m,
+                Err(e) => return Response::error(ErrorCode::StorageError, e.to_string()),
+            };
         let left = deadline.saturating_duration_since(Instant::now());
         if !messages.is_empty() || left.is_zero() || sh.closing.get() {
             return Response::FetchOk(FetchOk {
@@ -1025,13 +1027,14 @@ async fn fetch(sh: &Shared, f: proto::Fetch) -> Response {
     }
 }
 
-/// Messages from `max(from, start_seq)` while their content fits
-/// `max_bytes`; the first one always.
+/// Messages from `max(from, start_seq)` while their encoded size fits
+/// `max_bytes`, at most `max_messages` of them; the first one always.
 async fn read_messages(
     sh: &Shared,
     partition: &Partition,
     from: u64,
     max_bytes: usize,
+    max_messages: usize,
 ) -> Result<Vec<FetchedMessage>, StoreError> {
     let store = sh.store.lock().await;
     let mut out = Vec::new();
@@ -1050,7 +1053,7 @@ async fn read_messages(
                 .collect(),
             body: e.payload,
         };
-        let n = message.content_bytes();
+        let n = fetched_bytes(&message);
         if !out.is_empty() && bytes + n > max_bytes {
             break;
         }
@@ -1060,9 +1063,79 @@ async fn read_messages(
             timestamp_ms: e.timestamp,
             message,
         });
-        if bytes >= max_bytes {
+        if bytes >= max_bytes || out.len() >= max_messages {
             break;
         }
     }
     Ok(out)
+}
+
+/// A `FetchedMessage`'s encoded size (docs/protocol.md 4.6, 4.8): seq and
+/// timestamp, flags, the key with its length, the header count and each
+/// header with its lengths, the body with its length. Counting only the
+/// content let a Fetch of empty bodies return every message up to
+/// `next_seq`.
+fn fetched_bytes(m: &proto::Message) -> usize {
+    let key = m.key.as_ref().map_or(0, |k| 2 + k.len());
+    let headers = if m.headers.is_empty() {
+        0
+    } else {
+        2 + m.headers.len() * 6 + m.header_bytes()
+    };
+    8 + 8 + 1 + key + headers + 4 + m.body.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `fetched_bytes` is exactly what one more message adds to an encoded
+    /// FetchOk.
+    #[test]
+    fn fetched_bytes_matches_the_encoding() {
+        let fetch_ok = |messages: Vec<FetchedMessage>| {
+            let mut out = Vec::new();
+            proto::encode_response(
+                &mut out,
+                1,
+                &Response::FetchOk(FetchOk {
+                    leader_epoch: 1,
+                    start_seq: 0,
+                    next_seq: 1,
+                    messages,
+                }),
+            );
+            out.len()
+        };
+        let empty = fetch_ok(Vec::new());
+        let header = |n: &[u8], v: &[u8]| proto::Header {
+            name: n.to_vec(),
+            value: v.to_vec(),
+        };
+        for message in [
+            proto::Message {
+                key: None,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            proto::Message {
+                key: Some(Vec::new()),
+                headers: Vec::new(),
+                body: b"body".to_vec(),
+            },
+            proto::Message {
+                key: Some(b"key".to_vec()),
+                headers: vec![header(b"h", b"v"), header(b"name", b"")],
+                body: b"x".to_vec(),
+            },
+        ] {
+            let n = fetched_bytes(&message);
+            let one = fetch_ok(vec![FetchedMessage {
+                seq: 7,
+                timestamp_ms: 9,
+                message,
+            }]);
+            assert_eq!(one - empty, n);
+        }
+    }
 }

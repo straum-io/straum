@@ -7,8 +7,12 @@ on Linux, the polling driver on macOS (development only).
 
 ```bash
 cargo run --release -p straum-broker -- \
-    --data-dir /var/lib/straum --cluster-id prod --node-id 1 --listen 0.0.0.0:7171
+    --data-dir /var/lib/straum --cluster-id prod --node-id 1 --listen 127.0.0.1:7171
 ```
+
+The listen address must be a loopback address: version 0 has no
+authentication, so the broker refuses any other address until
+authentication exists.
 
 ## How it works
 
@@ -29,7 +33,8 @@ cargo run --release -p straum-broker -- \
   `max_fetch_bytes` for its response); every Produce counts against the
   global `max_pending_bytes` until it is answered. At either limit the
   broker stops reading from that socket; nothing is buffered without bound.
-- **Fetch** reads from `max(from_seq, start_seq)` up to `max_bytes`. With no
+- **Fetch** reads from `max(from_seq, start_seq)` up to `max_bytes` of
+  encoded messages and at most `max_fetch_messages` messages. With no
   data it waits up to `max_wait_ms`, woken by the next commit of that
   partition (no polling); at most `max_fetch_waiters` fetches wait at once.
 - **Topics** are created explicitly (CreateTopic). Their configuration is a
@@ -78,6 +83,7 @@ also a flag, `--key value`, with `-` or `_`; flags win.
 | `max_fetch_bytes` | 4 MiB | caps a Fetch's `max_bytes` |
 | `max_fetch_wait_ms` | 30000 | caps a Fetch's `max_wait_ms` |
 | `max_fetch_waiters` | 1024 | more waiting fetches: `Overloaded` |
+| `max_fetch_messages` | 10000 | messages per Fetch response, at least 1 |
 | `max_connections` | 1024 | more are accepted and closed |
 | `shutdown_timeout_ms` | 5000 | |
 | `store_write_mode` | `sequential` | `sequential`, `parallel` (ParallelSync; not recommended on disks without power-loss protection, see the store's README), `inline` (InlineSmall, experimental) |
