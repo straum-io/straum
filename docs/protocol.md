@@ -254,13 +254,17 @@ within a partition, timestamps never decrease. Clients cannot set them.
 | `topic` | `string` | |
 | `partition` | `u32` | |
 | `from_seq` | `u64` | |
-| `max_bytes` | `u32` | of keys, header names and values, and bodies; capped by the broker's `max_fetch_bytes` |
+| `max_bytes` | `u32` | of the returned `FetchedMessage`s as encoded; capped by the broker's `max_fetch_bytes` |
 | `max_wait_ms` | `u32` | capped by the broker's `max_fetch_wait_ms` |
 | `expected_leader_epoch` | `u32` | as in Produce |
 
 The response holds the messages with seq ≥ max(`from_seq`, `start_seq`),
-in seq order, while their total size stays within `max_bytes`; the first
-such message is returned even if it alone is larger. If there is none, the
+in seq order, while their total encoded size (each `FetchedMessage` as
+below: `seq`, `timestamp_ms`, `flags`, the key and headers with their
+lengths, the body with its length; 21 bytes for an empty body without key
+or headers) stays within `max_bytes`, and at most the broker's
+`max_fetch_messages` (default 10 000) of them; the first such message is
+returned even if it alone is larger. If there is none, the
 broker waits up to `max_wait_ms` for one to be committed and answers then
 (possibly with no messages). A `from_seq` past `next_seq` waits the same
 way. Clients keep their own position (`next` = last seq + 1).

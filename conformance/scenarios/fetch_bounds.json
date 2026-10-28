@@ -1,0 +1,221 @@
+{
+  "name": "fetch_bounds",
+  "description": "Fetch counts each message's encoded size against max_bytes (21 bytes for an empty body without key or headers: seq, timestamp, flags, body length) and returns at most max_fetch_messages messages; the first message is returned even if it alone is larger.",
+  "broker": {
+    "max_fetch_messages": 3
+  },
+  "steps": [
+    {
+      "connect": "a"
+    },
+    {
+      "send": "a",
+      "id": "hello",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 0,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "hello",
+      "response": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "conformance",
+          "node_id": 1
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "create",
+      "request": {
+        "type": "CreateTopic",
+        "body": {
+          "name": "e",
+          "partitions": 1,
+          "replication_factor": 1,
+          "retention_ms": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "create",
+      "response": {
+        "type": "CreateTopicOk"
+      }
+    },
+    {
+      "send": "a",
+      "id": "p",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "e",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": ""
+            },
+            {
+              "key": null,
+              "headers": [],
+              "body": ""
+            },
+            {
+              "key": null,
+              "headers": [],
+              "body": ""
+            },
+            {
+              "key": null,
+              "headers": [],
+              "body": ""
+            },
+            {
+              "key": null,
+              "headers": [],
+              "body": ""
+            },
+            {
+              "key": null,
+              "headers": [],
+              "body": ""
+            },
+            {
+              "key": null,
+              "headers": [],
+              "body": ""
+            },
+            {
+              "key": null,
+              "headers": [],
+              "body": ""
+            },
+            {
+              "key": null,
+              "headers": [],
+              "body": ""
+            },
+            {
+              "key": null,
+              "headers": [],
+              "body": ""
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "p",
+      "response": {
+        "type": "ProduceOk",
+        "body": {
+          "base_seq": "0",
+          "count": 10
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "count",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "e",
+          "partition": 0,
+          "from_seq": "0",
+          "max_bytes": 1048576,
+          "max_wait_ms": 0,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "count",
+      "response": {
+        "type": "FetchOk",
+        "body": {
+          "next_seq": "10",
+          "messages": {
+            "$len": 3
+          }
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "bytes",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "e",
+          "partition": 0,
+          "from_seq": "0",
+          "max_bytes": 50,
+          "max_wait_ms": 0,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "bytes",
+      "response": {
+        "type": "FetchOk",
+        "body": {
+          "next_seq": "10",
+          "messages": {
+            "$len": 2
+          }
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "first",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "e",
+          "partition": 0,
+          "from_seq": "0",
+          "max_bytes": 1,
+          "max_wait_ms": 0,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "first",
+      "response": {
+        "type": "FetchOk",
+        "body": {
+          "next_seq": "10",
+          "messages": {
+            "$len": 1
+          }
+        }
+      }
+    }
+  ]
+}
