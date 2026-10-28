@@ -273,7 +273,8 @@ write_phase() {
         broker)
             mkdir -p "$run/mnt/data"
             "$BROKER" --data-dir "$run/mnt/data" --listen 127.0.0.1:0 --cluster-id powerloss \
-                --node-id 1 --store-write-mode "$mode" >/dev/null 2>"$it/broker.log" &
+                --node-id 1 --store-write-mode "$mode" --store-segment-max-bytes 65536 \
+                >/dev/null 2>"$it/broker.log" &
             WRITERS="$!"
             if ! wait_line "$it/broker.log" 'listening on' 120 "$WRITERS"; then
                 ERR="broker did not start (see $it)"; return 1

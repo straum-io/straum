@@ -151,11 +151,12 @@ fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
         let command = match kind {
             "clear" => "lazyfs::clear-cache".to_owned(),
             "crash" => {
-                let points = if compaction {
+                let points = match scenario {
                     // Operations a compaction issues.
-                    &CRASH_POINTS[..4]
-                } else {
-                    &CRASH_POINTS[..]
+                    "compaction" => &CRASH_POINTS[..4],
+                    // The broker never compacts: no segment is unlinked.
+                    "broker" => &CRASH_POINTS[..6],
+                    _ => &CRASH_POINTS[..],
                 };
                 let (op, rgx) = points[rng.below(points.len() as u64) as usize];
                 let timing = ["before", "after"][rng.below(2) as usize];
@@ -723,10 +724,11 @@ fn broker_produce(opts: &HashMap<&str, &str>) -> Result<String, String> {
                         ),
                         Err(_) => return,
                     }
-                    // Paced: unpaced, the two producers acknowledge ~6000
-                    // messages per iteration and verifying them all after
-                    // every fault makes 200 iterations take hours.
-                    std::thread::sleep(Duration::from_millis(2));
+                    // Paced: unpaced, the producers acknowledge ~6000
+                    // messages per iteration (3000 at 2 ms) and verifying
+                    // all of them after every fault makes 200 iterations
+                    // take hours.
+                    std::thread::sleep(Duration::from_millis(10));
                 }
             })
         })
@@ -810,7 +812,12 @@ fn broker_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
             "--node-id",
             "1",
         ])
-        .args(["--store-write-mode", mode])
+        .args([
+            "--store-write-mode",
+            mode,
+            "--store-segment-max-bytes",
+            "65536",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
