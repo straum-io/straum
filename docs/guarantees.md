@@ -12,9 +12,18 @@ on macOS does not mean the data is on stable storage.
 
 ## 1. What an acknowledgement means
 
-Version 0 accepts one acknowledgement level, `durable`. A Produce with
-`written` or `replicated` is refused with `UnsupportedAckLevel` before
-anything is stored.
+A Produce declares its acknowledgement level (`ack_level`), and the level
+defines what the acknowledgement promises:
+
+| Level | The acknowledgement means | Version 0 |
+|---|---|---|
+| `durable` | the messages are stored and synchronized to stable storage on the node (`fdatasync`) after the group commit | the only level |
+| `replicated` | the messages are committed by a majority of the cluster's nodes | refused (no cluster) |
+| `written` | the messages are accepted and written without synchronization | refused (no interval mode) |
+
+A Produce with `written` or `replicated` is refused with
+`UnsupportedAckLevel` before anything is stored. The rest of this page
+describes `durable`.
 
 - The broker commits the Produce requests of all connections together, in
   groups. A group is one `put_batch` call of the store and one WAL frame;
