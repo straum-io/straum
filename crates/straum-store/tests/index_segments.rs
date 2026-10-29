@@ -57,7 +57,7 @@ async fn records_of_a_cut_wal_tail_stay_stale() {
         put(&mut store, 1, 60, 70).await;
     }
     assert_eq!(find_index_record(&dir.0, INDEX_BLOCK_RECORD, 0, 0).stamp, 2);
-    let wal = dir.0.join("wal.log");
+    let wal = dir.0.join(common::WAL0);
     let bytes = std::fs::read(&wal).unwrap();
     let last = *wal_frame_starts(&bytes).last().unwrap();
     std::fs::write(&wal, &bytes[..last + 10]).unwrap();
@@ -105,7 +105,7 @@ async fn a_damaged_fence_header_fails_open() {
         put(&mut store, 1, 0, 60).await;
         put(&mut store, 1, 60, 70).await;
     }
-    let wal = dir.0.join("wal.log");
+    let wal = dir.0.join(common::WAL0);
     let bytes = std::fs::read(&wal).unwrap();
     let last = *wal_frame_starts(&bytes).last().unwrap();
     std::fs::write(&wal, &bytes[..last + 10]).unwrap();
@@ -183,7 +183,7 @@ async fn damaged_index_segments_are_repaired_and_reported() {
             let dir = TempDir::new("index-damage");
             let config = build(&dir.0, mode).await;
             damage(&dir.0);
-            let wal_before = std::fs::read(dir.0.join("wal.log")).unwrap();
+            let wal_before = std::fs::read(dir.0.join(common::WAL0)).unwrap();
             let store = Store::open(&dir.0, config).await.unwrap();
             let actions = &store.recovery_report().actions;
             assert!(
@@ -193,7 +193,7 @@ async fn damaged_index_segments_are_repaired_and_reported() {
                 "{mode:?} {what}: {actions:?}"
             );
             assert_eq!(
-                std::fs::read(dir.0.join("wal.log")).unwrap(),
+                std::fs::read(dir.0.join(common::WAL0)).unwrap(),
                 wal_before,
                 "{mode:?} {what}"
             );

@@ -45,7 +45,7 @@ async fn clean_open_reports_nothing_and_changes_nothing() {
 async fn torn_tail_is_truncated_and_reported() {
     let dir = TempDir::new("report-torn");
     build(&dir.0).await;
-    let path = dir.0.join("wal.log");
+    let path = dir.0.join(common::WAL0);
     let wal = std::fs::read(&path).unwrap();
     let last = *wal_frame_starts(&wal).last().unwrap();
     let cut = last + 10;
@@ -56,6 +56,7 @@ async fn torn_tail_is_truncated_and_reported() {
         actions.first(),
         Some(&RecoveryAction::TornTailTruncated {
             frame_seq: 2,
+            file: 0,
             offset: last as u64,
             bytes_removed: 10,
         }),
@@ -75,7 +76,7 @@ async fn orphans_and_lost_files_are_reported() {
     std::fs::write(dir.0.join("seg-00000000000000ff.dat"), b"orphan").unwrap();
     // An index segment whose header never became durable.
     std::fs::write(dir.0.join("idx-0000000000000007.dat"), b"STRMIDX").unwrap();
-    std::fs::write(dir.0.join("wal.log.tmp"), b"half-created").unwrap();
+    std::fs::write(dir.0.join(format!("{}.tmp", common::WAL0)), b"half-created").unwrap();
     let store = Store::open(&dir.0, Config::default()).await.unwrap();
     let actions = &store.recovery_report().actions;
     assert!(
@@ -102,7 +103,7 @@ async fn orphans_and_lost_files_are_reported() {
 async fn old_format_version_is_unsupported() {
     let dir = TempDir::new("report-old");
     build(&dir.0).await;
-    let path = dir.0.join("wal.log");
+    let path = dir.0.join(common::WAL0);
     let mut wal = std::fs::read(&path).unwrap();
     wal[8..12].copy_from_slice(&1u32.to_le_bytes());
     let crc = crc32c::crc32c(&wal[..20]);

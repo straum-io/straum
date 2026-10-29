@@ -272,12 +272,12 @@ verify() {
 # On a harness error it sets ERR and returns 1.
 write_phase() {
     local scenario="$1" mode="$2" run="$3" it="$4" delay="$5" wseed="$6" kind="$7" cmd="$8" arm="$9" i="${10}"
-    local ready
+    local ready root="$run/root/store"
+    [ "$scenario" = broker ] && root="$run/root/data/store"
     if [[ "$cmd" == *@IDX@* ]]; then
         # The index segment the writer will append to: the store opens with
         # no active segment and creates the next id at its first full block.
-        local root="$run/root/store" last next=0
-        [ "$scenario" = broker ] && root="$run/root/data/store"
+        local last next=0
         last="$(find "$root" -maxdepth 1 -name 'idx-*.dat' -printf '%f\n' 2>/dev/null |
             sed -n 's/^idx-\([0-9a-f]\{16\}\)\.dat$/\1/p' | sort | tail -1)"
         [ -n "$last" ] && next=$((16#$last + 1))
@@ -338,6 +338,13 @@ write_phase() {
         inject "$run" "$kind" "" 600
     else
         sleep "$(awk -v d="$delay" 'BEGIN {printf "%.3f", d / 1000}')"
+        if [[ "$cmd" == *@WAL@* ]]; then
+            # The WAL file being appended to now (files rotate).
+            local wal
+            wal="$(find "$root" -maxdepth 1 -name 'wal-*.log' -printf '%f\n' | sort | tail -1)"
+            cmd="${cmd//@WAL@/$wal}"
+            CMD="$cmd"
+        fi
         inject "$run" "$kind" "$cmd" 100
     fi
 }

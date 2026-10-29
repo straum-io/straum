@@ -23,8 +23,8 @@ use crate::codec::{
     RECORD_PUT_TOPIC_BASE, RECORD_RELEASE, Record, Rewritten, WAL_FILE_HEADER,
 };
 
-const WAL_FILE: &str = "wal.log";
-const WAL_TMP: &str = "wal.log.tmp";
+/// The single WAL file of formats before 13: refused, never read.
+const LEGACY_WAL_FILE: &str = "wal.log";
 /// Bounds of `Config::seek_page_entries`.
 const SEEK_PAGE_MIN: usize = 2;
 const SEEK_PAGE_MAX: usize = 4096;
@@ -104,6 +104,12 @@ pub struct Config {
     /// (D-191). 64 KiB stays a setting for topics where space matters more
     /// than read latency.
     pub max_block_raw_bytes: u64,
+    /// A WAL file holding at least this many bytes is closed before the
+    /// next frame, which starts a new file (`wal-<frame seq>.log`), so a
+    /// checkpoint can later reclaim WAL space by deleting whole files. A
+    /// file can exceed it by one frame. A file always holds at least one
+    /// frame before the next starts.
+    pub wal_file_max_bytes: u64,
 }
 
 impl Default for Config {
@@ -118,6 +124,7 @@ impl Default for Config {
             seek_page_entries: 256,
             dict_train_bytes: 1 << 20,
             max_block_raw_bytes: 16 << 10,
+            wal_file_max_bytes: 64 << 20,
         }
     }
 }
@@ -247,10 +254,16 @@ enum Location {
         id: u64,
         offset: u64,
     },
-    /// Absolute offset in `wal.log` (an inline block).
-    Wal {
-        offset: u64,
-    },
+    /// Inside a WAL frame (an inline block).
+    Wal(WalPos),
+}
+
+/// A byte position in the WAL: the file (named by the sequence number of
+/// its first frame) and the offset in it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WalPos {
+    file: u64,
+    offset: u64,
 }
 
 /// A compressed run of objects: the new objects of one batch, or the live
@@ -379,12 +392,15 @@ pub enum ConfigOverride {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecoveryAction {
-    /// A leftover `wal.log.tmp` from an interrupted WAL creation was deleted.
+    /// A leftover `wal-<seq>.log.tmp` from an interrupted WAL file
+    /// creation was deleted.
     WalTmpRemoved,
     /// A torn last frame (short or failing its CRC) was cut off.
     TornTailTruncated {
         /// The sequence number the torn frame would have had.
         frame_seq: u64,
+        /// The last WAL file, by its first frame's sequence number.
+        file: u64,
         offset: u64,
         bytes_removed: u64,
     },
@@ -392,6 +408,8 @@ pub enum RecoveryAction {
     /// bytes were not all durable, so it was never acknowledged.
     FrameDropped {
         frame_seq: u64,
+        /// The last WAL file, by its first frame's sequence number.
+        file: u64,
         offset: u64,
         mode: FrameMode,
         object: ObjectId,
@@ -472,9 +490,13 @@ struct Topic {
     attrs: VecDeque<AttrsAt>,
 }
 
-/// `(seq, WAL offset, length)` of an entry's key and headers (a Publish
-/// record's tail).
-type AttrsAt = (u64, u64, u32);
+/// Where an entry's key and headers lie: a Publish record's tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttrsAt {
+    seq: u64,
+    at: WalPos,
+    len: u32,
+}
 
 struct Active {
     id: u64,
@@ -496,8 +518,14 @@ struct Active {
 pub struct Store {
     dir: PathBuf,
     config: Config,
+    /// The WAL file being appended to, its first frame's sequence number
+    /// and its length.
     wal: File,
+    wal_id: u64,
     wal_len: u64,
+    /// The earlier WAL files, open for reads of inline blocks and of keys
+    /// and headers.
+    wal_files: HashMap<u64, File>,
     /// Sequence number of the next WAL frame.
     next_frame: u64,
     /// A WAL frame is being written. Frames are written one at a time and
@@ -560,10 +588,24 @@ impl Store {
         let dir = dir.as_ref().to_path_buf();
         let mut report = RecoveryReport::default();
         compio::fs::create_dir_all(&dir).await?;
-        let wal_path = dir.join(WAL_FILE);
-        let wal = open_wal(&dir, &mut report, config.dict_train_bytes).await?;
-        let bytes = compio::fs::read(&wal_path).await?;
-        let stored = codec::decode_wal_header(&bytes).ok_or(StoreError::UnsupportedFormat)?;
+        let files = read_wal_files(&dir, &mut report, config.dict_train_bytes).await?;
+        let stored = files
+            .first()
+            .and_then(|(_, bytes)| codec::decode_wal_header(bytes))
+            .ok_or(StoreError::UnsupportedFormat)?;
+        for (id, bytes) in &files[1..] {
+            match codec::decode_wal_header(bytes) {
+                None => return Err(StoreError::UnsupportedFormat),
+                Some(v) if v != stored => {
+                    return Err(StoreError::CorruptWal {
+                        file: *id,
+                        offset: 0,
+                        reason: "WAL files disagree on dict_train_bytes",
+                    });
+                }
+                Some(_) => {}
+            }
+        }
         if stored != config.dict_train_bytes {
             report
                 .config_overrides
@@ -575,67 +617,100 @@ impl Store {
         }
 
         // Only the last frame can be torn: a frame is written only after the
-        // previous one is durable. A bad frame with a valid frame anywhere
-        // after it is mid-log damage; the file is then left untouched.
+        // previous one is durable, and a WAL file is created only after the
+        // last frame of the previous file is. A bad frame with a valid frame
+        // after it, or in a file that another file follows, is mid-log
+        // damage; the files are then left untouched.
         let mut frames = Vec::new();
+        let last = files.len() - 1;
+        let (last_id, last_len) = (files[last].0, files[last].1.len());
         let mut pos = WAL_FILE_HEADER;
         // Next object and block numbers at the start of each frame: delta
         // bases. Both only grow, so each is the highest seen + 1.
         let mut next_object = 0u64;
         let mut next_block = 0u64;
         let mut dicts = Vec::new();
-        while pos < bytes.len() {
-            let offset = pos as u64;
-            let Some(frame) = codec::decode_frame(&bytes[pos..]) else {
-                if let Some(next) = codec::next_valid_frame(&bytes, pos) {
-                    return Err(StoreError::WalCorrupted {
-                        offset,
-                        next_frame: next as u64,
-                    });
-                }
-                break;
-            };
-            let corrupt = |reason| StoreError::CorruptWal { offset, reason };
-            if frame.seq != frames.len() as u64 {
-                return Err(corrupt("frame sequence number out of order"));
+        for (k, (id, bytes)) in files.iter().enumerate() {
+            let id = *id;
+            if id != frames.len() as u64 {
+                return Err(StoreError::CorruptWal {
+                    file: id,
+                    offset: 0,
+                    reason: if k == 0 {
+                        "the first WAL file does not start at frame 0"
+                    } else {
+                        "WAL file does not continue the previous one"
+                    },
+                });
             }
-            let mode = codec::frame_mode(&frame).map_err(corrupt)?;
-            let records =
-                codec::decode_records(&frame, next_object, next_block).map_err(corrupt)?;
-            for rec in &records {
-                match rec {
-                    Record::PutObject { number, .. } => {
-                        next_object = next_object.max(number.saturating_add(1));
+            pos = WAL_FILE_HEADER;
+            while pos < bytes.len() {
+                let offset = pos as u64;
+                let Some(frame) = codec::decode_frame(&bytes[pos..]) else {
+                    let next = match codec::next_valid_frame(bytes, pos) {
+                        Some(next) => Some((id, next as u64)),
+                        None => files
+                            .get(k + 1)
+                            .map(|(next, _)| (*next, WAL_FILE_HEADER as u64)),
+                    };
+                    if let Some((next_file, next_offset)) = next {
+                        return Err(StoreError::WalCorrupted {
+                            file: id,
+                            offset,
+                            next_file,
+                            next_offset,
+                        });
                     }
-                    Record::PutBlock { number, .. } | Record::PutInlineBlock { number, .. } => {
-                        next_block = next_block.max(number.saturating_add(1));
-                    }
-                    Record::Compact { rewritten, .. } => {
-                        for r in rewritten {
-                            next_block = next_block.max(r.block.saturating_add(1));
+                    break;
+                };
+                let corrupt = |reason| StoreError::CorruptWal {
+                    file: id,
+                    offset,
+                    reason,
+                };
+                if frame.seq != frames.len() as u64 {
+                    return Err(corrupt("frame sequence number out of order"));
+                }
+                let mode = codec::frame_mode(&frame).map_err(corrupt)?;
+                let records =
+                    codec::decode_records(&frame, next_object, next_block).map_err(corrupt)?;
+                for rec in &records {
+                    match rec {
+                        Record::PutObject { number, .. } => {
+                            next_object = next_object.max(number.saturating_add(1));
                         }
+                        Record::PutBlock { number, .. } | Record::PutInlineBlock { number, .. } => {
+                            next_block = next_block.max(number.saturating_add(1));
+                        }
+                        Record::Compact { rewritten, .. } => {
+                            for r in rewritten {
+                                next_block = next_block.max(r.block.saturating_add(1));
+                            }
+                        }
+                        Record::PutDict { data, .. } => dicts.push(*data),
+                        _ => {}
                     }
-                    Record::PutDict { data, .. } => dicts.push(*data),
-                    _ => {}
                 }
+                pos += frame.size();
+                frames.push((WalPos { file: id, offset }, mode, records));
             }
-            pos += frame.size();
-            frames.push((offset, mode, records));
         }
-        let torn = pos < bytes.len();
+        // `pos`: the end of the last file's valid frames.
+        let torn = pos < last_len;
 
         // The last complete frame's new blocks must be fully stored, decode,
         // and hold objects with a matching BLAKE3. Only a ParallelSync frame
-        // with nothing after it can lack them legitimately (crash before it
-        // was acknowledged); it is dropped. Anywhere else the frame was
-        // durable after its block bytes, or was followed by another frame
-        // and so acknowledged: corruption, reported with no file changed.
+        // with nothing after it, not even a WAL file, can lack them
+        // legitimately (crash before it was acknowledged); it is dropped.
+        // Anywhere else the frame was durable after its block bytes, or was
+        // followed by another frame or file and so acknowledged: corruption,
+        // reported with no file changed.
         let mut dropped = None;
         let mut check = codecs_for(&dicts)?;
-        if let Some((offset, mode, records)) = frames.last()
+        if let Some((at, mode, records)) = frames.last()
             && let Some(bad) = first_bad_object(&dir, records, &mut check).await?
         {
-            if *mode != FrameMode::ParallelSync || torn {
+            if *mode != FrameMode::ParallelSync || torn || at.file != last_id {
                 return Err(match bad.reason {
                     DropReason::ObjectMissing => StoreError::MissingObject(bad.object),
                     DropReason::ObjectHashMismatch => StoreError::HashMismatch(bad.object),
@@ -647,35 +722,51 @@ impl Store {
             }
             dropped = Some(RecoveryAction::FrameDropped {
                 frame_seq: frames.len() as u64 - 1,
-                offset: *offset,
+                file: last_id,
+                offset: at.offset,
                 mode: *mode,
                 object: bad.object,
                 reason: bad.reason,
-                bytes_removed: bytes.len() as u64 - offset,
+                bytes_removed: last_len as u64 - at.offset,
             });
-            pos = *offset as usize;
+            pos = at.offset as usize;
             frames.pop();
         }
         match dropped {
             Some(action) => report.actions.push(action),
             None if torn => report.actions.push(RecoveryAction::TornTailTruncated {
                 frame_seq: frames.len() as u64,
+                file: last_id,
                 offset: pos as u64,
-                bytes_removed: (bytes.len() - pos) as u64,
+                bytes_removed: (last_len - pos) as u64,
             }),
             None => {}
         }
+        let wal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(wal_path(&dir, last_id))
+            .await?;
         let wal_len = pos as u64;
-        if pos < bytes.len() {
+        if pos < last_len {
             wal.set_len(wal_len).await?;
             wal.sync_all().await?;
+        }
+        let mut wal_files = HashMap::with_capacity(last);
+        for (id, _) in &files[..last] {
+            wal_files.insert(*id, File::open(wal_path(&dir, *id)).await?);
         }
 
         let mut replay = Replay::default();
         let next_frame = frames.len() as u64;
-        for (offset, _, records) in frames {
-            let body_at = offset + FRAME_HEADER as u64;
-            let corrupt = |reason| StoreError::CorruptWal { offset, reason };
+        for (at, _, records) in frames {
+            let body_at = at.offset + FRAME_HEADER as u64;
+            let corrupt = |reason| StoreError::CorruptWal {
+                file: at.file,
+                offset: at.offset,
+                reason,
+            };
+            replay.file = at.file;
             for rec in records {
                 replay.apply(rec, body_at).map_err(corrupt)?;
             }
@@ -698,7 +789,9 @@ impl Store {
             dir,
             config,
             wal,
+            wal_id: last_id,
             wal_len,
+            wal_files,
             next_frame,
             in_flight: false,
             next_segment: replay.max_segment.map_or(0, |m| m + 1),
@@ -762,6 +855,7 @@ impl Store {
         train: bool,
     ) -> Result<Vec<u64>, StoreError> {
         self.begin_write();
+        self.rotate_wal().await?;
         self.commit_start = Instant::now();
         self.timing = CommitTiming::default();
         // Only between batches: every record in a sealed segment then
@@ -846,7 +940,7 @@ impl Store {
             self.dictionary = Some(data.len());
         }
         let mut attrs = Vec::new();
-        let wal_len = self.wal_len;
+        let (wal_id, wal_len) = (self.wal_id, self.wal_len);
         let mut inline_bytes = 0;
         for &(block, ref raw, new_objects) in &blocks {
             self.next_block += 1;
@@ -869,9 +963,10 @@ impl Store {
                 inline_bytes += len;
                 // The block's bytes end the record just written; the frame
                 // starts at `wal_len`, at index 0 of the buffer.
-                Location::Wal {
+                Location::Wal(WalPos {
+                    file: self.wal_id,
                     offset: self.wal_len + (wal_buf.len() - packed.len()) as u64,
-                }
+                })
             } else {
                 let (segment, offset) = self.reserve(len).await?;
                 self.seg_buf.extend_from_slice(&packed);
@@ -948,8 +1043,11 @@ impl Store {
                 // The attributes end the record just written; the frame
                 // starts at `wal_len`, at index 0 of the buffer.
                 let len = u32::try_from(attrs.len()).map_err(|_| StoreError::FrameTooLarge)?;
-                let at = wal_len + (wal_buf.len() - attrs.len()) as u64;
-                topic.attrs.push_back((seq, at, len));
+                let at = WalPos {
+                    file: wal_id,
+                    offset: wal_len + (wal_buf.len() - attrs.len()) as u64,
+                };
+                topic.attrs.push_back(AttrsAt { seq, at, len });
             }
             seqs.push(seq);
         }
@@ -1078,6 +1176,7 @@ impl Store {
 
     async fn release_inner(&mut self, name: &[u8], numbers: &[u64]) -> Result<u64, StoreError> {
         self.begin_write();
+        self.rotate_wal().await?;
         let Some(topic) = self.topics.get_mut(name) else {
             self.in_flight = false;
             return Ok(0);
@@ -1093,7 +1192,11 @@ impl Store {
             };
             frame.record(&mut wal_buf, &release)?;
             topic.first_live += 1;
-            if topic.attrs.front().is_some_and(|a| a.0 < topic.first_live) {
+            if topic
+                .attrs
+                .front()
+                .is_some_and(|a| a.seq < topic.first_live)
+            {
                 topic.attrs.pop_front();
             }
             if let Some(object) = self.objects.get_mut(&number) {
@@ -1205,6 +1308,7 @@ impl Store {
                     + rewrite_bound,
             )?;
             self.begin_write();
+            self.rotate_wal().await?;
             let mut kept_at = Vec::with_capacity(kept.len());
             let mut rewritten = Vec::new();
             let mut new_len = 0;
@@ -1479,18 +1583,24 @@ impl Store {
             return Ok(None);
         };
         let (_, payload) = self.read_object(number).await?;
-        let (key, headers) = match t.attrs.binary_search_by_key(&seq, |a| a.0) {
+        let (key, headers) = match t.attrs.binary_search_by_key(&seq, |a| a.seq) {
             Err(_) => (None, Vec::new()),
             Ok(i) => {
-                let (_, at, len) = t.attrs[i];
+                let AttrsAt { at, len, .. } = t.attrs[i];
+                let corrupt = |reason| StoreError::CorruptWal {
+                    file: at.file,
+                    offset: at.offset,
+                    reason,
+                };
+                let file = self
+                    .wal_file(at.file)
+                    .ok_or(corrupt("WAL file of a key or headers is not open"))?;
                 let len = len as usize;
-                let BufResult(res, buf) = self
-                    .wal
-                    .read_exact_at(Vec::with_capacity(len).slice(..len), at)
+                let BufResult(res, buf) = file
+                    .read_exact_at(Vec::with_capacity(len).slice(..len), at.offset)
                     .await;
                 res?;
-                codec::decode_attrs(&buf.into_inner())
-                    .map_err(|reason| StoreError::CorruptWal { offset: at, reason })?
+                codec::decode_attrs(&buf.into_inner()).map_err(corrupt)?
             }
         };
         Ok(Some(Entry {
@@ -1572,10 +1682,7 @@ impl Store {
     pub fn is_inline(&self, id: &ObjectId) -> Option<bool> {
         let number = self.ids.get(id)?;
         let o = self.objects.get(number)?;
-        Some(matches!(
-            self.blocks.get(&o.block)?.loc,
-            Location::Wal { .. }
-        ))
+        Some(matches!(self.blocks.get(&o.block)?.loc, Location::Wal(_)))
     }
 
     /// Index segment files the store holds open: at most
@@ -1603,6 +1710,35 @@ impl Store {
     /// ran (`Config::dict_train_bytes`), `Some(0)` if training built none.
     pub fn dictionary_bytes(&self) -> Option<usize> {
         self.dictionary
+    }
+
+    /// The handle of WAL file `id`: the one being appended to or an earlier
+    /// one.
+    fn wal_file(&self, id: u64) -> Option<&File> {
+        if id == self.wal_id {
+            Some(&self.wal)
+        } else {
+            self.wal_files.get(&id)
+        }
+    }
+
+    /// Before a frame is built: once the WAL file holds a frame and at
+    /// least `Config::wal_file_max_bytes`, the next frame starts a new file
+    /// named by its sequence number. Positions in the frame (inline blocks,
+    /// keys and headers) are taken after this.
+    async fn rotate_wal(&mut self) -> Result<(), StoreError> {
+        let len = self.wal_len;
+        if len <= WAL_FILE_HEADER as u64 || len < self.config.wal_file_max_bytes {
+            return Ok(());
+        }
+        let id = self.next_frame;
+        let file = create_wal_file(&self.dir, id, self.config.dict_train_bytes).await?;
+        self.stats.fsyncs += 2;
+        let old = std::mem::replace(&mut self.wal, file);
+        self.wal_files.insert(self.wal_id, old);
+        self.wal_id = id;
+        self.wal_len = WAL_FILE_HEADER as u64;
+        Ok(())
     }
 
     fn check_frame(&self, bytes: usize) -> Result<(), StoreError> {
@@ -1724,7 +1860,10 @@ impl Store {
                 Some(file) => (file, offset),
                 None => return Err(missing),
             },
-            Location::Wal { offset } => (&self.wal, offset),
+            Location::Wal(at) => match self.wal_file(at.file) {
+                Some(file) => (file, at.offset),
+                None => return Err(missing),
+            },
         };
         let len = usize::try_from(b.len).map_err(|_| StoreError::CorruptBlock {
             block: number,
@@ -2201,6 +2340,8 @@ struct Replay<'a> {
     segments: HashSet<u64>,
     /// Highest segment id seen in the WAL or on disk; ids are never reused.
     max_segment: Option<u64>,
+    /// The WAL file whose frames are being replayed.
+    file: u64,
 }
 
 #[derive(Default)]
@@ -2277,7 +2418,8 @@ impl<'a> Replay<'a> {
         Ok(())
     }
 
-    /// `body_at`: WAL offset of the frame body holding `rec`.
+    /// `body_at`: offset in WAL file `self.file` of the frame body holding
+    /// `rec`.
     fn apply(&mut self, rec: Record<'a>, body_at: u64) -> Result<(), &'static str> {
         match rec {
             Record::PutDict { number, data } => {
@@ -2322,9 +2464,10 @@ impl<'a> Replay<'a> {
                 data_at,
             } => {
                 let block = Block {
-                    loc: Location::Wal {
+                    loc: Location::Wal(WalPos {
+                        file: self.file,
                         offset: body_at + data_at as u64,
-                    },
+                    }),
                     len: data.len() as u64,
                     raw_len,
                     dict,
@@ -2389,7 +2532,11 @@ impl<'a> Replay<'a> {
                 t.entries.push((number, timestamp));
                 if !attrs.is_empty() {
                     let len = u32::try_from(attrs.len()).map_err(|_| "attributes too long")?;
-                    t.attrs.push((seq, body_at + attrs_at as u64, len));
+                    let at = WalPos {
+                        file: self.file,
+                        offset: body_at + attrs_at as u64,
+                    };
+                    t.attrs.push(AttrsAt { seq, at, len });
                 }
             }
             Record::Release { topic, seq } => {
@@ -2856,7 +3003,7 @@ async fn open_index(
                 record_bytes,
                 attrs: attrs
                     .iter()
-                    .filter(|a| a.0 >= *first_live)
+                    .filter(|a| a.seq >= *first_live)
                     .copied()
                     .collect(),
             },
@@ -2894,40 +3041,67 @@ fn check_refcounts<'a>(
     }
 }
 
-/// Opens `wal.log`, creating it with its file header if missing. A new WAL is
-/// written to `wal.log.tmp`, synced and renamed, so `wal.log` never exists
-/// without a complete header.
-async fn open_wal(
+/// Reads every WAL file `wal-<first frame seq>.log`, in order, creating
+/// the first with its file header if there is none. Leftover
+/// `wal-*.log.tmp` files of an interrupted creation are deleted
+/// (`WalTmpRemoved`). A directory holding the single `wal.log` of an
+/// earlier format is `UnsupportedFormat`, nothing changed.
+async fn read_wal_files(
     dir: &Path,
     report: &mut RecoveryReport,
     dict_train_bytes: u64,
-) -> Result<File, StoreError> {
-    let path = dir.join(WAL_FILE);
-    let tmp = dir.join(WAL_TMP);
-    match compio::fs::remove_file(&tmp).await {
-        Ok(()) => report.actions.push(RecoveryAction::WalTmpRemoved),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
+    if dir.join(LEGACY_WAL_FILE).exists() {
+        return Err(StoreError::UnsupportedFormat);
     }
-    if !path.exists() {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .await?;
-        write_all(&file, codec::wal_file_header(dict_train_bytes).to_vec(), 0)
-            .await
-            .0?;
-        file.sync_all().await?;
-        compio::fs::rename(&tmp, &path).await?;
+    let (mut ids, mut tmps) = (Vec::new(), Vec::new());
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(id) = parse_wal_name(name) {
+            ids.push(id);
+        } else if name.strip_suffix(".tmp").and_then(parse_wal_name).is_some() {
+            tmps.push(name.to_owned());
+        }
     }
-    // Makes the topics directory and a new WAL file durable.
-    sync_dir(dir).await?;
-    Ok(OpenOptions::new()
-        .read(true)
+    for tmp in &tmps {
+        compio::fs::remove_file(dir.join(tmp)).await?;
+        report.actions.push(RecoveryAction::WalTmpRemoved);
+    }
+    ids.sort_unstable();
+    if ids.is_empty() {
+        create_wal_file(dir, 0, dict_train_bytes).await?;
+        ids.push(0);
+    } else {
+        // Makes a removed tmp file, and the directory, durable.
+        sync_dir(dir).await?;
+    }
+    let mut files = Vec::with_capacity(ids.len());
+    for id in ids {
+        files.push((id, compio::fs::read(wal_path(dir, id)).await?));
+    }
+    Ok(files)
+}
+
+/// Creates WAL file `wal-<first>.log` holding only its file header: written
+/// to `wal-<first>.log.tmp`, synced, renamed, and the directory synced, so
+/// a WAL file never exists without a complete header. Returns it open for
+/// reads and appends.
+async fn create_wal_file(dir: &Path, first: u64, dict_train_bytes: u64) -> io::Result<File> {
+    let path = wal_path(dir, first);
+    let tmp = path.with_extension("log.tmp");
+    let file = OpenOptions::new()
         .write(true)
-        .open(&path)
-        .await?)
+        .create_new(true)
+        .open(&tmp)
+        .await?;
+    write_all(&file, codec::wal_file_header(dict_train_bytes).to_vec(), 0)
+        .await
+        .0?;
+    file.sync_all().await?;
+    compio::fs::rename(&tmp, &path).await?;
+    sync_dir(dir).await?;
+    OpenOptions::new().read(true).write(true).open(&path).await
 }
 
 /// Polls both futures until both are done, so their I/O is submitted
@@ -3084,7 +3258,7 @@ async fn first_bad_object(
             (None, None) => continue,
         };
         let block = Block {
-            loc: Location::Wal { offset: 0 },
+            loc: Location::Wal(WalPos::default()),
             len,
             raw_len,
             dict,
@@ -3135,6 +3309,18 @@ fn segment_path(dir: &Path, id: u64) -> PathBuf {
 
 fn parse_segment_name(name: &str) -> Option<u64> {
     let hex = name.strip_prefix("seg-")?.strip_suffix(".dat")?;
+    if hex.len() != 16 {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
+
+fn wal_path(dir: &Path, first: u64) -> PathBuf {
+    dir.join(format!("wal-{first:016x}.log"))
+}
+
+fn parse_wal_name(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("wal-")?.strip_suffix(".log")?;
     if hex.len() != 16 {
         return None;
     }

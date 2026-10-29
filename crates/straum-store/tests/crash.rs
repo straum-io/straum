@@ -51,6 +51,9 @@ fn config(mode_name: &str) -> Config {
         // Batches of up to 16 payloads of up to ~3 KiB: several blocks per
         // frame, so kills also land between them.
         max_block_raw_bytes: 4096,
+        // WAL files rotate every few frames, so kills also land around a
+        // file's creation and recovery spans many files.
+        wal_file_max_bytes: 16 << 10,
         ..Config::default()
     }
 }

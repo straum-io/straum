@@ -73,7 +73,7 @@ async fn a_full_block_damaged_after_open_fails_every_read_of_it() {
     // Flip a byte inside block 0's record while the store is open.
     let rec = find_index_record(&dir.0, INDEX_BLOCK_RECORD, 0, 0);
     edit(&rec.path, |b| b[rec.body.start + 3] ^= 0xff);
-    let wal_before = std::fs::read(dir.0.join("wal.log")).unwrap();
+    let wal_before = std::fs::read(dir.0.join(common::WAL0)).unwrap();
 
     let corrupt = |e: StoreError| matches!(e, StoreError::TopicIndexCorrupt { block: 0, .. });
     assert!(corrupt(store.read(b"t", 5).await.unwrap_err()));
@@ -81,7 +81,7 @@ async fn a_full_block_damaged_after_open_fails_every_read_of_it() {
     assert!(corrupt(store.entry(b"t", 5).await.unwrap_err()));
     assert!(corrupt(store.release_before(b"t", 70).await.unwrap_err()));
     // Nothing was written, and block 1 and the tail still read.
-    assert_eq!(std::fs::read(dir.0.join("wal.log")).unwrap(), wal_before);
+    assert_eq!(std::fs::read(dir.0.join(common::WAL0)).unwrap(), wal_before);
     assert_eq!(store.read(b"t", 100).await.unwrap(), Some(payload(100)));
     assert_eq!(store.read(b"t", 129).await.unwrap(), Some(payload(129)));
 }
@@ -209,12 +209,12 @@ async fn a_release_too_large_for_a_frame_fails_before_writing() {
     };
     let mut store = Store::open(&dir.0, config).await.unwrap();
     fill(&mut store, 2000).await;
-    let wal_before = std::fs::read(dir.0.join("wal.log")).unwrap();
+    let wal_before = std::fs::read(dir.0.join(common::WAL0)).unwrap();
     assert!(matches!(
         store.release_before(b"t", u64::MAX).await,
         Err(StoreError::FrameTooLarge)
     ));
-    assert_eq!(std::fs::read(dir.0.join("wal.log")).unwrap(), wal_before);
+    assert_eq!(std::fs::read(dir.0.join(common::WAL0)).unwrap(), wal_before);
     // A release that fits still works.
     assert_eq!(store.release_before(b"t", 10).await.unwrap(), 10);
 }

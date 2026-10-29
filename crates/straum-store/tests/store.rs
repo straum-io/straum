@@ -298,18 +298,18 @@ async fn torn_tail_at_every_offset() {
                 }
             }
         }
-        let wal = std::fs::read(dir.0.join("wal.log")).unwrap();
+        let wal = std::fs::read(dir.0.join(common::WAL0)).unwrap();
         let starts = wal_frame_starts(&wal);
         let last_start = *starts.last().unwrap();
         for cut in last_start..wal.len() {
             let work = TempDir::new("torn-cut");
             copy_dir(&dir.0, &work.0);
-            std::fs::write(work.0.join("wal.log"), &wal[..cut]).unwrap();
+            std::fs::write(work.0.join(common::WAL0), &wal[..cut]).unwrap();
             let store = match Store::open(&work.0, config).await {
                 Ok(store) => store,
                 Err(e) => panic!("{last}: recovery failed at cut {cut}: {e}"),
             };
-            let len = std::fs::metadata(work.0.join("wal.log")).unwrap().len();
+            let len = std::fs::metadata(work.0.join(common::WAL0)).unwrap().len();
             assert_eq!(
                 len, last_start as u64,
                 "{last}: torn tail truncated at cut {cut}"

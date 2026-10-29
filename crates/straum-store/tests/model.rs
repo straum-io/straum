@@ -159,6 +159,9 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
             // Payloads of up to 300 bytes: batches split into several
             // blocks, and the largest payloads are blocks of their own.
             max_block_raw_bytes: 128,
+            // A new WAL file every frame or two: inline blocks, keys and
+            // headers are read from earlier files.
+            wal_file_max_bytes: 512,
             ..Config::default()
         };
         let payloads = payloads();

@@ -4,6 +4,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The first WAL file, the only one below `Config::wal_file_max_bytes`.
+pub const WAL0: &str = "wal-0000000000000000.log";
+
 /// A fresh directory under the system temp dir, removed on drop.
 pub struct TempDir(pub PathBuf);
 

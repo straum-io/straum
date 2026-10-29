@@ -2,7 +2,7 @@
 
 What the broker in this repository promises today: one node, protocol
 version 0 ([protocol.md](protocol.md)), the straum-store engine with WAL
-format 12 ([format.md](../crates/straum-store/docs/format.md)). Anything
+format 13 ([format.md](../crates/straum-store/docs/format.md)). Anything
 this page does not state is not guaranteed. Section 7 lists the changes
 under way that will alter it.
 
@@ -109,13 +109,14 @@ At startup the store replays the WAL from the beginning
   | `IndexSegmentRemoved` | an index segment without an intact header is deleted; the index records it held are rewritten from the WAL (`TopicIndexRepaired`) |
   | `StaleIndexRecordsFenced` | index records of WAL frames that recovery cut were found; a new, empty index segment is created so they stay ignored once new frames reuse those frame numbers |
   | `TopicIndexRepaired` | full index blocks and seek pages of a topic that no index segment holds intact (the index is derived from the WAL and not synced) are re-encoded from the WAL and appended to a new index segment |
-  | `WalTmpRemoved` | `wal.log.tmp` of an interrupted WAL creation is deleted |
+  | `WalTmpRemoved` | a `wal-<seq>.log.tmp` of an interrupted WAL file creation is deleted |
 
   An empty report means nothing was changed.
 - **What it refuses.** Damage anywhere else stops the store from opening,
   and no file is changed: a damaged frame followed by a valid one
-  (`WalCorrupted`), a valid frame that is out of sequence or contradicts
-  earlier frames (`CorruptWal`), a body of the last frame missing or wrong
+  or in a WAL file that another follows (`WalCorrupted`), a valid frame
+  that is out of sequence or contradicts earlier frames, or a missing or
+  extra WAL file (`CorruptWal`), a body of the last frame missing or wrong
   in `sequential` or `inline` mode (`MissingObject`, `HashMismatch`), a
   body of an earlier frame missing or cut short (`MissingObject`), a
   block of the last frame that does not decompress or fails its checks
@@ -193,7 +194,7 @@ At startup the store replays the WAL from the beginning
   the object index took about 178 bytes allocated per stored body with
   compressed blocks (ADR-0014). A Linux process limited to 2 GiB was
   killed before 10 million unique messages.
-- **Disk grows with stored data.** The WAL is one file that is never cut,
+- **Disk grows with stored data.** The WAL files are never deleted,
   and nothing is released (retention by age is not enforced, topics
   cannot be deleted). Startup time grows with the WAL, which is replayed
   in full.

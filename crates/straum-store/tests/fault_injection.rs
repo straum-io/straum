@@ -88,10 +88,10 @@ async fn open_damaged(mode: WriteMode, damage: impl FnOnce(&Path)) -> Opened {
     copy_dir(&src.0, &work.0);
     damage(&work.0);
     let files_before = snapshot(&work.0);
-    let wal_before = std::fs::read(work.0.join("wal.log")).unwrap();
+    let wal_before = std::fs::read(work.0.join(common::WAL0)).unwrap();
     let res = Store::open(&work.0, config(mode)).await;
     let files_after = snapshot(&work.0);
-    let wal_after = std::fs::read(work.0.join("wal.log")).unwrap();
+    let wal_after = std::fs::read(work.0.join(common::WAL0)).unwrap();
     Opened {
         res,
         files_before,
@@ -129,6 +129,7 @@ async fn assert_last_frame_outcome(mode: WriteMode, o: Opened, reason: DropReaso
             actions.first(),
             Some(&RecoveryAction::FrameDropped {
                 frame_seq: u64::from(BATCHES) - 1,
+                file: 0,
                 offset: last as u64,
                 mode: FrameMode::ParallelSync,
                 object,
@@ -213,9 +214,9 @@ async fn last_frame_with_wrong_segment_bytes() {
 async fn parallel_sync_frame_followed_by_torn_tail_is_not_dropped() {
     let o = open_damaged(WriteMode::ParallelSync, |d| {
         std::fs::remove_file(segment(d, LAST)).unwrap();
-        let mut wal = std::fs::read(d.join("wal.log")).unwrap();
+        let mut wal = std::fs::read(d.join(common::WAL0)).unwrap();
         wal.extend_from_slice(&[0x5a; 30]);
-        std::fs::write(d.join("wal.log"), wal).unwrap();
+        std::fs::write(d.join(common::WAL0), wal).unwrap();
     })
     .await;
     assert!(
@@ -305,7 +306,7 @@ async fn inline_small_damaged_last_frame_is_dropped() {
             "one fdatasync per batch"
         );
     }
-    let path = dir.0.join("wal.log");
+    let path = dir.0.join(common::WAL0);
     let mut wal = std::fs::read(&path).unwrap();
     let last = *wal_frame_starts(&wal).last().unwrap();
     let len = wal.len();
@@ -318,6 +319,7 @@ async fn inline_small_damaged_last_frame_is_dropped() {
         store.recovery_report().actions.first(),
         Some(&RecoveryAction::TornTailTruncated {
             frame_seq: u64::from(BATCHES) - 1,
+            file: 0,
             offset: last as u64,
             bytes_removed: (len - last) as u64,
         })

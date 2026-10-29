@@ -113,7 +113,8 @@ the harness works; they are not the owner's hardware.
    - `crash`: `lazyfs::crash` kills LazyFS before or after the next
      `write`, `fsync`, `create` or `unlink` of a WAL, segment or index
      segment file;
-   - `torn`: `lazyfs::torn-op` splits the next write to `wal.log` or to
+   - `torn`: `lazyfs::torn-op` splits the next write to the WAL file
+     being appended to when the fault is sent (`wal-<seq>.log`) or to
      the index segment the writer will append to (`idx-<id>.dat`, the next
      id after those on disk when the writer starts) into 2–4 parts,
      persists a random subset and kills LazyFS.
@@ -135,7 +136,8 @@ the harness works; they are not the owner's hardware.
      lists, `FrameDropped` only in `parallel`, at most one WAL cut;
    - every change recovery made to the store directory is in the report
      and every report entry is a change on disk: a WAL change must be a cut
-     at the reported offset, a segment may only be deleted, an existing
+     of the reported WAL file at the reported offset, a deleted
+     `wal-*.log.tmp` needs `WalTmpRemoved`, a segment may only be deleted, an existing
      index segment only deleted (`IndexSegmentRemoved` with its size), and
      a new index segment must hold a fence (`StaleIndexRecordsFenced`) or
      repaired records (`TopicIndexRepaired`). Anything else is a silent
@@ -149,7 +151,7 @@ iterations also recover stores that were recovered before.
 
 | Scenario | Writer | Fault |
 |---|---|---|
-| `store` | batches of 1–16 messages to three topics, one released and compacted every 3rd round; segments of 64 KiB; `inline` stores bodies up to 1024 bytes in the WAL (the broker's `inline`: 4096), so both kinds of object occur | `clear`, `crash` or `torn` at a random moment |
+| `store` | batches of 1–16 messages to three topics, one released and compacted every 3rd round; segments and WAL files of 64 KiB; `inline` stores bodies up to 1024 bytes in the WAL (the broker's `inline`: 4096), so both kinds of object occur | `clear`, `crash` or `torn` at a random moment |
 | `broker` | `straum-broker` with `store_write_mode` set to the mode and 64 KiB segments; two producers with keys, headers and repeated bodies, 10 ms apart between requests | as `store` |
 | `compaction` | as `store`, compacting after every round | the writer sends a `crash` or `torn` (WAL) fault just before its 1st–4th compaction; the summary counts the iterations whose writer died inside the compaction |
 | `dictionary` | as `store`, on a fresh store per iteration with `dict_train_bytes` 64 KiB | the writer sends a `crash` or `torn` (WAL) fault just before the batch that trains the dictionary (`Store::trains_next_batch`) |

@@ -15,10 +15,10 @@ impl ObjectId {
 }
 
 /// `magic [8] | version u32 | dict_train_bytes u64 | crc32c u32` at the
-/// start of `wal.log`.
+/// start of every WAL file.
 pub const WAL_FILE_HEADER: usize = 24;
 pub const WAL_MAGIC: [u8; 8] = *b"STRMWAL\0";
-pub const WAL_VERSION: u32 = 12;
+pub const WAL_VERSION: u32 = 13;
 /// Header bytes covered by the header CRC (everything before it).
 const WAL_HEADER_CRC_AT: usize = 20;
 /// `len u32 | seq u64 | count u32 | mode u8 | crc32c u32`.

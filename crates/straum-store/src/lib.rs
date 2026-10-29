@@ -28,19 +28,34 @@ pub enum StoreError {
     /// `Config::max_frame_bytes`. Returned before any I/O.
     #[error("operation exceeds the maximum WAL frame size")]
     FrameTooLarge,
-    /// `wal.log` does not start with this version's file header (a phase 1
-    /// WAL, another program's file, or a future version).
+    /// A WAL file does not start with this version's file header (another
+    /// version, another program's file, a damaged header), or the
+    /// directory holds the single `wal.log` of a format before 13.
     #[error("WAL format not supported by this version")]
     UnsupportedFormat,
     /// A frame with a valid CRC that is malformed, out of sequence, or
     /// inconsistent with the frames before it.
-    #[error("corrupt WAL at offset {offset}: {reason}")]
-    CorruptWal { offset: u64, reason: &'static str },
+    /// Also WAL files that do not continue one another. `file` names the
+    /// WAL file by the sequence number of its first frame.
+    #[error("corrupt WAL file {file} at offset {offset}: {reason}")]
+    CorruptWal {
+        file: u64,
+        offset: u64,
+        reason: &'static str,
+    },
     /// A frame fails its CRC (or is short) but a frame with a valid CRC
-    /// starts later in the file: mid-log damage, not a torn tail. The WAL is
-    /// left unmodified.
-    #[error("WAL damaged at offset {offset}; a valid frame follows at {next_frame}")]
-    WalCorrupted { offset: u64, next_frame: u64 },
+    /// starts later in the file, or a later WAL file exists (one is created
+    /// only after the previous file's last frame is durable): mid-log
+    /// damage, not a torn tail. The WAL is left unmodified.
+    #[error(
+        "WAL file {file} damaged at offset {offset}; file {next_file} continues at {next_offset}"
+    )]
+    WalCorrupted {
+        file: u64,
+        offset: u64,
+        next_file: u64,
+        next_offset: u64,
+    },
     #[error("object {0:?} is missing or truncated on disk")]
     MissingObject(ObjectId),
     #[error("object {0:?} failed its hash check")]

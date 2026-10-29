@@ -38,13 +38,18 @@ macOS (development only). No tokio, including transitively.
   headers and timestamp. Without key and headers a publication costs no
   extra byte (measured with `examples/meta_bytes`); with them, the key and
   headers are neither deduplicated nor compressed, and each live entry
-  that has them keeps their WAL offset and length in memory (24 bytes)
+  that has them keeps their WAL position and length in memory (32 bytes)
   until shared attribute segments replace it (ADR-0014 §8).
 - `Store::topic_stats` (first and next seq, index bytes) and
   `Store::batch_frame_bytes` (the frame bound `put_batch` checks before any
   I/O, additive over messages) let a caller size its batches.
 - Group commit: one segment `fdatasync` and one WAL `fdatasync` per batch;
   a batch is acknowledged only after both.
+- The WAL is a sequence of files, `wal-<first frame seq>.log`: a file that
+  holds `Config::wal_file_max_bytes` (default 64 MiB) is closed before the
+  next frame, which starts a new file. Recovery reads them in order and
+  requires each to continue the previous one; only the last file's tail
+  can be cut. No file is deleted yet (ADR-0014 §3, the checkpoint).
 - Recovery from the WAL cuts a torn tail and checks the index segments and
   reference counts against it; index blocks and seek pages lost with
   unsynced pages are rewritten from the WAL. Every change recovery makes is listed in
@@ -122,8 +127,9 @@ Test variables: `STRAUM_STORE_CRASH_ITERATIONS` (default 200),
 | `tests/index_reads.rs` | live entries read from the index segments: reads across full blocks and the in-memory tail, before and after reopen; release across a block boundary; a full block damaged after open fails `read`, `entry`, `index_entry` and `release_before` with `TopicIndexCorrupt`, writing nothing; seek pages of 2 locations (four levels for 20 blocks) find every entry, and a damaged page fails exactly the blocks under it; reading across 20 index segments keeps at most `index_open_files` + 1 open; a release too large for a frame fails with `FrameTooLarge` before writing |
 | `tests/index_segments.rs` | index records of a cut WAL tail stay stale after new frames reuse their numbers (no false `TopicMismatch`); a damaged fence header fails open with `TopicMismatch`, no file changed (the documented limit); in every write mode, a deleted segment, all segments deleted, a damaged header, a cut record and zeroed unsynced pages are repaired from the WAL and reported, the WAL unchanged, and the next open is clean |
 | `tests/store.rs` | deduplication; one fsync per file per batch; restart; rotation; compaction; orphans; a corrupted block fails the read; an intact index block disagreeing with the WAL (`TopicMismatch`) or beyond it (`IndexSegmentCorrupt`) with no file changed; a lost or cut index segment rebuilt byte for byte; a damaged record ends the scan of its segment; WAL truncation at every byte of the last record (Publish, Release, Compact) |
-| `tests/model.rs` | proptest: random publish (with no key, an empty key, or a key and headers), release, compact and restart against an in-memory model, 128 cases per write mode, with dictionary training, a two-block cache, seek pages of 2 locations, index segments rotating every 256 bytes and two open index files |
-| `tests/crash.rs` | a writer in a child process killed with SIGKILL at a random moment, checked after each restart; one test per write mode; the dictionary is trained during the run; index segments rotate and seek pages (2 locations) fill during it |
+| `tests/model.rs` | proptest: random publish (with no key, an empty key, or a key and headers), release, compact and restart against an in-memory model, 128 cases per write mode, with dictionary training, a small block cache, seek pages of 2 locations, index segments rotating every 256 bytes, two open index files and WAL files of 512 bytes |
+| `tests/crash.rs` | a writer in a child process killed with SIGKILL at a random moment, checked after each restart; one test per write mode; the dictionary is trained during the run; index segments rotate, seek pages (2 locations) fill and WAL files (16 KiB) rotate during it |
+| `tests/wal_files.rs` | WAL files: one frame per file at a limit of 1 byte and frames up to the limit otherwise, in every write mode, with keys, headers and inline blocks read from earlier files after reopen; only the last file's tail is cut, and writing continues; damage at the end of an earlier file is `WalCorrupted`, a missing, renamed or damaged-header file and an old `wal.log` an error, no file changed; an empty last file and a leftover tmp file; a ParallelSync frame with a missing block is dropped only when no WAL file follows it |
 | `tests/publication.rs` | keys and headers through restart, release and compaction in every write mode; one object for the same payload under different keys; the frame bound counts them and is additive; `topic_stats` |
 | `tests/wal_corruption.rs` | any flipped bit in a middle frame gives `WalCorrupted` and leaves the file unchanged; in the last frame, truncation; a lost first half of the last frame is a torn tail; truncation at every byte; a `seq` gap; an old format gives `UnsupportedFormat`; `max_frame_bytes` |
 | `tests/fault_injection.rs` | hand-built states: a missing, short or damaged block of the last frame drops the frame in ParallelSync and is an error otherwise; a missing block of an earlier frame gives `MissingObject`, a damaged one `CorruptBlock` on read; every write mode |

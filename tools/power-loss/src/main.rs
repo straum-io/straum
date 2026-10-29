@@ -115,14 +115,16 @@ fn num(opts: &HashMap<&str, &str>, key: &str) -> Result<u64, String> {
 
 /// LazyFS crash points: `lazyfs::crash` kills LazyFS at the first matching
 /// operation after the command arrives, dropping its cache.
-const CRASH_POINTS: [(&str, &str); 7] = [
-    ("write", r"wal\.log"),
-    ("fsync", r"wal\.log"),
+const CRASH_POINTS: [(&str, &str); 8] = [
+    ("write", r"wal-.*\.log$"),
+    ("fsync", r"wal-.*\.log$"),
     ("write", "seg-"),
     ("fsync", "seg-"),
     ("write", "idx-"),
     ("create", "seg-"),
     ("unlink", "seg-"),
+    // A new WAL file, created when the previous one is full.
+    ("create", "wal-"),
 ];
 
 /// One line per iteration: `<i> <delay_ms> <writer_seed> <kind> <command>
@@ -161,11 +163,12 @@ fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
             }
             _ => {
                 // Torn WAL writes twice as often as torn index writes; a
-                // compaction writes no index. `@IDX@` is the index segment
-                // the writer will append to, named by run.sh before the
-                // writer starts.
+                // compaction writes no index. `@WAL@` is the WAL file being
+                // appended to when the fault is armed; `@IDX@` the index
+                // segment the writer will append to, named by run.sh
+                // before the writer starts.
                 let file = if compaction || rng.below(3) > 0 {
-                    "wal.log"
+                    "@WAL@"
                 } else {
                     "@IDX@"
                 };
@@ -203,9 +206,10 @@ fn store_config(mode: &str, opts: &HashMap<&str, &str>) -> Result<Config, String
         None => Config::default().dict_train_bytes,
     };
     Ok(Config {
-        // Small segments: rotation, sealing mid-batch and compaction happen
-        // within one iteration.
+        // Small segments and WAL files: rotation, sealing mid-batch and
+        // compaction happen within one iteration.
         segment_max_bytes: 64 << 10,
+        wal_file_max_bytes: 64 << 10,
         write_mode,
         dict_train_bytes,
         ..Config::default()
@@ -312,14 +316,31 @@ fn store_write(opts: &HashMap<&str, &str>) -> Result<String, String> {
     Ok(String::new())
 }
 
-/// Writes `--fault` to the LazyFS fault FIFO `--fifo`.
+/// The newest WAL file of the store in `dir`: the one being appended to.
+fn last_wal_file(dir: &Path) -> Option<String> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| wal_file_id(n).is_some())
+        .max()
+}
+
+/// The first frame seq of a WAL file `wal-<16 hex digits>.log`.
+fn wal_file_id(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("wal-")?.strip_suffix(".log")?;
+    (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok())?
+}
+
+/// Writes `--fault` to the LazyFS fault FIFO `--fifo`; `@WAL@` in it
+/// becomes the WAL file being appended to.
 #[expect(
     clippy::unwrap_used,
     reason = "a harness error ends the writer; run.sh reports the iteration"
 )]
 fn arm(opts: &HashMap<&str, &str>) {
     let fifo = opt(opts, "fifo").unwrap();
-    let fault = opt(opts, "fault").unwrap();
+    let wal = last_wal_file(Path::new(opt(opts, "dir").unwrap())).unwrap();
+    let fault = opt(opts, "fault").unwrap().replace("@WAL@", &wal);
     std::fs::OpenOptions::new()
         .write(true)
         .open(fifo)
@@ -411,15 +432,15 @@ fn parse_store_logs(logs: &str) -> Result<StoreLog, String> {
 }
 
 /// Every file under a store directory: relative path → (length, BLAKE3),
-/// plus the WAL's bytes, to check what recovery cut.
+/// plus the WAL files' bytes, to check what recovery cut.
 struct Snapshot {
     files: BTreeMap<String, (u64, [u8; 32])>,
-    wal: Vec<u8>,
+    wal: HashMap<String, Vec<u8>>,
 }
 
 fn snapshot(dir: &Path) -> Result<Snapshot, String> {
     let mut files = BTreeMap::new();
-    let mut wal = Vec::new();
+    let mut wal = HashMap::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let entries = match std::fs::read_dir(&d) {
@@ -443,8 +464,8 @@ fn snapshot(dir: &Path) -> Result<Snapshot, String> {
                 rel.clone(),
                 (bytes.len() as u64, *blake3::hash(&bytes).as_bytes()),
             );
-            if rel == "wal.log" {
-                wal = bytes;
+            if wal_file_id(&rel).is_some() {
+                wal.insert(rel, bytes);
             }
         }
     }
@@ -530,26 +551,29 @@ fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Res
         }
         let name = rel.rsplit('/').next().unwrap_or(rel);
         match (rel.as_str(), b, a) {
-            ("wal.log", Some(b), Some(a)) => {
+            (_, Some(b), Some(a)) if wal_file_id(rel).is_some() => {
                 let cut = a.0 as usize;
-                if a.0 >= b.0 || *blake3::hash(&before.wal[..cut]).as_bytes() != a.1 {
+                let bytes = before.wal.get(rel).map_or(&[][..], Vec::as_slice);
+                if a.0 >= b.0 || *blake3::hash(&bytes[..cut]).as_bytes() != a.1 {
                     return Err(format!(
-                        "silent repair: wal.log changed other than by a cut ({} → {} bytes)",
+                        "silent repair: {rel} changed other than by a cut ({} → {} bytes)",
                         b.0, a.0
                     ));
                 }
+                let file = wal_file_id(rel).unwrap_or_default().to_string();
                 let removed = (b.0 - a.0).to_string();
                 let offset = a.0.to_string();
                 explain(
                     &|x| {
                         matches!(action_name(x), "TornTailTruncated" | "FrameDropped")
+                            && action_field(x, "file") == Some(file.as_str())
                             && action_field(x, "offset") == Some(offset.as_str())
                             && action_field(x, "bytes_removed") == Some(removed.as_str())
                     },
-                    "wal.log (cut)",
+                    &format!("{rel} (cut)"),
                 )?;
             }
-            ("wal.log.tmp", Some(_), None) => {
+            (_, Some(_), None) if name.strip_suffix(".tmp").and_then(wal_file_id).is_some() => {
                 explain(&|x| action_name(x) == "WalTmpRemoved", rel)?;
             }
             (_, Some(_), None) if name.starts_with("seg-") => {
@@ -621,12 +645,12 @@ fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
     let mode = opt(opts, "mode")?;
     let config = store_config(mode, opts)?;
     let log = parse_store_logs(opt(opts, "logs")?)?;
-    if !dir.join("wal.log").exists() {
+    if last_wal_file(&dir).is_none() {
         return if log.acked.is_empty() {
             Ok("acked=0 (no store yet)".to_owned())
         } else {
             Err(format!(
-                "wal.log missing with {} acknowledged messages",
+                "no WAL file with {} acknowledged messages",
                 log.acked.len()
             ))
         };
@@ -875,11 +899,11 @@ fn broker_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
     let mode = opt(opts, "mode")?;
     let log = parse_broker_logs(opt(opts, "logs")?)?;
     let store_dir = data.join("store");
-    if !store_dir.join("wal.log").exists() {
+    if last_wal_file(&store_dir).is_none() {
         return if log.acked.is_empty() && !log.topic_acked {
             Ok("acked=0 (no store yet)".to_owned())
         } else {
-            Err("store/wal.log missing after acknowledgements".to_owned())
+            Err("no WAL file in store/ after acknowledgements".to_owned())
         };
     }
     let before = snapshot(&store_dir)?;
@@ -1032,49 +1056,52 @@ mod tests {
                 .collect(),
             wal: files
                 .iter()
-                .find(|(p, _)| *p == "wal.log")
-                .map(|(_, b)| b.to_vec())
-                .unwrap_or_default(),
+                .filter(|(p, _)| wal_file_id(p).is_some())
+                .map(|(p, b)| ((*p).to_owned(), b.to_vec()))
+                .collect(),
         }
     }
 
+    const W0: &str = "wal-0000000000000000.log";
     const IDX0: &str = "idx-0000000000000000.dat";
     const IDX1: &str = "idx-0000000000000001.dat";
 
     #[test]
     fn changes_must_match_the_report() {
         let before = snap(&[
-            ("wal.log", b"0123456789"),
+            (W0, b"0123456789"),
             ("seg-000000000000000a.dat", b"x"),
             (IDX0, b"abc"),
         ]);
         let cut = snap(&[
-            ("wal.log", b"012345"),
+            (W0, b"012345"),
             ("seg-000000000000000a.dat", b"x"),
             (IDX0, b"abc"),
         ]);
-        let torn = "TornTailTruncated { frame_seq: 3, offset: 6, bytes_removed: 4 }".to_owned();
+        let torn =
+            "TornTailTruncated { frame_seq: 3, file: 0, offset: 6, bytes_removed: 4 }".to_owned();
         assert!(check_changes(&before, &cut, std::slice::from_ref(&torn)).is_ok());
         // Cut without an entry, entry without a cut, wrong offset.
         assert!(check_changes(&before, &cut, &[]).is_err());
         assert!(check_changes(&before, &before, std::slice::from_ref(&torn)).is_err());
-        let wrong = "TornTailTruncated { frame_seq: 3, offset: 5, bytes_removed: 5 }".to_owned();
+        let wrong =
+            "TornTailTruncated { frame_seq: 3, file: 0, offset: 5, bytes_removed: 5 }".to_owned();
         assert!(check_changes(&before, &cut, &[wrong]).is_err());
         // A WAL rewritten, not cut.
         let rewritten = snap(&[
-            ("wal.log", b"01234X"),
+            (W0, b"01234X"),
             ("seg-000000000000000a.dat", b"x"),
             (IDX0, b"abc"),
         ]);
         assert!(check_changes(&before, &rewritten, &[torn]).is_err());
 
-        let no_seg = snap(&[("wal.log", b"0123456789"), (IDX0, b"abc")]);
+        let no_seg = snap(&[(W0, b"0123456789"), (IDX0, b"abc")]);
         let orphan = "OrphanSegmentRemoved { segment: 10 }".to_owned();
         assert!(check_changes(&before, &no_seg, &[orphan]).is_ok());
         assert!(check_changes(&before, &no_seg, &[]).is_err());
         // A segment changed in place is never a documented repair.
         let seg_changed = snap(&[
-            ("wal.log", b"0123456789"),
+            (W0, b"0123456789"),
             ("seg-000000000000000a.dat", b"y"),
             (IDX0, b"abc"),
         ]);
@@ -1082,16 +1109,38 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_names_its_wal_file() {
+        const W1: &str = "wal-0000000000000005.log";
+        let before = snap(&[(W0, b"0123456789"), (W1, b"abcdef")]);
+        let cut = snap(&[(W0, b"0123456789"), (W1, b"abc")]);
+        let torn = |file| {
+            format!(
+                "TornTailTruncated {{ frame_seq: 7, file: {file}, offset: 3, bytes_removed: 3 }}"
+            )
+        };
+        assert!(check_changes(&before, &cut, &[torn(5)]).is_ok());
+        assert!(check_changes(&before, &cut, &[torn(0)]).is_err());
+        let tmp = snap(&[
+            (W0, b"0123456789"),
+            (W1, b"abcdef"),
+            ("wal-0000000000000009.log.tmp", b"h"),
+        ]);
+        let removed = "WalTmpRemoved".to_owned();
+        assert!(check_changes(&tmp, &before, std::slice::from_ref(&removed)).is_ok());
+        assert!(check_changes(&tmp, &before, &[]).is_err());
+    }
+
+    #[test]
     fn index_segments_may_only_be_deleted_or_added_with_a_report_entry() {
-        let before = snap(&[("wal.log", b"0123456789"), (IDX0, b"abc")]);
+        let before = snap(&[(W0, b"0123456789"), (IDX0, b"abc")]);
         let repaired =
             r#"TopicIndexRepaired { topic: [111], blocks_rewritten: 1, pages_rewritten: 0 }"#
                 .to_owned();
         // An existing segment changed in place: never a repair.
-        let changed = snap(&[("wal.log", b"0123456789"), (IDX0, b"abd")]);
+        let changed = snap(&[(W0, b"0123456789"), (IDX0, b"abd")]);
         assert!(check_changes(&before, &changed, std::slice::from_ref(&repaired)).is_err());
         // Deleted, with its size reported.
-        let gone = snap(&[("wal.log", b"0123456789"), (IDX1, b"hdr+blocks")]);
+        let gone = snap(&[(W0, b"0123456789"), (IDX1, b"hdr+blocks")]);
         let removed = "IndexSegmentRemoved { segment: 0, bytes: 3 }".to_owned();
         let actions = [removed.clone(), repaired.clone()];
         assert!(check_changes(&before, &gone, &actions).is_ok());
@@ -1099,7 +1148,7 @@ mod tests {
         assert!(check_changes(&before, &gone, &[wrong, repaired.clone()]).is_err());
         // A new segment needs a fence or repaired records, and repaired
         // records need a new segment.
-        let added = snap(&[("wal.log", b"0123456789"), (IDX0, b"abc"), (IDX1, b"h")]);
+        let added = snap(&[(W0, b"0123456789"), (IDX0, b"abc"), (IDX1, b"h")]);
         assert!(check_changes(&before, &added, &[]).is_err());
         assert!(check_changes(&before, &added, std::slice::from_ref(&repaired)).is_ok());
         assert!(check_changes(&before, &before, std::slice::from_ref(&repaired)).is_err());
@@ -1112,10 +1161,11 @@ mod tests {
 
     #[test]
     fn report_rules() {
-        let dropped = "FrameDropped { frame_seq: 1, offset: 2, mode: ParallelSync, object: x, reason: ObjectMissing, bytes_removed: 3 }".to_owned();
+        let dropped = "FrameDropped { frame_seq: 1, file: 0, offset: 2, mode: ParallelSync, object: x, reason: ObjectMissing, bytes_removed: 3 }".to_owned();
         assert!(check_report(std::slice::from_ref(&dropped), "parallel").is_ok());
         assert!(check_report(std::slice::from_ref(&dropped), "sequential").is_err());
-        let torn = "TornTailTruncated { frame_seq: 1, offset: 2, bytes_removed: 3 }".to_owned();
+        let torn =
+            "TornTailTruncated { frame_seq: 1, file: 0, offset: 2, bytes_removed: 3 }".to_owned();
         assert!(check_report(&[torn, dropped], "parallel").is_err());
         assert!(check_report(&["Rewritten".to_owned()], "parallel").is_err());
     }

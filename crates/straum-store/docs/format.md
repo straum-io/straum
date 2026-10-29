@@ -10,8 +10,8 @@ names, segments).
 
 ```text
 <dir>/
-├── wal.log                      the log (one file, not rotated)
-├── wal.log.tmp                  only while a WAL is being created; deleted at open
+├── wal-<seq:016x>.log           the log, in files named by their first frame's sequence number
+├── wal-<seq:016x>.log.tmp       only while a WAL file is being created; deleted at open
 ├── seg-<id:016x>.dat            data segments; id is a u64 in hex, 16 digits
 └── idx-<id:016x>.dat            index segments: topic index blocks and seek pages of every topic
 ```
@@ -82,32 +82,48 @@ Only the WAL knows where a block lies (PutBlock and Compact records). Bytes
 no WAL record points to (orphans of a crash before the WAL fsync) are
 allowed: compaction removes them.
 
-## WAL `wal.log`
+## WAL `wal-<seq>.log`
 
-A file header (24 bytes), then frames. One frame is one batch of messages
-(`put_batch`), one `release_before` call, or one compaction step (one
-rewritten segment).
+The WAL is a sequence of files. Each is named by the sequence number of
+its first frame (16 hex digits) and holds a file header (24 bytes), then
+frames. One frame is one batch of messages (`put_batch`), one
+`release_before` call, or one compaction step (one rewritten segment).
+Frame sequence numbers run on across files: a file starts with the frame
+after the previous file's last.
+
+**Rotation.** Before a write builds its frame, a file that holds at least
+one frame and at least `Config::wal_file_max_bytes` (default 64 MiB) is
+closed and a new file is created, named by the next frame's sequence
+number; the frame goes there. A file can exceed the limit by one frame.
+Positions inside frames (inline blocks, keys and headers) name the file
+and the offset in it. Files are created as below, so a WAL file never
+exists without a complete header, and a file exists only after the last
+frame of the file before it is durable. No WAL file is deleted yet: a
+checkpoint will delete the files wholly before the frame it covers
+(ADR-0014 §3).
 
 ### File header
 
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 12 |
+| 8 | 4 | `version` u32 = 13 |
 | 12 | 8 | `dict_train_bytes` u64: the dictionary training threshold |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
-`dict_train_bytes` is written once, from `Config::dict_train_bytes`, when
-the WAL is created, and never changes. At open the store uses the header's
+`dict_train_bytes` is written from `Config::dict_train_bytes` when the
+WAL's first file is created, then copied into every later file's header,
+and never changes; files that disagree are `CorruptWal`. At open the store uses the header's
 value: a different `Config::dict_train_bytes` is ignored and listed in
 `RecoveryReport::config_overrides` (`ConfigOverride::DictTrainBytes`), so a
 reopen cannot move a trigger that has not fired.
 
-A new WAL is written to `wal.log.tmp`, synced (`fsync`), renamed to `wal.log`,
-and then the directory is synced. So `wal.log` never exists without a complete
-header. A file that does not start with an intact 24-byte header of this
-version (a WAL without a header, an empty file, another version, a header
-CRC mismatch) is `UnsupportedFormat`, and the file is not changed. Earlier versions are not supported: 1 had no mode byte in the
+A new WAL file is written to `wal-<seq>.log.tmp` with its header, synced
+(`fsync`), renamed to `wal-<seq>.log`, and then the directory is synced. A
+WAL file that does not start with an intact 24-byte header of this version
+(an empty file, another version, a header CRC mismatch), and a directory
+holding the single `wal.log` of a version before 13, are
+`UnsupportedFormat`, and no file is changed. Earlier versions are not supported: 1 had no mode byte in the
 frame, 2 full ids in Publish and in the topic index, 3 `topic_seq` in topic
 index entries, 4 fixed-width Publish and Release with the topic name, 5
 fixed-width PutObject and PutInline, 6 a topic index of 20-byte entries, 7
@@ -116,7 +132,8 @@ type 5, Compact type 4) and Publish without the publication's key and
 headers; 8 is two versions: on `main` version 7 with key and headers, on
 the block branch a 16-byte header without `dict_train_bytes`; 9 at most one
 rewritten block per Compact record, 10 one index file per topic
-(`topics/<hex>.idx`), 11 Publish without the publication's key and headers.
+(`topics/<hex>.idx`), 11 Publish without the publication's key and
+headers, 12 one WAL file, `wal.log`.
 
 ### Frame
 
@@ -220,8 +237,8 @@ frame.
 | `crc` u32 | 4 |
 | the stored block, to the end of the payload | the rest |
 
-The block's location is the absolute offset of its stored bytes in
-`wal.log`. **Inline blocks are never reclaimed.** Compaction rewrites
+The block's location is its WAL file and the offset of its stored bytes
+in that file. **Inline blocks are never reclaimed.** Compaction rewrites
 segments only; reclaiming WAL space needs a WAL checkpoint and truncation,
 which do not exist yet.
 
@@ -340,33 +357,39 @@ or rewritten blocks.
 
 A frame starts only after the previous frame is durable (its fdatasync
 returned): one writer, sequential group commit (`&mut self`, the `in_flight`
-flag with `debug_assert!` in `Store::begin_write`). Hence only the last frame
-of the file can be unacknowledged.
+flag with `debug_assert!` in `Store::begin_write`), and a WAL file is
+created only after the last frame of the previous file is durable. Hence
+only the last frame of the last file can be unacknowledged.
 
 ### Recovery
 
-Reading starts at byte 24. A frame is bad if its header or body is short or
-its CRC does not match.
+`wal-*.log.tmp` files are deleted (`WalTmpRemoved`). The WAL files are
+read in sequence-number order; the first must be named 0, and each later
+one must be named by the frame after the previous file's last; otherwise
+`CorruptWal { file, offset: 0, .. }` (a missing, extra or renamed file),
+and no file is changed. In each file reading starts at byte 24. A frame
+is bad if its header or body is short or its CRC does not match.
 
-1. A bad frame with no frame with a valid CRC readable from any later byte up
-   to the end of the file is a torn tail: the file is cut at the start of that
-   frame (`set_len` + `fsync`). This is the only change recovery makes to the
+1. A bad frame in the last WAL file with no frame with a valid CRC readable
+   from any later byte up to the end of the file is a torn tail: the file
+   is cut at the start of that frame (`set_len` + `fsync`). This is the only change recovery makes to the
    WAL besides rule 4. Any damage inside the last frame, in any byte order (for
    example, the first half unwritten and the second written), gives a torn
    tail, not an error: records without a checksum of their own are never
    taken for a frame.
-2. A bad frame followed by a frame with a valid CRC means the middle is
-   damaged: error `WalCorrupted { offset, next_frame }`, and the file is not
-   changed.
+2. A bad frame followed by a frame with a valid CRC, or in a file that
+   another WAL file follows, means the middle is damaged: error
+   `WalCorrupted { file, offset, next_file, next_offset }` (where reading
+   could continue), and no file is changed.
 3. A frame with a valid CRC but a `seq` out of order (a gap or a repeat),
    unparsable records, or records contradicting earlier frames is the error
-   `CorruptWal { offset, reason }`, and the file is not changed.
+   `CorruptWal { file, offset, reason }`, and no file is changed.
 4. The last complete frame: every block it introduces (PutBlock or
    PutInlineBlock) must be stored in full, decompress to its recorded raw
    length and CRC, split into its recorded objects, and each object's BLAKE3
    must equal its `object_id`. If not:
-   * `mode` = ParallelSync and nothing follows the frame in the file: the
-     frame was never acknowledged (a crash between the WAL and segment
+   * `mode` = ParallelSync and nothing follows the frame, neither in its
+     file nor as a later WAL file: the frame was never acknowledged (a crash between the WAL and segment
      fdatasyncs). The WAL is cut at the frame start, the segment bytes become
      orphans for compaction, and the recovery report gets `FrameDropped`
      (reason `ObjectMissing`, `BlockCorrupted` or `ObjectHashMismatch`);
@@ -374,9 +397,10 @@ its CRC does not match.
      frame, so this is corruption: error `MissingObject` (block absent or
      short), `CorruptBlock` (does not decode) or `HashMismatch`, and no file
      is changed;
-   * a torn tail follows the frame: the next frame had started, so this one
-     was acknowledged (a frame starts only after the previous one is durable).
-     Corruption in any mode: an error, and no file is changed.
+   * a torn tail or a later WAL file follows the frame: the next write had
+     started, so this frame was acknowledged (a frame or WAL file starts
+     only after the previous frame is durable). Corruption in any mode: an
+     error, and no file is changed.
 
    Residual ParallelSync risk: an acknowledged last frame whose block bytes
    are later corrupted on disk cannot be told from a crash before
@@ -394,9 +418,9 @@ report means recovery changed nothing. No change is made without an entry.
 
 | Action | When |
 |---|---|
-| `WalTmpRemoved` | `wal.log.tmp` of an interrupted WAL creation was deleted |
-| `TornTailTruncated { frame_seq, offset, bytes_removed }` | a torn last frame was cut (rule 1) |
-| `FrameDropped { frame_seq, offset, mode, object, reason, bytes_removed }` | a complete last ParallelSync frame was dropped (rule 4) |
+| `WalTmpRemoved` | a `wal-<seq>.log.tmp` of an interrupted WAL file creation was deleted (one entry per file) |
+| `TornTailTruncated { frame_seq, file, offset, bytes_removed }` | a torn last frame of the last WAL file `file` was cut (rule 1) |
+| `FrameDropped { frame_seq, file, offset, mode, object, reason, bytes_removed }` | a complete last ParallelSync frame was dropped (rule 4) |
 | `OrphanSegmentRemoved { segment }` | a segment file the WAL does not refer to was deleted |
 | `IndexSegmentRemoved { segment, bytes }` | an index segment without an intact header was deleted (`bytes` its length) |
 | `StaleIndexRecordsFenced { records, segment }` | index records of cut WAL frames were found; index segment `segment` was created to keep them stale |
@@ -485,10 +509,11 @@ progress holds its handle until it completes, so concurrent reads can each
 add one.
 
 The index holds no key or headers. In memory each live entry that has
-them keeps the WAL offset and length of its Publish record's attributes
-(`(seq, offset, length)`, 24 bytes per such entry); `Store::read_entry`
-reads them from `wal.log`, which is never rewritten. Replay rebuilds those
-offsets from the WAL.
+them keeps the WAL position and length of its Publish record's attributes
+(`(seq, WAL file, offset, length)`, 32 bytes per such entry);
+`Store::read_entry` reads them from that WAL file, which is never
+rewritten and not yet deleted. Replay rebuilds those positions from the
+WAL.
 `Store::index_entry(topic, seq)`.
 
 **Recovery.** Index segments are derived from the WAL. At open:
@@ -542,8 +567,9 @@ objects compressed into one block.
 1. the block → the active segment, one write
    (a new segment: create_new + directory fsync)
 2. fdatasync of every touched segment
-3. the batch's frame → one write to wal.log
-4. fdatasync of wal.log
+3. the batch's frame → one write to the WAL file (a new WAL file, if the
+   current one is full: created as in "WAL", before the frame is built)
+4. fdatasync of the WAL file
 5. index records of the blocks the batch completed → the active index
    segment, one write (no fsync); a new index segment is created and synced
    before step 1
@@ -561,7 +587,7 @@ no new object), steps 1–2 do not happen: one fdatasync per batch.
 2. a segment sealed mid-batch (rotation): write + fdatasync
 3. two chains at once:
      the active segment's buffer → write → segment fdatasync
-     the batch's frame → write to wal.log → wal.log fdatasync
+     the batch's frame → write to the WAL file → its fdatasync
 4. both chains done → index records (no fsync)
 5. acknowledgement
 ```
@@ -600,7 +626,7 @@ file holds bytes no block covers.
    (decoded and hash-checked first); live objects of partly dead blocks
    (hash-checked) → one new block, compressed, appended;
    fdatasync, directory fsync
-2. a frame with one Compact record → wal.log, fdatasync
+2. a frame with one Compact record → the WAL file, fdatasync
 3. the in-memory index switches to new; seg-<old>.dat is deleted
 ```
 
