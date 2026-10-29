@@ -91,7 +91,11 @@ jobs:
         with:
           path: ~/lazyfs
           key: lazyfs-${{ steps.pin.outputs.lazyfs }}-${{ runner.os }}-${{ runner.arch }}
+      # LazyFS 0.3.1 fetches dependencies whose CMakeLists ask for a CMake
+      # policy version below 3.5, which the runner's CMake 4 refuses.
       - if: steps.lazyfs.outputs.cache-hit != 'true'
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
           git clone https://github.com/dsrhaslab/lazyfs.git ~/lazyfs
           git -C ~/lazyfs checkout ${{ steps.pin.outputs.lazyfs }}
