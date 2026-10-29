@@ -99,7 +99,10 @@ pub struct Config {
     /// of at most this many raw bytes, so reading one object decompresses
     /// at most this much. An object larger than the limit is a block of
     /// its own; objects are never split. 0 is taken as 1 (every object
-    /// alone).
+    /// alone). Default 16 KiB: random and `dedup_scan` reads 2–3× faster
+    /// than at 64 KiB, for 10–17 % more disk bytes on 1–10 KiB log lines
+    /// (D-191). 64 KiB stays a setting for topics where space matters more
+    /// than read latency.
     pub max_block_raw_bytes: u64,
 }
 
@@ -114,7 +117,7 @@ impl Default for Config {
             index_open_files: 64,
             seek_page_entries: 256,
             dict_train_bytes: 1 << 20,
-            max_block_raw_bytes: 64 << 10,
+            max_block_raw_bytes: 16 << 10,
         }
     }
 }

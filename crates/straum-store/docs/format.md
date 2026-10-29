@@ -24,7 +24,7 @@ ids are a separate sequence: the highest on disk plus one, at most
 ## Blocks
 
 Objects are stored in blocks of at most `Config::max_block_raw_bytes` raw
-bytes (default 64 KiB). The new objects of one batch (`put_batch`), in order
+bytes (default 16 KiB; 64 KiB stays a setting). The new objects of one batch (`put_batch`), in order
 of first appearance in the batch, are split in that order into blocks: a
 block is closed when the next object's entry would take it over the limit,
 and an object whose entry alone is over the limit is a block of its own

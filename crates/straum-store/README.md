@@ -8,8 +8,11 @@ macOS (development only). No tokio, including transitively.
   bytes. The same bytes are stored once; publishing them again adds a
   reference and a new `topic_seq` entry.
 - The new objects of each batch are stored in blocks of at most
-  `Config::max_block_raw_bytes` raw bytes (default 64 KiB; a larger object
-  is a block of its own), each compressed with zstd level 1 and, once
+  `Config::max_block_raw_bytes` raw bytes (default 16 KiB; a larger object
+  is a block of its own; 64 KiB stays a setting for topics where space
+  matters more than read latency: D-191 measured random and `dedup_scan`
+  reads 2–3× faster at 16 KiB than at 64 KiB for 10–17 % more disk bytes
+  on 1–10 KiB log lines and about 2 % on 100 B), each compressed with zstd level 1 and, once
   trained, a 64 KiB dictionary (`Config::dict_train_bytes`). Reading one
   object decompresses one block, so the limit bounds the cost of a read
   whatever the batch size. Reads decompress the block and check its CRC and
@@ -89,7 +92,7 @@ Without block compression the same store was 1.162–1.415 times the plain
 log and 14.4–20.2 times the compressed one. The remaining gap to the
 compressed log is mostly the per-message metadata, which compression does
 not touch. These logs are a proxy; they say nothing about the duplicate
-share of real traffic. The default block limit (64 KiB) changes none of
+share of real traffic. A block limit of 64 KiB changes none of
 these sizes at batch 64; at batch 512 it adds 0.0 % (SSH), 0.3–0.6 % (BGL)
 and 2.5–2.6 % (OpenStack) to the store against one block per batch
 (`dedup-survey --batch 512 --max-block-raw-bytes`).
