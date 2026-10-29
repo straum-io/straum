@@ -9,14 +9,13 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::TempDir;
 use straum_client::proto::{Header, Message};
-use straum_client::{Client, ClientConfig, ProduceOptions};
+use straum_client::{Client, ClientConfig, ProduceOptions, wait_ready};
 
 /// xorshift64*: the test's only source of randomness, from the seed.
 struct Rng(u64);
@@ -35,31 +34,20 @@ impl Rng {
 }
 
 fn start(data: &std::path::Path) -> (Child, String) {
+    let addr = straum_conformance::broker::free_addr().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_straum-server"))
-        .args([
-            "--data-dir",
-            &data.to_string_lossy(),
-            "--listen",
-            "127.0.0.1:0",
-        ])
+        .args(["--data-dir", &data.to_string_lossy(), "--listen", &addr])
         .args(["--cluster-id", "crash", "--node-id", "1"])
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let mut lines = BufReader::new(stderr).lines();
-    let addr = loop {
-        let Some(line) = lines.next() else {
-            panic!("broker exited before listening")
-        };
-        let line = line.unwrap();
-        if let Some(a) = line.strip_prefix("straum-server: listening on ") {
-            break a.to_owned();
-        }
-    };
-    // Keep draining stderr so the child never blocks on it.
-    std::thread::spawn(move || for _ in lines {});
+    if let Err(e) = wait_ready(&addr, Duration::from_secs(60), || {
+        matches!(child.try_wait(), Ok(None))
+    }) {
+        let _ = child.kill();
+        panic!("broker at {addr} not ready: {e}");
+    }
     (child, addr)
 }
 

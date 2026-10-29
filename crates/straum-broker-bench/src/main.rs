@@ -7,7 +7,13 @@
 //!     [--sizes 100,1024,10240] [--producers 1,4,16] [--per-produce 1,64]
 //!     [--reps 1] [--rep-offset 0] [--seconds 5] [--max-bytes 1073741824]
 //!     [--min-requests 100] [--no-header]
+//! straum-broker-bench --free-addr
+//! straum-broker-bench --wait-ready <host:port> <seconds>
 //! ```
+//!
+//! `--free-addr` prints a loopback address with a port the system just gave
+//! out; `--wait-ready` exits 0 once a broker there answers Hello, 1 after
+//! `seconds` (scripts/bench/broker-e2e.sh starts the broker with both).
 //!
 //! A run lasts `--seconds` or until `--max-bytes` of bodies are acknowledged,
 //! whichever comes first, and at least `--min-requests` requests. Each run
@@ -225,6 +231,31 @@ fn run(a: &Args, topic: &str, size: usize, producers: usize, per: usize) -> Resu
 }
 
 fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["--free-addr"] => {
+            match std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()) {
+                Ok(a) => println!("{a}"),
+                Err(e) => {
+                    eprintln!("straum-broker-bench: reserve a port: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        ["--wait-ready", addr, seconds] => {
+            let Ok(s) = seconds.parse::<f64>() else {
+                eprintln!("straum-broker-bench: bad seconds {seconds}");
+                std::process::exit(2);
+            };
+            if let Err(e) = straum_client::wait_ready(addr, Duration::from_secs_f64(s), || true) {
+                eprintln!("straum-broker-bench: broker at {addr} not ready: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        _ => {}
+    }
     let a = match parse() {
         Ok(a) => a,
         Err(e) => {

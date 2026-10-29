@@ -74,9 +74,17 @@ Each `scenarios/<name>.json` is one scenario, run against a fresh broker:
 
 `broker` holds settings for the broker (keys of
 `crates/straum-broker/README.md`); the runner adds a new data directory,
-`--listen 127.0.0.1:0`, `--cluster-id conformance` and `--node-id 1`, and
-reads the address from the broker's `straum-server: listening on <address>`
-line on stderr. Steps run in order:
+`--listen 127.0.0.1:<port>` with a port it reserved by binding
+`127.0.0.1:0` and releasing it, `--cluster-id conformance` and
+`--node-id 1`.
+
+**Readiness.** A runner learns that the broker is ready through the
+protocol: it connects and sends Hello, retrying the connection every 50 ms
+until a `HelloOk` arrives or a timeout passes (30 s in this runner), then
+closes that connection and waits for the broker to close its side, so the
+probe is not counted in `open_connections`. The broker's stderr lines,
+`straum-server: listening on <address>` among them, are not part of this
+contract; runners do not parse them. Steps run in order:
 
 | Step | Meaning |
 |---|---|

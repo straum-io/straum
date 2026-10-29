@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 straum-store = { path = "../../crates/straum-store" }
 straum-client = { path = "../../crates/straum-client" }
+straum-conformance = { path = "../../crates/straum-conformance" }
 compio.workspace = true
 blake3.workspace = true
 
