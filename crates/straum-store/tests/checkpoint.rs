@@ -64,7 +64,7 @@ fn names(dir: &Path, prefix: &str) -> Vec<String> {
 
 /// The checkpoint tables and runs (objects and blocks) and dictionary files.
 fn all_tables(dir: &Path) -> Vec<String> {
-    let mut v: Vec<String> = ["objtab-", "reloc-", "blktab-", "blkrel-", "dict-"]
+    let mut v: Vec<String> = ["objtab-", "reloc-", "blktab-", "blkrel-", "dict-", "idrun-"]
         .iter()
         .flat_map(|p| names(dir, p))
         .collect();
@@ -605,7 +605,11 @@ async fn a_damaged_newest_manifest_falls_back_to_the_older_one() {
             );
             assert_eq!(
                 all_tables(&dir.0),
-                ["blktab-0000000000000000.tab", "objtab-0000000000000000.tab"],
+                [
+                    "blktab-0000000000000000.tab",
+                    "idrun-0000000000000001.run",
+                    "objtab-0000000000000000.tab"
+                ],
                 "{mode:?} {what}"
             );
             check(&store, live.clone()).await;
@@ -655,6 +659,7 @@ async fn a_damaged_only_manifest_is_ignored_while_the_wal_is_whole() {
                         "blktab-",
                         "blkrel-",
                         "dict-",
+                        "idrun-",
                     ]
                     .iter()
                     .any(|p| n.starts_with(p))
@@ -810,7 +815,11 @@ fn resumed(
 fn own_files(dir: &Path) -> Vec<String> {
     let mut v: Vec<String> = all_tables(dir)
         .into_iter()
-        .filter(|n| n != "objtab-0000000000000000.tab" && n != "blktab-0000000000000000.tab")
+        .filter(|n| {
+            n != "objtab-0000000000000000.tab"
+                && n != "blktab-0000000000000000.tab"
+                && n != "idrun-0000000000000001.run"
+        })
         .collect();
     v.sort();
     v

@@ -6,6 +6,7 @@
 
 mod block;
 mod codec;
+mod fuse;
 mod store;
 
 pub use codec::{FrameMode, MAX_TOPIC, ObjectId};

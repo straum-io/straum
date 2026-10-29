@@ -24,9 +24,16 @@ use crate::codec::{
     Rewritten, WAL_FILE_HEADER,
 };
 use crate::codec::{
-    BLKREL_ENTRY, BLKREL_MAGIC, BLKTAB_MAGIC, BLOCK_ENTRY, BlockPlace, Manifest, OBJECT_ENTRY,
-    OBJTAB_MAGIC, Placement, RELOC_ENTRY, RELOC_MAGIC,
+    BLKREL_ENTRY, BLKREL_MAGIC, BLKTAB_MAGIC, BLOCK_ENTRY, BlockPlace, ID_ENTRY, IDRUN_MAGIC,
+    Manifest, OBJECT_ENTRY, OBJTAB_MAGIC, Placement, RELOC_ENTRY, RELOC_MAGIC,
 };
+use crate::fuse::Fuse8;
+
+/// Id runs kept before a checkpoint merges them into one.
+// ponytail: every run merged into one past the bound (one sequential read
+// of all runs per merge); size-tiered merging when the milestone shows the
+// merge cost.
+const MAX_ID_RUNS: usize = 8;
 
 /// The single WAL file of formats before 13: refused, never read.
 const LEGACY_WAL_FILE: &str = "wal.log";
@@ -588,8 +595,13 @@ pub struct Store {
     /// Object number → object. Numbers are never reused and survive
     /// compaction; only locations change.
     objects: HashMap<u64, Object>,
-    /// BLAKE3 id → object number, for deduplication.
-    ids: HashMap<ObjectId, u64>,
+    /// BLAKE3 id → object number of the live objects allocated since the
+    /// last checkpoint (the memtable, ADR-0014 §1); older ids are in the id
+    /// runs.
+    memtable: HashMap<ObjectId, u64>,
+    /// The id runs the last checkpoint lists, newest first: their fences
+    /// and filters in memory, their pages on disk.
+    id_runs: Vec<IdRun>,
     next_object: u64,
     /// Block number → block. Numbers are never reused.
     blocks: HashMap<u64, Block>,
@@ -935,6 +947,18 @@ impl Store {
                 .filter(|x| c.placement(*x) != Some(placement_of(replay.objects.get(x))))
                 .collect()
         });
+        // The memtable holds the live objects the checkpoint does not cover;
+        // the id runs it lists hold the rest.
+        let covered_objects = checkpoint.as_ref().map_or(0, |c| c.manifest.next_object);
+        let memtable: HashMap<ObjectId, u64> = replay
+            .objects
+            .iter()
+            .filter(|(n, _)| **n >= covered_objects)
+            .map(|(&n, o)| (o.id, n))
+            .collect();
+        let id_runs = checkpoint
+            .as_ref()
+            .map_or_else(Vec::new, |c| c.id_runs.clone());
         let relocated_blocks = checkpoint.as_ref().map_or_else(BTreeSet::new, |c| {
             (0..c.manifest.next_block)
                 .filter(|b| c.block_placement(*b) != Some(block_place_of(replay.blocks.get(b))))
@@ -997,7 +1021,8 @@ impl Store {
             in_flight: false,
             next_segment: replay.max_segment.map_or(0, |m| m + 1),
             objects: replay.objects,
-            ids: replay.ids,
+            memtable,
+            id_runs,
             next_object: replay.next_object,
             blocks: replay.blocks,
             next_block: replay.next_block,
@@ -1066,6 +1091,7 @@ impl Store {
             block_tables: prev.block_tables.clone(),
             block_runs: prev.block_runs.clone(),
             segments,
+            id_runs: prev.id_runs.clone(),
         };
         // Each new table or run: (path, magic, first, count, width, entries).
         let mut written = Vec::new();
@@ -1135,6 +1161,33 @@ impl Store {
             m.block_runs.push((n, count));
             written.push((path, BLKREL_MAGIC, n, count, BLKREL_ENTRY, entries));
         }
+        // The memtable as an id run; past `MAX_ID_RUNS`, every run merged
+        // with it into one, dropping ids whose objects were reclaimed.
+        let mut id_written = None;
+        let merge = prev.id_runs.len() >= MAX_ID_RUNS;
+        if !self.memtable.is_empty() || merge {
+            let mut entries: Vec<(ObjectId, u64)> =
+                self.memtable.iter().map(|(&id, &n)| (id, n)).collect();
+            if merge {
+                for run in &self.id_runs {
+                    for (id, number) in self.id_run_entries(run).await? {
+                        if self.objects.contains_key(&number) {
+                            entries.push((id, number));
+                        }
+                    }
+                }
+            }
+            entries.sort_unstable();
+            let (bytes, run) = encode_id_run(n, &entries);
+            let path = idrun_path(&self.dir, n);
+            write_new_synced(&path, bytes.clone()).await?;
+            names.push(file_name(&path));
+            if merge {
+                m.id_runs.clear();
+            }
+            m.id_runs.push((n, entries.len() as u64));
+            id_written = Some((path, bytes, run));
+        }
         // The dictionary, once: the first checkpoint after training.
         let mut dict_written = None;
         if prev.dict == 0
@@ -1146,8 +1199,16 @@ impl Store {
             m.dict = 1;
             dict_written = Some(path);
         }
-        if !written.is_empty() || dict_written.is_some() {
+        if !written.is_empty() || dict_written.is_some() || id_written.is_some() {
             sync_dir(&self.dir).await?;
+        }
+        if let Some((path, bytes, _)) = &id_written
+            && compio::fs::read(path).await? != *bytes
+        {
+            return Err(StoreError::CorruptCheckpoint {
+                checkpoint: n,
+                reason: "the id run written does not read back",
+            });
         }
         // The new tables, runs and dictionary read back as written before
         // any manifest lists them: a failure leaves them unlisted orphans.
@@ -1187,6 +1248,19 @@ impl Store {
             compio::fs::remove_file(checkpoint_path(&self.dir, prev.n)).await?;
             sync_dir(&self.dir).await?;
         }
+        if let Some((_, _, run)) = id_written {
+            if merge {
+                // Superseded: the new manifest no longer lists them. A crash
+                // before the unlinks leaves orphans, deleted at open.
+                for old in std::mem::take(&mut self.id_runs) {
+                    self.files.forget(FileKey::IdRun(old.n));
+                    compio::fs::remove_file(idrun_path(&self.dir, old.n)).await?;
+                }
+                sync_dir(&self.dir).await?;
+            }
+            self.id_runs.insert(0, run);
+            self.memtable.clear();
+        }
         self.checkpoint = Some(m);
         self.relocated.clear();
         self.relocated_blocks.clear();
@@ -1220,6 +1294,92 @@ impl Store {
     /// first.
     pub fn checkpoint_number(&self) -> Option<u64> {
         self.checkpoint.as_ref().map(|m| m.n)
+    }
+
+    /// The live object number of `id`: the memtable, then each id run from
+    /// newest to oldest whose filter answers yes (one page read each, the
+    /// page found through the run's fences). A number compaction reclaimed
+    /// is a miss.
+    async fn lookup(&self, id: &ObjectId) -> Result<Option<u64>, StoreError> {
+        if let Some(&n) = self.memtable.get(id)
+            && self.objects.contains_key(&n)
+        {
+            return Ok(Some(n));
+        }
+        let (key, fence) = (codec::id_key(id), codec::id_fence(id));
+        for run in &self.id_runs {
+            if !run.filter.contains(key) {
+                continue;
+            }
+            // The last page whose first id may precede `id`, and earlier
+            // pages that start with the same 8 bytes.
+            // ponytail: binary search over the in-memory fences, not ADR
+            // §1's interpolation; both read the same one page.
+            let mut p = run.fences.partition_point(|&f| f <= fence);
+            while p > 0 {
+                p -= 1;
+                let page = self.id_run_page(run, p).await?;
+                let count = page.len() / ID_ENTRY;
+                let i = partition(count, |i| {
+                    codec::id_entry(&page, i).is_some_and(|(x, _)| x < *id)
+                });
+                if let Some((x, n)) = codec::id_entry(&page, i)
+                    && x == *id
+                {
+                    if self.objects.contains_key(&n) {
+                        return Ok(Some(n));
+                    }
+                    break;
+                }
+                if run.fences[p] < fence {
+                    break;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Page `p` of id run `run`, checked against its CRC
+    /// (`CorruptCheckpoint` otherwise).
+    async fn id_run_page(&self, run: &IdRun, p: usize) -> Result<Vec<u8>, StoreError> {
+        let corrupt = || StoreError::CorruptCheckpoint {
+            checkpoint: run.n,
+            reason: "an id run page is missing or damaged",
+        };
+        let page_len = codec::page_len(ID_ENTRY);
+        let start = p * page_len;
+        let len = page_len.min(run.pages_len.saturating_sub(start));
+        let file = self
+            .files
+            .get(FileKey::IdRun(run.n))
+            .await?
+            .ok_or_else(corrupt)?;
+        let BufResult(res, buf) = file
+            .read_exact_at(
+                Vec::with_capacity(len).slice(..len),
+                (codec::TABLE_HEADER + start) as u64,
+            )
+            .await;
+        match res {
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Err(corrupt()),
+            res => res?,
+        }
+        let buf = buf.into_inner();
+        codec::decode_page(&buf, p as u64, ID_ENTRY)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(corrupt)
+    }
+
+    /// Every entry of id run `run`, page by page (for a merge).
+    async fn id_run_entries(&self, run: &IdRun) -> Result<Vec<(ObjectId, u64)>, StoreError> {
+        let mut out = Vec::with_capacity(run.count as usize);
+        for p in 0..run.fences.len() {
+            let page = self.id_run_page(run, p).await?;
+            for i in 0..page.len() / ID_ENTRY {
+                out.extend(codec::id_entry(&page, i));
+            }
+        }
+        Ok(out)
     }
 
     /// Records that compaction changed block `number`'s place.
@@ -1306,11 +1466,14 @@ impl Store {
         let (mut deduplicated, mut new_bytes) = (0, 0);
         for m in batch {
             let id = ObjectId::of(m.payload);
-            if let Some(&number) = self.ids.get(&id) {
+            if let Some(number) = self.lookup(&id).await? {
                 deduplicated += 1;
                 numbers.push((number, false));
                 continue;
             }
+            // An id the memtable or a run's filter covers never gets a
+            // second number (ADR-0014 §5); `lookup` searched both.
+            debug_assert!(!self.memtable.contains_key(&id));
             let number = self.next_object;
             self.next_object += 1;
             // Block and index are set below, once the blocks are known.
@@ -1320,7 +1483,7 @@ impl Store {
                 index: 0,
             };
             self.objects.insert(number, object);
-            self.ids.insert(id, number);
+            self.memtable.insert(id, number);
             fresh.push(m.payload);
             new_bytes += m.payload.len() as u64;
             numbers.push((number, true));
@@ -1911,7 +2074,9 @@ impl Store {
         for n in dead.iter().chain(&partial) {
             for &(_, number, live) in members.get(n).map_or(&[][..], Vec::as_slice) {
                 if !live && let Some(o) = self.objects.remove(&number) {
-                    self.ids.remove(&o.id);
+                    if self.memtable.get(&o.id) == Some(&number) {
+                        self.memtable.remove(&o.id);
+                    }
                     stats.objects_dropped += 1;
                     self.relocate(number);
                 }
@@ -2273,8 +2438,12 @@ impl Store {
     /// Whether the object is in the index: stored and not reclaimed.
     /// Reference counts are not kept (ADR-0014 step 5): compaction marks
     /// live objects from the topic indexes instead.
+    ///
+    /// For tests and diagnostics: a scan of the object map.
+    // ponytail: O(objects); the dense table answers it once the maps leave
+    // memory.
     pub fn contains(&self, id: &ObjectId) -> bool {
-        self.ids.contains_key(id)
+        self.objects.values().any(|o| o.id == *id)
     }
 
     pub fn object_count(&self) -> usize {
@@ -2284,9 +2453,9 @@ impl Store {
     /// Whether the object's block is stored in the WAL (InlineSmall);
     /// `None` if the object is not in the index. Dead objects of such
     /// blocks are never reclaimed by compaction.
+    /// For tests and diagnostics: a scan of the object map.
     pub fn is_inline(&self, id: &ObjectId) -> Option<bool> {
-        let number = self.ids.get(id)?;
-        let o = self.objects.get(number)?;
+        let o = self.objects.values().find(|o| o.id == *id)?;
         Some(matches!(self.blocks.get(&o.block)?.loc, Location::Wal(_)))
     }
 
@@ -2795,6 +2964,7 @@ enum FileKey {
     Data(u64),
     Wal(u64),
     Index(u64),
+    IdRun(u64),
 }
 
 impl FileKey {
@@ -2803,6 +2973,7 @@ impl FileKey {
             Self::Data(id) => segment_path(dir, id),
             Self::Wal(first) => wal_path(dir, first),
             Self::Index(id) => index_path(dir, id),
+            Self::IdRun(n) => idrun_path(dir, n),
         }
     }
 }
@@ -4136,6 +4307,10 @@ fn checkpoint_path(dir: &Path, n: u64) -> PathBuf {
     dir.join(format!("checkpoint-{n:016x}"))
 }
 
+fn idrun_path(dir: &Path, n: u64) -> PathBuf {
+    dir.join(format!("idrun-{n:016x}.run"))
+}
+
 fn blktab_path(dir: &Path, first: u64) -> PathBuf {
     dir.join(format!("blktab-{first:016x}.tab"))
 }
@@ -4243,6 +4418,7 @@ enum CheckpointFile {
     BlockTable(u64),
     BlockRun(u64),
     Dict(u64),
+    IdRun(u64),
 }
 
 fn parse_checkpoint_file(name: &str) -> Option<CheckpointFile> {
@@ -4279,6 +4455,12 @@ fn parse_checkpoint_file(name: &str) -> Option<CheckpointFile> {
         return hex16(hex).map(CheckpointFile::BlockRun);
     }
     if let Some(hex) = name
+        .strip_prefix("idrun-")
+        .and_then(|r| r.strip_suffix(".run"))
+    {
+        return hex16(hex).map(CheckpointFile::IdRun);
+    }
+    if let Some(hex) = name
         .strip_prefix("dict-")
         .and_then(|r| r.strip_suffix(".bin"))
     {
@@ -4298,6 +4480,49 @@ async fn write_new_synced(path: &Path, bytes: Vec<u8>) -> Result<(), StoreError>
     write_all(&file, bytes, 0).await.0?;
     file.sync_data().await?;
     Ok(())
+}
+
+/// An id run in memory: its fences (the first 8 bytes of each page's first
+/// id) and its filter; its pages are read from `idrun-<n>.run` on demand.
+#[derive(Clone)]
+struct IdRun {
+    /// The checkpoint that wrote it.
+    n: u64,
+    count: u64,
+    fences: Vec<u64>,
+    filter: Fuse8,
+    /// Bytes of the pages after the header.
+    pages_len: usize,
+}
+
+/// The file of id run `n` holding `entries` (sorted by id), and the run in
+/// memory: `table header | pages of id [32] | number u64 | footer`
+/// (`codec::put_id_run_footer`).
+fn encode_id_run(n: u64, entries: &[(ObjectId, u64)]) -> (Vec<u8>, IdRun) {
+    let mut body = Vec::with_capacity(entries.len() * ID_ENTRY);
+    for (id, number) in entries {
+        body.extend_from_slice(&id.0);
+        body.extend_from_slice(&number.to_le_bytes());
+    }
+    let per_page = (codec::page_len(ID_ENTRY) - 4) / ID_ENTRY;
+    let fences: Vec<u64> = entries
+        .chunks(per_page)
+        .map(|c| codec::id_fence(&c[0].0))
+        .collect();
+    let keys: Vec<u64> = entries.iter().map(|(id, _)| codec::id_key(id)).collect();
+    let filter = Fuse8::build(&keys);
+    let mut out = codec::table_header(IDRUN_MAGIC, n).to_vec();
+    codec::put_pages(&mut out, &body, ID_ENTRY);
+    let pages_len = out.len() - codec::TABLE_HEADER;
+    codec::put_id_run_footer(&mut out, &fences, &filter);
+    let run = IdRun {
+        n,
+        count: entries.len() as u64,
+        fences,
+        filter,
+        pages_len,
+    };
+    (out, run)
 }
 
 /// Block `b`'s entry in a block table; `None` for a number with no block.
@@ -4340,6 +4565,12 @@ struct LoadedCheckpoint {
     block_runs: Vec<Vec<u8>>,
     /// The dictionary file's bytes, if the manifest lists one.
     dict: Option<Vec<u8>>,
+    /// The id runs, newest first.
+    id_runs: Vec<IdRun>,
+    /// Every id run entry `(id, number)`, for the comparison with the WAL.
+    // ponytail: every entry read at open, while open replays the whole WAL
+    // anyway; from step 6b open reads only the footers.
+    id_entries: Vec<(ObjectId, u64)>,
 }
 
 impl LoadedCheckpoint {
@@ -4432,6 +4663,30 @@ impl LoadedCheckpoint {
             return Err(self.corrupt(
                 "the dictionary or its trigger differs from the WAL at the covered frame",
             ));
+        }
+        // Every live object below `next_object` in exactly one run, under
+        // its id; an entry of an object reclaimed since is allowed.
+        let mut seen = HashSet::with_capacity(self.id_entries.len());
+        for &(id, number) in &self.id_entries {
+            let wrong = number >= m.next_object
+                || !seen.insert(number)
+                || replay.objects.get(&number).is_some_and(|o| o.id != id);
+            if wrong {
+                return Err(StoreError::CheckpointMismatch {
+                    checkpoint: m.n,
+                    number,
+                });
+            }
+        }
+        if let Some((&number, _)) = replay
+            .objects
+            .iter()
+            .find(|(n, _)| **n < m.next_object && !seen.contains(*n))
+        {
+            return Err(StoreError::CheckpointMismatch {
+                checkpoint: m.n,
+                number,
+            });
         }
         for b in 0..m.next_block {
             if self.block_placement(b) != Some(block_place_of(replay.blocks.get(&b))) {
@@ -4627,6 +4882,26 @@ async fn load_checkpoint(dir: &Path, manifest: Manifest) -> Result<LoadedCheckpo
             )
         }
     };
+    let mut id_runs = Vec::with_capacity(manifest.id_runs.len());
+    let mut id_entries = Vec::new();
+    let mut last = 0u64;
+    for &(run, count) in &manifest.id_runs {
+        let bytes = match compio::fs::read(idrun_path(dir, run)).await {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            res => Some(res?),
+        };
+        let loaded = (run > last && run <= n)
+            .then_some(bytes)
+            .flatten()
+            .and_then(|b| decode_id_run(&b, run, count));
+        let (r, entries) = loaded.ok_or(corrupt(
+            "an id run is missing, damaged, short or out of order",
+        ))?;
+        last = run;
+        id_runs.push(r);
+        id_entries.extend(entries);
+    }
+    id_runs.reverse();
     Ok(LoadedCheckpoint {
         manifest,
         tables,
@@ -4634,6 +4909,51 @@ async fn load_checkpoint(dir: &Path, manifest: Manifest) -> Result<LoadedCheckpo
         block_tables,
         block_runs,
         dict,
+        id_runs,
+        id_entries,
+    })
+}
+
+/// Id run `n` from its file: the header names it, the pages are intact and
+/// hold exactly `count` entries sorted strictly by id, the footer is
+/// intact, its fences are the pages' first ids and its filter finds every
+/// id. `None` otherwise.
+fn decode_id_run(bytes: &[u8], n: u64, count: u64) -> Option<(IdRun, Vec<(ObjectId, u64)>)> {
+    codec::decode_table_header(IDRUN_MAGIC, bytes).filter(|&f| f == n)?;
+    let (fences, filter, end) = codec::decode_id_run_footer(bytes)?;
+    let pages = bytes.get(codec::TABLE_HEADER..end)?;
+    let body = if count == 0 {
+        pages.is_empty().then(Vec::new)?
+    } else {
+        codec::decode_pages(pages, ID_ENTRY)?
+    };
+    if body.len() as u64 != count * ID_ENTRY as u64 {
+        return None;
+    }
+    let entries: Vec<(ObjectId, u64)> = (0..count as usize)
+        .filter_map(|i| codec::id_entry(&body, i))
+        .collect();
+    let per_page = (codec::page_len(ID_ENTRY) - 4) / ID_ENTRY;
+    let ok = entries.windows(2).all(|w| w[0].0 < w[1].0)
+        && fences
+            == entries
+                .chunks(per_page)
+                .map(|c| codec::id_fence(&c[0].0))
+                .collect::<Vec<_>>()
+        && entries
+            .iter()
+            .all(|(id, _)| filter.contains(codec::id_key(id)));
+    ok.then_some({
+        (
+            IdRun {
+                n,
+                count,
+                fences,
+                filter,
+                pages_len: pages.len(),
+            },
+            entries,
+        )
     })
 }
 
@@ -4772,7 +5092,12 @@ async fn open_checkpoint(
                         .iter()
                         .map(|&(k, _)| file_name(&blkrel_path(dir, k))),
                 )
-                .chain((m.dict != 0).then(|| file_name(&dict_path(dir, m.dict))));
+                .chain((m.dict != 0).then(|| file_name(&dict_path(dir, m.dict))))
+                .chain(
+                    m.id_runs
+                        .iter()
+                        .map(|&(k, _)| file_name(&idrun_path(dir, k))),
+                );
             for f in listed {
                 if !present(&f) && !inside.contains(&f) {
                     return Err(StoreError::CorruptCheckpoint {
@@ -4790,7 +5115,8 @@ async fn open_checkpoint(
             | CheckpointFile::Tmp(n)
             | CheckpointFile::Quarantined(n)
             | CheckpointFile::Run(n)
-            | CheckpointFile::BlockRun(n) => Some(n),
+            | CheckpointFile::BlockRun(n)
+            | CheckpointFile::IdRun(n) => Some(n),
             CheckpointFile::Table(_) | CheckpointFile::BlockTable(_) | CheckpointFile::Dict(_) => {
                 None
             }
@@ -4822,8 +5148,13 @@ async fn open_checkpoint(
         .unwrap_or_default();
     let (used_n, used_next, used_next_block, used_dict) =
         (used.n, used.next_object, used.next_block, used.dict);
-    let (tables, runs, block_tables, block_runs) =
-        (used.tables, used.runs, used.block_tables, used.block_runs);
+    let (tables, runs, block_tables, block_runs, id_runs_used) = (
+        used.tables,
+        used.runs,
+        used.block_tables,
+        used.block_runs,
+        used.id_runs,
+    );
     // Tables and runs are cumulative: the newest manifest quarantined now
     // may list every table and run newer than the manifest used, so those
     // go with it (a later interrupted checkpoint's table cannot be told
@@ -4873,10 +5204,11 @@ async fn open_checkpoint(
                 continue;
             }
             CheckpointFile::BlockRun(k) if block_runs.iter().any(|r| r.0 == k) => continue,
+            CheckpointFile::IdRun(k) if id_runs_used.iter().any(|r| r.0 == k) => continue,
             CheckpointFile::Dict(k) if k == used_dict => continue,
             CheckpointFile::Table(first) => newest.is_some() && first >= used_next,
             CheckpointFile::BlockTable(first) => newest.is_some() && first >= used_next_block,
-            CheckpointFile::Run(k) | CheckpointFile::BlockRun(k) => {
+            CheckpointFile::Run(k) | CheckpointFile::BlockRun(k) | CheckpointFile::IdRun(k) => {
                 newest.is_some_and(|d| k > used_n && k <= d)
             }
             // The dictionary is written once, by the first checkpoint after
