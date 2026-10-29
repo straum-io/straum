@@ -3,6 +3,8 @@ Section: net
 Priority: optional
 # scripts/ppa.sh replaces @MAINTAINER@ with the uploader's key identity.
 Maintainer: @MAINTAINER@
+# STALE: the Launchpad (PPA) build is paused until Launchpad has Rust 1.95,
+# which the broker needs; this Rust 1.91 toolchain cannot build it (D-253 A).
 Build-Depends: debhelper-compat (= 13), cargo-1.91, rustc-1.91
 Standards-Version: 4.6.2
 Homepage: https://github.com/straum-io/straum
