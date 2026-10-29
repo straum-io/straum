@@ -45,7 +45,8 @@ straum-cli consume orders
   content id; every publication keeps its own sequence number, key and
   headers. Deduplication is invisible to clients.
 - **Strict recovery.** After a crash, recovery changes only what the
-  documented rules allow (a torn last WAL frame, derived indexes) and
+  documented rules allow (for example a torn last WAL frame or a derived
+  index; the full list is in [docs/guarantees.md](docs/guarantees.md)) and
   reports every change; anything else is an error, not a silent repair.
   Crash tests and a LazyFS power-loss harness run in CI on every PR.
 - **Bounded requests.** Backpressure per connection and across
@@ -94,11 +95,14 @@ scripts/validate.sh push    # adds the long tests, and the io_uring container (s
 - `scripts/`: validation, the Linux container, benchmarks, the power-loss
   harness.
 - `docs/`: guarantees and protocol.
+- `.github/`: CI, the release pipeline (runs only on version tags), the
+  PR body check, the Issue and PR templates.
 - `Dockerfile`, `debian/`, `deploy/kubernetes/`: packaging, not yet
   working with the current broker (it is built as `straum-broker`).
 
 The previous code, a replicated log with scheduled leadership, is kept
 under the tag
-[`archive/main-2026-10-23`](https://github.com/straum-io/straum/tree/archive/main-2026-10-23).
+[`archive/main-2026-10-23`](https://github.com/straum-io/straum/tree/archive/main-2026-10-23)
+and in the releases `v0.1.0-rc.1` to `v0.1.0-rc.3`.
 
 Apache License 2.0.
