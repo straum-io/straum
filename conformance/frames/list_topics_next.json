@@ -1,0 +1,15 @@
+{
+  "name": "list_topics_next",
+  "note": "a later page; a limit over the maximum is capped by the broker",
+  "direction": "request",
+  "type_code": 8,
+  "correlation_id": "24",
+  "frame_bytes": 100,
+  "message": {
+    "type": "ListTopics",
+    "body": {
+      "cursor": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+      "limit": 4294967295
+    }
+  }
+}

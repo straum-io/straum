@@ -1,0 +1,20 @@
+{
+  "name": "error_frame_too_large",
+  "note": "every error code, plain",
+  "direction": "response",
+  "type_code": 65535,
+  "correlation_id": "105",
+  "frame_bytes": 47,
+  "message": {
+    "type": "Error",
+    "body": {
+      "code": "FrameTooLarge",
+      "message": "FrameTooLarge",
+      "leader_node_id": 0,
+      "leader_epoch": 0,
+      "retry_after_ms": 0,
+      "min_version": 0,
+      "max_version": 0
+    }
+  }
+}

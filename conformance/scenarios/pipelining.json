@@ -1,0 +1,216 @@
+{
+  "name": "pipelining",
+  "description": "Requests sent without waiting are all answered, each with its correlation id; a waiting Fetch does not hold back later responses; produces of one connection keep their order.",
+  "steps": [
+    {
+      "connect": "a"
+    },
+    {
+      "send": "a",
+      "id": "hello",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 0,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "hello",
+      "response": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "conformance",
+          "node_id": 1
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "create",
+      "request": {
+        "type": "CreateTopic",
+        "body": {
+          "name": "pipe",
+          "partitions": 1,
+          "replication_factor": 1,
+          "retention_ms": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "create",
+      "response": {
+        "type": "CreateTopicOk"
+      }
+    },
+    {
+      "send": "a",
+      "id": "wait",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "pipe",
+          "partition": 0,
+          "from_seq": "3",
+          "max_bytes": 1048576,
+          "max_wait_ms": 2000,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "p0",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "pipe",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": "61"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "p1",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "pipe",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": "62"
+            },
+            {
+              "key": null,
+              "headers": [],
+              "body": "63"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "p2",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "pipe",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": "64"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "ping",
+      "request": {
+        "type": "Ping",
+        "body": {
+          "nonce": "7"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "ping",
+      "response": {
+        "type": "Pong",
+        "body": {
+          "nonce": "7"
+        }
+      },
+      "within_ms": 1500
+    },
+    {
+      "expect": "a",
+      "id": "p2",
+      "response": {
+        "type": "ProduceOk",
+        "body": {
+          "base_seq": "3",
+          "count": 1
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "p0",
+      "response": {
+        "type": "ProduceOk",
+        "body": {
+          "base_seq": "0",
+          "count": 1
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "p1",
+      "response": {
+        "type": "ProduceOk",
+        "body": {
+          "base_seq": "1",
+          "count": 2
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "wait",
+      "response": {
+        "type": "FetchOk",
+        "body": {
+          "messages": [
+            {
+              "seq": "3",
+              "timestamp_ms": "*",
+              "key": null,
+              "headers": [],
+              "body": "64"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

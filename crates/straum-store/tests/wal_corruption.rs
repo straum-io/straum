@@ -21,6 +21,7 @@ async fn build(dir: &Path) {
         let batch = [Message {
             topic: b"t",
             payload: &payload,
+            ..Default::default()
         }];
         store.put_batch(&batch, u64::from(i)).await.unwrap();
     }
@@ -219,6 +220,7 @@ async fn batch_over_max_frame_is_rejected_before_io() {
         .map(|p| Message {
             topic: b"t",
             payload: p,
+            ..Default::default()
         })
         .collect();
     let wal_before = std::fs::read(dir.0.join("wal.log")).unwrap();

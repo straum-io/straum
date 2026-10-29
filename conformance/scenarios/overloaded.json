@@ -1,0 +1,141 @@
+{
+  "name": "overloaded",
+  "description": "A Fetch that would wait while max_fetch_waiters fetches already wait is Overloaded with a retry hint; once the first is answered, a new one waits.",
+  "broker": {
+    "max_fetch_waiters": 1
+  },
+  "steps": [
+    {
+      "connect": "a"
+    },
+    {
+      "send": "a",
+      "id": "hello",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 0,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "hello",
+      "response": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "conformance",
+          "node_id": 1
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "create",
+      "request": {
+        "type": "CreateTopic",
+        "body": {
+          "name": "o",
+          "partitions": 1,
+          "replication_factor": 1,
+          "retention_ms": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "create",
+      "response": {
+        "type": "CreateTopicOk"
+      }
+    },
+    {
+      "send": "a",
+      "id": "first",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "o",
+          "partition": 0,
+          "from_seq": "0",
+          "max_bytes": 1048576,
+          "max_wait_ms": 1500,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "sleep_ms": 200
+    },
+    {
+      "send": "a",
+      "id": "second",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "o",
+          "partition": 0,
+          "from_seq": "0",
+          "max_bytes": 1048576,
+          "max_wait_ms": 1500,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "second",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "Overloaded",
+          "retry_after_ms": {
+            "$ge": 1
+          }
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "first",
+      "response": {
+        "type": "FetchOk",
+        "body": {
+          "messages": []
+        }
+      },
+      "within_ms": 4000
+    },
+    {
+      "send": "a",
+      "id": "third",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "o",
+          "partition": 0,
+          "from_seq": "0",
+          "max_bytes": 1048576,
+          "max_wait_ms": 200,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "third",
+      "response": {
+        "type": "FetchOk",
+        "body": {
+          "messages": []
+        }
+      },
+      "not_before_ms": 150
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "create_topic_ok",
+  "note": "empty body",
+  "direction": "response",
+  "type_code": 32772,
+  "correlation_id": "7",
+  "frame_bytes": 14,
+  "message": {
+    "type": "CreateTopicOk",
+    "body": {}
+  }
+}

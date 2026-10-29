@@ -1,0 +1,17 @@
+{
+  "name": "produce_ok",
+  "note": "",
+  "direction": "response",
+  "type_code": 32774,
+  "correlation_id": "10",
+  "frame_bytes": 38,
+  "message": {
+    "type": "ProduceOk",
+    "body": {
+      "base_seq": "0",
+      "count": 1,
+      "leader_epoch": 1,
+      "timestamp_ms": "1761350400000"
+    }
+  }
+}

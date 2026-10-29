@@ -1,0 +1,14 @@
+{
+  "name": "pong",
+  "note": "",
+  "direction": "response",
+  "type_code": 32770,
+  "correlation_id": "4",
+  "frame_bytes": 22,
+  "message": {
+    "type": "Pong",
+    "body": {
+      "nonce": "72623859790382856"
+    }
+  }
+}

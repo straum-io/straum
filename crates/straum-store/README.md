@@ -28,6 +28,18 @@ macOS (development only). No tokio, including transitively.
   reads (a read in progress holds its handle until it completes, so
   concurrent reads can add one each). Topic state is still rebuilt from the WAL at open, and the object
   index (id → number → block) is still in memory (ADR-0014).
+- A publication may carry a key and headers (`Message::key`,
+  `Message::headers`). They are stored with its Publish record in the WAL,
+  not with the object: the same bytes under different keys are one object,
+  and `Store::read_entry` returns each publication with its own key,
+  headers and timestamp. Without key and headers a publication costs no
+  extra byte (measured with `examples/meta_bytes`); with them, the key and
+  headers are neither deduplicated nor compressed, and each live entry
+  that has them keeps their WAL offset and length in memory (24 bytes)
+  until shared attribute segments replace it (ADR-0014 §8).
+- `Store::topic_stats` (first and next seq, index bytes) and
+  `Store::batch_frame_bytes` (the frame bound `put_batch` checks before any
+  I/O, additive over messages) let a caller size its batches.
 - Group commit: one segment `fdatasync` and one WAL `fdatasync` per batch;
   a batch is acknowledged only after both.
 - Recovery from the WAL cuts a torn tail and checks the index segments and
@@ -46,7 +58,15 @@ Write modes (`Config::write_mode`):
 - `Sequential` (default): the segment is synced before the WAL frame is
   written.
 - `ParallelSync`: the segment and WAL syncs run concurrently. Recovery drops
-  a last frame whose block did not reach disk.
+  a last frame whose block did not reach disk. Not recommended on
+  disks without power-loss protection: there concurrent fdatasyncs
+  serialize, so the mode gains little. Measured on a Samsung 860 EVO (SATA,
+  ext4, io_uring): the segment fdatasync took 6.0 ms at the median alone
+  and 11.5 ms when it overlapped the WAL fdatasync (timed in the build with
+  compressed blocks). `ParallelSync` wrote at
+  a median 1.06× `Sequential` without block compression (0.50–1.98×) and
+  1.11× with capped compressed blocks of 16 KiB (0.51–1.97×), across 27
+  configurations of payload, message size and batch size each.
 - `InlineSmall`: experimental, for benchmarks only, never a default. A block
   no larger than the threshold is written into the WAL and never reclaimed,
   because there is no WAL checkpoint yet.
@@ -77,14 +97,16 @@ and 2.5–2.6 % (OpenStack) to the store against one block per batch
 ## Build and test
 
 ```bash
-cargo build
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-scripts/container/linux.sh --switch-machine test --workspace   # Linux, io_uring
+scripts/validate.sh quick   # fmt, clippy, the quick tests on macOS
+scripts/validate.sh push    # macOS and the io_uring container, long tests, 50 crash iterations
+scripts/validate.sh pr      # as push, 200 crash iterations
 ```
 
-The container script and its Podman machine setup are described in
-`scripts/container/README.md`.
+The long tests (the crash test and the proptest model) are
+`#[ignore = "long: ..."]`: `cargo test --workspace` skips them,
+`cargo test --workspace -- --include-ignored` runs them. CI runs them on
+every PR. The container script and its Podman machine setup are described
+in `scripts/container/README.md`.
 
 Test variables: `STRAUM_STORE_CRASH_ITERATIONS` (default 200),
 `STRAUM_STORE_CRASH_SEED` (default 24301), `PROPTEST_CASES` (default 128).
@@ -97,8 +119,9 @@ Test variables: `STRAUM_STORE_CRASH_ITERATIONS` (default 200),
 | `tests/index_reads.rs` | live entries read from the index segments: reads across full blocks and the in-memory tail, before and after reopen; release across a block boundary; a full block damaged after open fails `read`, `entry`, `index_entry` and `release_before` with `TopicIndexCorrupt`, writing nothing; seek pages of 2 locations (four levels for 20 blocks) find every entry, and a damaged page fails exactly the blocks under it; reading across 20 index segments keeps at most `index_open_files` + 1 open; a release too large for a frame fails with `FrameTooLarge` before writing |
 | `tests/index_segments.rs` | index records of a cut WAL tail stay stale after new frames reuse their numbers (no false `TopicMismatch`); a damaged fence header fails open with `TopicMismatch`, no file changed (the documented limit); in every write mode, a deleted segment, all segments deleted, a damaged header, a cut record and zeroed unsynced pages are repaired from the WAL and reported, the WAL unchanged, and the next open is clean |
 | `tests/store.rs` | deduplication; one fsync per file per batch; restart; rotation; compaction; orphans; a corrupted block fails the read; an intact index block disagreeing with the WAL (`TopicMismatch`) or beyond it (`IndexSegmentCorrupt`) with no file changed; a lost or cut index segment rebuilt byte for byte; a damaged record ends the scan of its segment; WAL truncation at every byte of the last record (Publish, Release, Compact) |
-| `tests/model.rs` | proptest: random publish, release, compact and restart against an in-memory model, 128 cases per write mode, with dictionary training, a two-block cache, seek pages of 2 locations, index segments rotating every 256 bytes and two open index files |
+| `tests/model.rs` | proptest: random publish (with no key, an empty key, or a key and headers), release, compact and restart against an in-memory model, 128 cases per write mode, with dictionary training, a two-block cache, seek pages of 2 locations, index segments rotating every 256 bytes and two open index files |
 | `tests/crash.rs` | a writer in a child process killed with SIGKILL at a random moment, checked after each restart; one test per write mode; the dictionary is trained during the run; index segments rotate and seek pages (2 locations) fill during it |
+| `tests/publication.rs` | keys and headers through restart, release and compaction in every write mode; one object for the same payload under different keys; the frame bound counts them and is additive; `topic_stats` |
 | `tests/wal_corruption.rs` | any flipped bit in a middle frame gives `WalCorrupted` and leaves the file unchanged; in the last frame, truncation; a lost first half of the last frame is a torn tail; truncation at every byte; a `seq` gap; an old format gives `UnsupportedFormat`; `max_frame_bytes` |
 | `tests/fault_injection.rs` | hand-built states: a missing, short or damaged block of the last frame drops the frame in ParallelSync and is an error otherwise; a missing block of an earlier frame gives `MissingObject`, a damaged one `CorruptBlock` on read; every write mode |
 | `tests/multi_block.rs` | `max_block_raw_bytes`: a batch split in order, an oversized object alone, duplicates across a batch's blocks, compaction within the limit, a frame of several blocks with one missing in every write mode; a batch mixing inline and segment blocks; `last_commit_timing` in every write mode |

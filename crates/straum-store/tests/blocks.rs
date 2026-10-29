@@ -9,7 +9,11 @@ use common::{Rng, TempDir};
 use straum_store::{Config, ConfigOverride, Message, ObjectId, Store, WriteMode};
 
 fn msg<'a>(topic: &'a [u8], payload: &'a [u8]) -> Message<'a> {
-    Message { topic, payload }
+    Message {
+        topic,
+        payload,
+        ..Default::default()
+    }
 }
 
 fn modes() -> [WriteMode; 3] {

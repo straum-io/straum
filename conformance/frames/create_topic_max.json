@@ -1,0 +1,17 @@
+{
+  "name": "create_topic_max",
+  "note": "largest values; v0 answers Unsupported (partitions > 1)",
+  "direction": "request",
+  "type_code": 4,
+  "correlation_id": "8",
+  "frame_bytes": 110,
+  "message": {
+    "type": "CreateTopic",
+    "body": {
+      "name": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+      "partitions": 4294967295,
+      "replication_factor": 65535,
+      "retention_ms": "18446744073709551615"
+    }
+  }
+}

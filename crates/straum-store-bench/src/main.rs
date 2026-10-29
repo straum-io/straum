@@ -619,6 +619,7 @@ async fn run_store(
             .map(|p| Message {
                 topic: TOPIC,
                 payload: p,
+                ..Default::default()
             })
             .collect();
         let start = Instant::now();
@@ -779,6 +780,7 @@ async fn prepare_dedup(
             .map(|p| Message {
                 topic: DEDUP_TOPIC,
                 payload: p,
+                ..Default::default()
             })
             .collect();
         store

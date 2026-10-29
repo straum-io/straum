@@ -1,0 +1,77 @@
+{
+  "name": "produce_ok",
+  "description": "A Produce answered at once: no retry, the client returns the ack.",
+  "client": {
+    "op": "produce",
+    "topic": "t",
+    "partition": 0,
+    "producer_id": "77",
+    "producer_seq": "5",
+    "messages": [
+      {
+        "key": "6b",
+        "headers": [],
+        "body": "68656c6c6f"
+      }
+    ]
+  },
+  "server": [
+    {
+      "accept": true
+    },
+    {
+      "expect": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "auth_mechanism": "none"
+        }
+      },
+      "reply": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "fake",
+          "node_id": 1,
+          "max_frame_bytes": 8388608,
+          "max_message_bytes": 1048576
+        }
+      }
+    },
+    {
+      "expect": {
+        "type": "Produce",
+        "body": {
+          "topic": "t",
+          "partition": 0,
+          "producer_id": "77",
+          "producer_seq": "5",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "messages": [
+            {
+              "key": "6b",
+              "headers": [],
+              "body": "68656c6c6f"
+            }
+          ]
+        }
+      },
+      "reply": {
+        "type": "ProduceOk",
+        "body": {
+          "base_seq": "10",
+          "count": 1,
+          "leader_epoch": 1,
+          "timestamp_ms": "1761350400000"
+        }
+      }
+    }
+  ],
+  "result": {
+    "ok": {
+      "base_seq": "10",
+      "count": 1
+    }
+  }
+}

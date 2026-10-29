@@ -1,0 +1,15 @@
+{
+  "name": "list_topics_ok_empty",
+  "note": "the last page: an empty next_cursor",
+  "direction": "response",
+  "type_code": 32776,
+  "correlation_id": "21",
+  "frame_bytes": 20,
+  "message": {
+    "type": "ListTopicsOk",
+    "body": {
+      "topics": [],
+      "next_cursor": ""
+    }
+  }
+}

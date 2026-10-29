@@ -92,7 +92,7 @@ rewritten segment).
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 11 |
+| 8 | 4 | `version` u32 = 12 |
 | 12 | 8 | `dict_train_bytes` u64: the dictionary training threshold |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -111,9 +111,11 @@ frame, 2 full ids in Publish and in the topic index, 3 `topic_seq` in topic
 index entries, 4 fixed-width Publish and Release with the topic name, 5
 fixed-width PutObject and PutInline, 6 a topic index of 20-byte entries, 7
 uncompressed objects located by segment offset (PutObject type 1, PutInline
-type 5, Compact type 4), 8 a 16-byte header without `dict_train_bytes`, 9
-at most one rewritten block per Compact record, 10 one index file per topic
-(`topics/<hex>.idx`).
+type 5, Compact type 4) and Publish without the publication's key and
+headers; 8 is two versions: on `main` version 7 with key and headers, on
+the block branch a 16-byte header without `dict_train_bytes`; 9 at most one
+rewritten block per Compact record, 10 one index file per topic
+(`topics/<hex>.idx`), 11 Publish without the publication's key and headers.
 
 ### Frame
 
@@ -259,7 +261,7 @@ Publish. A number is never repeated, and a name gets a number once. Recovery
 builds the number → name table from these records; a Publish or Release with
 a number that has no PutTopic is `CorruptWal`.
 
-### 2 — Publish (payload 4–40 bytes)
+### 2 — Publish (payload 4–40 bytes + attributes)
 
 | Field | Size |
 |---|---|
@@ -267,6 +269,23 @@ a number that has no PutTopic is `CorruptWal`.
 | `topic_seq` varint | 1–10 |
 | Δ`object_number`, zigzag varint | 1–10 |
 | Δ`timestamp`, zigzag varint (ms, given by the caller; does not decrease within a topic) | 1–10 |
+| attributes: the publication's key and headers, to the end of the payload | 0 if neither |
+
+Attributes (`codec::encode_attrs`), present only if the publication has a
+key or at least one header:
+
+| Field | Encoding |
+|---|---|
+| `key` | varint `length + 1`, then the bytes; `0`: no key (a present empty key is `1`) |
+| `count` | varint, the number of headers |
+| per header | `name`: varint length, bytes; `value`: varint length, bytes |
+
+A key and headers belong to the publication, not to the object: the object
+is the payload alone, identified by its BLAKE3 id and stored once. The same
+payload published with different keys or headers is one object with one
+Publish per publication, each with its own attributes. Attributes are
+neither deduplicated nor compressed. Present-but-empty attributes (`00 00`)
+are `CorruptWal`: they are stored as nothing.
 
 Deltas are taken within the frame, from the previous Publish of the same
 frame. For a frame's first Publish, the object number base is the next object
@@ -417,7 +436,7 @@ pages. A 24-byte header, then records.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 49 44 58 00` (`"STRMIDX\0"`) |
-| 8 | 4 | `version` u32 = 11 (the WAL version) |
+| 8 | 4 | `version` u32 = 12 (the WAL version) |
 | 12 | 8 | `created_at` u64: the store's next WAL frame number when the segment was created |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -463,6 +482,12 @@ The last full block read is cached per topic. At most
 recently used closed first, plus the segment being written; a read in
 progress holds its handle until it completes, so concurrent reads can each
 add one.
+
+The index holds no key or headers. In memory each live entry that has
+them keeps the WAL offset and length of its Publish record's attributes
+(`(seq, offset, length)`, 24 bytes per such entry); `Store::read_entry`
+reads them from `wal.log`, which is never rewritten. Replay rebuilds those
+offsets from the WAL.
 `Store::index_entry(topic, seq)`.
 
 **Recovery.** Index segments are derived from the WAL. At open:
@@ -553,7 +578,7 @@ For a batch of `b` messages:
 |---|---|
 | PutObject (new object only) | 2 + 32 + Δnumber 1 + Δblock 1 + Δindex 1 |
 | PutBlock (one per batch with new objects) | 2 + Δnumber 1 + segment 1 + offset 1–4 (segments up to 64 MiB) + length, raw length 1–5 each + dictionary 1 + CRC 4, shared by `b` |
-| Publish | 2 + 4…40: topic number and seq 1–10 each; number and time deltas usually 1 byte each; the time of a frame's first Publish about 6 bytes for millisecond time |
+| Publish | 2 + 4…40: topic number and seq 1–10 each; number and time deltas usually 1 byte each; the time of a frame's first Publish about 6 bytes for millisecond time; plus the attributes: 0 bytes without key and headers, 2 for an empty key, `1 + key` + 1 for a key below 127 bytes and no headers |
 | frame header | 21 / `b` |
 | topic index entry | ~2 (+ ~9 for a block's first entry and about 13 bytes of record header and CRC per 64 entries; a seek page adds 16 bytes per 64 entries) |
 | PutTopic | once per topic |

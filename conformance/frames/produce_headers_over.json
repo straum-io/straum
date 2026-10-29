@@ -1,0 +1,288 @@
+{
+  "name": "produce_headers_over",
+  "note": "65 headers: MessageTooLarge with default limits",
+  "direction": "request",
+  "type_code": 6,
+  "correlation_id": "16",
+  "frame_bytes": 518,
+  "message": {
+    "type": "Produce",
+    "body": {
+      "topic": "orders",
+      "partition": 0,
+      "producer_id": "7",
+      "producer_seq": "1",
+      "ack_level": 1,
+      "expected_leader_epoch": 0,
+      "timeout_ms": 0,
+      "messages": [
+        {
+          "key": null,
+          "headers": [
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            },
+            {
+              "name": "68",
+              "value": ""
+            }
+          ],
+          "body": "78"
+        }
+      ]
+    }
+  }
+}

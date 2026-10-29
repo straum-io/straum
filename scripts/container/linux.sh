@@ -9,6 +9,8 @@
 #   scripts/container/linux.sh                    # cargo test --workspace
 #   scripts/container/linux.sh run -p straum-store --example uring_probe
 #   scripts/container/linux.sh --switch-machine test --workspace
+#   scripts/container/linux.sh --session test --workspace
+#   scripts/container/linux.sh --end-session
 #   STORE_CONTAINER_ARGS="-v /host/dir:/bench" scripts/container/linux.sh run ...
 #   scripts/container/linux.sh -- scripts/bench/format7-vs-8.sh --quick --out /bench/out
 #
@@ -22,22 +24,42 @@
 # machine was running, `straum-test` is started for the command and stopped
 # after it. The command's exit status is returned.
 #
+# --session switches like --switch-machine but leaves `straum-test` running
+# afterwards, so the next command starts at once; the previous machine
+# stays stopped until --end-session, which stops `straum-test` and starts
+# Podman's default machine. A running `straum-test` is always reused.
+#
 # The configuration of machines other than `straum-test` is never changed.
 #
 # Build artifacts go to a named volume, not ./target: macOS and Linux
-# artifacts must never share a target directory.
+# artifacts must never share a target directory. The volume is one per
+# source tree (named after a checksum of its path): every tree is mounted
+# at /src, so a shared volume let one worktree's artifacts look up to date
+# in another.
 set -eu
 
 MACHINE="${CONTAINER_CONNECTION:-straum-test}"
 # rust:1-bookworm, rustc 1.99.1, pinned by digest.
 IMAGE="${STORE_LINUX_IMAGE:-docker.io/library/rust@sha256:8a2a102d089fbd151137b9473c01b1ed4519a64fb9c032a03609b815701615c8}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+TARGET_VOLUME="straum-container-target-$(printf '%s' "$ROOT" | cksum | cut -d ' ' -f 1)"
 
 SWITCH=0
-if [ "${1:-}" = "--switch-machine" ]; then
-    SWITCH=1
-    shift
-fi
+SESSION=0
+case "${1:-}" in
+    --switch-machine) SWITCH=1; shift ;;
+    --session) SWITCH=1; SESSION=1; shift ;;
+    --end-session)
+        echo "scripts/container/linux.sh: stopping '$MACHINE'" >&2
+        podman machine stop "$MACHINE" >/dev/null
+        default="$(podman machine list --format '{{.Name}}' | sed -n 's/\*$//p')"
+        if [ -n "$default" ] && [ "$default" != "$MACHINE" ]; then
+            echo "scripts/container/linux.sh: starting '$default'" >&2
+            podman machine start "$default" >/dev/null
+        fi
+        exit 0
+        ;;
+esac
 
 if ! command -v podman >/dev/null 2>&1; then
     echo "scripts/container/linux.sh: podman not found" >&2
@@ -105,7 +127,7 @@ restore() {
 }
 
 if [ "$target_running" -eq 0 ]; then
-    trap restore EXIT
+    [ "$SESSION" -eq 1 ] || trap restore EXIT
     if [ -n "$other" ]; then
         echo "scripts/container/linux.sh: stopping '$other' (--switch-machine)" >&2
         podman machine stop "$other" >/dev/null
@@ -124,7 +146,7 @@ fi
 podman --connection "$MACHINE" run --rm --name "$NAME" \
     -v "$ROOT":/src -w /src \
     -v straum-container-registry:/usr/local/cargo/registry \
-    -v straum-container-target:/src/target \
+    -v "$TARGET_VOLUME":/src/target \
     ${STORE_CONTAINER_ARGS:-} \
     "$IMAGE" \
     sh -c 'rustup component add clippy rustfmt >/dev/null 2>&1 || true

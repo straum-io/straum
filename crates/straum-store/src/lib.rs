@@ -10,8 +10,8 @@ mod store;
 
 pub use codec::{FrameMode, MAX_TOPIC, ObjectId};
 pub use store::{
-    CommitTiming, CompactStats, Config, ConfigOverride, DropReason, Message, RecoveryAction,
-    RecoveryReport, Stats, Store, WriteMode,
+    CommitTiming, CompactStats, Config, ConfigOverride, DropReason, Entry, Message, RecoveryAction,
+    RecoveryReport, Stats, Store, TopicStats, WriteMode,
 };
 
 #[derive(Debug, thiserror::Error)]

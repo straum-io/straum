@@ -144,10 +144,37 @@ fn block_ranges(lens: impl IntoIterator<Item = usize>, cap: u64) -> Vec<Range<us
     ranges
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Message<'a> {
     pub topic: &'a [u8],
     pub payload: &'a [u8],
+    /// The publication's key; `Some(&[])` is a present, empty key. Key and
+    /// headers belong to the publication, not to the object: the object is
+    /// the payload alone (its BLAKE3 id), stored once.
+    pub key: Option<&'a [u8]>,
+    /// The publication's headers `(name, value)`, in order.
+    pub headers: &'a [(&'a [u8], &'a [u8])],
+}
+
+/// One live entry as `Store::read_entry` returns it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Entry {
+    pub timestamp: u64,
+    pub key: Option<Vec<u8>>,
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub payload: Vec<u8>,
+}
+
+/// One topic's counters, from memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TopicStats {
+    /// The first live seq.
+    pub first_live: u64,
+    /// The seq the next entry gets.
+    pub next_seq: u64,
+    /// Bytes of the topic's index: its records in the index segments (full
+    /// blocks and seek pages) and its encoded last, incomplete block.
+    pub index_bytes: u64,
 }
 
 /// When the last batch's syncs ran, in nanoseconds from the start of its
@@ -417,7 +444,17 @@ struct Topic {
     first_live: u64,
     /// The last full block read.
     read_cache: RefCell<Option<CachedBlock>>,
+    /// Bytes of the topic's index records (blocks and seek pages).
+    record_bytes: u64,
+    /// Where the key and headers of each live entry that has them lie in
+    /// the WAL: `(seq, offset, length)`, in seq order. Entries without
+    /// either are not listed.
+    attrs: VecDeque<AttrsAt>,
 }
+
+/// `(seq, WAL offset, length)` of an entry's key and headers (a Publish
+/// record's tail).
+type AttrsAt = (u64, u64, u32);
 
 struct Active {
     id: u64,
@@ -695,48 +732,7 @@ impl Store {
             u32::try_from(m.payload.len()).map_err(|_| StoreError::ObjectTooLarge)?;
         }
         let train = !batch.is_empty() && self.should_train();
-        // Upper bound: every object counted as new, so the batch's blocks
-        // are at most the ranges of all its payloads. An inline block is at
-        // most the threshold and at most zstd's bound for its raw bytes.
-        let ranges = block_ranges(
-            batch.iter().map(|m| MAX_VARINT + m.payload.len()),
-            self.config.max_block_raw_bytes,
-        );
-        let block: usize = ranges
-            .iter()
-            .map(|range| match self.config.write_mode.inline_threshold() {
-                Some(t) => {
-                    let raw: usize = batch[range.clone()]
-                        .iter()
-                        .map(|m| MAX_VARINT + m.payload.len())
-                        .sum();
-                    let inline = t.min(block::compress_bound(raw));
-                    RECORD_PUT_BLOCK.max(RECORD_PUT_INLINE_BLOCK_BASE + inline)
-                }
-                None => RECORD_PUT_BLOCK,
-            })
-            .sum();
-        let dict = if train {
-            RECORD_PUT_DICT_BASE + block::DICT_SIZE
-        } else {
-            0
-        };
-        let frame: usize = FRAME_HEADER
-            + block
-            + dict
-            + batch
-                .iter()
-                .map(|m| {
-                    // A new topic adds its PutTopic (counted per message: an
-                    // upper bound).
-                    let topic = if self.topics.contains_key(m.topic) {
-                        0
-                    } else {
-                        RECORD_PUT_TOPIC_BASE + m.topic.len()
-                    };
-                    RECORD_PUT_OBJECT + RECORD_PUBLISH + topic
-                })
-                .sum::<usize>();
+        let frame = self.batch_frame_bytes(batch);
         self.check_frame(frame)?;
         let res = self.put_batch_inner(batch, now_ms, train).await;
         self.poison_on_err(res)
@@ -832,6 +828,8 @@ impl Store {
             }
             self.dictionary = Some(data.len());
         }
+        let mut attrs = Vec::new();
+        let wal_len = self.wal_len;
         let mut inline_bytes = 0;
         for &(block, ref raw, new_objects) in &blocks {
             self.next_block += 1;
@@ -918,13 +916,24 @@ impl Store {
             if topic.index.push(&mut topic.tail, number, timestamp) {
                 filled.push((m.topic, seq / INDEX_BLOCK, std::mem::take(&mut topic.tail)));
             }
+            attrs.clear();
+            codec::encode_attrs(&mut attrs, m.key, m.headers);
             let publish = Record::Publish {
                 topic: topic.number,
                 seq,
                 number,
                 timestamp,
+                attrs: &attrs,
+                attrs_at: 0,
             };
             frame.record(&mut wal_buf, &publish)?;
+            if !attrs.is_empty() {
+                // The attributes end the record just written; the frame
+                // starts at `wal_len`, at index 0 of the buffer.
+                let len = u32::try_from(attrs.len()).map_err(|_| StoreError::FrameTooLarge)?;
+                let at = wal_len + (wal_buf.len() - attrs.len()) as u64;
+                topic.attrs.push_back((seq, at, len));
+            }
             seqs.push(seq);
         }
         // Their records describe this batch's frame: the stamp is the frame
@@ -1060,6 +1069,9 @@ impl Store {
             };
             frame.record(&mut wal_buf, &release)?;
             topic.first_live += 1;
+            if topic.attrs.front().is_some_and(|a| a.0 < topic.first_live) {
+                topic.attrs.pop_front();
+            }
             if let Some(object) = self.objects.get_mut(&number) {
                 object.refs -= 1;
             }
@@ -1426,6 +1438,98 @@ impl Store {
             .topic_entry(topic, t, seq)
             .await?
             .map(|(number, _)| number))
+    }
+
+    /// Entry `seq` of `topic` with its timestamp, key and headers; `None` if
+    /// the entry was never published or was released. The payload's hash
+    /// is verified. Key and headers are read from the WAL.
+    pub async fn read_entry(&self, topic: &[u8], seq: u64) -> Result<Option<Entry>, StoreError> {
+        self.usable()?;
+        let Some(t) = self.topics.get(topic) else {
+            return Ok(None);
+        };
+        if seq < t.first_live {
+            return Ok(None);
+        }
+        let Some((number, timestamp)) = self.topic_entry(topic, t, seq).await? else {
+            return Ok(None);
+        };
+        let (_, payload) = self.read_object(number).await?;
+        let (key, headers) = match t.attrs.binary_search_by_key(&seq, |a| a.0) {
+            Err(_) => (None, Vec::new()),
+            Ok(i) => {
+                let (_, at, len) = t.attrs[i];
+                let len = len as usize;
+                let BufResult(res, buf) = self
+                    .wal
+                    .read_exact_at(Vec::with_capacity(len).slice(..len), at)
+                    .await;
+                res?;
+                codec::decode_attrs(&buf.into_inner())
+                    .map_err(|reason| StoreError::CorruptWal { offset: at, reason })?
+            }
+        };
+        Ok(Some(Entry {
+            timestamp,
+            key,
+            headers,
+            payload,
+        }))
+    }
+
+    /// Counters of `topic`; `None` if it has no entry.
+    pub fn topic_stats(&self, topic: &[u8]) -> Option<TopicStats> {
+        self.topics.get(topic).map(|t| TopicStats {
+            first_live: t.first_live,
+            next_seq: t.index.seq(),
+            index_bytes: t.record_bytes + t.tail.len() as u64,
+        })
+    }
+
+    /// The upper bound of the WAL frame `put_batch` checks against
+    /// `Config::max_frame_bytes` before any I/O: every object counted as
+    /// new and as a block of its own (inline up to the threshold and zstd's
+    /// bound for its raw bytes), plus the dictionary if the batch trains
+    /// it. Additive over messages: the bound of two batches together is the
+    /// sum of their bounds minus the bound of an empty batch, so a caller
+    /// can grow a batch message by message. A batch over the limit fails
+    /// with `FrameTooLarge`.
+    pub fn batch_frame_bytes(&self, batch: &[Message<'_>]) -> usize {
+        let inline = self.config.write_mode.inline_threshold();
+        let dict = if self.should_train() {
+            RECORD_PUT_DICT_BASE + block::DICT_SIZE
+        } else {
+            0
+        };
+        FRAME_HEADER
+            + dict
+            + batch
+                .iter()
+                .map(|m| {
+                    let raw = MAX_VARINT + m.payload.len();
+                    let block = match inline {
+                        Some(t) => RECORD_PUT_BLOCK
+                            .max(RECORD_PUT_INLINE_BLOCK_BASE + t.min(block::compress_bound(raw))),
+                        None => RECORD_PUT_BLOCK,
+                    };
+                    // A new topic adds its PutTopic (counted per message: an
+                    // upper bound).
+                    let topic = if self.topics.contains_key(m.topic) {
+                        0
+                    } else {
+                        RECORD_PUT_TOPIC_BASE + m.topic.len()
+                    };
+                    block
+                        + RECORD_PUT_OBJECT
+                        + RECORD_PUBLISH
+                        + codec::attrs_len(m.key, m.headers)
+                        + topic
+                })
+                .sum::<usize>()
+    }
+
+    pub fn max_frame_bytes(&self) -> u32 {
+        self.config.max_frame_bytes
     }
 
     /// `None` if the object is not in the index (never stored, or reclaimed).
@@ -1813,6 +1917,7 @@ impl Store {
             let Some(t) = self.topics.get_mut(name) else {
                 unreachable!("the batch created the topic")
             };
+            t.record_bytes += u64::from(loc.len);
             if t.spine.len() <= level as usize {
                 t.spine.push(Vec::new());
             }
@@ -1852,6 +1957,8 @@ impl Store {
                 spine: Vec::new(),
                 first_live: 0,
                 read_cache: RefCell::new(None),
+                record_bytes: 0,
+                attrs: VecDeque::new(),
             };
             self.topics.insert(name.to_vec(), topic);
         }
@@ -2079,6 +2186,9 @@ struct ReplayTopic {
     /// `(object number, timestamp)`.
     entries: Vec<(u64, u64)>,
     first_live: u64,
+    /// Key and headers of the entries that have them, released ones
+    /// included.
+    attrs: Vec<AttrsAt>,
 }
 
 impl<'a> Replay<'a> {
@@ -2238,6 +2348,8 @@ impl<'a> Replay<'a> {
                 seq,
                 number,
                 timestamp,
+                attrs,
+                attrs_at,
             } => {
                 let name = self.topic_name(topic)?;
                 let t = self.topics.entry(name).or_default();
@@ -2251,6 +2363,10 @@ impl<'a> Replay<'a> {
                     .ok_or("Publish references an object not in the index")?;
                 object.refs += 1;
                 t.entries.push((number, timestamp));
+                if !attrs.is_empty() {
+                    let len = u32::try_from(attrs.len()).map_err(|_| "attributes too long")?;
+                    t.attrs.push((seq, body_at + attrs_at as u64, len));
+                }
             }
             Record::Release { topic, seq } => {
                 let topic = self.topic_name(topic)?;
@@ -2471,9 +2587,9 @@ async fn open_segments(
     Ok(segments)
 }
 
-/// A topic at open: its name, its entries from the WAL and its first live
-/// seq.
-type WalTopic<'r> = (&'r [u8], &'r [(u64, u64)], u64);
+/// A topic at open: its name, its entries from the WAL, its first live
+/// seq and where its entries' key and headers lie.
+type WalTopic<'r> = (&'r [u8], &'r [(u64, u64)], u64, &'r [AttrsAt]);
 
 /// A seek page found in an index segment: its location and body.
 type FoundPage<'b> = (IndexLoc, &'b [u8]);
@@ -2524,13 +2640,15 @@ async fn open_index(
             replay
                 .topics
                 .get(name)
-                .map_or((name, &[][..], 0), |t| (name, &t.entries[..], t.first_live))
+                .map_or((name, &[][..], 0, &[][..]), |t| {
+                    (name, &t.entries[..], t.first_live, &t.attrs[..])
+                })
         })
         .collect();
     let block = INDEX_BLOCK as usize;
     let mut blocks: Vec<Vec<Option<IndexLoc>>> = topics
         .iter()
-        .map(|(_, entries, _)| vec![None; entries.len() / block])
+        .map(|(_, entries, _, _)| vec![None; entries.len() / block])
         .collect();
     let mut pages: HashMap<(u64, u8, u64), Vec<FoundPage<'_>>> = HashMap::new();
     // fence[i]: the lowest created_at of the segments after segment i.
@@ -2574,7 +2692,7 @@ async fn open_index(
                         .and_then(|b| blocks[t].get_mut(b))
                         .ok_or_else(|| corrupt("index block beyond the topic's full blocks"))?;
                     let first = rec.number as usize * block;
-                    let (name, entries, _) = topics[t];
+                    let (name, entries, _, _) = topics[t];
                     let want = &entries[first..first + block];
                     let got = codec::decode_index_entries(rec.body)
                         .ok_or_else(|| corrupt("index block does not decode"))?;
@@ -2626,7 +2744,9 @@ async fn open_index(
 
     let fan = index.fanout;
     let mut out = HashMap::with_capacity(topics.len());
-    for (number, ((name, entries, first_live), found)) in (0u64..).zip(topics.iter().zip(blocks)) {
+    for (number, ((name, entries, first_live, attrs), found)) in
+        (0u64..).zip(topics.iter().zip(blocks))
+    {
         let mut blocks_rewritten = 0;
         let mut locs = Vec::with_capacity(found.len());
         for (b, slot) in (0u64..).zip(found) {
@@ -2647,6 +2767,7 @@ async fn open_index(
             };
             locs.push(loc);
         }
+        let mut record_bytes: u64 = locs.iter().map(|l| u64::from(l.len)).sum();
         // Seek pages level by level; a page is reused if a segment holds
         // one with exactly the expected locations.
         let mut pages_rewritten = 0;
@@ -2675,6 +2796,7 @@ async fn open_index(
                             .await?
                     }
                 };
+                record_bytes += u64::from(loc.len);
                 upper.push(loc);
             }
             spine.push(level_locs[upper.len() * fan..].to_vec());
@@ -2707,6 +2829,12 @@ async fn open_index(
                 spine,
                 first_live: *first_live,
                 read_cache: RefCell::new(None),
+                record_bytes,
+                attrs: attrs
+                    .iter()
+                    .filter(|a| a.0 >= *first_live)
+                    .copied()
+                    .collect(),
             },
         );
     }
@@ -3068,6 +3196,8 @@ mod tests {
             seq,
             number,
             timestamp: 0,
+            attrs: &[],
+            attrs_at: 0,
         }
     }
 

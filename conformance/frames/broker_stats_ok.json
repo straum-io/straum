@@ -1,0 +1,29 @@
+{
+  "name": "broker_stats_ok",
+  "note": "",
+  "direction": "response",
+  "type_code": 32778,
+  "correlation_id": "23",
+  "frame_bytes": 130,
+  "message": {
+    "type": "BrokerStatsOk",
+    "body": {
+      "node_id": 1,
+      "open_connections": 2,
+      "pending_bytes": "0",
+      "pending_bytes_peak": "4096",
+      "max_pending_bytes": "67108864",
+      "fetch_waiters": 1,
+      "produce_requests": "10",
+      "groups_committed": "4",
+      "fsyncs": "8",
+      "messages_accepted": "12",
+      "messages_deduplicated": "1",
+      "body_bytes_received": "600",
+      "body_bytes_new": "550",
+      "wal_bytes": "1000",
+      "segment_bytes": "550",
+      "index_bytes": "96"
+    }
+  }
+}

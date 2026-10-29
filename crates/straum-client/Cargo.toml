@@ -1,0 +1,15 @@
+[package]
+name = "straum-client"
+version = "0.1.0"
+description = "The reference Straum client: blocking, std::net, with the normative retry behavior"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+straum-proto = { path = "../straum-proto" }
+
+[lints]
+workspace = true

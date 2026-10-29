@@ -27,6 +27,7 @@ async fn put(store: &mut Store, tag: u8, from: u64, to: u64) {
         .map(|p| Message {
             topic: b"t",
             payload: p,
+            ..Default::default()
         })
         .collect();
     store.put_batch(&batch, from).await.unwrap();

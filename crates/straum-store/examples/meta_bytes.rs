@@ -66,6 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .map(|p| Message {
                                     topic: TOPIC,
                                     payload: p,
+                                    ..Default::default()
                                 })
                                 .collect();
                             // Realistic Unix-millisecond timestamps: varint

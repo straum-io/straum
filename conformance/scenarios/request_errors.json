@@ -1,0 +1,429 @@
+{
+  "name": "request_errors",
+  "description": "UnsupportedAckLevel, MalformedRequest, Unsupported and Forbidden; the connection stays usable.",
+  "steps": [
+    {
+      "connect": "a"
+    },
+    {
+      "send": "a",
+      "id": "hello",
+      "request": {
+        "type": "Hello",
+        "body": {
+          "min_version": 0,
+          "max_version": 0,
+          "client_name": "conformance",
+          "auth_mechanism": "none",
+          "auth_payload": ""
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "hello",
+      "response": {
+        "type": "HelloOk",
+        "body": {
+          "version": 0,
+          "cluster_id": "conformance",
+          "node_id": 1
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "create",
+      "request": {
+        "type": "CreateTopic",
+        "body": {
+          "name": "r",
+          "partitions": 1,
+          "replication_factor": 1,
+          "retention_ms": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "create",
+      "response": {
+        "type": "CreateTopicOk"
+      }
+    },
+    {
+      "send": "a",
+      "id": "written",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "r",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 0,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": "78"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "written",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "UnsupportedAckLevel"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "replicated",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "r",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 2,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": "78"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "replicated",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "UnsupportedAckLevel"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "badack",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "r",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 7,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": "78"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "badack",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "MalformedRequest"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "empty",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "r",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": []
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "empty",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "MalformedRequest"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "badname",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "a/b",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": "78"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "badname",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "MalformedRequest"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "parts",
+      "request": {
+        "type": "CreateTopic",
+        "body": {
+          "name": "two",
+          "partitions": 2,
+          "replication_factor": 1,
+          "retention_ms": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "parts",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "Unsupported"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "rf",
+      "request": {
+        "type": "CreateTopic",
+        "body": {
+          "name": "rf3",
+          "partitions": 1,
+          "replication_factor": 3,
+          "retention_ms": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "rf",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "Unsupported"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "zero",
+      "request": {
+        "type": "CreateTopic",
+        "body": {
+          "name": "zero",
+          "partitions": 0,
+          "replication_factor": 1,
+          "retention_ms": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "zero",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "MalformedRequest"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "reserved",
+      "request": {
+        "type": "CreateTopic",
+        "body": {
+          "name": "__internal",
+          "partitions": 1,
+          "replication_factor": 1,
+          "retention_ms": "0"
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "reserved",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "Forbidden"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "pres",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "__internal",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": "78"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "pres",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "Forbidden"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "fres",
+      "request": {
+        "type": "Fetch",
+        "body": {
+          "topic": "__internal",
+          "partition": 0,
+          "from_seq": "0",
+          "max_bytes": 1048576,
+          "max_wait_ms": 0,
+          "expected_leader_epoch": 0
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "fres",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "Forbidden"
+        }
+      }
+    },
+    {
+      "send_raw": "a",
+      "id": "unknown",
+      "correlation_id": "900",
+      "hex": "0a00000077078403000000000000"
+    },
+    {
+      "expect": "a",
+      "id": "unknown",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "Unsupported"
+        }
+      }
+    },
+    {
+      "send_raw": "a",
+      "id": "trailing",
+      "correlation_id": "901",
+      "hex": "13000000020085030000000000000100000000000000ff"
+    },
+    {
+      "expect": "a",
+      "id": "trailing",
+      "response": {
+        "type": "Error",
+        "body": {
+          "code": "MalformedRequest"
+        }
+      }
+    },
+    {
+      "send": "a",
+      "id": "still",
+      "request": {
+        "type": "Produce",
+        "body": {
+          "topic": "r",
+          "partition": 0,
+          "producer_id": "1",
+          "producer_seq": "1",
+          "ack_level": 1,
+          "expected_leader_epoch": 0,
+          "timeout_ms": 0,
+          "messages": [
+            {
+              "key": null,
+              "headers": [],
+              "body": "66696e65"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "expect": "a",
+      "id": "still",
+      "response": {
+        "type": "ProduceOk",
+        "body": {
+          "base_seq": "0"
+        }
+      }
+    }
+  ]
+}

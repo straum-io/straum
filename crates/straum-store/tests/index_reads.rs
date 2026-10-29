@@ -11,7 +11,11 @@ use common::{INDEX_BLOCK_RECORD, INDEX_SEEK_PAGE, TempDir, edit, find_index_reco
 use straum_store::{Config, Message, Store, StoreError};
 
 fn msg<'a>(topic: &'a [u8], payload: &'a [u8]) -> Message<'a> {
-    Message { topic, payload }
+    Message {
+        topic,
+        payload,
+        ..Default::default()
+    }
 }
 
 fn payload(i: u64) -> Vec<u8> {

@@ -1,0 +1,24 @@
+{
+  "name": "list_topics_ok",
+  "note": "a page with more topics after it",
+  "direction": "response",
+  "type_code": 32776,
+  "correlation_id": "21",
+  "frame_bytes": 198,
+  "message": {
+    "type": "ListTopicsOk",
+    "body": {
+      "topics": [
+        {
+          "name": "orders",
+          "partitions": 1
+        },
+        {
+          "name": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+          "partitions": 1
+        }
+      ],
+      "next_cursor": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt"
+    }
+  }
+}

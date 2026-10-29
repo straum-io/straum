@@ -3,14 +3,27 @@
 [![CI](https://github.com/straum-io/straum/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/straum-io/straum/actions/workflows/ci.yml)
 ![Status: rebuilding](https://img.shields.io/badge/status-rebuilding-lightgrey)
 
-Straum is being rebuilt from scratch. This repository holds a storage engine
-and the build and release setup the new code will use:
+Straum is being rebuilt from scratch. This repository holds a single-node
+broker, its protocol and conformance suite, a storage engine, and the build
+and release setup:
 
+- `crates/straum-broker`: the broker, version 0: one node, one shard, the
+  binary protocol of [docs/protocol.md](docs/protocol.md) over TCP
+  ([README](crates/straum-broker/README.md)). What it guarantees, and
+  what it does not yet: [docs/guarantees.md](docs/guarantees.md).
+- `crates/straum-proto`: the protocol's encoding, no I/O.
+  `crates/straum-client`: the reference client (blocking, `std::net`).
+- `conformance/`: the language-independent conformance suite (golden
+  frames, partitioner vectors, broker and client scenarios;
+  [README](conformance/README.md)), run by `crates/straum-conformance`,
+  which also holds the scripted fake server for client SDKs.
 - `crates/straum-store`: a content-addressed log storage engine on compio
   (one shard, local; [README](crates/straum-store/README.md)).
   `crates/straum-store-bench` is its disk benchmark, `tools/dedup-survey` a
   duplicate survey over log files, `tools/block-survey` a block compression
   survey.
+- `crates/straum-broker-bench` and `scripts/bench/broker-e2e.sh`: the
+  broker's end-to-end benchmark.
 - `.github/`: CI (`ci.yml`), the release pipeline (`release.yml`), the PR
   body check (`pr-contract.yml`), the Issue and PR templates.
 - `Cargo.toml`, `clippy.toml`: the workspace settings (members under
@@ -24,6 +37,8 @@ and the build and release setup the new code will use:
 - `scripts/bench/format7-vs-8.sh`: the storage engine's format 7 against
   its compressed-block format on a Linux machine
   ([how to run it](crates/straum-store/README.md#format-7-against-format-8-on-a-linux-machine)).
+- `scripts/validate.sh quick|push|pr`: the validation levels (quick tests
+  on macOS; macOS and the io_uring container with the long tests).
 
 The release pipeline runs only on version tags.
 

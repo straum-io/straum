@@ -1,0 +1,32 @@
+{
+  "name": "produce_full",
+  "note": "largest field values, binary key, header and body",
+  "direction": "request",
+  "type_code": 6,
+  "correlation_id": "13",
+  "frame_bytes": 154,
+  "message": {
+    "type": "Produce",
+    "body": {
+      "topic": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+      "partition": 4294967295,
+      "producer_id": "18446744073709551615",
+      "producer_seq": "18446744073709551615",
+      "ack_level": 2,
+      "expected_leader_epoch": 4294967295,
+      "timeout_ms": 4294967295,
+      "messages": [
+        {
+          "key": "ffffff",
+          "headers": [
+            {
+              "name": "000102",
+              "value": "fefe"
+            }
+          ],
+          "body": "00ff"
+        }
+      ]
+    }
+  }
+}

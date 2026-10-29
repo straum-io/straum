@@ -14,7 +14,11 @@ use straum_store::{
 };
 
 fn msg<'a>(topic: &'a [u8], payload: &'a [u8]) -> Message<'a> {
-    Message { topic, payload }
+    Message {
+        topic,
+        payload,
+        ..Default::default()
+    }
 }
 
 fn random(seed: u64, len: usize) -> Vec<u8> {

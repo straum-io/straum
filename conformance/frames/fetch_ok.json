@@ -1,0 +1,44 @@
+{
+  "name": "fetch_ok",
+  "note": "the same body three times: plain, with a key, with a key and a header",
+  "direction": "response",
+  "type_code": 32775,
+  "correlation_id": "19",
+  "frame_bytes": 132,
+  "message": {
+    "type": "FetchOk",
+    "body": {
+      "leader_epoch": 1,
+      "start_seq": "0",
+      "next_seq": "3",
+      "messages": [
+        {
+          "seq": "0",
+          "timestamp_ms": "1761350400000",
+          "key": null,
+          "headers": [],
+          "body": "68656c6c6f"
+        },
+        {
+          "seq": "1",
+          "timestamp_ms": "1761350400000",
+          "key": "61",
+          "headers": [],
+          "body": "68656c6c6f"
+        },
+        {
+          "seq": "2",
+          "timestamp_ms": "1761350400001",
+          "key": "62",
+          "headers": [
+            {
+              "name": "68",
+              "value": "76"
+            }
+          ],
+          "body": "68656c6c6f"
+        }
+      ]
+    }
+  }
+}

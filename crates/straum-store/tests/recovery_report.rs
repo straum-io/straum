@@ -21,6 +21,7 @@ async fn build(dir: &Path) {
         let batch = [Message {
             topic: b"t",
             payload: &p,
+            ..Default::default()
         }];
         store.put_batch(&batch, u64::from(i)).await.unwrap();
     }
