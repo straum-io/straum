@@ -15,6 +15,9 @@ names, segments).
 ├── seg-<id:016x>.dat            data segments; id is a u64 in hex, 16 digits
 ├── idx-<id:016x>.dat            index segments: topic index blocks, attribute records and seek pages of every topic
 ├── objtab-<first:016x>.tab      object tables written by checkpoints, by their first object number
+├── blktab-<first:016x>.tab      block tables written by checkpoints, by their first block number
+├── blkrel-<n:016x>.run          block relocation runs, by the checkpoint that wrote them
+├── dict-<number:016x>.bin       the dictionary, written by the first checkpoint after training
 ├── reloc-<n:016x>.run           relocation runs, by the checkpoint that wrote them
 ├── checkpoint-<n:016x>          the checkpoint manifest (one; n from 1, never repeated)
 ├── checkpoint-<n:016x>.tmp      only while a manifest is being written; deleted at open
@@ -115,7 +118,7 @@ checkpoint will delete the files wholly before the frame it covers
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 18 |
+| 8 | 4 | `version` u32 = 19 |
 | 12 | 8 | `dict_train_bytes` u64: the dictionary training threshold |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -146,7 +149,9 @@ blocks only in the WAL (no attribute records), 14 no checkpoint files, 15 refere
 checked at open and in Compact replay, 16 damaged manifests deleted and
 checkpoint numbers reused after a fallback (so an older build must not
 write a directory that holds quarantined manifests), 17 a damaged manifest
-quarantined alone as `checkpoint-<n>.damaged` (its tables and runs deleted). The number keeps increasing
+quarantined alone as `checkpoint-<n>.damaged` (its tables and runs deleted), 18 no block
+tables, block relocation runs or dictionary file, and a manifest without the next
+segment number, the training state, the dictionary and the live segments. The number keeps increasing
 with each format change on this line; none is reused (D-251 A).
 
 ### Frame
@@ -494,7 +499,7 @@ attribute records and seek pages. A 24-byte header, then records.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 49 44 58 00` (`"STRMIDX\0"`) |
-| 8 | 4 | `version` u32 = 18 (the WAL version) |
+| 8 | 4 | `version` u32 = 19 (the WAL version) |
 | 12 | 8 | `created_at` u64: the number of the first WAL frame its records may describe (the batch's frame for a segment started while writing a batch's records, the frame count for one started at open) |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -628,23 +633,26 @@ the rebuilding open is interrupted (some segments deleted, others not),
 open again with the setting. Without the setting, open never deletes an
 intact index segment.
 
-## Checkpoint (ADR-0014 step 4)
+## Checkpoint (ADR-0014 steps 4 and 4a)
 
 `Store::checkpoint`, between batches, writes the object table of the object
 numbers allocated since the last checkpoint and the relocation run of the
 numbers that checkpoint already covered whose place compaction changed
-since, then the manifest. Interim rule until ADR-0014 step 6b: no WAL file
+since; the same for blocks (block table, block relocation run, D-255 A);
+the dictionary file once, at the first checkpoint after training; then the
+manifest. Interim rule until ADR-0014 step 6b: no WAL file
 is deleted and open still replays the whole WAL, so the checkpoint is
 checked against it at every open; the in-memory object maps stay. The
 broker does not checkpoint yet (step 7 adds the triggers).
 
-Object tables and relocation runs share a 24-byte header and a page layout:
+Object and block tables and their relocation runs share a 24-byte header
+and a page layout:
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 8 | `magic` = `"STRMOBJ\0"` (table) or `"STRMREL\0"` (run) |
-| 8 | 4 | `version` u32 = 18 (the WAL version) |
-| 12 | 8 | `first` u64: the table's first object number, or the number of the checkpoint that wrote the run (also in the file name) |
+| 0 | 8 | `magic` = `"STRMOBJ\0"` (object table), `"STRMREL\0"` (relocation run), `"STRMBLK\0"` (block table) or `"STRMBRL\0"` (block relocation run) |
+| 8 | 4 | `version` u32 = 19 (the WAL version) |
+| 12 | 8 | `first` u64: the table's first object or block number, or the number of the checkpoint that wrote the run (also in the file name) |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
 Then pages of at most 4 KiB: as many whole entries as fit in 4092 bytes,
@@ -655,21 +663,37 @@ entries; the last page holds the rest (at least one entry).
 |---|---|---|
 | object table | `id [32] \| block u64 \| index u32`, one per number from `first`, in order; a number compaction had reclaimed by then: a zero id and `block`, `index` all ones | 44 (93 per page) |
 | relocation run | `number u64 \| block u64 \| index u32`: the number's place at the checkpoint, `block` and `index` all ones if reclaimed; numbers strictly increasing | 20 (204 per page) |
+| block table | `kind u8 \| at u64 \| offset u64 \| len u64 \| raw_len u64 \| dict u32 \| crc u32 \| objects u32`, one per block number from `first`: kind 0 a segment block (`at` the segment id), kind 1 an inline block (`at` the WAL file, `offset` in it); `len` the stored and `raw_len` the raw length, `dict` the dictionary number (0 none), `crc` the raw block's CRC32C, `objects` its object count; a number with no block (reclaimed, or a hole a rewrite left): all 45 bytes ones | 45 (90 per page) |
+| block relocation run | `number u64 \| segment u64 \| offset u64`: a covered block compaction moved (its new place) or reclaimed (all ones); numbers strictly increasing | 24 (170 per page) |
 
 A number's place is the newest run that lists it, else its table's entry
-(the id comes from the table: ids never change). How a block is located
-(segment, offset, lengths, dictionary, CRC) is still only in the WAL
-(D-255). The manifest does not yet hold the next segment number, the
-dictionary's location, `dict_train_bytes` or the live segment list that
-ADR-0014 §3 lists: the WAL keeps them until D-255 is answered, before
-step 6b.
+(the id comes from the table: ids never change). A block's place is the
+same: its lengths, dictionary, CRC and object count come from its table
+(compaction copies a kept block unchanged), its segment and offset from
+the newest block run that lists it. Inline blocks stay at their WAL
+position until step 8 moves them into segments.
+
+Dictionary file `dict-<number>.bin`: `magic "STRMDIC\0" | version u32 |
+number u64 | len u64 | dictionary bytes | crc u32` (CRC32C of every byte
+before it); length 0 if training built no dictionary. Written once, by the
+first checkpoint after training (the WAL's PutDict record holds it until
+then), and listed by every later manifest.
 
 Manifest `checkpoint-<n>`: `magic "STRMCKP\0" | version u32 | n u64 |
-covered u64 | next_object u64 | next_block u64 | next_topic u64 | tables
-u32 | (first u64, count u64) per table | runs u32 | (checkpoint u64, count
-u64) per run | crc u32` (CRC32C of every byte before it). `covered`: the
-frames below it are covered; the tables, in order, cover object numbers
-`0..next_object` without gaps; the runs are listed oldest first.
+covered u64 | next_object u64 | next_block u64 | next_topic u64 |
+next_segment u64 | dict_train_bytes u64 | dictless_raw u64 | dict u64 |
+tables u32 | (first u64, count u64) per table | runs u32 | (checkpoint u64,
+count u64) per run | block tables u32 | (first u64, count u64) per block
+table | block runs u32 | (checkpoint u64, count u64) per block run |
+segments u32 | id u64 per live data segment | crc u32` (CRC32C of every
+byte before it). `covered`: the frames below it are covered; the tables,
+in order, cover object numbers `0..next_object` and the block tables block
+numbers `0..next_block` without gaps; the runs are listed oldest first;
+`next_segment` is above every segment the covered frames reference;
+`dict_train_bytes` is the WAL header's value and `dictless_raw` the raw
+bytes of batch blocks stored without a dictionary (the training trigger);
+`dict` names the dictionary file, 0 before training; `segments` are the
+data segments the covered frames reference, ascending.
 
 **Writing.** New table and run files are created (`create_new`), written
 and `fdatasync`ed, then the directory is synced; the manifest is written to
@@ -701,13 +725,20 @@ first frame the WAL files hold. Every table and run the manifest in use
 lists must be present, with an intact header naming it, intact pages and
 exactly the listed count, the tables contiguous from 0 to `next_object`,
 the runs ordered and their numbers increasing and below `next_object`;
-otherwise `CorruptCheckpoint` and no file is changed: the fallback is for
+the same for block tables (contiguous from 0 to `next_block`, every entry
+of a known kind) and block runs (below `next_block`); a listed dictionary
+file present, intact and naming its number; otherwise `CorruptCheckpoint`
+and no file is changed: the fallback is for
 a damaged manifest only. `covered` above the WAL's frame count is
 `CorruptCheckpoint`. When replay reaches frame `covered`, the checkpoint
 must match the state the WAL gives there: the next object, block and topic
-numbers (`CorruptCheckpoint`) and every object number's place, reclaimed
-or `(id, block, index)` (`CheckpointMismatch { number }`). Covered numbers
-whose place differs at the end of the WAL go to the next checkpoint's run.
+numbers, the live segments and `next_segment` above them, `dict_train_bytes`,
+`dictless_raw` and the dictionary's bytes (`CorruptCheckpoint`), every
+object number's place, reclaimed or `(id, block, index)`
+(`CheckpointMismatch { number }`), and every block number's place and
+layout (`CheckpointBlockMismatch { block }`). Covered numbers and blocks
+whose place differs at the end of the WAL go to the next checkpoint's
+runs.
 After every check, the checkpoint files the manifest in use does not list
 are deleted (`CheckpointFileRemoved`): earlier manifests, tmp manifests,
 tables and runs of an interrupted checkpoint.
@@ -715,9 +746,11 @@ tables and runs of an interrupted checkpoint.
 **Quarantine** (D-257 A as amended by the owner). A damaged manifest is
 never deleted: it moves, unchanged, into a quarantine directory
 `quarantine-<n>` with the tables and runs it may list. Tables and runs are
-cumulative, so the newest manifest quarantined may list every table at or
-above the used manifest's `next_object` and every run numbered above the
-used manifest up to its own: they move with it (a table that cannot be
+cumulative, so the newest manifest quarantined may list every object
+table at or above the used manifest's `next_object`, every block table at
+or above its `next_block`, every run and block run numbered above the used
+manifest up to its own, and the dictionary file if the used manifest lists
+none: they move with it (a table that cannot be
 attributed with certainty, such as a later interrupted checkpoint's, is
 kept there too); runs above it are orphans. The move: create the directory
 and sync the store directory; move the tables and runs, sync both

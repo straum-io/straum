@@ -23,7 +23,10 @@ use crate::codec::{
     RECORD_PUT_INLINE_BLOCK_BASE, RECORD_PUT_OBJECT, RECORD_PUT_TOPIC_BASE, RECORD_RELEASE, Record,
     Rewritten, WAL_FILE_HEADER,
 };
-use crate::codec::{Manifest, OBJECT_ENTRY, OBJTAB_MAGIC, Placement, RELOC_ENTRY, RELOC_MAGIC};
+use crate::codec::{
+    BLKREL_ENTRY, BLKREL_MAGIC, BLKTAB_MAGIC, BLOCK_ENTRY, BlockPlace, Manifest, OBJECT_ENTRY,
+    OBJTAB_MAGIC, Placement, RELOC_ENTRY, RELOC_MAGIC,
+};
 
 /// The single WAL file of formats before 13: refused, never read.
 const LEGACY_WAL_FILE: &str = "wal.log";
@@ -598,7 +601,7 @@ pub struct Store {
     dictless_raw: u64,
     /// Length of the dictionary once training ran; `Some(0)` if it built
     /// none. Training runs once.
-    dictionary: Option<usize>,
+    dictionary: Option<Vec<u8>>,
     next_topic: u64,
     /// Every segment the WAL references (and that exists).
     segments: HashSet<u64>,
@@ -621,6 +624,9 @@ pub struct Store {
     /// Object numbers the last checkpoint covers whose place compaction
     /// changed since: the next checkpoint's relocation run.
     relocated: BTreeSet<u64>,
+    /// Block numbers the last checkpoint covers whose place compaction
+    /// changed since (moved or reclaimed): the next block relocation run.
+    relocated_blocks: BTreeSet<u64>,
     /// A compaction in progress (`compact_step`).
     compaction: Option<Compaction>,
     /// The next checkpoint's number: above every manifest, tmp manifest,
@@ -902,7 +908,7 @@ impl Store {
         }
         for (seq, (at, _, records)) in (0u64..).zip(frames) {
             if let Some(c) = checkpoint.as_ref().filter(|c| c.manifest.covered == seq) {
-                c.check(&replay)?;
+                c.check(&replay, config.dict_train_bytes)?;
             }
             let body_at = at.offset + FRAME_HEADER as u64;
             let corrupt = |reason| StoreError::CorruptWal {
@@ -920,7 +926,7 @@ impl Store {
             .as_ref()
             .filter(|c| c.manifest.covered == next_frame)
         {
-            c.check(&replay)?;
+            c.check(&replay, config.dict_train_bytes)?;
         }
         // Covered numbers compaction moved or reclaimed after the
         // checkpoint: the next checkpoint's relocation run.
@@ -929,8 +935,13 @@ impl Store {
                 .filter(|x| c.placement(*x) != Some(placement_of(replay.objects.get(x))))
                 .collect()
         });
+        let relocated_blocks = checkpoint.as_ref().map_or_else(BTreeSet::new, |c| {
+            (0..c.manifest.next_block)
+                .filter(|b| c.block_placement(*b) != Some(block_place_of(replay.blocks.get(b))))
+                .collect()
+        });
         let codecs = codecs_for(&replay.dicts)?;
-        let dictionary = replay.dicts.last().map(|d| d.len());
+        let dictionary = replay.dicts.last().map(|d| d.to_vec());
 
         // Every check runs before the first change, so an error leaves every
         // file as it was: replay, live objects, segment bounds, the index.
@@ -1011,6 +1022,7 @@ impl Store {
             next_checkpoint,
             quarantined_files,
             relocated,
+            relocated_blocks,
             compaction: None,
         })
     }
@@ -1037,14 +1049,23 @@ impl Store {
         let n = self.next_checkpoint;
         // Not reused even if this checkpoint fails.
         self.next_checkpoint += 1;
+        let mut segments: Vec<u64> = self.segments.iter().copied().collect();
+        segments.sort_unstable();
         let mut m = Manifest {
             n,
             covered: self.next_frame,
             next_object: self.next_object,
             next_block: self.next_block,
             next_topic: self.next_topic,
+            next_segment: self.next_segment,
+            dict_train_bytes: self.config.dict_train_bytes,
+            dictless_raw: self.dictless_raw,
+            dict: prev.dict,
             tables: prev.tables.clone(),
             runs: prev.runs.clone(),
+            block_tables: prev.block_tables.clone(),
+            block_runs: prev.block_runs.clone(),
+            segments,
         };
         // Each new table or run: (path, magic, first, count, width, entries).
         let mut written = Vec::new();
@@ -1080,12 +1101,66 @@ impl Store {
             m.runs.push((n, count));
             written.push((path, RELOC_MAGIC, n, count, RELOC_ENTRY, entries));
         }
-        if !written.is_empty() {
+        if self.next_block > prev.next_block {
+            let first = prev.next_block;
+            let mut entries = Vec::with_capacity((self.next_block - first) as usize * BLOCK_ENTRY);
+            for b in first..self.next_block {
+                codec::put_block_entry(&mut entries, block_place_of(self.blocks.get(&b)));
+            }
+            let mut out = codec::table_header(BLKTAB_MAGIC, first).to_vec();
+            codec::put_pages(&mut out, &entries, BLOCK_ENTRY);
+            let path = blktab_path(&self.dir, first);
+            write_new_synced(&path, out).await?;
+            names.push(file_name(&path));
+            let count = self.next_block - first;
+            m.block_tables.push((first, count));
+            written.push((path, BLKTAB_MAGIC, first, count, BLOCK_ENTRY, entries));
+        }
+        if !self.relocated_blocks.is_empty() {
+            let mut entries = Vec::with_capacity(self.relocated_blocks.len() * BLKREL_ENTRY);
+            for &b in &self.relocated_blocks {
+                let at = match self.blocks.get(&b).map(|b| b.loc) {
+                    Some(Location::Segment { id, offset }) => Some((id, offset)),
+                    // Compaction never moves an inline block.
+                    _ => None,
+                };
+                codec::put_blkrel_entry(&mut entries, b, at);
+            }
+            let mut out = codec::table_header(BLKREL_MAGIC, n).to_vec();
+            codec::put_pages(&mut out, &entries, BLKREL_ENTRY);
+            let path = blkrel_path(&self.dir, n);
+            write_new_synced(&path, out).await?;
+            names.push(file_name(&path));
+            let count = self.relocated_blocks.len() as u64;
+            m.block_runs.push((n, count));
+            written.push((path, BLKREL_MAGIC, n, count, BLKREL_ENTRY, entries));
+        }
+        // The dictionary, once: the first checkpoint after training.
+        let mut dict_written = None;
+        if prev.dict == 0
+            && let Some(data) = &self.dictionary
+        {
+            let path = dict_path(&self.dir, 1);
+            write_new_synced(&path, codec::encode_dict_file(1, data)).await?;
+            names.push(file_name(&path));
+            m.dict = 1;
+            dict_written = Some(path);
+        }
+        if !written.is_empty() || dict_written.is_some() {
             sync_dir(&self.dir).await?;
         }
-        // The new tables and runs read back as written before any manifest
-        // lists them: a failure leaves them unlisted orphans.
+        // The new tables, runs and dictionary read back as written before
+        // any manifest lists them: a failure leaves them unlisted orphans.
         self.verify_tables(n, written).await?;
+        if let Some(path) = dict_written {
+            let bytes = compio::fs::read(&path).await?;
+            if codec::decode_dict_file(&bytes, 1) != self.dictionary.as_deref() {
+                return Err(StoreError::CorruptCheckpoint {
+                    checkpoint: n,
+                    reason: "the dictionary file written does not read back",
+                });
+            }
+        }
         let path = checkpoint_path(&self.dir, n);
         let tmp = path.with_extension("tmp");
         write_new_synced(&tmp, m.encode()).await?;
@@ -1114,6 +1189,7 @@ impl Store {
         }
         self.checkpoint = Some(m);
         self.relocated.clear();
+        self.relocated_blocks.clear();
         Ok(())
     }
 
@@ -1144,6 +1220,17 @@ impl Store {
     /// first.
     pub fn checkpoint_number(&self) -> Option<u64> {
         self.checkpoint.as_ref().map(|m| m.n)
+    }
+
+    /// Records that compaction changed block `number`'s place.
+    fn relocate_block(&mut self, number: u64) {
+        if self
+            .checkpoint
+            .as_ref()
+            .is_some_and(|m| number < m.next_block)
+        {
+            self.relocated_blocks.insert(number);
+        }
     }
 
     /// Records that compaction changed object `number`'s place.
@@ -1279,7 +1366,7 @@ impl Store {
             if !data.is_empty() {
                 self.codecs.get_mut().add_dictionary(number, data)?;
             }
-            self.dictionary = Some(data.len());
+            self.dictionary = Some(data.clone());
         }
         let mut attrs = Vec::new();
         let (wal_id, wal_len) = (self.wal_id, self.wal_len);
@@ -1831,11 +1918,13 @@ impl Store {
             }
             self.blocks.remove(n);
             self.uncache(*n);
+            self.relocate_block(*n);
         }
         for (n, offset) in kept_at {
             if let Some(b) = self.blocks.get_mut(&n) {
                 b.loc = Location::Segment { id: new, offset };
             }
+            self.relocate_block(n);
         }
         for r in rewritten {
             for (index, number) in (0..).zip(&r.objects) {
@@ -2232,7 +2321,7 @@ impl Store {
     /// Length of the store's compression dictionary; `None` before training
     /// ran (`Config::dict_train_bytes`), `Some(0)` if training built none.
     pub fn dictionary_bytes(&self) -> Option<usize> {
-        self.dictionary
+        self.dictionary.as_ref().map(Vec::len)
     }
 
     /// A handle of WAL file `id`: the one being appended to, or an earlier
@@ -4047,6 +4136,18 @@ fn checkpoint_path(dir: &Path, n: u64) -> PathBuf {
     dir.join(format!("checkpoint-{n:016x}"))
 }
 
+fn blktab_path(dir: &Path, first: u64) -> PathBuf {
+    dir.join(format!("blktab-{first:016x}.tab"))
+}
+
+fn blkrel_path(dir: &Path, n: u64) -> PathBuf {
+    dir.join(format!("blkrel-{n:016x}.run"))
+}
+
+fn dict_path(dir: &Path, number: u64) -> PathBuf {
+    dir.join(format!("dict-{number:016x}.bin"))
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -4139,6 +4240,9 @@ enum CheckpointFile {
     Quarantined(u64),
     Table(u64),
     Run(u64),
+    BlockTable(u64),
+    BlockRun(u64),
+    Dict(u64),
 }
 
 fn parse_checkpoint_file(name: &str) -> Option<CheckpointFile> {
@@ -4162,6 +4266,24 @@ fn parse_checkpoint_file(name: &str) -> Option<CheckpointFile> {
     {
         return hex16(hex).map(CheckpointFile::Table);
     }
+    if let Some(hex) = name
+        .strip_prefix("blktab-")
+        .and_then(|r| r.strip_suffix(".tab"))
+    {
+        return hex16(hex).map(CheckpointFile::BlockTable);
+    }
+    if let Some(hex) = name
+        .strip_prefix("blkrel-")
+        .and_then(|r| r.strip_suffix(".run"))
+    {
+        return hex16(hex).map(CheckpointFile::BlockRun);
+    }
+    if let Some(hex) = name
+        .strip_prefix("dict-")
+        .and_then(|r| r.strip_suffix(".bin"))
+    {
+        return hex16(hex).map(CheckpointFile::Dict);
+    }
     let hex = name.strip_prefix("reloc-")?.strip_suffix(".run")?;
     hex16(hex).map(CheckpointFile::Run)
 }
@@ -4178,6 +4300,27 @@ async fn write_new_synced(path: &Path, bytes: Vec<u8>) -> Result<(), StoreError>
     Ok(())
 }
 
+/// Block `b`'s entry in a block table; `None` for a number with no block.
+fn block_place_of(b: Option<&Block>) -> Option<BlockPlace> {
+    b.map(|b| {
+        let (wal, at, offset) = match b.loc {
+            Location::Segment { id, offset } => (false, id, offset),
+            Location::Wal(p) => (true, p.file, p.offset),
+        };
+        // Dictionary numbers are 0 or 1, object counts and CRCs fit u32.
+        BlockPlace {
+            wal,
+            at,
+            offset,
+            len: b.len,
+            raw_len: b.raw_len,
+            dict: b.dict as u32,
+            crc: b.crc,
+            objects: b.objects as u32,
+        }
+    })
+}
+
 fn placement_of(o: Option<&Object>) -> Placement {
     // Object indexes are block positions, below 2^32.
     o.map(|o| (o.id, o.block, o.index as u32))
@@ -4191,6 +4334,12 @@ struct LoadedCheckpoint {
     tables: Vec<(u64, Vec<u8>)>,
     /// Entries of each relocation run, newest first.
     runs: Vec<Vec<u8>>,
+    /// `(first block number, entries)`, in number order.
+    block_tables: Vec<(u64, Vec<u8>)>,
+    /// Entries of each block relocation run, newest first.
+    block_runs: Vec<Vec<u8>>,
+    /// The dictionary file's bytes, if the manifest lists one.
+    dict: Option<Vec<u8>>,
 }
 
 impl LoadedCheckpoint {
@@ -4225,9 +4374,42 @@ impl LoadedCheckpoint {
         Some(base)
     }
 
+    /// Block `b`'s place as the checkpoint records it: the newest block
+    /// run that lists it (a new segment and offset, or reclaimed), else its
+    /// table; `None` if no table covers it or an entry does not decode.
+    fn block_placement(&self, b: u64) -> Option<Option<BlockPlace>> {
+        let t = self
+            .block_tables
+            .partition_point(|(first, _)| *first <= b)
+            .checked_sub(1)?;
+        let (first, entries) = &self.block_tables[t];
+        let base = codec::block_entry(entries, usize::try_from(b - first).ok()?)?;
+        for run in &self.block_runs {
+            let count = run.len() / BLKREL_ENTRY;
+            let i = partition(count, |i| {
+                codec::blkrel_entry(run, i).is_some_and(|(number, _)| number < b)
+            });
+            if let Some((number, at)) = codec::blkrel_entry(run, i)
+                && number == b
+            {
+                return Some(match (base, at) {
+                    (Some(p), Some((segment, offset))) => Some(BlockPlace {
+                        wal: false,
+                        at: segment,
+                        offset,
+                        ..p
+                    }),
+                    _ => None,
+                });
+            }
+        }
+        Some(base)
+    }
+
     /// The checkpoint against the replay of exactly the frames it covers:
-    /// the next numbers, and every covered object's place.
-    fn check(&self, replay: &Replay<'_>) -> Result<(), StoreError> {
+    /// the next numbers, the live segments, the training state and
+    /// dictionary, and every covered object's and block's place.
+    fn check(&self, replay: &Replay<'_>, dict_train_bytes: u64) -> Result<(), StoreError> {
         let m = &self.manifest;
         if (m.next_object, m.next_block, m.next_topic)
             != (
@@ -4237,6 +4419,27 @@ impl LoadedCheckpoint {
             )
         {
             return Err(self.corrupt("next numbers differ from the WAL at the covered frame"));
+        }
+        let mut segments: Vec<u64> = replay.segments.iter().copied().collect();
+        segments.sort_unstable();
+        if m.segments != segments || replay.max_segment.is_some_and(|x| m.next_segment <= x) {
+            return Err(self.corrupt("live segments differ from the WAL at the covered frame"));
+        }
+        if (m.dict_train_bytes, m.dictless_raw) != (dict_train_bytes, replay.dictless_raw)
+            || self.dict.as_deref() != replay.dicts.last().copied()
+            || (m.dict == 0) != replay.dicts.is_empty()
+        {
+            return Err(self.corrupt(
+                "the dictionary or its trigger differs from the WAL at the covered frame",
+            ));
+        }
+        for b in 0..m.next_block {
+            if self.block_placement(b) != Some(block_place_of(replay.blocks.get(&b))) {
+                return Err(StoreError::CheckpointBlockMismatch {
+                    checkpoint: m.n,
+                    block: b,
+                });
+            }
         }
         for x in 0..m.next_object {
             if self.placement(x) != Some(placement_of(replay.objects.get(&x))) {
@@ -4352,10 +4555,85 @@ async fn load_checkpoint(dir: &Path, manifest: Manifest) -> Result<LoadedCheckpo
         runs.push(entries);
     }
     runs.reverse();
+    let mut block_tables = Vec::with_capacity(manifest.block_tables.len());
+    let mut next = 0u64;
+    for &(first, count) in &manifest.block_tables {
+        let entries = match first == next {
+            true => {
+                read_table(
+                    blktab_path(dir, first),
+                    BLKTAB_MAGIC,
+                    first,
+                    count,
+                    BLOCK_ENTRY,
+                )
+                .await?
+            }
+            false => None,
+        }
+        .filter(|e| (0..count as usize).all(|i| codec::block_entry(e, i).is_some()))
+        .ok_or(corrupt(
+            "a block table is missing, damaged, short or out of order",
+        ))?;
+        next = first + count;
+        block_tables.push((first, entries));
+    }
+    if next != manifest.next_block {
+        return Err(corrupt("block tables do not cover every block number"));
+    }
+    let mut block_runs = Vec::with_capacity(manifest.block_runs.len());
+    let mut last = 0u64;
+    for &(run, count) in &manifest.block_runs {
+        let entries = match run > last && run <= n {
+            true => {
+                read_table(
+                    blkrel_path(dir, run),
+                    BLKREL_MAGIC,
+                    run,
+                    count,
+                    BLKREL_ENTRY,
+                )
+                .await?
+            }
+            false => None,
+        }
+        .filter(|e| {
+            let numbers: Vec<u64> = (0..count as usize)
+                .filter_map(|i| codec::blkrel_entry(e, i).map(|(x, _)| x))
+                .collect();
+            numbers.windows(2).all(|w| w[0] < w[1])
+                && numbers.last().is_some_and(|&x| x < manifest.next_block)
+        })
+        .ok_or(corrupt(
+            "a block relocation run is missing, damaged, short or out of order",
+        ))?;
+        last = run;
+        block_runs.push(entries);
+    }
+    block_runs.reverse();
+    let dict = match manifest.dict {
+        0 => None,
+        d => {
+            let bytes = match compio::fs::read(dict_path(dir, d)).await {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                res => Some(res?),
+            };
+            Some(
+                bytes
+                    .as_deref()
+                    .and_then(|b| codec::decode_dict_file(b, d))
+                    .map(<[u8]>::to_vec)
+                    .ok_or(corrupt("the dictionary file is missing or damaged"))?,
+            )
+        }
+    };
     Ok(LoadedCheckpoint {
         manifest,
         tables,
         runs,
+        block_tables,
+        block_runs,
+        dict,
     })
 }
 
@@ -4483,7 +4761,18 @@ async fn open_checkpoint(
                 .tables
                 .iter()
                 .map(|&(first, _)| file_name(&objtab_path(dir, first)))
-                .chain(m.runs.iter().map(|&(k, _)| file_name(&reloc_path(dir, k))));
+                .chain(m.runs.iter().map(|&(k, _)| file_name(&reloc_path(dir, k))))
+                .chain(
+                    m.block_tables
+                        .iter()
+                        .map(|&(first, _)| file_name(&blktab_path(dir, first))),
+                )
+                .chain(
+                    m.block_runs
+                        .iter()
+                        .map(|&(k, _)| file_name(&blkrel_path(dir, k))),
+                )
+                .chain((m.dict != 0).then(|| file_name(&dict_path(dir, m.dict))));
             for f in listed {
                 if !present(&f) && !inside.contains(&f) {
                     return Err(StoreError::CorruptCheckpoint {
@@ -4500,8 +4789,11 @@ async fn open_checkpoint(
             CheckpointFile::Manifest(n)
             | CheckpointFile::Tmp(n)
             | CheckpointFile::Quarantined(n)
-            | CheckpointFile::Run(n) => Some(n),
-            CheckpointFile::Table(_) => None,
+            | CheckpointFile::Run(n)
+            | CheckpointFile::BlockRun(n) => Some(n),
+            CheckpointFile::Table(_) | CheckpointFile::BlockTable(_) | CheckpointFile::Dict(_) => {
+                None
+            }
         })
         .max()
         .map_or(1, |n| n.saturating_add(1));
@@ -4524,10 +4816,14 @@ async fn open_checkpoint(
         Some(m) => Some(load_checkpoint(dir, m).await?),
         None => None,
     };
-    let (used_n, used_next, tables, runs) = match loaded.as_ref().map(|l| &l.manifest) {
-        Some(m) => (m.n, m.next_object, m.tables.clone(), m.runs.clone()),
-        None => (0, 0, Vec::new(), Vec::new()),
-    };
+    let used = loaded
+        .as_ref()
+        .map(|l| l.manifest.clone())
+        .unwrap_or_default();
+    let (used_n, used_next, used_next_block, used_dict) =
+        (used.n, used.next_object, used.next_block, used.dict);
+    let (tables, runs, block_tables, block_runs) =
+        (used.tables, used.runs, used.block_tables, used.block_runs);
     // Tables and runs are cumulative: the newest manifest quarantined now
     // may list every table and run newer than the manifest used, so those
     // go with it (a later interrupted checkpoint's table cannot be told
@@ -4573,8 +4869,19 @@ async fn open_checkpoint(
             CheckpointFile::Quarantined(_) => continue,
             CheckpointFile::Table(first) if tables.iter().any(|t| t.0 == first) => continue,
             CheckpointFile::Run(k) if runs.iter().any(|r| r.0 == k) => continue,
+            CheckpointFile::BlockTable(first) if block_tables.iter().any(|t| t.0 == first) => {
+                continue;
+            }
+            CheckpointFile::BlockRun(k) if block_runs.iter().any(|r| r.0 == k) => continue,
+            CheckpointFile::Dict(k) if k == used_dict => continue,
             CheckpointFile::Table(first) => newest.is_some() && first >= used_next,
-            CheckpointFile::Run(k) => newest.is_some_and(|d| k > used_n && k <= d),
+            CheckpointFile::BlockTable(first) => newest.is_some() && first >= used_next_block,
+            CheckpointFile::Run(k) | CheckpointFile::BlockRun(k) => {
+                newest.is_some_and(|d| k > used_n && k <= d)
+            }
+            // The dictionary is written once, by the first checkpoint after
+            // training: a newer damaged manifest may list it.
+            CheckpointFile::Dict(_) => newest.is_some(),
             CheckpointFile::Manifest(_) | CheckpointFile::Tmp(_) => false,
         };
         match quarantine.first_mut().filter(|_| to_newest) {
