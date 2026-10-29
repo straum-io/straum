@@ -269,6 +269,55 @@ async fn a_missing_or_foreign_file_is_an_error_and_changes_nothing() {
     }
 }
 
+/// A directory with data or index segments but no WAL file is refused
+/// (`CorruptWal`) before anything changes: a new store would delete the
+/// segments as orphans and replace a leftover tmp file.
+#[compio::test]
+async fn segments_without_a_wal_file_are_refused_and_change_nothing() {
+    let dir = TempDir::new("walfiles-none");
+    let mut store = Store::open(&dir.0, Config::default()).await.unwrap();
+    put(&mut store, 0, 70).await;
+    drop(store);
+    let names = |d: &Path, prefix: &str| -> Vec<PathBuf> {
+        std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with(prefix))
+            .collect()
+    };
+    assert!(!names(&dir.0, "seg-").is_empty() && !names(&dir.0, "idx-").is_empty());
+    for keep in ["seg-", "idx-", "both"] {
+        let work = TempDir::new("walfiles-none-work");
+        common::copy_dir(&dir.0, &work.0);
+        for (_, path) in wal_files(&work.0) {
+            std::fs::remove_file(path).unwrap();
+        }
+        for other in ["seg-", "idx-"] {
+            if keep != "both" && other != keep {
+                for path in names(&work.0, other) {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+        }
+        std::fs::write(work.0.join(format!("{}.tmp", common::WAL0)), b"half").unwrap();
+        let before = snapshot(&work.0);
+        let res = Store::open(&work.0, Config::default()).await;
+        assert!(
+            matches!(
+                res,
+                Err(StoreError::CorruptWal {
+                    file: 0,
+                    offset: 0,
+                    ..
+                })
+            ),
+            "{keep}: {:?}",
+            res.err()
+        );
+        assert!(snapshot(&work.0) == before, "{keep}: files changed");
+    }
+}
+
 #[compio::test]
 async fn an_empty_last_file_and_a_leftover_tmp_file() {
     let dir = TempDir::new("walfiles-empty");

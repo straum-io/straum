@@ -116,8 +116,10 @@ At startup the store replays the WAL from the beginning
 - **What it refuses.** Damage anywhere else stops the store from opening,
   and no file is changed: a damaged frame followed by a valid one
   or in a WAL file that another follows (`WalCorrupted`), a valid frame
-  that is out of sequence or contradicts earlier frames, or a missing or
-  extra WAL file (`CorruptWal`), a body of the last frame missing or wrong
+  that is out of sequence or contradicts earlier frames, a missing or
+  extra WAL file, or data or index segments with no WAL file at all
+  (`CorruptWal`; a new WAL would make those segments orphans, so the
+  directory is refused instead of emptied), a body of the last frame missing or wrong
   in `sequential` or `inline` mode (`MissingObject`, `HashMismatch`), a
   body of an earlier frame missing or cut short (`MissingObject`), a
   block of the last frame that does not decompress or fails its checks
