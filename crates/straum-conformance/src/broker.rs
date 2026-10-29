@@ -53,7 +53,7 @@ impl BrokerProcess {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Some(addr) = line.strip_prefix("straum-broker: listening on ") {
+                if let Some(addr) = line.strip_prefix("straum-server: listening on ") {
                     let _ = tx.send(addr.to_owned());
                 }
             }

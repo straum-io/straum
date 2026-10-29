@@ -259,7 +259,7 @@ step git -C "$REPO" worktree add --detach "$WORKTREE" "$COMMIT"
 } >>"$ENV_MD"
 step env CARGO_TARGET_DIR="$WORK/target" cargo build --manifest-path "$WORKTREE/Cargo.toml" \
     --release --locked -p straum-broker -p straum-broker-bench
-BROKER="$WORK/target/release/straum-broker"
+BROKER="$WORK/target/release/straum-server"
 BENCH="$WORK/target/release/straum-broker-bench"
 
 # --- Broker per run ----------------------------------------------------------
@@ -273,14 +273,14 @@ start_broker() {
         </dev/null >/dev/null 2>"$err" &
     BROKER_PID=$!
     for _ in $(seq 1 100); do
-        BROKER_ADDR="$(sed -n 's/^straum-broker: listening on //p' "$err")"
+        BROKER_ADDR="$(sed -n 's/^straum-server: listening on //p' "$err")"
         [ -n "$BROKER_ADDR" ] && break
         kill -0 "$BROKER_PID" 2>/dev/null || break
         sleep 0.1
     done
     cat "$err" >>"$LOG"
     [ -n "$BROKER_ADDR" ] || die "the broker did not start; see $LOG"
-    grep -q '^straum-broker: compio driver IoUring$' "$err" ||
+    grep -q '^straum-server: compio driver IoUring$' "$err" ||
         die "the broker does not use io_uring: $(grep 'compio driver' "$err")"
 }
 

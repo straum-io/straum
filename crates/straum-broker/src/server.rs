@@ -147,14 +147,14 @@ pub async fn serve(
     let store = Store::open(config.data_dir.join("store"), store_config).await?;
     let report = store.recovery_report();
     eprintln!(
-        "straum-broker: node {} of cluster {:?}{}; store recovery: {} action(s)",
+        "straum-server: node {} of cluster {:?}{}; store recovery: {} action(s)",
         identity.node_id,
         identity.cluster_id,
         if created { " (new data directory)" } else { "" },
         report.actions.len()
     );
     for action in &report.actions {
-        eprintln!("straum-broker: recovery: {action:?}");
+        eprintln!("straum-server: recovery: {action:?}");
     }
     let (catalog, clock_floor) = load_catalog(&store, config.node_id).await?;
 
@@ -183,8 +183,8 @@ pub async fn serve(
     });
     let commit = compio::runtime::spawn(commit_loop(Rc::clone(&shared)));
     let driver = compio::runtime::Runtime::with_current(|rt| rt.driver_type());
-    eprintln!("straum-broker: compio driver {driver:?}");
-    eprintln!("straum-broker: listening on {addr}");
+    eprintln!("straum-server: compio driver {driver:?}");
+    eprintln!("straum-server: listening on {addr}");
     ready(addr, StopHandle { flag: stop, addr });
 
     loop {
@@ -208,7 +208,7 @@ pub async fn serve(
 
     // Shutdown: no new connections or requests; finish the queued groups,
     // answer waiting fetches, wait for the answers to be written.
-    eprintln!("straum-broker: stopping");
+    eprintln!("straum-server: stopping");
     drop(listener);
     shared.closing.set(true);
     shared.queued.notify();
@@ -229,7 +229,7 @@ pub async fn serve(
             break;
         }
     }
-    eprintln!("straum-broker: stopped");
+    eprintln!("straum-server: stopped");
     Ok(())
 }
 

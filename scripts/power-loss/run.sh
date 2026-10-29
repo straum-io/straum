@@ -90,13 +90,13 @@ LAZYFS_BIN="$LAZYFS/lazyfs/build/lazyfs"
 # one for this process only.
 ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
-echo "building straum-power-loss and straum-broker (release)"
+echo "building straum-power-loss and straum-server (release)"
 if ! (cd "$ROOT" && cargo build --release -p straum-power-loss -p straum-broker) >"$OUT/build.log" 2>&1; then
     echo "build failed: $OUT/build.log" >&2
     exit 2
 fi
 BIN="$ROOT/target/release/straum-power-loss"
-BROKER="$ROOT/target/release/straum-broker"
+BROKER="$ROOT/target/release/straum-server"
 
 # ---------------------------------------------------------------- environment
 
@@ -292,7 +292,7 @@ write_phase() {
                 ERR="second broker start changed the store again (see $it/broker.log)"; return 1
             fi
             local addr
-            addr="$(sed -n 's/^straum-broker: listening on //p' "$it/broker.log")"
+            addr="$(sed -n 's/^straum-server: listening on //p' "$it/broker.log")"
             "$BIN" broker-produce --addr "$addr" --base $((i * 2000000)) --seed "$wseed" \
                 >"$it/producer.log" 2>"$it/producer.err" &
             WRITERS="$WRITERS $!"; ready="$it/producer.log"

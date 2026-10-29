@@ -16,7 +16,8 @@ silently.
 
 ## Quick start
 
-Start a broker on loopback:
+Start a broker on loopback (the binary is `straum-server`; `cargo run`
+builds it as `target/release/straum-server`):
 
 ```bash
 git clone https://github.com/straum-io/straum && cd straum

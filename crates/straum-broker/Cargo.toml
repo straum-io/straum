@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+# The crate is straum-broker; its one binary is straum-server, so
+# `cargo run -p straum-broker` runs it.
+[[bin]]
+name = "straum-server"
+path = "src/main.rs"
+
 [dependencies]
 straum-proto = { path = "../straum-proto" }
 straum-store = { path = "../straum-store" }
