@@ -265,3 +265,13 @@ proptest! {
         prop_assert_eq!(Response::decode(h.msg_type, b).unwrap(), resp);
     }
 }
+
+/// Found by fuzzing (`fuzz/`, target `proto_json`): `from_str_radix`
+/// takes a leading `+`, so `unhex` read `"+0"` as the byte 0.
+#[test]
+fn unhex_takes_hex_digits_only() {
+    for s in ["+0", "+f", "0+0f", "-1", " 0"] {
+        assert_eq!(json::unhex(s), None, "{s:?}");
+    }
+    assert_eq!(json::unhex("00fFa0"), Some(vec![0, 0xff, 0xa0]));
+}
