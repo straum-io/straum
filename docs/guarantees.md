@@ -121,7 +121,7 @@ At startup the store replays the WAL from the beginning
   | `CheckpointQuarantineResumed` | a quarantine an earlier open or checkpoint began and did not finish (its directory exists, the manifest still in place) is completed in the same directory; the files found there are listed, so every change is reported at least once |
 
   The last four concern the store's checkpoints (ADR-0014), which the
-  broker does not write yet. A quarantine is reported once, by the open
+  broker does not write yet. A quarantine is reported at least once (exactly once without a crash), by the open
   that made it, or, if that open was interrupted before moving the
   manifest, by the open that completes it (a crash after the manifest's
   move and before the report is returned leaves those moves unreported,
