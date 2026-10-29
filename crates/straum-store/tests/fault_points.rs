@@ -189,6 +189,8 @@ async fn a_crash_at_every_checkpoint_step_recovers() {
                     matches!(store.checkpoint().await, Err(StoreError::Poisoned)),
                     "{mode:?} {point:?}"
                 );
+            } else {
+                assert!(res.is_ok(), "{mode:?} {point:?}");
             }
             drop(store);
             reopen_and_verify(&dir.0, mode, &live, &format!("{mode:?} {point:?}")).await;
@@ -222,7 +224,7 @@ async fn a_lost_rename_recovers_from_the_previous_manifest() {
         let (mut store, live) = prepare(&dir.0, mode).await;
         let prev = store.checkpoint_number().unwrap();
         arm_fault(FaultPoint::CheckpointRenamed, 1);
-        assert!(store.checkpoint().await.is_err());
+        assert!(store.checkpoint().await.is_err() && !disarm_fault());
         drop(store);
         let new = format!("checkpoint-{:016x}", prev + 1);
         std::fs::rename(dir.0.join(&new), dir.0.join(format!("{new}.tmp"))).unwrap();
@@ -344,7 +346,10 @@ async fn lost_directory_entries_recover() {
         let (mut store, live) = prepare(&dir.0, mode).await;
         let before = names(&dir.0);
         arm_fault(FaultPoint::CheckpointDictionary, 1);
-        assert!(store.checkpoint().await.is_err(), "{mode:?}");
+        assert!(
+            store.checkpoint().await.is_err() && !disarm_fault(),
+            "{mode:?}"
+        );
         drop(store);
         for new in names(&dir.0).difference(&before) {
             std::fs::remove_file(dir.0.join(new)).unwrap();
@@ -357,7 +362,10 @@ async fn lost_directory_entries_recover() {
         let prev_name = format!("checkpoint-{prev:016x}");
         let prev_bytes = std::fs::read(dir.0.join(&prev_name)).unwrap();
         arm_fault(FaultPoint::CheckpointPreviousDeleted, 1);
-        assert!(store.checkpoint().await.is_err(), "{mode:?}");
+        assert!(
+            store.checkpoint().await.is_err() && !disarm_fault(),
+            "{mode:?}"
+        );
         drop(store);
         std::fs::write(dir.0.join(&prev_name), prev_bytes).unwrap();
         disarm_fault();
