@@ -730,7 +730,7 @@ directories; move the manifest last, sync both.
   and `checkpoint-<n>` is still in the store directory (a crash after the
   directory's creation and before the manifest's move, at open, at write
   time, or while completing an earlier one). Open completes it in that
-  same directory: it moves the files the quarantine takes that are still in
+  same directory, syncing the store directory first: it moves the files the quarantine takes that are still in
   place, then the manifest, and reports the files it found there
   (`CheckpointQuarantineResumed`, `found`: the interrupted open's report was
   lost) and each move (`CheckpointFileQuarantined`). It then uses the
@@ -744,7 +744,14 @@ directories; move the manifest last, sync both.
   while no `checkpoint-<n>` is in the store directory is kept, unread.
 
 Every change is reported at least once: by the open that made it, or, when
-that open crashed, as `found` by the open that completes the quarantine.
+that open crashed before moving the manifest, as `found` by the open that
+completes the quarantine. Not covered: a crash after the manifest's move
+(the quarantine is then complete) and before `Store::open` returns its
+report, or before the checkpoint returns its error; those moves are in no
+report, and only `quarantined_files` and the broker's warning show them
+(the same window as every other repair recovery makes; card D-260). A
+quarantine name that is not a directory is `CorruptCheckpoint`, no file
+changed.
 `Store::quarantined_files` counts the files in all quarantine directories
 at open. Checkpoint numbers do not repeat (the next is above every
 manifest, tmp manifest, run and quarantine directory on disk). With no manifest

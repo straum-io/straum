@@ -766,6 +766,7 @@ async fn an_interrupted_write_time_quarantine_is_completed_and_falls_back() {
         let twice = TempDir::new("checkpoint-quarantine-write-time-twice");
         common::copy_dir(&dir.0, &twice.0);
         std::fs::create_dir(twice.0.join("quarantine-0000000000000002.1")).unwrap();
+        let before = snapshot(&twice.0);
         let res = Store::open(&twice.0, config(mode)).await;
         assert!(
             matches!(
@@ -775,6 +776,7 @@ async fn an_interrupted_write_time_quarantine_is_completed_and_falls_back() {
             "{mode:?}: {:?}",
             res.err()
         );
+        assert!(snapshot(&twice.0) == before, "{mode:?}: files changed");
 
         let store = Store::open(&dir.0, config(mode)).await.unwrap();
         let acts = actions(&store);
@@ -786,4 +788,97 @@ async fn an_interrupted_write_time_quarantine_is_completed_and_falls_back() {
         let store = Store::open(&dir.0, config(mode)).await.unwrap();
         assert!(store.recovery_report().is_empty(), "{mode:?}");
     }
+}
+
+/// The write-time quarantine interrupted earlier: right after the
+/// directory's creation, or after only the first of its files moved. The
+/// next open completes it in place, moving the rest, falls back to the
+/// previous manifest and reports both, in every write mode.
+#[compio::test]
+async fn an_early_interrupted_write_time_quarantine_is_completed() {
+    for mode in MODES {
+        let own_len = {
+            let probe = TempDir::new("checkpoint-quarantine-probe");
+            build_with_both_manifests(&probe.0, mode).await;
+            own_files(&probe.0).len()
+        };
+        for moved_first in 0..own_len {
+            let dir = TempDir::new("checkpoint-quarantine-write-early");
+            let live = build_with_both_manifests(&dir.0, mode).await;
+            let own = own_files(&dir.0);
+            std::fs::create_dir(dir.0.join(Q2)).unwrap();
+            for f in &own[..moved_first] {
+                std::fs::rename(dir.0.join(f), dir.0.join(Q2).join(f)).unwrap();
+            }
+            let store = Store::open(&dir.0, config(mode)).await.unwrap();
+            let acts = actions(&store);
+            assert_eq!(
+                acts[0],
+                resumed(2, Some(1), Q2, &own[..moved_first]),
+                "{mode:?} {moved_first}"
+            );
+            let mut now: Vec<String> = own[moved_first..].to_vec();
+            now.push("checkpoint-0000000000000002".to_owned());
+            now.sort();
+            assert_eq!(moved(&acts, Q2), now, "{mode:?} {moved_first}");
+            assert!(removed(&acts).is_empty(), "{mode:?}: {acts:?}");
+            assert_eq!(store.checkpoint_number(), Some(1));
+            check(&store, live.clone()).await;
+        }
+    }
+}
+
+/// One open with an interrupted quarantine of the older manifest and a new
+/// damage of the newer one: no intact manifest remains, so the state is
+/// rebuilt from the WAL (`fallback: None`); the interrupted quarantine is
+/// completed in its directory and the new one, the newest, takes the
+/// tables and runs. In every write mode.
+#[compio::test]
+async fn an_interrupted_and_a_new_quarantine_in_one_open() {
+    for mode in MODES {
+        let dir = TempDir::new("checkpoint-quarantine-both");
+        let live = build_with_both_manifests(&dir.0, mode).await;
+        let q1 = "quarantine-0000000000000001";
+        std::fs::create_dir(dir.0.join(q1)).unwrap();
+        edit(&dir.0.join("checkpoint-0000000000000002"), |b| b[13] ^= 1);
+        let mut tables: Vec<String> = names(&dir.0, "objtab-")
+            .into_iter()
+            .chain(names(&dir.0, "reloc-"))
+            .collect();
+        tables.push("checkpoint-0000000000000002".to_owned());
+        tables.sort();
+        let store = Store::open(&dir.0, config(mode)).await.unwrap();
+        let acts = actions(&store);
+        assert_eq!(acts[0], damaged(2, None, Q2), "{mode:?}");
+        assert!(
+            acts.contains(&resumed(1, None, q1, &[])),
+            "{mode:?}: {acts:?}"
+        );
+        assert_eq!(moved(&acts, q1), ["checkpoint-0000000000000001"]);
+        assert_eq!(moved(&acts, Q2), tables, "{mode:?}");
+        assert!(removed(&acts).is_empty(), "{mode:?}: {acts:?}");
+        assert_eq!(store.checkpoint_number(), None);
+        check(&store, live).await;
+        drop(store);
+        let store = Store::open(&dir.0, config(mode)).await.unwrap();
+        assert!(store.recovery_report().is_empty(), "{mode:?}");
+    }
+}
+
+/// A file (not a directory) under a quarantine name is not explained: open
+/// fails before any change.
+#[compio::test]
+async fn a_quarantine_name_that_is_not_a_directory_fails_open() {
+    let dir = TempDir::new("checkpoint-quarantine-file");
+    build_with_both_manifests(&dir.0, WriteMode::Sequential).await;
+    std::fs::write(dir.0.join(Q2), b"x").unwrap();
+    std::fs::write(dir.0.join("checkpoint-0000000000000009.tmp"), b"half").unwrap();
+    let before = snapshot(&dir.0);
+    let res = Store::open(&dir.0, Config::default()).await;
+    assert!(
+        matches!(res, Err(StoreError::CorruptCheckpoint { .. })),
+        "{:?}",
+        res.err()
+    );
+    assert!(snapshot(&dir.0) == before, "files changed");
 }

@@ -4081,13 +4081,13 @@ fn free_quarantine_name(dir: &Path, n: u64) -> io::Result<String> {
     Ok(name)
 }
 
-/// Moves `files` of the store directory, unchanged, into the new
-/// directory `quarantine`: the tables and runs first, synced with both
-/// directories, then the manifest, synced again (the caller syncs the store
-/// directory once more). While the damaged manifest is still in the store
-/// directory, an interrupted move is finished by the next open, which finds
-/// the manifest again and quarantines it with the files still in place (in
-/// the next free name); so a table or run it may list is never deleted.
+/// Moves `files` of the store directory, unchanged, into the directory
+/// `quarantine` (created now, or an interrupted quarantine's, which is
+/// completed): the tables and runs first, synced with both directories,
+/// then the manifest, synced again (the caller syncs the store directory
+/// once more). While the manifest is still in the store directory, an
+/// interrupted move is completed by the next open in the same directory;
+/// so a table or run it may list is never deleted.
 async fn move_to_quarantine(
     dir: &Path,
     quarantine: &str,
@@ -4097,8 +4097,10 @@ async fn move_to_quarantine(
     let q = dir.join(quarantine);
     if create {
         std::fs::create_dir(&q)?;
-        sync_dir(dir).await?;
     }
+    // Also when completing: the directory entry an interrupted open made
+    // may not be durable yet.
+    sync_dir(dir).await?;
     let (manifests, others): (Vec<&String>, Vec<&String>) =
         files.iter().partition(|f| f.starts_with("checkpoint-"));
     for group in [others, manifests] {
@@ -4393,10 +4395,12 @@ struct Quarantine {
 /// ignored (its files are orphans) only while the WAL holds every frame
 /// (`wal_first == 0`, always so until ADR-0014 step 6b deletes WAL files);
 /// otherwise the state the deleted frames described is lost: an error.
-/// Each damaged manifest moves into a quarantine directory
-/// `quarantine-<n>` (the next free `.1`, `.2`, … if taken; never
-/// overwritten), with the tables and runs it may list; quarantine
-/// directories are kept and never read.
+/// Each damaged manifest moves into a new quarantine directory
+/// `quarantine-<n>` (the next free `.1`, `.2`, … past completed ones; never
+/// overwritten), with the tables and runs it may list; an interrupted
+/// quarantine (its directory without the manifest, the manifest still in
+/// place) is completed in its directory. Quarantine directories are listed
+/// to tell completed from interrupted ones; their files are never read.
 async fn open_checkpoint(
     dir: &Path,
     wal_first: u64,
@@ -4424,16 +4428,17 @@ async fn open_checkpoint(
     for (f, name) in &found {
         if let CheckpointFile::Quarantined(n) = *f {
             let path = dir.join(name);
-            let files = if path.is_dir() {
-                let mut v = Vec::new();
-                for e in std::fs::read_dir(&path)? {
-                    v.push(e?.file_name().to_string_lossy().into_owned());
-                }
-                v.sort();
-                v
-            } else {
-                Vec::new()
-            };
+            if !path.is_dir() {
+                return Err(StoreError::CorruptCheckpoint {
+                    checkpoint: n,
+                    reason: "a quarantine name that is not a directory",
+                });
+            }
+            let mut files = Vec::new();
+            for e in std::fs::read_dir(&path)? {
+                files.push(e?.file_name().to_string_lossy().into_owned());
+            }
+            files.sort();
             dirs.push((n, name.clone(), files));
         }
     }

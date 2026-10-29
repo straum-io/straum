@@ -122,8 +122,11 @@ At startup the store replays the WAL from the beginning
 
   The last four concern the store's checkpoints (ADR-0014), which the
   broker does not write yet. A quarantine is reported once, by the open
-  that made it, or, if that open was interrupted, by the open that
-  completes it; while quarantined
+  that made it, or, if that open was interrupted before moving the
+  manifest, by the open that completes it (a crash after the manifest's
+  move and before the report is returned leaves those moves unreported,
+  like any repair in that window; the warning and the count still show
+  them); while quarantined
   files exist, the broker prints one
   startup warning (`straum-server: warning: …`, not a recovery line) until
   an operator removes them. An empty report means nothing was changed.
