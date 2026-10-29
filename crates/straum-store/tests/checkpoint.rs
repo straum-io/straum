@@ -1044,6 +1044,26 @@ async fn the_dictionary_file_is_written_once_and_checked() {
         assert!(store.recovery_report().is_empty(), "{mode:?}");
         check(&store, 0..400).await;
         drop(store);
+        // The newest manifest claims no dictionary on a trained store.
+        {
+            let work = TempDir::new("checkpoint-dict-none");
+            common::copy_dir(&dir.0, &work.0);
+            edit(&path_of(&work.0, "checkpoint-", 0), |b| {
+                b[76..84].fill(0);
+                reseal_manifest(b);
+            });
+            let before = snapshot(&work.0);
+            let res = Store::open(&work.0, cfg).await;
+            assert!(
+                matches!(
+                    res,
+                    Err(StoreError::CorruptCheckpoint { checkpoint: 3, .. })
+                ),
+                "{mode:?}: {:?}",
+                res.err()
+            );
+            assert!(snapshot(&work.0) == before, "{mode:?}: files changed");
+        }
         for (what, change) in [
             (
                 "missing",
