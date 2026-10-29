@@ -608,7 +608,10 @@ TLS, frames are as in section 2, for both versions.
   without a frame.
 - Which listen address needs TLS and `auth = scram` is a broker setting
   (ADR-0015 §1): every address but loopback needs both. A client never
-  sends a password to an address other than loopback without TLS.
+  sends a password to an address other than loopback without TLS that
+  verifies the server's certificate and name: without that check, a
+  man in the middle collects the SCRAM exchange for an offline
+  dictionary attack.
 
 **States of a connection:**
 
@@ -770,7 +773,11 @@ ServerSignature = HMAC(ServerKey, AuthMessage)
   the server nonce starts with its `c-nonce` and is longer, `iterations`
   is from 4 096 to 1 000 000 (the range of `auth_scram_iterations`, so a
   broker cannot make the client run an unbounded PBKDF2), and
-  `ServerSignature` equals the one it computes.
+  `ServerSignature` equals the one it computes. With SCRAM it also fails
+  unless `HelloOk` has `auth_complete = 0` and `AuthContinueOk` has
+  `auth_complete = 1` with a verified `v=`, and on an `m=` attribute or a
+  malformed `s=` or `i=` in the server-first-message: a broker that
+  skips a step has not proved it holds the credential.
 
 ### 10.8 AuthContinue
 
@@ -939,7 +946,8 @@ only, ADR-0015 §1) every request is allowed, except the four writes of
 - The check runs after the topic name is validated and before the topic
   is looked up: a principal without the operation gets `Forbidden`
   whether the topic exists or not. Names starting with `__` stay
-  `Forbidden` for everyone.
+  `Forbidden` for everyone. A principal allowed `create` but not
+  `describe` still learns from `TopicExists` that a topic exists.
 - Cluster `admin` includes adding entries for oneself: it is full access.
 
 ### 10.13 Changed responses of version 0 requests
