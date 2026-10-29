@@ -7,7 +7,8 @@
 //! plan          --scenario S --seed N --iterations K --store-root P
 //! store-write   --dir D --mode M --seed N [--compact-every C]
 //!               [--arm-at-compaction K --fifo F --fault CMD]
-//! store-verify  --dir D --mode M --logs DIR
+//!               [--dict-train-bytes B [--arm-at-train --fifo F --fault CMD]]
+//! store-verify  --dir D --mode M --logs DIR [--dict-train-bytes B]
 //! broker-produce --addr A --base N --seed N
 //! broker-verify --broker BIN --data-dir D --mode M --logs DIR --stderr FILE
 //! ```
@@ -119,7 +120,7 @@ const CRASH_POINTS: [(&str, &str); 7] = [
     ("fsync", r"wal\.log"),
     ("write", "seg-"),
     ("fsync", "seg-"),
-    ("write", r"\.idx"),
+    ("write", "idx-"),
     ("create", "seg-"),
     ("unlink", "seg-"),
 ];
@@ -132,15 +133,13 @@ fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
     let seed = num(opts, "seed")?;
     let iterations = num(opts, "iterations")?;
     let root = opt(opts, "store-root")?;
-    let index = match scenario {
-        "broker" => hex(format!("t/{BROKER_TOPIC}/0").as_bytes()),
-        _ => hex(ORDERS),
-    };
     for i in 0..iterations {
         let mut rng = Rng::new(mix(seed, i));
         let writer_seed = rng.next();
         let delay = rng.below(300);
-        let compaction = scenario == "compaction";
+        // The writer arms these faults itself, at a compaction or at the
+        // batch that trains the dictionary.
+        let compaction = matches!(scenario, "compaction" | "dictionary");
         let kind = match rng.below(3) {
             0 if !compaction => "clear",
             0 | 1 => "crash",
@@ -150,8 +149,8 @@ fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
             "clear" => "lazyfs::clear-cache".to_owned(),
             "crash" => {
                 let points = match scenario {
-                    // Operations a compaction issues.
-                    "compaction" => &CRASH_POINTS[..4],
+                    // Operations a compaction or a training batch issues.
+                    "compaction" | "dictionary" => &CRASH_POINTS[..4],
                     // The broker never compacts: no segment is unlinked.
                     "broker" => &CRASH_POINTS[..6],
                     _ => &CRASH_POINTS[..],
@@ -162,11 +161,13 @@ fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
             }
             _ => {
                 // Torn WAL writes twice as often as torn index writes; a
-                // compaction writes no index.
+                // compaction writes no index. `@IDX@` is the index segment
+                // the writer will append to, named by run.sh before the
+                // writer starts.
                 let file = if compaction || rng.below(3) > 0 {
-                    "wal.log".to_owned()
+                    "wal.log"
                 } else {
-                    format!("topics/{index}.idx")
+                    "@IDX@"
                 };
                 let parts = 2 + rng.below(3);
                 let persist: Vec<String> = (1..=parts)
@@ -189,7 +190,7 @@ fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
 
 // ---------------------------------------------------------------- store
 
-fn store_config(mode: &str) -> Result<Config, String> {
+fn store_config(mode: &str, opts: &HashMap<&str, &str>) -> Result<Config, String> {
     let write_mode = match mode {
         "sequential" => WriteMode::Sequential,
         "parallel" => WriteMode::ParallelSync,
@@ -197,11 +198,16 @@ fn store_config(mode: &str) -> Result<Config, String> {
         "inline" => WriteMode::InlineSmall { threshold: 1024 },
         _ => return Err(format!("unknown write mode {mode}")),
     };
+    let dict_train_bytes = match opts.get("dict-train-bytes") {
+        Some(_) => num(opts, "dict-train-bytes")?,
+        None => Config::default().dict_train_bytes,
+    };
     Ok(Config {
         // Small segments: rotation, sealing mid-batch and compaction happen
         // within one iteration.
         segment_max_bytes: 64 << 10,
         write_mode,
+        dict_train_bytes,
         ..Config::default()
     })
 }
@@ -247,7 +253,8 @@ fn store_write(opts: &HashMap<&str, &str>) -> Result<String, String> {
     let arm_at = opts
         .get("arm-at-compaction")
         .map_or(Ok(0), |_| num(opts, "arm-at-compaction"))?;
-    let config = store_config(mode)?;
+    let arm_at_train = opts.contains_key("arm-at-train");
+    let config = store_config(mode, opts)?;
     println!("SEED {seed} END");
     let rt = compio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     rt.block_on(async {
@@ -269,6 +276,14 @@ fn store_write(opts: &HashMap<&str, &str>) -> Result<String, String> {
                 })
                 .collect();
             let now = now_ms();
+            if store.trains_next_batch() {
+                // The fault, if armed here, hits the batch that trains.
+                if arm_at_train {
+                    arm(opts);
+                    println!("ARMED {round} END");
+                }
+                println!("TRAIN {round} END");
+            }
             println!("TRY {round} END");
             let seqs = store.put_batch(&batch, now).await.unwrap();
             // An ACK line is a durability promise: printed only after
@@ -285,16 +300,8 @@ fn store_write(opts: &HashMap<&str, &str>) -> Result<String, String> {
             if round % compact_every == 0 {
                 compactions += 1;
                 if compactions == arm_at {
-                    let fifo = opt(opts, "fifo").unwrap();
-                    let fault = opt(opts, "fault").unwrap();
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(fifo)
-                        .and_then(|mut f| writeln!(f, "{fault}"))
-                        .unwrap();
+                    arm(opts);
                     println!("ARMED {round} END");
-                    // LazyFS reads the FIFO on its own thread.
-                    std::thread::sleep(Duration::from_millis(200));
                 }
                 println!("COMPACT-START {round} END");
                 let stats = store.compact().await.unwrap();
@@ -303,6 +310,23 @@ fn store_write(opts: &HashMap<&str, &str>) -> Result<String, String> {
         }
     });
     Ok(String::new())
+}
+
+/// Writes `--fault` to the LazyFS fault FIFO `--fifo`.
+#[expect(
+    clippy::unwrap_used,
+    reason = "a harness error ends the writer; run.sh reports the iteration"
+)]
+fn arm(opts: &HashMap<&str, &str>) {
+    let fifo = opt(opts, "fifo").unwrap();
+    let fault = opt(opts, "fault").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(fifo)
+        .and_then(|mut f| writeln!(f, "{fault}"))
+        .unwrap();
+    // LazyFS reads the FIFO on its own thread.
+    std::thread::sleep(Duration::from_millis(200));
 }
 
 /// What the writer logs of one scenario say: every acknowledged message and
@@ -314,6 +338,9 @@ struct StoreLog {
     /// The last round each writer handed to the store: at most one batch
     /// per writer can be durable without its ACK lines.
     unacked: Vec<(u64, u64)>,
+    /// The round whose batch trained the dictionary, and the last round
+    /// acknowledged, of the last writer log that has a `TRAIN` line.
+    train: Option<(u64, u64)>,
 }
 
 /// `iter-*/<name>` under `logs`, in iteration order.
@@ -343,6 +370,7 @@ fn parse_store_logs(logs: &str) -> Result<StoreLog, String> {
     for path in log_files(logs, "writer.log")? {
         let mut seed = None;
         let mut last_try = None;
+        let (mut trained, mut last_ack) = (None, 0);
         for f in log_lines(&path)? {
             let n = |i: usize| -> Result<u64, String> {
                 f.get(i)
@@ -352,9 +380,11 @@ fn parse_store_logs(logs: &str) -> Result<StoreLog, String> {
             match f[0].as_str() {
                 "SEED" => seed = Some(n(1)?),
                 "TRY" => last_try = Some(n(1)?),
+                "TRAIN" => trained = Some(n(1)?),
                 "ACK" => {
                     let seed = seed.ok_or("ACK before SEED")?;
                     let (round, j, seq) = (n(1)?, n(2)?, n(4)?);
+                    last_ack = last_ack.max(round);
                     let key = (f[3].clone().into_bytes(), seq);
                     if let Some(prev) = log.acked.insert(key, (seed, round, j))
                         && store_message(prev.0, prev.1, prev.2).1
@@ -372,6 +402,9 @@ fn parse_store_logs(logs: &str) -> Result<StoreLog, String> {
         }
         if let (Some(seed), Some(round)) = (seed, last_try) {
             log.unacked.push((seed, round));
+        }
+        if let Some(round) = trained {
+            log.train = Some((round, last_ack));
         }
     }
     Ok(log)
@@ -433,12 +466,13 @@ fn action_field<'a>(a: &'a str, field: &str) -> Option<&'a str> {
 /// The report holds only the changes `docs/guarantees.md` §3 lists, and
 /// `FrameDropped` only in ParallelSync.
 fn check_report(actions: &[String], mode: &str) -> Result<(), String> {
-    const ALLOWED: [&str; 6] = [
+    const ALLOWED: [&str; 7] = [
         "WalTmpRemoved",
         "TornTailTruncated",
         "FrameDropped",
         "OrphanSegmentRemoved",
-        "UnknownTopicIndexRemoved",
+        "IndexSegmentRemoved",
+        "StaleIndexRecordsFenced",
         "TopicIndexRepaired",
     ];
     let mut cuts = 0;
@@ -462,9 +496,18 @@ fn check_report(actions: &[String], mode: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The id of an index segment file `idx-<16 hex digits>.dat`.
+fn index_segment_id(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("idx-")?.strip_suffix(".dat")?;
+    (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok())?
+}
+
 /// Every difference between the snapshots before and after recovery is
 /// listed in the report, and every report entry is a difference on disk.
-/// Anything else is a silent repair.
+/// Anything else is a silent repair. Index segments: recovery never
+/// changes an existing one, it may only delete it (`IndexSegmentRemoved`);
+/// a new one holds a fence (`StaleIndexRecordsFenced`) or the blocks and
+/// seek pages of `TopicIndexRepaired`, which all go to new segments.
 fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Result<(), String> {
     let mut explained = vec![false; actions.len()];
     let mut explain = |pred: &dyn Fn(&str) -> bool, what: &str| -> Result<(), String> {
@@ -479,6 +522,7 @@ fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Res
         Ok(())
     };
     let keys: HashSet<&String> = before.files.keys().chain(after.files.keys()).collect();
+    let mut new_index = Vec::new();
     for rel in keys {
         let (b, a) = (before.files.get(rel), after.files.get(rel));
         if b == a {
@@ -523,25 +567,44 @@ fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Res
                     rel,
                 )?;
             }
-            (_, Some(_), None) if rel.starts_with("topics/") => {
+            (_, Some(b), None) if index_segment_id(name).is_some() => {
+                let id = index_segment_id(name).unwrap_or_default().to_string();
+                let bytes = b.0.to_string();
                 explain(
                     &|x| {
-                        action_name(x) == "UnknownTopicIndexRemoved"
-                            && action_field(x, "path").is_some_and(|p| p.ends_with(rel.as_str()))
+                        action_name(x) == "IndexSegmentRemoved"
+                            && action_field(x, "segment") == Some(id.as_str())
+                            && action_field(x, "bytes") == Some(bytes.as_str())
                     },
                     rel,
                 )?;
             }
-            (_, _, Some(_)) if rel.starts_with("topics/") => {
-                explain(
-                    &|x| {
-                        action_name(x) == "TopicIndexRepaired"
-                            && action_field(x, "path").is_some_and(|p| p.ends_with(rel.as_str()))
-                    },
-                    rel,
-                )?;
+            (_, None, Some(_)) if index_segment_id(name).is_some() => {
+                new_index.push((rel.clone(), index_segment_id(name).unwrap_or_default()));
             }
             _ => return Err(format!("silent repair: {rel} changed ({b:?} → {a:?})")),
+        }
+    }
+    // A new index segment is a fence or holds repaired records; repaired
+    // records need a new segment.
+    let repaired: Vec<usize> = (0..actions.len())
+        .filter(|&i| action_name(&actions[i]) == "TopicIndexRepaired")
+        .collect();
+    for (rel, id) in &new_index {
+        let id = id.to_string();
+        let fence = actions.iter().position(|x| {
+            action_name(x) == "StaleIndexRecordsFenced"
+                && action_field(x, "segment") == Some(id.as_str())
+        });
+        match fence {
+            Some(i) => explained[i] = true,
+            None if !repaired.is_empty() => {}
+            None => return Err(format!("silent repair: {rel} created with no report entry")),
+        }
+    }
+    if !new_index.is_empty() {
+        for i in repaired {
+            explained[i] = true;
         }
     }
     if let Some(i) = explained.iter().position(|e| !e) {
@@ -556,7 +619,7 @@ fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Res
 fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
     let dir = PathBuf::from(opt(opts, "dir")?);
     let mode = opt(opts, "mode")?;
-    let config = store_config(mode)?;
+    let config = store_config(mode, opts)?;
     let log = parse_store_logs(opt(opts, "logs")?)?;
     if !dir.join("wal.log").exists() {
         return if log.acked.is_empty() {
@@ -646,6 +709,16 @@ fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
             if store.refcount(id) != Some(*n) {
                 return Err(format!("refcount of {id:?}: {:?}, live entries {n}", store.refcount(id)));
             }
+        }
+        // An acknowledged training batch, or one after it, makes the
+        // dictionary durable: recovery must find it in the WAL.
+        if let Some((train, last_ack)) = log.train
+            && last_ack >= train
+            && store.dictionary_bytes().is_none()
+        {
+            return Err(format!(
+                "round {last_ack} acknowledged after the training round {train}, but no dictionary after recovery"
+            ));
         }
         drop(store);
 
@@ -942,10 +1015,6 @@ fn broker_check(
     Ok((actions, summary))
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -969,17 +1038,20 @@ mod tests {
         }
     }
 
+    const IDX0: &str = "idx-0000000000000000.dat";
+    const IDX1: &str = "idx-0000000000000001.dat";
+
     #[test]
     fn changes_must_match_the_report() {
         let before = snap(&[
             ("wal.log", b"0123456789"),
             ("seg-000000000000000a.dat", b"x"),
-            ("topics/6f.idx", b"abc"),
+            (IDX0, b"abc"),
         ]);
         let cut = snap(&[
             ("wal.log", b"012345"),
             ("seg-000000000000000a.dat", b"x"),
-            ("topics/6f.idx", b"abc"),
+            (IDX0, b"abc"),
         ]);
         let torn = "TornTailTruncated { frame_seq: 3, offset: 6, bytes_removed: 4 }".to_owned();
         assert!(check_changes(&before, &cut, std::slice::from_ref(&torn)).is_ok());
@@ -992,11 +1064,11 @@ mod tests {
         let rewritten = snap(&[
             ("wal.log", b"01234X"),
             ("seg-000000000000000a.dat", b"x"),
-            ("topics/6f.idx", b"abc"),
+            (IDX0, b"abc"),
         ]);
         assert!(check_changes(&before, &rewritten, &[torn]).is_err());
 
-        let no_seg = snap(&[("wal.log", b"0123456789"), ("topics/6f.idx", b"abc")]);
+        let no_seg = snap(&[("wal.log", b"0123456789"), (IDX0, b"abc")]);
         let orphan = "OrphanSegmentRemoved { segment: 10 }".to_owned();
         assert!(check_changes(&before, &no_seg, &[orphan]).is_ok());
         assert!(check_changes(&before, &no_seg, &[]).is_err());
@@ -1004,17 +1076,38 @@ mod tests {
         let seg_changed = snap(&[
             ("wal.log", b"0123456789"),
             ("seg-000000000000000a.dat", b"y"),
-            ("topics/6f.idx", b"abc"),
+            (IDX0, b"abc"),
         ]);
         assert!(check_changes(&before, &seg_changed, &[]).is_err());
+    }
 
-        let idx = snap(&[
-            ("wal.log", b"0123456789"),
-            ("seg-000000000000000a.dat", b"x"),
-            ("topics/6f.idx", b"abd"),
-        ]);
-        let repaired = r#"TopicIndexRepaired { path: "/m/store/topics/6f.idx", entries_kept: 1, bytes_truncated: 1, entries_rewritten: 1 }"#.to_owned();
-        assert!(check_changes(&before, &idx, &[repaired]).is_ok());
+    #[test]
+    fn index_segments_may_only_be_deleted_or_added_with_a_report_entry() {
+        let before = snap(&[("wal.log", b"0123456789"), (IDX0, b"abc")]);
+        let repaired =
+            r#"TopicIndexRepaired { topic: [111], blocks_rewritten: 1, pages_rewritten: 0 }"#
+                .to_owned();
+        // An existing segment changed in place: never a repair.
+        let changed = snap(&[("wal.log", b"0123456789"), (IDX0, b"abd")]);
+        assert!(check_changes(&before, &changed, std::slice::from_ref(&repaired)).is_err());
+        // Deleted, with its size reported.
+        let gone = snap(&[("wal.log", b"0123456789"), (IDX1, b"hdr+blocks")]);
+        let removed = "IndexSegmentRemoved { segment: 0, bytes: 3 }".to_owned();
+        let actions = [removed.clone(), repaired.clone()];
+        assert!(check_changes(&before, &gone, &actions).is_ok());
+        let wrong = "IndexSegmentRemoved { segment: 0, bytes: 4 }".to_owned();
+        assert!(check_changes(&before, &gone, &[wrong, repaired.clone()]).is_err());
+        // A new segment needs a fence or repaired records, and repaired
+        // records need a new segment.
+        let added = snap(&[("wal.log", b"0123456789"), (IDX0, b"abc"), (IDX1, b"h")]);
+        assert!(check_changes(&before, &added, &[]).is_err());
+        assert!(check_changes(&before, &added, std::slice::from_ref(&repaired)).is_ok());
+        assert!(check_changes(&before, &before, std::slice::from_ref(&repaired)).is_err());
+        let fenced = "StaleIndexRecordsFenced { records: 2, segment: 1 }".to_owned();
+        assert!(check_changes(&before, &added, std::slice::from_ref(&fenced)).is_ok());
+        let elsewhere = "StaleIndexRecordsFenced { records: 2, segment: 7 }".to_owned();
+        assert!(check_changes(&before, &added, &[elsewhere]).is_err());
+        assert!(check_changes(&before, &added, &[fenced, repaired]).is_ok());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 What the broker in this repository promises today: one node, protocol
 version 0 ([protocol.md](protocol.md)), the straum-store engine with WAL
-format 8 ([format.md](../crates/straum-store/docs/format.md)). Anything
+format 12 ([format.md](../crates/straum-store/docs/format.md)). Anything
 this page does not state is not guaranteed. Section 7 lists the changes
 under way that will alter it.
 
@@ -54,7 +54,7 @@ the order of the syncs, and so in what recovery may remove.
 |---|---|---|
 | `sequential` (default) | new bodies written to a data segment and synced; then the WAL frame written and synced | only a WAL frame that was never acknowledged (a torn last frame) |
 | `parallel` (ParallelSync) | the segment sync and the WAL sync run at the same time | a torn last frame, as above; and a complete last frame whose bodies are not on disk (a crash between the two syncs): it was never acknowledged, it is dropped and reported as `FrameDropped` |
-| `inline` (InlineSmall, experimental) | bodies up to 4096 bytes inside the WAL frame, larger ones in segments as in `sequential` | as `sequential` |
+| `inline` (InlineSmall, experimental) | a compressed block of new bodies up to 4096 bytes inside the WAL frame, larger blocks in segments as in `sequential` | as `sequential` |
 
 Residual risks:
 
@@ -106,8 +106,9 @@ At startup the store replays the WAL from the beginning
   | `TornTailTruncated` | a last WAL frame that is short or fails its CRC, with no valid frame after it, is cut |
   | `FrameDropped` | a complete last ParallelSync frame whose bodies are missing or wrong is cut |
   | `OrphanSegmentRemoved` | a data segment the WAL does not refer to is deleted |
-  | `UnknownTopicIndexRemoved` | an index file of a topic absent from the WAL is deleted |
-  | `TopicIndexRepaired` | a topic index that is shorter than or differs from the WAL (it is derived from the WAL and not synced) is cut and rewritten from the WAL |
+  | `IndexSegmentRemoved` | an index segment without an intact header is deleted; the index records it held are rewritten from the WAL (`TopicIndexRepaired`) |
+  | `StaleIndexRecordsFenced` | index records of WAL frames that recovery cut were found; a new, empty index segment is created so they stay ignored once new frames reuse those frame numbers |
+  | `TopicIndexRepaired` | full index blocks and seek pages of a topic that no index segment holds intact (the index is derived from the WAL and not synced) are re-encoded from the WAL and appended to a new index segment |
   | `WalTmpRemoved` | `wal.log.tmp` of an interrupted WAL creation is deleted |
 
   An empty report means nothing was changed.
@@ -116,14 +117,20 @@ At startup the store replays the WAL from the beginning
   (`WalCorrupted`), a valid frame that is out of sequence or contradicts
   earlier frames (`CorruptWal`), a body of the last frame missing or wrong
   in `sequential` or `inline` mode (`MissingObject`, `HashMismatch`), a
-  body of an earlier frame missing or cut short (`MissingObject`), a full
-  index block that disagrees with the WAL (`TopicMismatch`), a WAL of
-  another format version (`UnsupportedFormat`). The broker then does not
-  start.
+  body of an earlier frame missing or cut short (`MissingObject`), a
+  block of the last frame that does not decompress or fails its checks
+  (`CorruptBlock`), an intact index block that disagrees with the WAL
+  (`TopicMismatch`) or that the WAL cannot have (`IndexSegmentCorrupt`), a
+  WAL of another format version (`UnsupportedFormat`). The broker then
+  does not start. A damaged header of an index segment that fences stale
+  records also fails open with `TopicMismatch` (D-229: a documented
+  rebuild path is to follow).
 - **Detected on read.** At open, earlier frames' bodies are checked only
-  for presence and length. Every read checks a body against its BLAKE3
-  id; a mismatch is `StorageError` in the Fetch response, and the broker
-  keeps serving other reads and writes.
+  for presence and length. Every read checks a body's block (length,
+  CRC32C, layout) and the body's BLAKE3 id, and every full index block or
+  seek page read against its CRC, topic and number (`TopicIndexCorrupt`);
+  a failure is `StorageError` in the Fetch response, and the broker keeps
+  serving other reads and writes.
 - **Not detected on read.** Keys and headers are read from the WAL at
   fetch time and checked only for a valid encoding; the WAL frame's CRC
   is checked at open, not on each read. Damage to them after open that
@@ -177,14 +184,15 @@ At startup the store replays the WAL from the beginning
   topic index format may change incompatibly. A data directory written by
   another WAL format version is refused (`UnsupportedFormat`), not
   converted; there is no upgrade path yet.
-- **Memory grows with stored data.** The store keeps, per stored body and
-  per message, entries in memory, and nothing bounds them: the broker does
-  not refuse writes as memory grows. Measured on this engine with
-  100-byte bodies (store alone, written in batches of 512): about 259
-  bytes allocated per message with unique bodies and about 156 with half
-  of the bodies repeated (10 million messages, macOS); resident memory on
-  Linux about 240 and 135 bytes per message (5 million messages). A Linux
-  process limited to 2 GiB was killed before 10 million unique messages.
+- **Memory grows with stored data.** The store keeps, per stored body,
+  entries in memory (the object index), and nothing bounds them: the
+  broker does not refuse writes as memory grows. Topic entries are read
+  from disk; a live message with a key or headers keeps 24 bytes in
+  memory. Measured with 100-byte bodies (store alone, batches of 512,
+  10 million unique messages, macOS) before topic entries moved to disk:
+  the object index took about 178 bytes allocated per stored body with
+  compressed blocks (ADR-0014). A Linux process limited to 2 GiB was
+  killed before 10 million unique messages.
 - **Disk grows with stored data.** The WAL is one file that is never cut,
   and nothing is released (retention by age is not enforced, topics
   cannot be deleted). Startup time grows with the WAL, which is replayed
@@ -203,11 +211,9 @@ Each item changes this page when it is merged.
   256 MiB), the WAL in files that checkpoints reclaim, startup time bounded
   by the checkpoint interval. Beyond the budget, deduplication becomes
   partial: a repeat of old content may be stored again as a new body. This
-  stays invisible to clients. In progress on the branch `store-checkpoint`
-  and its follow-up.
-- **Compressed blocks**: new bodies stored zstd-compressed in blocks, a
-  new WAL format version; directories of format 8 are then refused.
-  Branch `store-block-compression`.
+  stays invisible to clients. In progress on the branch `store-core`
+  (ADR-0014): topic entries are already read from shared index segments
+  instead of memory.
 - **Protocol version 0 layouts**: `ListTopics` pagination and a bound on
   the topics of a `Metadata` request
   ([#93](https://github.com/straum-io/straum/issues/93)); open questions

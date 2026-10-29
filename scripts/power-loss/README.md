@@ -112,9 +112,11 @@ the harness works; they are not the owner's hardware.
      unmounted;
    - `crash`: `lazyfs::crash` kills LazyFS before or after the next
      `write`, `fsync`, `create` or `unlink` of a WAL, segment or index
-     file;
-   - `torn`: `lazyfs::torn-op` splits the next write to `wal.log` or to a
-     topic index into 2–4 parts, persists a random subset and kills LazyFS.
+     segment file;
+   - `torn`: `lazyfs::torn-op` splits the next write to `wal.log` or to
+     the index segment the writer will append to (`idx-<id>.dat`, the next
+     id after those on disk when the writer starts) into 2–4 parts,
+     persists a random subset and kills LazyFS.
 
    If a `crash` or `torn` fault's operation does not come within 10 s
    (60 s in the compaction scenario), LazyFS is killed instead, which is
@@ -133,8 +135,11 @@ the harness works; they are not the owner's hardware.
      lists, `FrameDropped` only in `parallel`, at most one WAL cut;
    - every change recovery made to the store directory is in the report
      and every report entry is a change on disk: a WAL change must be a cut
-     at the reported offset, a segment may only be deleted, an index only
-     deleted or rewritten. Anything else is a silent repair;
+     at the reported offset, a segment may only be deleted, an existing
+     index segment only deleted (`IndexSegmentRemoved` with its size), and
+     a new index segment must hold a fence (`StaleIndexRecordsFenced`) or
+     repaired records (`TopicIndexRepaired`). Anything else is a silent
+     repair;
    - a second open finds nothing to change.
 
 The store directory carries over from one iteration to the next, so later
@@ -147,20 +152,24 @@ iterations also recover stores that were recovered before.
 | `store` | batches of 1–16 messages to three topics, one released and compacted every 3rd round; segments of 64 KiB; `inline` stores bodies up to 1024 bytes in the WAL (the broker's `inline`: 4096), so both kinds of object occur | `clear`, `crash` or `torn` at a random moment |
 | `broker` | `straum-broker` with `store_write_mode` set to the mode and 64 KiB segments; two producers with keys, headers and repeated bodies, 10 ms apart between requests | as `store` |
 | `compaction` | as `store`, compacting after every round | the writer sends a `crash` or `torn` (WAL) fault just before its 1st–4th compaction; the summary counts the iterations whose writer died inside the compaction |
-| `dictionary` | — | not applicable: main has no dictionary training |
+| `dictionary` | as `store`, on a fresh store per iteration with `dict_train_bytes` 64 KiB | the writer sends a `crash` or `torn` (WAL) fault just before the batch that trains the dictionary (`Store::trains_next_batch`) |
+
+The summary's `in-op` column counts the iterations whose writer died
+inside the compaction (`compaction`) or inside the training batch
+(`dictionary`).
 
 ### Dictionary
 
-Block compression (branch `store-block-compression`) trains a zstd
-dictionary once per store, inside the `put_batch` that crosses
-`Config::dict_train_bytes`. When that lands, the scenario is: a fresh store
-per iteration with a small `dict_train_bytes` (64 KiB), a writer like
-`store-write` that prints `TRAIN` before the batch that will train, and the
-fault armed from that line; the checks are those of `store`, plus that the
-dictionary is in the WAL after recovery whenever a batch after the training
-batch was acknowledged. Until the writer has that option, `run.sh` reports
-the scenario as failed once `dict_train_bytes` exists in the store, so a
-run after the merge cannot pass without it.
+The store trains a zstd dictionary once, inside the `put_batch` that
+follows `Config::dict_train_bytes` raw bytes stored without one; the
+dictionary goes into that batch's WAL frame. Each iteration starts a
+fresh store, so every iteration has a training batch, and the writer
+prints `TRAIN <round>` and arms the fault just before it. The verifier
+uses only that iteration's writer log. Its checks are those of `store`,
+plus: when the training round or a later one was acknowledged, the
+dictionary is in the store after recovery. The iteration line says
+`where=in-training` when the writer died before the training batch was
+acknowledged, `after-training` or `before-training` otherwise.
 
 ## Reproducing a failure
 

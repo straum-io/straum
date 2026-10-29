@@ -978,6 +978,13 @@ impl Store {
         Ok(seqs)
     }
 
+    /// Whether the next non-empty `put_batch` trains the dictionary (the
+    /// raw bytes stored without one reached `Config::dict_train_bytes` and
+    /// training has not run). For tests and fault injection.
+    pub fn trains_next_batch(&self) -> bool {
+        self.should_train()
+    }
+
     fn should_train(&self) -> bool {
         self.dictionary.is_none()
             && self.config.dict_train_bytes > 0

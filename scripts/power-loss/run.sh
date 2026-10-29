@@ -245,10 +245,17 @@ FAILED=0
 : >"$OUT/iterations.log"
 : >"$OUT/summary.rows"
 
-# verify <scenario> <mode> <run> <dir for the log>: prints the RESULT line.
+# Dictionary scenario: a store trains once, after this many raw bytes.
+DICT_TRAIN_BYTES=65536
+
+# verify <scenario> <mode> <run> <dir for the log> [<writer logs>]: prints
+# the RESULT line. The writer logs default to every iteration's.
 verify() {
-    local scenario="$1" mode="$2" run="$3" dir="$4"
-    if [ "$scenario" = broker ]; then
+    local scenario="$1" mode="$2" run="$3" dir="$4" logs="${5:-$3}"
+    if [ "$scenario" = dictionary ]; then
+        timeout 3600 "$BIN" store-verify --dir "$run/mnt/store" --mode "$mode" \
+            --logs "$logs" --dict-train-bytes "$DICT_TRAIN_BYTES" >"$dir/verify.log" 2>&1
+    elif [ "$scenario" = broker ]; then
         timeout 3600 "$BIN" broker-verify --broker "$BROKER" --data-dir "$run/mnt/data" \
             --mode "$mode" --logs "$run" --stderr "$dir/verify-broker.log" >"$dir/verify.log" 2>&1
     else
@@ -266,6 +273,17 @@ verify() {
 write_phase() {
     local scenario="$1" mode="$2" run="$3" it="$4" delay="$5" wseed="$6" kind="$7" cmd="$8" arm="$9" i="${10}"
     local ready
+    if [[ "$cmd" == *@IDX@* ]]; then
+        # The index segment the writer will append to: the store opens with
+        # no active segment and creates the next id at its first full block.
+        local root="$run/root/store" last next=0
+        [ "$scenario" = broker ] && root="$run/root/data/store"
+        last="$(find "$root" -maxdepth 1 -name 'idx-*.dat' -printf '%f\n' 2>/dev/null |
+            sed -n 's/^idx-\([0-9a-f]\{16\}\)\.dat$/\1/p' | sort | tail -1)"
+        [ -n "$last" ] && next=$((16#$last + 1))
+        cmd="${cmd//@IDX@/$(printf 'idx-%016x.dat' "$next")}"
+        CMD="$cmd"
+    fi
     case "$scenario" in
         store)
             "$BIN" store-write --dir "$run/mnt/store" --mode "$mode" --seed "$wseed" \
@@ -276,6 +294,15 @@ write_phase() {
             "$BIN" store-write --dir "$run/mnt/store" --mode "$mode" --seed "$wseed" \
                 --compact-every 1 --arm-at-compaction "$arm" --fifo "$run/faults.fifo" \
                 --fault "$cmd" >"$it/writer.log" 2>"$it/writer.err" &
+            WRITERS="$!"; ready="$it/writer.log"
+            ;;
+        dictionary)
+            # A fresh store per iteration: the dictionary trains once per
+            # store. The writer arms the fault before the training batch.
+            rm -rf -- "${run:?}/mnt/store"
+            "$BIN" store-write --dir "$run/mnt/store" --mode "$mode" --seed "$wseed" \
+                --dict-train-bytes "$DICT_TRAIN_BYTES" --arm-at-train 1 \
+                --fifo "$run/faults.fifo" --fault "$cmd" >"$it/writer.log" 2>"$it/writer.err" &
             WRITERS="$!"; ready="$it/writer.log"
             ;;
         broker)
@@ -305,8 +332,9 @@ write_phase() {
     for pid in $WRITERS; do
         kill -0 "$pid" 2>/dev/null || { ERR="a writer exited before the fault (see $it)"; return 1; }
     done
-    if [ "$scenario" = compaction ]; then
-        # The writer arms the fault itself, just before a compaction.
+    if [ "$scenario" = compaction ] || [ "$scenario" = dictionary ]; then
+        # The writer arms the fault itself, just before a compaction or the
+        # batch that trains the dictionary.
         inject "$run" "$kind" "" 600
     else
         sleep "$(awk -v d="$delay" 'BEGIN {printf "%.3f", d / 1000}')"
@@ -317,17 +345,6 @@ write_phase() {
 run_scenario() {
     local scenario="$1" mode="$2"
     local name="$scenario-$mode" run="$OUT/$scenario-$mode"
-    if [ "$scenario" = dictionary ]; then
-        if grep -q dict_train_bytes "$ROOT/crates/straum-store/src/store.rs"; then
-            echo "$name: FAIL the store trains dictionaries but this harness does not drive it yet (README.md, Dictionary)"
-            echo "$name 0 0 1 - - - - - - harness-missing" >>"$OUT/summary.rows"
-            FAILED=1
-        else
-            echo "$name: not applicable: this store has no dictionary training"
-            echo "$name 0 0 0 - - - - - - not-applicable" >>"$OUT/summary.rows"
-        fi
-        return
-    fi
     local store_root="$run/root/store"
     [ "$scenario" = broker ] && store_root="$run/root/data/store"
     if [ -e "$run" ]; then
@@ -359,8 +376,9 @@ run_scenario() {
             echo "fault command longer than LazyFS reads (255 bytes): use a shorter --out" >&2
             status=failed; FAILED=1; break
         fi
-        local where=""
+        local where="" logs="$run"
         ERR=""
+        CMD="$cmd"
         if ! write_phase "$scenario" "$mode" "$run" "$it" "$delay" "$wseed" "$kind" "$cmd" "$arm" "$i"; then
             # shellcheck disable=SC2086
             [ -n "$WRITERS" ] && kill -KILL $WRITERS 2>/dev/null
@@ -374,6 +392,19 @@ run_scenario() {
             where="outside-compaction"
             grep ' END$' "$it/writer.log" | tail -1 | grep -q '^COMPACT-START' && where="in-compaction"
             [ "$where" = in-compaction ] && incompaction=$((incompaction + 1))
+        elif [ "$scenario" = dictionary ]; then
+            # Each iteration has its own store: only its own writer log.
+            logs="$run/logs-$i"
+            mkdir -p "$logs" && ln -sfn "$it" "$logs/iter"
+            where="after-training"
+            local train
+            train="$(sed -n 's/^TRAIN \([0-9]*\) END$/\1/p' "$it/writer.log")"
+            if [ -z "$train" ]; then
+                where="before-training"
+            elif ! grep -q "^ACK $train " "$it/writer.log"; then
+                where="in-training"
+                incompaction=$((incompaction + 1))
+            fi
         fi
         if [ -n "$ERR" ]; then
             result="RESULT FAIL $ERR"
@@ -383,13 +414,13 @@ run_scenario() {
             rm -rf -- "${run:?}/pre-recovery"
             cp -a "$run/root" "$run/pre-recovery"
             mount_lazyfs "$run" "$it/lazyfs.log" || { result="RESULT FAIL remount"; }
-            [ -n "$MOUNTED" ] && result="$(verify "$scenario" "$mode" "$run" "$it")"
+            [ -n "$MOUNTED" ] && result="$(verify "$scenario" "$mode" "$run" "$it" "$logs")"
         fi
         local verdict=PASS
         case "$result" in "RESULT ok"*) pass=$((pass + 1)) ;; *) verdict=FAIL; fail=$((fail + 1)); status=failed ;; esac
         printf '%s %s iter=%s fault=%s outcome=%s delay_ms=%s seed=%s %s%s %s cmd=%s\n' \
             "$verdict" "$name" "$i" "$kind" "$OUTCOME" "$delay" "$wseed" \
-            "${where:+where=}" "$where" "${result#RESULT }" "$cmd" | tee -a "$OUT/iterations.log"
+            "${where:+where=}" "$where" "${result#RESULT }" "$CMD" | tee -a "$OUT/iterations.log"
     done 3<"$run/plan.txt"
     unmount_lazyfs
 
@@ -425,7 +456,7 @@ for scenario in ${SCENARIOS//,/ }; do
 done
 
 {
-    printf '%-22s %6s %5s %5s %6s %6s %5s %9s %14s %9s  %s\n' scenario planned pass fail clear crash torn fallback in-compaction acked "recovery actions"
+    printf '%-22s %6s %5s %5s %6s %6s %5s %9s %14s %9s  %s\n' scenario planned pass fail clear crash torn fallback in-op acked "recovery actions"
     while read -r name planned pass fail clear crash torn fallback inc acked actions; do
         printf '%-22s %6s %5s %5s %6s %6s %5s %9s %14s %9s  %s\n' "$name" "$planned" "$pass" "$fail" "$clear" "$crash" "$torn" "$fallback" "$inc" "$acked" "$actions"
     done <"$OUT/summary.rows"
