@@ -320,7 +320,8 @@ async fn files_of_an_interrupted_checkpoint_are_removed_and_reported() {
 
 /// Interim rule (step 4): with no manifest, tables and runs are files of a
 /// first checkpoint that never completed. Removed and reported; the WAL
-/// still holds everything. Once step 6b deletes WAL files this must refuse.
+/// still holds everything. Once step 6b deletes WAL files, tables without a
+/// manifest must be refused when WAL files they would cover are gone.
 #[compio::test]
 async fn tables_without_a_manifest_are_orphans_while_the_wal_is_whole() {
     let dir = TempDir::new("checkpoint-no-manifest");
@@ -347,6 +348,11 @@ async fn another_version_with_a_manifest_is_unsupported() {
     for name in names(&dir.0, "wal-") {
         edit(&dir.0.join(name), |b| b[8] ^= 1);
     }
+    // The manifest of the same other version, intact.
+    edit(&path_of(&dir.0, "checkpoint-", 0), |b| {
+        b[8] ^= 1;
+        reseal_manifest(b);
+    });
     let res = Store::open(&dir.0, Config::default()).await;
     assert!(
         matches!(res, Err(StoreError::UnsupportedFormat)),

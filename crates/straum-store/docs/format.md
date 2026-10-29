@@ -678,7 +678,9 @@ whose place differs at the end of the WAL go to the next checkpoint's run.
 After every check, the checkpoint files the manifest does not list are
 deleted (`CheckpointFileRemoved`). With no manifest at all, every table and run
 is such a file (a first checkpoint that did not complete); while no WAL
-file is deleted the WAL still holds everything they described. Checkpoint files without any WAL file
+file is deleted the WAL still holds everything they described (from
+step 6b, tables without a manifest must be refused when WAL files they
+would cover are gone). Checkpoint files without any WAL file
 are `CorruptWal`, as segments are.
 
 ## Write order (one batch)
