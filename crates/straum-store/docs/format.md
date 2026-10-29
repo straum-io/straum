@@ -643,7 +643,10 @@ entries; the last page holds the rest (at least one entry).
 A number's place is the newest run that lists it, else its table's entry
 (the id comes from the table: ids never change). How a block is located
 (segment, offset, lengths, dictionary, CRC) is still only in the WAL
-(D-254).
+(D-255). The manifest does not yet hold the next segment number, the
+dictionary's location, `dict_train_bytes` or the live segment list that
+ADR-0014 §3 lists: the WAL keeps them until D-255 is answered, before
+step 6b.
 
 Manifest `checkpoint-<n>`: `magic "STRMCKP\0" | version u32 | n u64 |
 covered u64 | next_object u64 | next_block u64 | next_topic u64 | tables
@@ -673,7 +676,9 @@ the WAL gives there: the next object, block and topic numbers
 `(id, block, index)` (`CheckpointMismatch { number }`). Covered numbers
 whose place differs at the end of the WAL go to the next checkpoint's run.
 After every check, the checkpoint files the manifest does not list are
-deleted (`CheckpointFileRemoved`). Checkpoint files without any WAL file
+deleted (`CheckpointFileRemoved`). With no manifest at all, every table and run
+is such a file (a first checkpoint that did not complete); while no WAL
+file is deleted the WAL still holds everything they described. Checkpoint files without any WAL file
 are `CorruptWal`, as segments are.
 
 ## Write order (one batch)

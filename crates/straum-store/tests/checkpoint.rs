@@ -160,7 +160,7 @@ async fn damaged_checkpoint_files_fail_open_and_change_nothing() {
     let mismatch =
         |e: &StoreError| matches!(e, StoreError::CheckpointMismatch { checkpoint: 2, .. });
     type Expect = fn(&StoreError) -> bool;
-    let cases: [(&str, Change, Expect); 10] = [
+    let cases: [(&str, Change, Expect); 12] = [
         (
             "manifest CRC",
             |d| edit(&path_of(d, "checkpoint-", 0), |b| b[13] ^= 1),
@@ -194,6 +194,16 @@ async fn damaged_checkpoint_files_fail_open_and_change_nothing() {
         (
             "run missing",
             |d| std::fs::remove_file(path_of(d, "reloc-", 0)).unwrap(),
+            corrupt,
+        ),
+        (
+            "run cut",
+            |d| edit(&path_of(d, "reloc-", 0), |b| b.truncate(b.len() - 2)),
+            corrupt,
+        ),
+        (
+            "run page damaged",
+            |d| edit(&path_of(d, "reloc-", 0), |b| b[30] ^= 1),
             corrupt,
         ),
         // A covered object that did not move (no run lists it): its block
@@ -306,4 +316,41 @@ async fn files_of_an_interrupted_checkpoint_are_removed_and_reported() {
         res.err()
     );
     assert!(snapshot(&work.0) == before);
+}
+
+/// Interim rule (step 4): with no manifest, tables and runs are files of a
+/// first checkpoint that never completed. Removed and reported; the WAL
+/// still holds everything. Once step 6b deletes WAL files this must refuse.
+#[compio::test]
+async fn tables_without_a_manifest_are_orphans_while_the_wal_is_whole() {
+    let dir = TempDir::new("checkpoint-no-manifest");
+    build(&dir.0, WriteMode::Sequential).await;
+    std::fs::remove_file(path_of(&dir.0, "checkpoint-", 0)).unwrap();
+    let store = Store::open(&dir.0, Config::default()).await.unwrap();
+    let removed = store
+        .recovery_report()
+        .actions
+        .iter()
+        .filter(|a| matches!(a, RecoveryAction::CheckpointFileRemoved { .. }))
+        .count();
+    assert_eq!(removed, 3, "{:?}", store.recovery_report());
+    assert_eq!(store.checkpoint_number(), None);
+    check(&store, 60..160).await;
+}
+
+/// A directory of another format version with a manifest is
+/// `UnsupportedFormat`, not a damaged checkpoint.
+#[compio::test]
+async fn another_version_with_a_manifest_is_unsupported() {
+    let dir = TempDir::new("checkpoint-version");
+    build(&dir.0, WriteMode::Sequential).await;
+    for name in names(&dir.0, "wal-") {
+        edit(&dir.0.join(name), |b| b[8] ^= 1);
+    }
+    let res = Store::open(&dir.0, Config::default()).await;
+    assert!(
+        matches!(res, Err(StoreError::UnsupportedFormat)),
+        "{:?}",
+        res.err()
+    );
 }

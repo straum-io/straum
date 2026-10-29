@@ -619,7 +619,6 @@ impl Store {
         let mut report = RecoveryReport::default();
         compio::fs::create_dir_all(&dir).await?;
         let (files, tmps) = read_wal_files(&dir, &mut report, config.dict_train_bytes).await?;
-        let (checkpoint, checkpoint_orphans) = open_checkpoint(&dir).await?;
         let stored = files
             .first()
             .and_then(|(_, bytes)| codec::decode_wal_header(bytes))
@@ -646,6 +645,9 @@ impl Store {
                 });
             config.dict_train_bytes = stored;
         }
+        // After the version check: a directory of another format is
+        // `UnsupportedFormat`, not a damaged checkpoint.
+        let (checkpoint, checkpoint_orphans) = open_checkpoint(&dir).await?;
 
         // Only the last frame can be torn: a frame is written only after the
         // previous one is durable, and a WAL file is created only after the
