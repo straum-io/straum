@@ -42,11 +42,14 @@ fn start(data: &std::path::Path) -> (Child, String) {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    if let Err(e) = wait_ready(&addr, Duration::from_secs(60), || {
+    match wait_ready(&addr, Duration::from_secs(60), || {
         matches!(child.try_wait(), Ok(None))
     }) {
-        let _ = child.kill();
-        panic!("broker at {addr} not ready: {e}");
+        Ok(ok) if ok.cluster_id == "crash" => {}
+        res => {
+            let _ = child.kill();
+            panic!("broker at {addr} not ready: {res:?}");
+        }
     }
     (child, addr)
 }

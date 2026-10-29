@@ -79,12 +79,15 @@ Each `scenarios/<name>.json` is one scenario, run against a fresh broker:
 `--node-id 1`.
 
 **Readiness.** A runner learns that the broker is ready through the
-protocol: it connects and sends Hello, retrying the connection every 50 ms
-until a `HelloOk` arrives or a timeout passes (30 s in this runner), then
-closes that connection and waits for the broker to close its side, so the
-probe is not counted in `open_connections`. The broker's stderr lines,
-`straum-server: listening on <address>` among them, are not part of this
-contract; runners do not parse them. Steps run in order:
+protocol: it connects and sends Hello, retrying until a `HelloOk` arrives
+or a timeout passes, and does not parse the broker's logs. The broker's
+stderr lines, `straum-server: listening on <address>` among them, are not
+part of this contract. A probe connection that stays open counts in
+`BrokerStats.open_connections` (`admin.json` expects 1), so a runner closes
+it and waits for the broker to close its side (EOF) before the first step.
+This runner retries every 50 ms for about 30 s and checks that `HelloOk`
+carries `cluster_id` `conformance`, so a different broker on a reused port
+does not pass as ready. Steps run in order:
 
 | Step | Meaning |
 |---|---|

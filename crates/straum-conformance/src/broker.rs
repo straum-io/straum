@@ -56,7 +56,12 @@ impl BrokerProcess {
             matches!(broker.child.try_wait(), Ok(None))
         });
         match ready {
-            Ok(_) => Ok(broker),
+            // Another broker on a reused port answers with its own cluster id.
+            Ok(ok) if ok.cluster_id == "conformance" => Ok(broker),
+            Ok(ok) => Err(format!(
+                "{} answered for cluster {:?}, not this runner's broker",
+                broker.addr, ok.cluster_id
+            )),
             Err(e) => Err(format!(
                 "the broker at {} is not ready: {e} (exit {:?})",
                 broker.addr,
@@ -67,7 +72,7 @@ impl BrokerProcess {
 }
 
 /// A loopback address with a port the system just gave out and released.
-// ponytail: another process may take the port before the broker binds it;
+// Another process may take the port before the broker binds it;
 // the broker then exits and the readiness wait reports it.
 pub fn free_addr() -> Result<String, String> {
     TcpListener::bind("127.0.0.1:0")

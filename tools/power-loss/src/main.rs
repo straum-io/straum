@@ -837,7 +837,12 @@ fn broker_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
         matches!(child.try_wait(), Ok(None))
     })
     .map_err(|e| format!("broker not ready (recovery refused?): {e}"))
-    .and_then(|_| broker_check(&addr, &log));
+    .and_then(|ok| match ok.cluster_id.as_str() {
+        "powerloss" => broker_check(&addr, &log),
+        other => Err(format!(
+            "{addr} answered for cluster {other:?}, not this broker"
+        )),
+    });
     let _ = child.kill();
     let _ = child.wait();
     let summary = res?;
