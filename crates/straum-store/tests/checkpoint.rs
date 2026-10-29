@@ -368,10 +368,25 @@ fn removed(actions: &[RecoveryAction]) -> Vec<String> {
     files
 }
 
-const MANIFEST_DAMAGE: [(&str, Change); 3] = [
+const MANIFEST_DAMAGE: [(&str, Change); 4] = [
     ("CRC", |p| edit(p, |b| b[13] ^= 1)),
     ("cut", |p| edit(p, |b| b.truncate(b.len() - 1))),
     ("empty", |p| std::fs::write(p, b"").unwrap()),
+    // An intact manifest under another checkpoint's name.
+    ("misnamed", |p| {
+        let name = p.file_name().unwrap().to_str().unwrap();
+        let n = u64::from_str_radix(name.strip_prefix("checkpoint-").unwrap(), 16).unwrap();
+        let other = p.with_file_name(format!("checkpoint-{:016x}", n - 1));
+        let bytes = if n > 1 && other.exists() {
+            std::fs::read(&other).unwrap()
+        } else {
+            let mut b = std::fs::read(p).unwrap();
+            b[12] ^= 1;
+            reseal_manifest(&mut b);
+            b
+        };
+        std::fs::write(p, bytes).unwrap();
+    }),
 ];
 
 /// `build` with checkpoint 1's manifest left in place, as a crash between

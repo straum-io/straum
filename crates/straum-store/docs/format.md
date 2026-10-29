@@ -659,13 +659,16 @@ frames below it are covered; the tables, in order, cover object numbers
 **Writing.** New table and run files are created (`create_new`), written
 and `fdatasync`ed, then the directory is synced; the manifest is written to
 `checkpoint-<n>.tmp`, `fdatasync`ed, renamed to `checkpoint-<n>` and the
-directory synced; then `checkpoint-<n>` and the new table and run are read back and
-must decode to what was written; only then is `checkpoint-<n − 1>` deleted
-and the directory synced, so a damaged newest manifest has an older one to
-fall back to. A crash before the rename leaves the previous checkpoint
-valid and the new files unlisted; after it, the previous manifest is
-unlisted. A checkpoint that fails (the read-back included) makes the store
-refuse further use, with the previous manifest still in place.
+directory synced; then `checkpoint-<n>` is read back and must decode to what was
+written (a manifest that does not is deleted again and the directory
+synced); only then is `checkpoint-<n − 1>` deleted and the directory
+synced, so a damaged newest manifest has an older one to fall back to. The
+new table and run are read back, and must hold the entries written, before
+the manifest tmp file is written, so a failure there leaves them unlisted.
+A crash before the rename leaves the previous checkpoint valid and the new
+files unlisted; after it, the previous manifest is unlisted. A checkpoint
+that fails (a read-back included) makes the store refuse further use, with
+the previous manifest still the one in use.
 
 **Recovery.** Before replay, the manifests are read newest first. A
 manifest that fails its CRC, is of another version or does not name

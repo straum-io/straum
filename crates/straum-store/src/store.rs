@@ -653,6 +653,17 @@ impl Store {
                 });
             config.dict_train_bytes = stored;
         }
+        // Until ADR-0014 step 6b deletes WAL files, the WAL starts at frame
+        // 0. Step 6b removes this check; `open_checkpoint` then refuses a
+        // WAL that starts later unless an intact checkpoint covers the
+        // frames before it.
+        if files[0].0 != 0 {
+            return Err(StoreError::CorruptWal {
+                file: files[0].0,
+                offset: 0,
+                reason: "the first WAL file does not start at frame 0",
+            });
+        }
         // After the version check: a directory of another format is
         // `UnsupportedFormat`, not a damaged checkpoint.
         let (checkpoint, checkpoint_orphans) =
@@ -906,8 +917,9 @@ impl Store {
     /// numbers allocated since the last one, a relocation run of the
     /// covered numbers compaction moved or reclaimed since, each synced,
     /// then the manifest `checkpoint-<n>` through a synced tmp file and a
-    /// rename; the previous manifest is deleted only once the new one and
-    /// the new files read back intact. Interim rule until
+    /// rename; the new tables and runs are read back before the manifest is
+    /// written, and the previous manifest is deleted only once the new one
+    /// reads back (a manifest that does not is removed again). Interim rule until
     /// step 6b: no WAL file is deleted, so open still replays the whole WAL
     /// and checks the checkpoint against it. Call between batches.
     pub async fn checkpoint(&mut self) -> Result<(), StoreError> {
@@ -930,7 +942,8 @@ impl Store {
             tables: prev.tables.clone(),
             runs: prev.runs.clone(),
         };
-        let mut wrote = false;
+        // Each new table or run: (path, magic, first, count, width, entries).
+        let mut written = Vec::new();
         if self.next_object > prev.next_object {
             let first = prev.next_object;
             let mut entries =
@@ -940,9 +953,11 @@ impl Store {
             }
             let mut out = codec::table_header(OBJTAB_MAGIC, first).to_vec();
             codec::put_pages(&mut out, &entries, OBJECT_ENTRY);
-            write_new_synced(&objtab_path(&self.dir, first), out).await?;
-            m.tables.push((first, self.next_object - first));
-            wrote = true;
+            let path = objtab_path(&self.dir, first);
+            write_new_synced(&path, out).await?;
+            let count = self.next_object - first;
+            m.tables.push((first, count));
+            written.push((path, OBJTAB_MAGIC, first, count, OBJECT_ENTRY, entries));
         }
         if !self.relocated.is_empty() {
             let mut entries = Vec::with_capacity(self.relocated.len() * RELOC_ENTRY);
@@ -952,22 +967,35 @@ impl Store {
             }
             let mut out = codec::table_header(RELOC_MAGIC, n).to_vec();
             codec::put_pages(&mut out, &entries, RELOC_ENTRY);
-            write_new_synced(&reloc_path(&self.dir, n), out).await?;
-            m.runs.push((n, self.relocated.len() as u64));
-            wrote = true;
+            let path = reloc_path(&self.dir, n);
+            write_new_synced(&path, out).await?;
+            let count = self.relocated.len() as u64;
+            m.runs.push((n, count));
+            written.push((path, RELOC_MAGIC, n, count, RELOC_ENTRY, entries));
         }
-        if wrote {
+        if !written.is_empty() {
             sync_dir(&self.dir).await?;
         }
+        // The new tables and runs read back as written before any manifest
+        // lists them: a failure leaves them unlisted orphans.
+        self.verify_tables(n, written).await?;
         let path = checkpoint_path(&self.dir, n);
         let tmp = path.with_extension("tmp");
         write_new_synced(&tmp, m.encode()).await?;
         compio::fs::rename(&tmp, &path).await?;
         sync_dir(&self.dir).await?;
-        // The previous manifest stays until the new one and the files this
-        // checkpoint wrote read back intact: open falls back to it if the
-        // new one is damaged.
-        self.verify_checkpoint(&m, &prev).await?;
+        // The previous manifest stays until the new one reads back as
+        // written: open falls back to it if the new one is damaged. A
+        // failed read-back removes the new manifest, so the previous one
+        // stays the one in use.
+        if read_manifest(&self.dir, n).await?.as_ref() != Some(&m) {
+            compio::fs::remove_file(&path).await?;
+            sync_dir(&self.dir).await?;
+            return Err(StoreError::CorruptCheckpoint {
+                checkpoint: n,
+                reason: "the manifest written does not read back",
+            });
+        }
         if prev.n > 0 {
             compio::fs::remove_file(checkpoint_path(&self.dir, prev.n)).await?;
             sync_dir(&self.dir).await?;
@@ -977,34 +1005,17 @@ impl Store {
         Ok(())
     }
 
-    /// Reads back manifest `m` and the table and run it adds to `prev`'s:
-    /// each must decode to what was written (`CorruptCheckpoint`
-    /// otherwise). The OS may answer from its page cache, so this checks
-    /// what was written, not the medium.
-    async fn verify_checkpoint(&self, m: &Manifest, prev: &Manifest) -> Result<(), StoreError> {
-        let corrupt = |reason| StoreError::CorruptCheckpoint {
-            checkpoint: m.n,
-            reason,
-        };
-        if read_manifest(&self.dir, m.n).await?.as_ref() != Some(m) {
-            return Err(corrupt("the manifest written does not read back"));
-        }
-        for &(first, count) in &m.tables[prev.tables.len()..] {
-            let path = objtab_path(&self.dir, first);
-            if read_table(path, OBJTAB_MAGIC, first, count, OBJECT_ENTRY)
-                .await?
-                .is_none()
-            {
-                return Err(corrupt("the object table written does not read back"));
-            }
-        }
-        for &(run, count) in &m.runs[prev.runs.len()..] {
-            let path = reloc_path(&self.dir, run);
-            if read_table(path, RELOC_MAGIC, run, count, RELOC_ENTRY)
-                .await?
-                .is_none()
-            {
-                return Err(corrupt("the relocation run written does not read back"));
+    /// Reads back the tables and runs checkpoint `n` wrote (`(path, magic,
+    /// first, count, width, entries)`): each must decode to the entries
+    /// written (`CorruptCheckpoint` otherwise). The OS may answer from its
+    /// page cache, so this checks what was written, not the medium.
+    async fn verify_tables(&self, n: u64, written: Vec<WrittenTable>) -> Result<(), StoreError> {
+        for (path, magic, first, count, width, entries) in written {
+            if read_table(path, magic, first, count, width).await? != Some(entries) {
+                return Err(StoreError::CorruptCheckpoint {
+                    checkpoint: n,
+                    reason: "a table or run written does not read back",
+                });
             }
         }
         Ok(())
@@ -3980,6 +3991,10 @@ fn partition(n: usize, below: impl Fn(usize) -> bool) -> usize {
     lo
 }
 
+/// A table or run a checkpoint wrote: `(path, magic, first, count,
+/// width, entries)`.
+type WrittenTable = (PathBuf, [u8; 8], u64, u64, usize, Vec<u8>);
+
 /// The entries of table or run file `path`: its header must be intact,
 /// carry `magic` and name `first`, and its pages intact and holding exactly
 /// `count` entries of `width` bytes. `None` if it is missing or not so.
@@ -4127,7 +4142,7 @@ async fn open_checkpoint(
             });
     }
     let Some(manifest) = used else {
-        if wal_first > 0 && !found.is_empty() {
+        if wal_first > 0 {
             return Err(StoreError::CorruptCheckpoint {
                 checkpoint: damaged.first().copied().unwrap_or(0),
                 reason: "no intact manifest, and the WAL no longer holds every frame",

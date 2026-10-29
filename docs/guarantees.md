@@ -116,7 +116,7 @@ At startup the store replays the WAL from the beginning
   | `TopicIndexRepaired` | full index blocks and seek pages of a topic that no index segment holds intact (the index is derived from the WAL and not synced) are re-encoded from the WAL and appended to a new index segment |
   | `WalTmpRemoved` | a `wal-<seq>.log.tmp` of an interrupted WAL file creation is deleted |
   | `CheckpointFileRemoved` | a checkpoint file the checkpoint in use does not list (an earlier or damaged manifest, a tmp manifest, a table or run of an interrupted checkpoint) is deleted |
-  | `CheckpointManifestDamaged` | the newest checkpoint manifest fails its CRC or does not decode: the newest intact older manifest is used instead; with none, the checkpoint is ignored and the state rebuilt from the WAL, which still holds every frame (no WAL file is deleted yet). The damaged manifest is deleted (`CheckpointFileRemoved`) |
+  | `CheckpointManifestDamaged` | a checkpoint manifest, read newest first, fails its CRC, version or name check, or does not decode (one entry per such manifest): the newest intact older manifest is used instead; with none, the checkpoint is ignored and the state rebuilt from the WAL, which still holds every frame (no WAL file is deleted yet). The damaged manifest is deleted (`CheckpointFileRemoved`) |
 
   The last two concern the store's checkpoints (ADR-0014), which the broker
   does not write yet. An empty report means nothing was changed.
