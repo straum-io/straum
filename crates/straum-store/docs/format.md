@@ -18,6 +18,7 @@ names, segments).
 ├── blktab-<first:016x>.tab      block tables written by checkpoints, by their first block number
 ├── blkrel-<n:016x>.run          block relocation runs, by the checkpoint that wrote them
 ├── dict-<number:016x>.bin       the dictionary, written by the first checkpoint after training
+├── idrun-<n:016x>.run           id runs (id → object number), by the checkpoint that wrote them
 ├── reloc-<n:016x>.run           relocation runs, by the checkpoint that wrote them
 ├── checkpoint-<n:016x>          the checkpoint manifest (one; n from 1, never repeated)
 ├── checkpoint-<n:016x>.tmp      only while a manifest is being written; deleted at open
@@ -118,7 +119,7 @@ checkpoint will delete the files wholly before the frame it covers
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 19 |
+| 8 | 4 | `version` u32 = 20 |
 | 12 | 8 | `dict_train_bytes` u64: the dictionary training threshold |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -151,7 +152,8 @@ checkpoint numbers reused after a fallback (so an older build must not
 write a directory that holds quarantined manifests), 17 a damaged manifest
 quarantined alone as `checkpoint-<n>.damaged` (its tables and runs deleted), 18 no block
 tables, block relocation runs or dictionary file, and a manifest without the next
-segment number, the training state, the dictionary and the live segments. The number keeps increasing
+segment number, the training state, the dictionary and the live segments, 19 no id
+runs (every id in memory). The number keeps increasing
 with each format change on this line; none is reused (D-251 A).
 
 ### Frame
@@ -499,7 +501,7 @@ attribute records and seek pages. A 24-byte header, then records.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 49 44 58 00` (`"STRMIDX\0"`) |
-| 8 | 4 | `version` u32 = 19 (the WAL version) |
+| 8 | 4 | `version` u32 = 20 (the WAL version) |
 | 12 | 8 | `created_at` u64: the number of the first WAL frame its records may describe (the batch's frame for a segment started while writing a batch's records, the frame count for one started at open) |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -651,7 +653,7 @@ and a page layout:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `"STRMOBJ\0"` (object table), `"STRMREL\0"` (relocation run), `"STRMBLK\0"` (block table) or `"STRMBRL\0"` (block relocation run) |
-| 8 | 4 | `version` u32 = 19 (the WAL version) |
+| 8 | 4 | `version` u32 = 20 (the WAL version) |
 | 12 | 8 | `first` u64: the table's first object or block number, or the number of the checkpoint that wrote the run (also in the file name) |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -679,13 +681,44 @@ before it); length 0 if training built no dictionary. Written once, by the
 first checkpoint after training (the WAL's PutDict record holds it until
 then), and listed by every later manifest.
 
+Id run `idrun-<n>.run` (ADR-0014 step 6): the 24-byte header (`magic`
+`"STRMIDR\0"`, `first` = `n`), then pages of `id [32] | number u64`
+entries (40 bytes, 102 per page) sorted by id, then a footer: `pages u64 |
+fence u64 per page | filter | len u32 | crc u32` (`len` the footer's
+bytes before it; the CRC32C over the footer and `len`). A fence is the
+first 8 bytes of a page's first id, big-endian. The filter is a binary
+fuse filter with 8-bit fingerprints (Graf and Lemire, arity 3) over each
+id's key, its bytes 8 to 16 read little-endian (`seed u64 | segment_length
+u32 | segment_count_length u32 | len u32 | fingerprints`, `len` =
+`segment_count_length + 2 × segment_length`, `segment_length` a power of
+two dividing `segment_count_length`): with `h = fmix64(key + seed)`
+(MurmurHash3's finalizer: `h ^= h >> 33; h *= 0xff51afd7ed558ccd; h ^= h >>
+33; h *= 0xc4ceb9fe1a85ec53; h ^= h >> 33`, wrapping), positions `h0 =
+(h × segment_count_length) >> 64`, `h1 = (h0 + segment_length) ^ ((h >> 18)
+& (segment_length − 1))`, `h2 = (h0 + 2 × segment_length) ^ (h &
+(segment_length − 1))`, and fingerprint `f = (h ^ (h >> 32)) as u8`, the
+key may be in the run if `f ^ fp[h0] ^ fp[h1] ^ fp[h2] == 0`; about 9 bits
+per id, 0.39 % false positives. A checkpoint writes the memtable (the live
+ids allocated since the last one) as a run. Runs merge by size tier
+(ADR-0014 §1): a run's tier is `floor(log4(entries))`; when the new run's
+tier would hold four runs, the new run absorbs the other three, and the
+result absorbs the three of its own tier the same way, one k-way merge
+over their pages that drops ids whose objects compaction reclaimed, the
+output written page by page. Each tier keeps at most three runs. The
+merged runs are deleted after the new manifest (a crash before leaves them
+unlisted: deleted at open, `CheckpointFileRemoved`). A lookup checks the memtable, then each run from newest
+to oldest whose filter answers yes: the run's fences give the one page to
+read (a page whose CRC fails is `CorruptCheckpoint`), and a number found
+whose object compaction reclaimed is a miss.
+
 Manifest `checkpoint-<n>`: `magic "STRMCKP\0" | version u32 | n u64 |
 covered u64 | next_object u64 | next_block u64 | next_topic u64 |
 next_segment u64 | dict_train_bytes u64 | dictless_raw u64 | dict u64 |
 tables u32 | (first u64, count u64) per table | runs u32 | (checkpoint u64,
 count u64) per run | block tables u32 | (first u64, count u64) per block
-table | block runs u32 | (checkpoint u64, count u64) per block run |
-segments u32 | id u64 per live data segment | crc u32` (CRC32C of every
+table | block runs u32 | (checkpoint u64, count u64) per block run | id
+runs u32 | (checkpoint u64, count u64) per id run | segments u32 | id u64
+per live data segment | crc u32` (CRC32C of every
 byte before it). `covered`: the frames below it are covered; the tables,
 in order, cover object numbers `0..next_object` and the block tables block
 numbers `0..next_block` without gaps; the runs are listed oldest first;
@@ -726,7 +759,10 @@ lists must be present, with an intact header naming it, intact pages and
 exactly the listed count, the tables contiguous from 0 to `next_object`,
 the runs ordered and their numbers increasing and below `next_object`;
 the same for block tables (contiguous from 0 to `next_block`, every entry
-of a known kind) and block runs (below `next_block`); a listed dictionary
+of a known kind) and block runs (below `next_block`); every listed id run
+present with an intact header naming it, intact pages and footer, its
+entries sorted, its fences the pages' first ids and its filter finding
+every id; a listed dictionary
 file present, intact and naming its number; otherwise `CorruptCheckpoint`
 and no file is changed: the fallback is for
 a damaged manifest only. `covered` above the WAL's frame count is
@@ -735,7 +771,9 @@ must match the state the WAL gives there: the next object, block and topic
 numbers, the live segments and `next_segment` above them, `dict_train_bytes`,
 `dictless_raw` and the dictionary's bytes (`CorruptCheckpoint`), every
 object number's place, reclaimed or `(id, block, index)`
-(`CheckpointMismatch { number }`), and every block number's place and
+(`CheckpointMismatch { number }`), every live object below `next_object`
+in exactly one id run under its id (`CheckpointMismatch { number }`), and
+every block number's place and
 layout (`CheckpointBlockMismatch { block }`). Covered numbers and blocks
 whose place differs at the end of the WAL go to the next checkpoint's
 runs.
@@ -748,8 +786,8 @@ never deleted: it moves, unchanged, into a quarantine directory
 `quarantine-<n>` with the tables and runs it may list. Tables and runs are
 cumulative, so the newest manifest quarantined may list every object
 table at or above the used manifest's `next_object`, every block table at
-or above its `next_block`, every run and block run numbered above the used
-manifest up to its own, and the dictionary file if the used manifest lists
+or above its `next_block`, every run, block run and id run numbered above
+the used manifest up to its own, and the dictionary file if the used manifest lists
 none: they move with it (a table that cannot be
 attributed with certainty, such as a later interrupted checkpoint's, is
 kept there too); runs above it are orphans. The move: create the directory

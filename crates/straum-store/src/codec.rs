@@ -18,7 +18,7 @@ impl ObjectId {
 /// start of every WAL file.
 pub const WAL_FILE_HEADER: usize = 24;
 pub const WAL_MAGIC: [u8; 8] = *b"STRMWAL\0";
-pub const WAL_VERSION: u32 = 19;
+pub const WAL_VERSION: u32 = 20;
 /// Header bytes covered by the header CRC (everything before it).
 const WAL_HEADER_CRC_AT: usize = 20;
 /// `len u32 | seq u64 | count u32 | mode u8 | crc32c u32`.
@@ -1230,7 +1230,7 @@ pub fn decode_table_header(magic: [u8; 8], buf: &[u8]) -> Option<u64> {
     (*h == table_header(magic, first)).then_some(first)
 }
 
-fn page_crc(page: u64, entries: &[u8]) -> u32 {
+pub fn page_crc(page: u64, entries: &[u8]) -> u32 {
     crc32c::crc32c_append(crc32c::crc32c(&page.to_le_bytes()), entries)
 }
 
@@ -1298,6 +1298,81 @@ pub fn reloc_entry(entries: &[u8], i: usize) -> Option<(u64, Option<(u64, u32)>)
         u64_at(e, 0),
         (block != u64::MAX || index != u32::MAX).then_some((block, index)),
     ))
+}
+
+pub const IDRUN_MAGIC: [u8; 8] = *b"STRMIDR\0";
+/// An id run entry: `id [32] | number u64`, sorted by id.
+pub const ID_ENTRY: usize = 40;
+
+/// The page length of entries of `width` bytes (the last page may be
+/// shorter).
+pub fn page_len(width: usize) -> usize {
+    (PAGE - 4) / width * width + 4
+}
+
+/// The entries of page `page` of a table body, checked against its CRC.
+pub fn decode_page(buf: &[u8], page: u64, width: usize) -> Option<&[u8]> {
+    let (entries, crc) = buf.split_at_checked(buf.len().checked_sub(4)?)?;
+    (!entries.is_empty() && entries.len() % width == 0 && page_crc(page, entries) == u32_at(crc, 0))
+        .then_some(entries)
+}
+
+/// The fence of an id: its first 8 bytes, big-endian, so fences order as
+/// ids do.
+pub fn id_fence(id: &ObjectId) -> u64 {
+    u64::from_be_bytes(id.0[..8].try_into().unwrap_or([0; 8]))
+}
+
+/// The filter key of an id: bytes 8 to 16 (uniform; independent of the
+/// fence).
+pub fn id_key(id: &ObjectId) -> u64 {
+    u64::from_le_bytes(id.0[8..16].try_into().unwrap_or([0; 8]))
+}
+
+/// Entry `i` of an id run's entries.
+pub fn id_entry(entries: &[u8], i: usize) -> Option<(ObjectId, u64)> {
+    let e = entries.get(i.checked_mul(ID_ENTRY)?..)?.get(..ID_ENTRY)?;
+    Some((id_at(e, 0), u64_at(e, 32)))
+}
+
+/// An id run's footer: `pages u64 | fence u64 per page | filter | len u32
+/// | crc32c u32` (`len` the footer's length before it, the CRC over the
+/// footer and `len`).
+pub fn put_id_run_footer(out: &mut Vec<u8>, fences: &[u64], filter: &crate::fuse::Fuse8) {
+    let start = out.len();
+    out.extend_from_slice(&(fences.len() as u64).to_le_bytes());
+    for f in fences {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    filter.encode(out);
+    let len = (out.len() - start) as u32;
+    out.extend_from_slice(&len.to_le_bytes());
+    let crc = crc32c::crc32c(&out[start..]);
+    out.extend_from_slice(&crc.to_le_bytes());
+}
+
+/// The fences and filter of an id run file, and the length of its pages;
+/// `None` if the footer fails its CRC or does not decode.
+pub fn decode_id_run_footer(file: &[u8]) -> Option<(Vec<u64>, crate::fuse::Fuse8, usize)> {
+    let n = file.len();
+    let tail = file.get(n.checked_sub(8)?..)?;
+    let len = u32_at(tail, 0) as usize;
+    let start = n.checked_sub(8 + len)?;
+    if crc32c::crc32c(&file[start..n - 4]) != u32_at(tail, 4) {
+        return None;
+    }
+    let footer = &file[start..n - 8];
+    let pages = usize::try_from(u64_at(footer.get(..8)?, 0)).ok()?;
+    let fences_end = 8usize.checked_add(pages.checked_mul(8)?)?;
+    let fences: Vec<u64> = footer
+        .get(8..fences_end)?
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
+        .collect();
+    let (filter, rest) = crate::fuse::Fuse8::decode(&footer[fences_end..])?;
+    rest.is_empty().then_some((fences, filter, start))
 }
 
 pub const BLKTAB_MAGIC: [u8; 8] = *b"STRMBLK\0";
@@ -1424,8 +1499,9 @@ pub fn decode_dict_file(buf: &[u8], number: u64) -> Option<&[u8]> {
 /// next_segment u64 | dict_train_bytes u64 | dictless_raw u64 | dict u64 |
 /// then five lists, each `count u32` and its items: tables `(first u64,
 /// count u64)`, runs `(checkpoint u64, count u64)`, block tables `(first
-/// u64, count u64)`, block runs `(checkpoint u64, count u64)`, live
-/// segments `(id u64)` | crc32c u32` over everything before it.
+/// u64, count u64)`, block runs `(checkpoint u64, count u64)`, id runs
+/// `(checkpoint u64, count u64)`, then live segments `(id u64)` | crc32c
+/// u32` over everything before it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Manifest {
     /// The checkpoint's number, from 1.
@@ -1457,6 +1533,9 @@ pub struct Manifest {
     pub block_runs: Vec<(u64, u64)>,
     /// The data segments the covered frames reference, ascending.
     pub segments: Vec<u64>,
+    /// Id runs `(checkpoint that wrote it, entries)`, oldest first: every
+    /// live id below `next_object`, each in one run.
+    pub id_runs: Vec<(u64, u64)>,
 }
 
 impl Manifest {
@@ -1482,6 +1561,7 @@ impl Manifest {
             &self.runs,
             &self.block_tables,
             &self.block_runs,
+            &self.id_runs,
         ] {
             out.extend_from_slice(&(list.len() as u32).to_le_bytes());
             for (a, b) in list {
@@ -1512,7 +1592,7 @@ impl Manifest {
         for v in &mut u64s {
             *v = u64_at(r.take(8).ok()?, 0);
         }
-        let mut lists = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut lists = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         for list in &mut lists {
             for _ in 0..r.u32().ok()? {
                 let pair = r.take(16).ok()?;
@@ -1523,7 +1603,7 @@ impl Manifest {
         for _ in 0..r.u32().ok()? {
             segments.push(u64_at(r.take(8).ok()?, 0));
         }
-        let [tables, runs, block_tables, block_runs] = lists;
+        let [tables, runs, block_tables, block_runs, id_runs] = lists;
         let [
             n,
             covered,
@@ -1550,6 +1630,7 @@ impl Manifest {
             block_tables,
             block_runs,
             segments,
+            id_runs,
         })
     }
 }
@@ -2335,6 +2416,7 @@ mod tests {
             block_tables: vec![(0, 2)],
             block_runs: vec![(3, 1)],
             segments: vec![1, 5],
+            id_runs: vec![(1, 3), (3, 1)],
         };
         let b = m.encode();
         assert_eq!(Manifest::decode(&b), Some(m));
