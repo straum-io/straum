@@ -14,7 +14,7 @@ A cargo-fuzz crate with a workspace of its own: the main workspace and
 The base store is written through the store's API at start-up
 (`build_store` in `src/lib.rs`), deterministically. An archive is `flags u8`,
 then `name_len u8 | name | len u32 | bytes` per file; flag bit 0 recomputes
-the CRCs of WAL files, manifests, object tables and relocation runs, so
+the CRCs of WAL files and of every checkpoint file, so
 mutations get past the checksums.
 
 Store invariants, checked after every open: no panic; a failed open changes
@@ -43,9 +43,12 @@ open's result.
 
 `regressions/<target>/*.hex` are fixed findings, `regressions/open/` open
 ones, as hex text. `cargo test --release` (stable) replays the fixed ones,
-checks every seed and that the base store is deterministic;
-`-- --include-ignored` also replays the open ones and runs
-`tests/findings.rs`, the open findings rebuilt through the store's API.
+checks every seed, that the base store is deterministic and that the CRC
+recompute matches every checksum the store writes; `-- --include-ignored`
+also replays the open ones and runs `tests/findings.rs`, the open store
+findings built through the API. A saved store input names its format
+version and goes stale (`UnsupportedFormat`) when it changes; the API-built
+form does not.
 Protocol findings are regression tests in `crates/straum-proto/tests`.
 
 To save a crash: `xxd -p -c 64 artifacts/<target>/crash-<hash> >
@@ -60,8 +63,8 @@ Open, reported to the store's owners:
   damaged (`FrameDropped`); the frame before it was followed by that frame,
   so it was acknowledged, but its blocks are checked for presence and
   bounds only. It is now last, and the reopen checks it in full and drops
-  it as never acknowledged. `tests/findings.rs` builds it through the API;
-  `regressions/open/store_wal/` holds the fuzzer's input.
+  it as never acknowledged. `tests/findings.rs` builds it through the API
+  (the fuzzer's input was in format 18 and no longer opens).
 - **F2** (seen in `store_checkpoint`): the store's file name parsers use
   `u64::from_str_radix`, which takes a `+` sign and upper-case hex, so
   `checkpoint-+000000000000002` is read as manifest 2 and the path rebuilt

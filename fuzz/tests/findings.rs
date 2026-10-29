@@ -1,6 +1,6 @@
 //! Open findings (README, "Findings"), each built through the store's
-//! API. Ignored while open; the reproducers under `regressions/open/` are
-//! the fuzzer's own inputs for the same findings.
+//! API, so they outlive format version changes that make a saved fuzz
+//! input stale. Ignored while open.
 
 use straum_fuzz::{check_dir, config, scratch};
 use straum_store::{Message, Store, WriteMode};

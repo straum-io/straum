@@ -67,3 +67,42 @@ fn regressions_hold_the_invariants() {
 fn open_findings_hold_the_invariants() {
     replay_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("regressions/open"));
 }
+
+/// Recomputing the CRCs of an intact file changes nothing: the harness
+/// knows every checksum layout the base store writes.
+#[test]
+fn reseal_keeps_intact_files() {
+    for (name, bytes) in &base_store().files {
+        let mut b = bytes.clone();
+        straum_fuzz::reseal_file(name, &mut b);
+        assert!(b == *bytes, "{name}");
+        // And it restores a zeroed CRC: the file header's for WAL files,
+        // the last one for the others.
+        let at = if name.starts_with("wal-") {
+            20
+        } else {
+            b.len() - 4
+        };
+        if !name.starts_with("seg-") && !name.starts_with("idx-") {
+            b[at..at + 4].fill(0);
+            straum_fuzz::reseal_file(name, &mut b);
+            assert!(b == *bytes, "{name}: CRC at {at} not restored");
+        }
+    }
+    let names: Vec<&str> = base_store().files.iter().map(|(n, _)| n.as_str()).collect();
+    for prefix in [
+        "wal-",
+        "checkpoint-",
+        "objtab-",
+        "reloc-",
+        "blktab-",
+        "blkrel-",
+        "idrun-",
+        "dict-",
+    ] {
+        assert!(
+            names.iter().any(|n| n.starts_with(prefix)),
+            "base store has no {prefix} file: {names:?}"
+        );
+    }
+}

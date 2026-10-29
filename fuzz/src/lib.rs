@@ -102,7 +102,8 @@ pub fn proto_json(data: &[u8]) {
 /// A store directory as fuzz input: `flags u8`, then entries `name_len u8 |
 /// name | len u32 | bytes` (a length past the end takes the rest). Flag bit 0
 /// recomputes every CRC of WAL files, manifests, object tables and
-/// relocation runs, so mutations reach the parsers behind the checksums.
+/// relocation runs, block tables and runs, id runs and dictionary files, so
+/// mutations reach the parsers behind the checksums.
 pub struct Archive {
     pub reseal: bool,
     pub files: Vec<(String, Vec<u8>)>,
@@ -181,8 +182,9 @@ fn put_crc(bytes: &mut [u8], at: usize, crc: u32) {
 }
 
 /// Recomputes the CRCs of a file by its name (docs/format.md of
-/// straum-store): WAL file header and frames, manifest, table and run
-/// header and pages. Other files are left as they are.
+/// straum-store): WAL file header and frames; manifest and dictionary
+/// file; header and pages of tables and runs; an id run's footer. Other
+/// files are left as they are.
 pub fn reseal_file(name: &str, b: &mut [u8]) {
     let base = name.rsplit('/').next().unwrap_or(name);
     if base.starts_with("wal-") {
@@ -200,27 +202,57 @@ pub fn reseal_file(name: &str, b: &mut [u8]) {
             put_crc(b, pos + 17, crc);
             pos = end;
         }
-    } else if base.starts_with("checkpoint-") {
+    } else if base.starts_with("checkpoint-") || base.starts_with("dict-") {
         if let Some(end) = b.len().checked_sub(4) {
             put_crc(b, end, crc32c::crc32c(&b[..end]));
         }
-    } else if base.starts_with("objtab-") || base.starts_with("reloc-") {
+    } else if ["objtab-", "reloc-", "blktab-", "blkrel-"]
+        .iter()
+        .any(|p| base.starts_with(p))
+    {
         if b.len() < 24 {
             return;
         }
         put_crc(b, 20, crc32c::crc32c(&b[..20]));
-        let entry = if b.starts_with(b"STRMOBJ\0") { 44 } else { 20 };
-        let page = 4092 / entry * entry + 4;
-        let mut pos = 24;
-        for k in 0u64.. {
-            let end = (pos + page).min(b.len());
-            if end < pos + 4 {
-                break;
-            }
-            let crc = crc32c::crc32c_append(crc32c::crc32c(&k.to_le_bytes()), &b[pos..end - 4]);
-            put_crc(b, end - 4, crc);
-            pos = end;
+        let entry = match &b[..8] {
+            b"STRMOBJ\0" => 44,
+            b"STRMBLK\0" => 45,
+            b"STRMBRL\0" => 24,
+            _ => 20,
+        };
+        let len = b.len();
+        reseal_pages(&mut b[..len], entry);
+    } else if base.starts_with("idrun-") {
+        // Header, pages of 40-byte entries, then a footer `… | len u32 |
+        // crc u32` whose CRC covers the footer and `len`.
+        if b.len() < 32 {
+            return;
         }
+        put_crc(b, 20, crc32c::crc32c(&b[..20]));
+        let end = b.len();
+        let len = u32::from_le_bytes([b[end - 8], b[end - 7], b[end - 6], b[end - 5]]) as usize;
+        let Some(footer) = (end - 8).checked_sub(len).filter(|f| *f >= 24) else {
+            return;
+        };
+        reseal_pages(&mut b[..footer], 40);
+        put_crc(b, end - 4, crc32c::crc32c(&b[footer..end - 4]));
+    }
+}
+
+/// Page CRCs of a table or run of `entry`-byte entries after its 24-byte
+/// header: pages of as many entries as fit in 4092 bytes, each followed by
+/// a CRC32C of its number (u64) and its entries.
+fn reseal_pages(b: &mut [u8], entry: usize) {
+    let page = 4092 / entry * entry + 4;
+    let mut pos = 24;
+    for k in 0u64.. {
+        let end = (pos + page).min(b.len());
+        if end < pos + 4 {
+            break;
+        }
+        let crc = crc32c::crc32c_append(crc32c::crc32c(&k.to_le_bytes()), &b[pos..end - 4]);
+        put_crc(b, end - 4, crc);
+        pos = end;
     }
 }
 
@@ -317,9 +349,18 @@ pub fn build_store(dir: &Path, mode: WriteMode) -> Built {
 }
 
 pub fn is_checkpoint_file(name: &str) -> bool {
-    ["checkpoint-", "objtab-", "reloc-", "quarantine-"]
-        .iter()
-        .any(|p| name.starts_with(p))
+    [
+        "checkpoint-",
+        "objtab-",
+        "reloc-",
+        "blktab-",
+        "blkrel-",
+        "idrun-",
+        "dict-",
+        "quarantine-",
+    ]
+    .iter()
+    .any(|p| name.starts_with(p))
 }
 
 /// The base store of the fuzz targets, built once per process.
