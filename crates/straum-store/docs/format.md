@@ -821,8 +821,8 @@ completes the quarantine. Not covered: a crash after the manifest's move
 report, or before the checkpoint returns its error; those moves are in no
 report, and only `quarantined_files` and the broker's warning show them
 (the same window as every other repair recovery makes; it stands until
-the recovery log of ADR-0014 §3, D-260 B, lands with the fault injection
-before step 6b). "At least once" (owner): exactly once without a crash, a
+the recovery log of ADR-0014 §3, D-260 B, lands; the fault injection
+that tests this window, `tests/fault_points.rs`, is in place). "At least once" (owner): exactly once without a crash, a
 repeat after an interrupted open allowed, never an omission. A
 quarantine name that is not a directory is `CorruptCheckpoint`, no file
 changed.

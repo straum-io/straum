@@ -6,11 +6,15 @@
 
 mod block;
 mod codec;
+mod fault;
 mod fuse;
 mod recent;
 mod store;
 
 pub use codec::{FrameMode, MAX_TOPIC, ObjectId};
+/// Deterministic fault injection, for tests (ADR-0014, before step 6b).
+#[doc(hidden)]
+pub use fault::{FaultPoint, arm as arm_fault, disarm as disarm_fault};
 /// The recent-id cache, public for its measurement (`straum-store-bench`'s
 /// `recent-ids`).
 pub use recent::RecentIds;
