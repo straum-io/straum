@@ -159,7 +159,7 @@ impl Config {
         let mut pairs = Vec::new();
         let mut it = args.iter();
         while let Some(flag) = it.next() {
-            if flag == "--store-rebuild-index" {
+            if flag == "--store-rebuild-index" || flag == "--store_rebuild_index" {
                 config.store_rebuild_index = true;
                 continue;
             }
@@ -297,6 +297,11 @@ mod tests {
         assert!(c.store_rebuild_index);
         let c = Config::from_args(args(&["--store-rebuild-index", "--node-id", "2"])).unwrap();
         assert!(c.store_rebuild_index && c.node_id == 2);
+        assert!(
+            Config::from_args(args(&["--store_rebuild_index"]))
+                .unwrap()
+                .store_rebuild_index
+        );
         // In a configuration file, or as a `key value` flag, it is refused
         // and the message names the flag.
         for (k, v) in [
