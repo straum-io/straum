@@ -3,8 +3,8 @@ name: release
 # A pushed version tag builds the straum-server image for linux/amd64 and
 # linux/arm64 and publishes it to Docker Hub, builds the Debian packages for
 # both, and creates the GitHub release with the packages, their checksums and
-# provenance, and uploads Ubuntu source packages to the Launchpad PPA (Constitution
-# §12.3: only release versions are published). A pull request that touches
+# provenance (Constitution §12.3: only release versions are published). The
+# Launchpad PPA is paused (D-253 A, job ppa). A pull request that touches
 # the build builds the amd64 image, both packages and the noble source package,
 # without publishing anything.
 #
@@ -17,9 +17,16 @@ name: release
 on:
   push:
     tags: ['v*.*.*']
-# The pull_request trigger (paths Dockerfile, .dockerignore, Cargo.toml,
-# Cargo.lock, crates/**, debian/**, scripts/ppa.sh, this file) is off until
-# a crate builds the straum-server binary again: every job here needs it.
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - debian/**
+      - scripts/ppa.sh
+      - .github/workflows/release.yml
 
 permissions:
   contents: read
@@ -54,10 +61,10 @@ jobs:
             type=raw,value=latest,enable=${{ env.PUBLISH == 'true' && !contains(github.ref_name, '-') }}
           labels: |
             org.opencontainers.image.title=straum-server
-            org.opencontainers.image.description=Replicated log (experimental, not production-ready)
+            org.opencontainers.image.description=Durable event log for one server (experimental, not production-ready)
             org.opencontainers.image.licenses=Apache-2.0
 
-      # ponytail: arm64 builds under QEMU, slow for a Rust workspace; move to
+      # arm64 builds under QEMU, slow for a Rust workspace; move to
       # native arm64 runners with a manifest merge if release builds get too long.
       - uses: docker/setup-qemu-action@v3
         if: env.PUBLISH == 'true'
@@ -107,7 +114,7 @@ jobs:
           else
               version="0.0.0~pr${PR}"
           fi
-          cargo deb --locked -p server --deb-version "$version"
+          cargo deb --locked -p straum-broker --deb-version "$version"
           ls -l target/debian/
       - uses: actions/upload-artifact@v4
         with:
@@ -154,13 +161,16 @@ jobs:
           gh release create "$TAG" dist/*.deb dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --verify-tag $pre \
             --title "$TAG" --generate-notes \
-            --notes "Experimental, not production-ready. Image: \`docker pull ${IMAGE}:${TAG#v}\` (linux/amd64, linux/arm64). Packages: \`sudo apt install ./straum_<version>_<arch>.deb\`, then edit /etc/default/straum and \`systemctl enable --now straum\`. Verify a package: \`sha256sum -c SHA256SUMS\` or \`gh attestation verify <file> -R ${GITHUB_REPOSITORY}\`."
+            --notes "Experimental, not production-ready. Image: \`docker pull ${IMAGE}:${TAG#v}\` (linux/amd64, linux/arm64). Packages: \`sudo apt install ./straum_<version>_<arch>.deb\`, then set cluster_id and node_id in /etc/straum/straum.conf and \`systemctl enable --now straum\`. The broker listens on loopback only until authentication exists. Verify a package: \`sha256sum -c SHA256SUMS\` or \`gh attestation verify <file> -R ${GITHUB_REPOSITORY}\`."
 
   # Ubuntu source packages for the Launchpad PPA, which builds them per series
   # and architecture (scripts/ppa.sh, debian/). A pull request builds the noble
-  # source package and then builds it with the network cut off, as Launchpad
-  # does.
+  # source package; the binary build with the network cut off, as Launchpad
+  # does, and the upload are off: the workspace needs Rust 1.95 and the
+  # newest versioned Rust in Ubuntu is 1.93, so Launchpad cannot build the
+  # package; the PPA is paused (D-253 A, straum-dev-plan).
   ppa:
+    if: github.event_name == 'pull_request'
     needs: [image, deb]
     runs-on: ubuntu-24.04
     steps:
@@ -186,7 +196,7 @@ jobs:
               PPA_UNSIGNED=1 scripts/ppa.sh "0.0.0~pr${PR}" noble
           fi
       - name: Build offline, as Launchpad does
-        if: github.event_name == 'pull_request'
+        if: false
         run: |
           set -eu
           cd target/ppa

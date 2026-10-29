@@ -1,21 +1,19 @@
 [Unit]
-Description=Straum node (experimental)
+Description=Straum broker (experimental)
 Documentation=https://github.com/straum-io/straum
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-# Settings: /etc/default/straum (docs/configuration.md). The node refuses to
-# start until it is configured.
-EnvironmentFile=/etc/default/straum
-Environment=STRAUM_CLUSTER_DATA_DIR=/var/lib/straum
-ExecStart=/usr/bin/straum-server
-# systemctl reload: the TLS and credential files read again (D-166 A).
-ExecReload=/bin/kill -HUP $MAINPID
+# Settings: /etc/straum/straum.conf (crates/straum-broker/README.md). The
+# broker refuses to start until cluster_id and node_id are set there.
+ExecStart=/usr/bin/straum-server --config /etc/straum/straum.conf
 DynamicUser=yes
 StateDirectory=straum
 Restart=on-failure
 RestartSec=5
+# Exit status 2: invalid flags or settings; restarting does not fix it.
+RestartPreventExitStatus=2
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -37,6 +35,8 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
+# The store and the network run on io_uring, which @system-service leaves out.
+SystemCallFilter=io_uring_setup io_uring_enter io_uring_register
 SystemCallFilter=~@privileged @resources
 UMask=0077
 

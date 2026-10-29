@@ -1054,6 +1054,7 @@ dependencies = [
  "blake3",
  "compio",
  "straum-client",
+ "straum-conformance",
  "straum-store",
 ]
 

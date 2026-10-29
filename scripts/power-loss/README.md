@@ -152,7 +152,7 @@ iterations also recover stores that were recovered before.
 | Scenario | Writer | Fault |
 |---|---|---|
 | `store` | batches of 1–16 messages to three topics, one released and compacted every 3rd round; segments and WAL files of 64 KiB; `inline` stores bodies up to 1024 bytes in the WAL (the broker's `inline`: 4096), so both kinds of object occur | `clear`, `crash` or `torn` at a random moment |
-| `broker` | `straum-broker` with `store_write_mode` set to the mode and 64 KiB segments; two producers with keys, headers and repeated bodies, 10 ms apart between requests | as `store` |
+| `broker` | `straum-server` (crate `straum-broker`) with `store_write_mode` set to the mode and 64 KiB segments; two producers with keys, headers and repeated bodies, 10 ms apart between requests | as `store` |
 | `compaction` | as `store`, compacting after every round | the writer sends a `crash` or `torn` (WAL) fault just before its 1st–4th compaction; the summary counts the iterations whose writer died inside the compaction |
 | `dictionary` | as `store`, on a fresh store per iteration with `dict_train_bytes` 64 KiB | the writer sends a `crash` or `torn` (WAL) fault just before the batch that trains the dictionary (`Store::trains_next_batch`) |
 

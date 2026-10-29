@@ -12,7 +12,8 @@ retries; every other error, and any unknown code, goes to the caller.
 request. `Client::partition_for` is the default partitioner (crc32c of the
 key modulo the partition count) or round robin without a key.
 `Connection` is one TCP connection without retries, with pipelining
-(`send`, then `recv` in any order).
+(`send`, then `recv` in any order). `wait_ready` waits until a broker
+answers Hello, the readiness rule of `conformance/README.md`.
 
 ```rust
 let mut c = Client::connect(ClientConfig::new("127.0.0.1:7171"))?;

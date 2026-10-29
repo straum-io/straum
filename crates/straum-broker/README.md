@@ -3,7 +3,8 @@
 The Straum broker, version 0: one node, one shard, the binary protocol of
 [docs/protocol.md](../../docs/protocol.md) over TCP, on the
 [straum-store](../straum-store/README.md) engine. Runtime: compio, io_uring
-on Linux, the polling driver on macOS (development only).
+on Linux, the polling driver on macOS (development only). The binary is
+`straum-server` (`target/release/straum-server`).
 
 ```bash
 cargo run --release -p straum-broker -- \
@@ -50,18 +51,21 @@ authentication exists.
 - **Timestamps** are assigned at group commit, never below the last one
   stored, and recorded through the store.
 - **Startup**: identity check, store open, the store's recovery report on
-  stderr once, `straum-broker: compio driver <driver>`, then
-  `straum-broker: listening on <address>`. **SIGTERM or SIGINT**: no new
-  connections or requests, queued groups committed, waiting fetches
-  answered, answers written (up to `shutdown_timeout_ms`), store closed.
-  Nothing is logged per message.
+  stderr once, `straum-server: compio driver <driver>`, then
+  `straum-server: listening on <address>`. The broker is ready when it
+  answers Hello; clients and runners detect that through the protocol, not
+  from these lines (conformance/README.md, Readiness). **SIGTERM or
+  SIGINT**: no new connections or requests, queued groups committed,
+  waiting fetches answered, answers written (up to `shutdown_timeout_ms`),
+  store closed. Nothing is logged per message.
 - A failed store write makes every later write answer `StorageError` until
   the broker is restarted (the store refuses writes after an I/O error).
 
 ## Configuration
 
 `--config <file>` reads `key = value` lines (`#` comments); every key is
-also a flag, `--key value`, with `-` or `_`; flags win.
+also a flag, `--key value`, with `-` or `_`; flags win. Invalid flags or
+settings exit with status 2; any other startup or runtime error, 1.
 
 | Key | Default | |
 |---|---|---|

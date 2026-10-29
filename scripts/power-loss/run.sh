@@ -90,13 +90,13 @@ LAZYFS_BIN="$LAZYFS/lazyfs/build/lazyfs"
 # (the store bounds its own, but the broker adds connections).
 ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
-echo "building straum-power-loss and straum-broker (release)"
+echo "building straum-power-loss and straum-server (release)"
 if ! (cd "$ROOT" && cargo build --release -p straum-power-loss -p straum-broker) >"$OUT/build.log" 2>&1; then
     echo "build failed: $OUT/build.log" >&2
     exit 2
 fi
 BIN="$ROOT/target/release/straum-power-loss"
-BROKER="$ROOT/target/release/straum-broker"
+BROKER="$ROOT/target/release/straum-server"
 
 # ---------------------------------------------------------------- environment
 
@@ -307,19 +307,14 @@ write_phase() {
             ;;
         broker)
             mkdir -p "$run/mnt/data"
-            "$BROKER" --data-dir "$run/mnt/data" --listen 127.0.0.1:0 --cluster-id powerloss \
+            local addr
+            addr="$("$BIN" free-addr | sed -n 's/^RESULT ok //p')"
+            [ -n "$addr" ] || { ERR="no free port"; return 1; }
+            "$BROKER" --data-dir "$run/mnt/data" --listen "$addr" --cluster-id powerloss \
                 --node-id 1 --store-write-mode "$mode" --store-segment-max-bytes 65536 \
                 >/dev/null 2>"$it/broker.log" &
             WRITERS="$!"
-            if ! wait_line "$it/broker.log" 'listening on' 120 "$WRITERS"; then
-                ERR="broker did not start (see $it)"; return 1
-            fi
-            # Recovery ran in the verifier's broker: nothing is left to do.
-            if ! grep -q 'store recovery: 0 action(s)' "$it/broker.log"; then
-                ERR="second broker start changed the store again (see $it/broker.log)"; return 1
-            fi
-            local addr
-            addr="$(sed -n 's/^straum-broker: listening on //p' "$it/broker.log")"
+            # The producer waits until the broker answers Hello.
             "$BIN" broker-produce --addr "$addr" --base $((i * 2000000)) --seed "$wseed" \
                 >"$it/producer.log" 2>"$it/producer.err" &
             WRITERS="$WRITERS $!"; ready="$it/producer.log"
@@ -327,6 +322,11 @@ write_phase() {
     esac
     if ! wait_line "$ready" '^READY END' 300 "${WRITERS##* }"; then
         ERR="writer did not get ready (see $it)"; return 1
+    fi
+    # Recovery ran in the verifier's broker: nothing is left to do. The
+    # broker printed its recovery report before it answered Hello.
+    if [ "$scenario" = broker ] && ! grep -q 'store recovery: 0 action(s)' "$it/broker.log"; then
+        ERR="second broker start changed the store again (see $it/broker.log)"; return 1
     fi
     local pid
     for pid in $WRITERS; do

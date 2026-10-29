@@ -13,7 +13,7 @@
 # must never share a target directory.
 set -eu
 
-IMAGE="${STRAUM_LINUX_IMAGE:-rust:1.88-bookworm}"
+IMAGE="${STRAUM_LINUX_IMAGE:-rust:1.95-bookworm}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 ENGINE="${STRAUM_CONTAINER_ENGINE:-}"

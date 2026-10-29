@@ -1,4 +1,4 @@
-//! `straum-broker --config <file> [--<key> <value> ...]`: settings in
+//! `straum-server --config <file> [--<key> <value> ...]`: settings in
 //! crates/straum-broker/README.md. SIGTERM or SIGINT stops it: no new
 //! connections or requests, queued groups committed, waiting fetches
 //! answered, the store closed.
@@ -14,14 +14,14 @@ fn main() -> ExitCode {
     let config = match Config::from_args(std::env::args().skip(1)) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("straum-broker: {e}");
+            eprintln!("straum-server: {e}");
             return ExitCode::from(2);
         }
     };
     let rt = match compio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("straum-broker: runtime: {e}");
+            eprintln!("straum-server: runtime: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -45,7 +45,7 @@ fn main() -> ExitCode {
     match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("straum-broker: {e}");
+            eprintln!("straum-server: {e}");
             ExitCode::FAILURE
         }
     }

@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
 
 pub use straum_proto as proto;
 use straum_proto::{
@@ -221,23 +221,8 @@ impl Client {
         if self.conn.is_none() {
             let mut conn = Connection::connect(&self.target, self.config.connect_timeout)?;
             conn.set_read_timeout(self.config.request_timeout)?;
-            let resp = conn.call(&Request::Hello(Hello {
-                min_version: proto::VERSION,
-                max_version: proto::VERSION,
-                client_name: self.config.client_name.clone(),
-                auth_mechanism: "none".into(),
-                auth_payload: Vec::new(),
-            }))?;
-            match resp {
-                Response::HelloOk(ok) => self.conn = Some((conn, ok)),
-                Response::Error(e) => return Err(ClientError::Broker(e)),
-                r => {
-                    return Err(ClientError::Protocol(format!(
-                        "Hello answered with {}",
-                        r.name()
-                    )));
-                }
-            }
+            let ok = hello(&mut conn, &self.config.client_name)?;
+            self.conn = Some((conn, ok));
         }
         self.conn
             .as_mut()
@@ -498,9 +483,82 @@ impl Client {
     }
 }
 
+fn hello(conn: &mut Connection, client_name: &str) -> Result<HelloOk, ClientError> {
+    let resp = conn.call(&Request::Hello(Hello {
+        min_version: proto::VERSION,
+        max_version: proto::VERSION,
+        client_name: client_name.to_owned(),
+        auth_mechanism: "none".into(),
+        auth_payload: Vec::new(),
+    }))?;
+    match resp {
+        Response::HelloOk(ok) => Ok(ok),
+        Response::Error(e) => Err(ClientError::Broker(e)),
+        r => Err(ClientError::Protocol(format!(
+            "Hello answered with {}",
+            r.name()
+        ))),
+    }
+}
+
+/// Waits until the broker at `addr` is ready, by the rule of
+/// conformance/README.md: connects and says Hello every 50 ms until the
+/// broker answers `HelloOk`, `alive` returns false or `timeout` passes. I/O
+/// errors are retried; an answer other than `HelloOk` is returned at once.
+/// The probe connection is closed and its end awaited (EOF from the broker)
+/// before returning, so the broker no longer counts it as open.
+pub fn wait_ready(
+    addr: &str,
+    timeout: Duration,
+    mut alive: impl FnMut() -> bool,
+) -> Result<HelloOk, ClientError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match probe(addr) {
+            Err(ClientError::Io(_)) if alive() && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            res => return res,
+        }
+    }
+}
+
+fn probe(addr: &str) -> Result<HelloOk, ClientError> {
+    let mut conn = Connection::connect(addr, Duration::from_secs(1))?;
+    conn.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let ok = hello(&mut conn, "straum-ready")?;
+    conn.stream.shutdown(Shutdown::Write)?;
+    let mut rest = [0; 256];
+    while conn.stream.read(&mut rest)? > 0 {}
+    Ok(ok)
+}
+
 fn unexpected(r: &Response) -> ClientError {
     match r {
         Response::Error(e) => ClientError::Broker(e.clone()),
         r => ClientError::Protocol(format!("unexpected {}", r.name())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_ready_stops_when_the_broker_is_gone() {
+        // A port nobody listens on any more.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let start = Instant::now();
+        let mut calls = 0;
+        let res = wait_ready(&addr, Duration::from_secs(30), || {
+            calls += 1;
+            calls < 3
+        });
+        assert!(matches!(res, Err(ClientError::Io(_))));
+        assert_eq!(calls, 3);
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 }

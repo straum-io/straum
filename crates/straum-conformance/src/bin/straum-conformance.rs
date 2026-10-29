@@ -1,4 +1,4 @@
-//! `straum-conformance broker <straum-broker binary> [scenario dir]` runs the
+//! `straum-conformance broker <straum-server binary> [scenario dir]` runs the
 //! broker scenarios against fresh broker processes;
 //! `straum-conformance client [scenario dir]` runs the client scenarios with
 //! straum-client against the fake server. Exits 0 if every scenario passes.
@@ -20,7 +20,7 @@ fn main() -> ExitCode {
         [k] if k == "client" => ("client", None, conformance_dir().join("client-scenarios")),
         [k, d] if k == "client" => ("client", None, PathBuf::from(d)),
         _ => {
-            eprintln!("usage: straum-conformance broker <straum-broker> [dir] | client [dir]");
+            eprintln!("usage: straum-conformance broker <straum-server> [dir] | client [dir]");
             return ExitCode::from(2);
         }
     };

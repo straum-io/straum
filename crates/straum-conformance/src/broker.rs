@@ -1,11 +1,12 @@
 //! Runs a broker scenario (`conformance/scenarios/*.json`) against a fresh
 //! broker process: the runner starts the broker binary with a new data
-//! directory and the scenario's settings, reads the bound address from its
-//! `listening on` line, plays the steps and stops the broker.
+//! directory, a free loopback port and the scenario's settings, waits until
+//! it answers Hello (`straum_client::wait_ready`), plays the steps and stops
+//! the broker.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -32,10 +33,11 @@ impl BrokerProcess {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos())
         ));
+        let addr = free_addr()?;
         let mut cmd = Command::new(bin);
         cmd.args(["--data-dir", &dir.to_string_lossy()]).args([
             "--listen",
-            "127.0.0.1:0",
+            &addr,
             "--cluster-id",
             "conformance",
             "--node-id",
@@ -44,31 +46,39 @@ impl BrokerProcess {
         for (k, v) in settings {
             cmd.arg(format!("--{k}")).arg(v);
         }
-        let mut child = cmd
+        let child = cmd
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("{}: {e}", bin.display()))?;
-        let stderr = child.stderr.take().ok_or("no stderr")?;
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Some(addr) = line.strip_prefix("straum-broker: listening on ") {
-                    let _ = tx.send(addr.to_owned());
-                }
-            }
+        let mut broker = Self { child, addr, dir };
+        let ready = straum_client::wait_ready(&broker.addr, Duration::from_secs(30), || {
+            matches!(broker.child.try_wait(), Ok(None))
         });
-        match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(addr) => Ok(Self { child, addr, dir }),
-            Err(_) => {
-                let _ = child.kill();
-                let status = child.wait().ok();
-                Err(format!(
-                    "the broker did not start listening (exit {status:?})"
-                ))
-            }
+        match ready {
+            // Another broker on a reused port answers with its own cluster id.
+            Ok(ok) if ok.cluster_id == "conformance" => Ok(broker),
+            Ok(ok) => Err(format!(
+                "{} answered for cluster {:?}, not this runner's broker",
+                broker.addr, ok.cluster_id
+            )),
+            Err(e) => Err(format!(
+                "the broker at {} is not ready: {e} (exit {:?})",
+                broker.addr,
+                broker.child.try_wait().ok().flatten()
+            )),
         }
     }
+}
+
+/// A loopback address with a port the system just gave out and released.
+// Another process may take the port before the broker binds it;
+// the broker then exits and the readiness wait reports it.
+pub fn free_addr() -> Result<String, String> {
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.to_string())
+        .map_err(|e| format!("reserve a port: {e}"))
 }
 
 impl Drop for BrokerProcess {
