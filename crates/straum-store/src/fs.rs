@@ -52,6 +52,11 @@ mod real {
         path.is_dir()
     }
 
+    /// As `is_dir`, not following a symlink (as `DirEntry::file_type`).
+    pub fn is_dir_entry(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+    }
+
     pub fn exists(path: &Path) -> bool {
         path.exists()
     }

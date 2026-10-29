@@ -160,6 +160,11 @@ fn workload(seed: u64) -> Run {
             _ => run(store.release_before(SCRATCH, now.saturating_sub(300))).map(|_| ()),
         };
         sim::note(format!("{step} {op} {:?}", res.as_ref().err()).as_bytes());
+        // After its first error the store refuses everything.
+        assert!(
+            out.errors == 0 || res.is_err(),
+            "seed {seed}: a call after an error succeeded"
+        );
         if let Err(e) = res {
             if out.errors > 0 || !sim::is_down() {
                 // After its first error the store refuses everything.
@@ -439,8 +444,12 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 /// Ordered and Unordered alternate every four seeds, so each scenario
 /// runs under both.
+/// `STRAUM_STORE_SIM_MODEL=posix` runs every seed under `Model::Posix`
+/// (finding: such a sweep fails, see the pinned test below).
 fn model(seed: u64) -> Model {
-    if (seed / 4).is_multiple_of(2) {
+    if std::env::var("STRAUM_STORE_SIM_MODEL").as_deref() == Ok("posix") {
+        Model::Posix
+    } else if (seed / 4).is_multiple_of(2) {
         Model::Ordered
     } else {
         Model::Unordered
@@ -489,6 +498,30 @@ fn posix_rename_model_reaches_a_manifest_in_two_places() {
             && msg.contains("quarantine-0000000000000004"),
         "{msg}"
     );
+}
+
+/// The Posix sweep behind the finding, counted: every seed in
+/// `STRAUM_STORE_SIM_SEED..+STRAUM_STORE_SIM_SEEDS` (default 1..=1000)
+/// under `Model::Posix`, each failure printed as `POSIX <scenario> <seed>
+/// <first line>`.
+#[test]
+#[ignore = "finding: counts the Posix-model failures; run with --ignored --nocapture"]
+fn posix_sweep_counts_failures() {
+    let first = env_u64("STRAUM_STORE_SIM_SEED", 1);
+    let n = env_u64("STRAUM_STORE_SIM_SEEDS", 1000);
+    let mut failed = 0;
+    for seed in first..first + n {
+        if let Err(e) = std::panic::catch_unwind(|| simulate(seed, Model::Posix)) {
+            failed += 1;
+            let m = e.downcast_ref::<String>().cloned().unwrap_or_default();
+            println!(
+                "POSIX {} {seed} {}",
+                seed % 4,
+                m.lines().next().unwrap_or("")
+            );
+        }
+    }
+    println!("POSIX failed {failed} of {n}");
 }
 
 fn hex(b: &[u8]) -> String {

@@ -712,6 +712,10 @@ pub mod fs {
         with(|d| d.live.get(path) == Some(&Node::Dir))
     }
 
+    pub fn is_dir_entry(path: &Path) -> bool {
+        is_dir(path)
+    }
+
     pub fn exists(path: &Path) -> bool {
         with(|d| d.live.contains_key(path))
     }

@@ -4192,7 +4192,9 @@ async fn move_to_quarantine(
 fn count_quarantined(dir: &Path) -> io::Result<u64> {
     let mut n = 0;
     for name in fs::list(dir)? {
-        if name.to_str().and_then(parse_quarantine_name).is_some() && fs::is_dir(&dir.join(&name)) {
+        if name.to_str().and_then(parse_quarantine_name).is_some()
+            && fs::is_dir_entry(&dir.join(&name))
+        {
             n += fs::list(&dir.join(&name))?.len() as u64;
         }
     }
