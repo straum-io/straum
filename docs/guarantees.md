@@ -142,11 +142,12 @@ At startup the store replays the WAL from the beginning
   block of the last frame that does not decompress or fails its checks
   (`CorruptBlock`), an intact index block that disagrees with the WAL
   (`TopicMismatch`) or that the WAL cannot have (`IndexSegmentCorrupt`), a
-  WAL of another format version (`UnsupportedFormat`), a table or run
-  that the checkpoint in use lists missing or damaged
+  WAL of another format version (`UnsupportedFormat`), a table, run or
+  dictionary file that the checkpoint in use lists missing or damaged
   (`CorruptCheckpoint`; the fallback is for a damaged manifest only), a
-  checkpoint that disagrees with the WAL
-  (`CheckpointMismatch`). The broker then
+  checkpoint that disagrees with the WAL on an object, a block or its
+  other state (`CheckpointMismatch`, `CheckpointBlockMismatch`,
+  `CorruptCheckpoint`). The broker then
   does not start. A damaged header of an index segment that fences stale
   records also fails open with `TopicMismatch`; the operator then starts the
   broker once with the flag `--store-rebuild-index`, which rebuilds the index

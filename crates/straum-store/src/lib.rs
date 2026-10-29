@@ -6,9 +6,18 @@
 
 mod block;
 mod codec;
+mod fault;
+mod fuse;
+mod recent;
 mod store;
 
 pub use codec::{FrameMode, MAX_TOPIC, ObjectId};
+/// Deterministic fault injection, for tests (ADR-0014, before step 6b).
+#[doc(hidden)]
+pub use fault::{FaultPoint, arm as arm_fault, disarm as disarm_fault};
+/// The recent-id cache, public for its measurement (`straum-store-bench`'s
+/// `recent-ids`).
+pub use recent::RecentIds;
 pub use store::{
     CommitTiming, CompactStats, CompactStep, Config, ConfigOverride, DropReason, Entry, Message,
     RecoveryAction, RecoveryReport, Stats, Store, TopicStats, WriteMode,
@@ -104,4 +113,9 @@ pub enum StoreError {
     /// checkpoint covers. No file is changed.
     #[error("checkpoint {checkpoint} disagrees with the WAL on object number {number}")]
     CheckpointMismatch { checkpoint: u64, number: u64 },
+    /// A checkpoint's block table or block relocation run gives block
+    /// `block` another place, layout or dictionary (or none) than the WAL
+    /// has at the frames the checkpoint covers. No file is changed.
+    #[error("checkpoint {checkpoint} disagrees with the WAL on block {block}")]
+    CheckpointBlockMismatch { checkpoint: u64, block: u64 },
 }

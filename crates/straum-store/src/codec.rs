@@ -18,7 +18,7 @@ impl ObjectId {
 /// start of every WAL file.
 pub const WAL_FILE_HEADER: usize = 24;
 pub const WAL_MAGIC: [u8; 8] = *b"STRMWAL\0";
-pub const WAL_VERSION: u32 = 18;
+pub const WAL_VERSION: u32 = 20;
 /// Header bytes covered by the header CRC (everything before it).
 const WAL_HEADER_CRC_AT: usize = 20;
 /// `len u32 | seq u64 | count u32 | mode u8 | crc32c u32`.
@@ -1230,7 +1230,7 @@ pub fn decode_table_header(magic: [u8; 8], buf: &[u8]) -> Option<u64> {
     (*h == table_header(magic, first)).then_some(first)
 }
 
-fn page_crc(page: u64, entries: &[u8]) -> u32 {
+pub fn page_crc(page: u64, entries: &[u8]) -> u32 {
     crc32c::crc32c_append(crc32c::crc32c(&page.to_le_bytes()), entries)
 }
 
@@ -1300,10 +1300,208 @@ pub fn reloc_entry(entries: &[u8], i: usize) -> Option<(u64, Option<(u64, u32)>)
     ))
 }
 
+pub const IDRUN_MAGIC: [u8; 8] = *b"STRMIDR\0";
+/// An id run entry: `id [32] | number u64`, sorted by id.
+pub const ID_ENTRY: usize = 40;
+
+/// The page length of entries of `width` bytes (the last page may be
+/// shorter).
+pub fn page_len(width: usize) -> usize {
+    (PAGE - 4) / width * width + 4
+}
+
+/// The entries of page `page` of a table body, checked against its CRC.
+pub fn decode_page(buf: &[u8], page: u64, width: usize) -> Option<&[u8]> {
+    let (entries, crc) = buf.split_at_checked(buf.len().checked_sub(4)?)?;
+    (!entries.is_empty() && entries.len() % width == 0 && page_crc(page, entries) == u32_at(crc, 0))
+        .then_some(entries)
+}
+
+/// The fence of an id: its first 8 bytes, big-endian, so fences order as
+/// ids do.
+pub fn id_fence(id: &ObjectId) -> u64 {
+    u64::from_be_bytes(id.0[..8].try_into().unwrap_or([0; 8]))
+}
+
+/// The filter key of an id: bytes 8 to 16 (uniform; independent of the
+/// fence).
+pub fn id_key(id: &ObjectId) -> u64 {
+    u64::from_le_bytes(id.0[8..16].try_into().unwrap_or([0; 8]))
+}
+
+/// Entry `i` of an id run's entries.
+pub fn id_entry(entries: &[u8], i: usize) -> Option<(ObjectId, u64)> {
+    let e = entries.get(i.checked_mul(ID_ENTRY)?..)?.get(..ID_ENTRY)?;
+    Some((id_at(e, 0), u64_at(e, 32)))
+}
+
+/// An id run's footer: `pages u64 | fence u64 per page | filter | len u32
+/// | crc32c u32` (`len` the footer's length before it, the CRC over the
+/// footer and `len`).
+pub fn put_id_run_footer(out: &mut Vec<u8>, fences: &[u64], filter: &crate::fuse::Fuse8) {
+    let start = out.len();
+    out.extend_from_slice(&(fences.len() as u64).to_le_bytes());
+    for f in fences {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    filter.encode(out);
+    let len = (out.len() - start) as u32;
+    out.extend_from_slice(&len.to_le_bytes());
+    let crc = crc32c::crc32c(&out[start..]);
+    out.extend_from_slice(&crc.to_le_bytes());
+}
+
+/// The fences and filter of an id run file, and the length of its pages;
+/// `None` if the footer fails its CRC or does not decode.
+pub fn decode_id_run_footer(file: &[u8]) -> Option<(Vec<u64>, crate::fuse::Fuse8, usize)> {
+    let n = file.len();
+    let tail = file.get(n.checked_sub(8)?..)?;
+    let len = u32_at(tail, 0) as usize;
+    let start = n.checked_sub(8 + len)?;
+    if crc32c::crc32c(&file[start..n - 4]) != u32_at(tail, 4) {
+        return None;
+    }
+    let footer = &file[start..n - 8];
+    let pages = usize::try_from(u64_at(footer.get(..8)?, 0)).ok()?;
+    let fences_end = 8usize.checked_add(pages.checked_mul(8)?)?;
+    let fences: Vec<u64> = footer
+        .get(8..fences_end)?
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
+        .collect();
+    let (filter, rest) = crate::fuse::Fuse8::decode(&footer[fences_end..])?;
+    rest.is_empty().then_some((fences, filter, start))
+}
+
+pub const BLKTAB_MAGIC: [u8; 8] = *b"STRMBLK\0";
+pub const BLKREL_MAGIC: [u8; 8] = *b"STRMBRL\0";
+pub const DICT_MAGIC: [u8; 8] = *b"STRMDIC\0";
+
+/// A block table entry: `kind u8 | at u64 | offset u64 | len u64 | raw_len
+/// u64 | dict u32 | crc u32 | objects u32`. `kind` 0: a segment block
+/// (`at` the segment id); 1: an inline block (`at` the WAL file). A number
+/// with no block (reclaimed, or a hole a rewrite left): all ones.
+pub const BLOCK_ENTRY: usize = 45;
+/// A block relocation run entry: `number u64 | segment u64 | offset u64`,
+/// segment and offset all ones for a block reclaimed.
+pub const BLKREL_ENTRY: usize = 24;
+
+/// Where a block lies and what it holds, as the checkpoint records it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockPlace {
+    /// In a WAL frame (an inline block), not a segment.
+    pub wal: bool,
+    /// The segment id, or the WAL file for an inline block.
+    pub at: u64,
+    pub offset: u64,
+    pub len: u64,
+    pub raw_len: u64,
+    pub dict: u32,
+    pub crc: u32,
+    pub objects: u32,
+}
+
+pub fn put_block_entry(out: &mut Vec<u8>, place: Option<BlockPlace>) {
+    match place {
+        None => out.extend_from_slice(&[0xff; BLOCK_ENTRY]),
+        Some(b) => {
+            out.push(u8::from(b.wal));
+            for v in [b.at, b.offset, b.len, b.raw_len] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [b.dict, b.crc, b.objects] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// Entry `i` of a block table's entries; `Some(None)` for a number with no
+/// block, `None` past the end or for an unknown kind.
+pub fn block_entry(entries: &[u8], i: usize) -> Option<Option<BlockPlace>> {
+    let e = entries
+        .get(i.checked_mul(BLOCK_ENTRY)?..)?
+        .get(..BLOCK_ENTRY)?;
+    if e.iter().all(|&b| b == 0xff) {
+        return Some(None);
+    }
+    let wal = match e[0] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    Some(Some(BlockPlace {
+        wal,
+        at: u64_at(e, 1),
+        offset: u64_at(e, 9),
+        len: u64_at(e, 17),
+        raw_len: u64_at(e, 25),
+        dict: u32_at(e, 33),
+        crc: u32_at(e, 37),
+        objects: u32_at(e, 41),
+    }))
+}
+
+pub fn put_blkrel_entry(out: &mut Vec<u8>, number: u64, at: Option<(u64, u64)>) {
+    let (segment, offset) = at.unwrap_or((u64::MAX, u64::MAX));
+    for v in [number, segment, offset] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Entry `i` of a block relocation run: the block number and its new
+/// `(segment, offset)`, `None` if reclaimed.
+pub fn blkrel_entry(entries: &[u8], i: usize) -> Option<(u64, Option<(u64, u64)>)> {
+    let e = entries
+        .get(i.checked_mul(BLKREL_ENTRY)?..)?
+        .get(..BLKREL_ENTRY)?;
+    let (segment, offset) = (u64_at(e, 8), u64_at(e, 16));
+    Some((
+        u64_at(e, 0),
+        (segment != u64::MAX || offset != u64::MAX).then_some((segment, offset)),
+    ))
+}
+
+/// A dictionary file `dict-<number>.bin`: `magic "STRMDIC\0" | version u32
+/// | number u64 | len u64 | dictionary bytes | crc32c u32` over every byte
+/// before it. An empty dictionary (training built none) has length 0.
+pub fn encode_dict_file(number: u64, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + data.len());
+    out.extend_from_slice(&DICT_MAGIC);
+    out.extend_from_slice(&WAL_VERSION.to_le_bytes());
+    out.extend_from_slice(&number.to_le_bytes());
+    out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    out.extend_from_slice(data);
+    let crc = crc32c::crc32c(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// The dictionary bytes of an intact dictionary file of this version that
+/// names `number`.
+pub fn decode_dict_file(buf: &[u8], number: u64) -> Option<&[u8]> {
+    let (body, crc) = buf.split_at_checked(buf.len().checked_sub(4)?)?;
+    if crc32c::crc32c(body) != u32_at(crc, 0) || body.len() < 28 {
+        return None;
+    }
+    let len = usize::try_from(u64_at(body, 20)).ok()?;
+    (body[..8] == DICT_MAGIC
+        && u32_at(body, 8) == WAL_VERSION
+        && u64_at(body, 12) == number
+        && body.len() == 28 + len)
+        .then(|| &body[28..])
+}
+
 /// A checkpoint manifest `checkpoint-<n>`: `magic [8] | version u32 | n u64
 /// | covered u64 | next_object u64 | next_block u64 | next_topic u64 |
-/// tables u32 | (first u64, count u64) per table | runs u32 | (checkpoint
-/// u64, count u64) per run | crc32c u32` over everything before it.
+/// next_segment u64 | dict_train_bytes u64 | dictless_raw u64 | dict u64 |
+/// then five lists, each `count u32` and its items: tables `(first u64,
+/// count u64)`, runs `(checkpoint u64, count u64)`, block tables `(first
+/// u64, count u64)`, block runs `(checkpoint u64, count u64)`, id runs
+/// `(checkpoint u64, count u64)`, then live segments `(id u64)` | crc32c
+/// u32` over everything before it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Manifest {
     /// The checkpoint's number, from 1.
@@ -1313,11 +1511,31 @@ pub struct Manifest {
     pub next_object: u64,
     pub next_block: u64,
     pub next_topic: u64,
+    /// Above every segment id the covered frames reference.
+    pub next_segment: u64,
+    /// The WAL file header's value.
+    pub dict_train_bytes: u64,
+    /// Raw bytes of batch blocks stored without a dictionary (the training
+    /// trigger).
+    pub dictless_raw: u64,
+    /// The dictionary file `dict-<n>.bin` it lists; 0 before training.
+    pub dict: u64,
     /// Object tables `(first number, count)`, together covering numbers
     /// `0..next_object` in order.
     pub tables: Vec<(u64, u64)>,
     /// Relocation runs `(checkpoint that wrote it, entries)`, oldest first.
     pub runs: Vec<(u64, u64)>,
+    /// Block tables `(first number, count)`, together covering block
+    /// numbers `0..next_block` in order.
+    pub block_tables: Vec<(u64, u64)>,
+    /// Block relocation runs `(checkpoint that wrote it, entries)`, oldest
+    /// first.
+    pub block_runs: Vec<(u64, u64)>,
+    /// The data segments the covered frames reference, ascending.
+    pub segments: Vec<u64>,
+    /// Id runs `(checkpoint that wrote it, entries)`, oldest first: every
+    /// live id below `next_object`, each in one run.
+    pub id_runs: Vec<(u64, u64)>,
 }
 
 impl Manifest {
@@ -1331,15 +1549,29 @@ impl Manifest {
             self.next_object,
             self.next_block,
             self.next_topic,
+            self.next_segment,
+            self.dict_train_bytes,
+            self.dictless_raw,
+            self.dict,
         ] {
             out.extend_from_slice(&v.to_le_bytes());
         }
-        for list in [&self.tables, &self.runs] {
+        for list in [
+            &self.tables,
+            &self.runs,
+            &self.block_tables,
+            &self.block_runs,
+            &self.id_runs,
+        ] {
             out.extend_from_slice(&(list.len() as u32).to_le_bytes());
             for (a, b) in list {
                 out.extend_from_slice(&a.to_le_bytes());
                 out.extend_from_slice(&b.to_le_bytes());
             }
+        }
+        out.extend_from_slice(&(self.segments.len() as u32).to_le_bytes());
+        for id in &self.segments {
+            out.extend_from_slice(&id.to_le_bytes());
         }
         let crc = crc32c::crc32c(&out);
         out.extend_from_slice(&crc.to_le_bytes());
@@ -1356,27 +1588,49 @@ impl Manifest {
         if r.take(8).ok()? != CHECKPOINT_MAGIC || r.u32().ok()? != WAL_VERSION {
             return None;
         }
-        let mut u64s = [0u64; 5];
+        let mut u64s = [0u64; 9];
         for v in &mut u64s {
             *v = u64_at(r.take(8).ok()?, 0);
         }
-        let mut lists = [Vec::new(), Vec::new()];
+        let mut lists = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         for list in &mut lists {
             for _ in 0..r.u32().ok()? {
                 let pair = r.take(16).ok()?;
                 list.push((u64_at(pair, 0), u64_at(pair, 8)));
             }
         }
-        let [tables, runs] = lists;
-        let [n, covered, next_object, next_block, next_topic] = u64s;
+        let mut segments = Vec::new();
+        for _ in 0..r.u32().ok()? {
+            segments.push(u64_at(r.take(8).ok()?, 0));
+        }
+        let [tables, runs, block_tables, block_runs, id_runs] = lists;
+        let [
+            n,
+            covered,
+            next_object,
+            next_block,
+            next_topic,
+            next_segment,
+            dict_train_bytes,
+            dictless_raw,
+            dict,
+        ] = u64s;
         r.0.is_empty().then_some(Self {
             n,
             covered,
             next_object,
             next_block,
             next_topic,
+            next_segment,
+            dict_train_bytes,
+            dictless_raw,
+            dict,
             tables,
             runs,
+            block_tables,
+            block_runs,
+            segments,
+            id_runs,
         })
     }
 }
@@ -2104,5 +2358,74 @@ mod tests {
         };
         assert_eq!(got, &attrs[..]);
         assert_eq!(&f.body[attrs_at..attrs_at + attrs.len()], &attrs[..]);
+    }
+
+    #[test]
+    fn block_entries_dictionary_files_and_manifests_round_trip() {
+        let place = BlockPlace {
+            wal: true,
+            at: 7,
+            offset: 1 << 40,
+            len: 5,
+            raw_len: u64::from(u32::MAX) + 9,
+            dict: 1,
+            crc: 0xdead_beef,
+            objects: 3,
+        };
+        let mut e = Vec::new();
+        put_block_entry(&mut e, Some(place));
+        put_block_entry(&mut e, None);
+        assert_eq!(e.len(), 2 * BLOCK_ENTRY);
+        assert_eq!(block_entry(&e, 0), Some(Some(place)));
+        assert_eq!(block_entry(&e, 1), Some(None));
+        assert_eq!(block_entry(&e, 2), None);
+        e[0] = 2;
+        assert_eq!(block_entry(&e, 0), None, "unknown kind");
+        let mut r = Vec::new();
+        put_blkrel_entry(&mut r, 4, Some((2, 9)));
+        put_blkrel_entry(&mut r, 5, None);
+        assert_eq!(blkrel_entry(&r, 0), Some((4, Some((2, 9)))));
+        assert_eq!(blkrel_entry(&r, 1), Some((5, None)));
+
+        for data in [&b""[..], b"dictionary"] {
+            let f = encode_dict_file(1, data);
+            assert_eq!(decode_dict_file(&f, 1), Some(data));
+            assert_eq!(decode_dict_file(&f, 2), None, "another number");
+            for i in 0..f.len() {
+                for bit in 0..8 {
+                    let mut bad = f.clone();
+                    bad[i] ^= 1 << bit;
+                    assert_eq!(decode_dict_file(&bad, 1), None, "flip at {i}.{bit}");
+                }
+            }
+            assert_eq!(decode_dict_file(&f[..f.len() - 1], 1), None);
+        }
+
+        let m = Manifest {
+            n: 3,
+            covered: 10,
+            next_object: 4,
+            next_block: 2,
+            next_topic: 1,
+            next_segment: 6,
+            dict_train_bytes: 1 << 20,
+            dictless_raw: 99,
+            dict: 1,
+            tables: vec![(0, 4)],
+            runs: vec![(2, 1)],
+            block_tables: vec![(0, 2)],
+            block_runs: vec![(3, 1)],
+            segments: vec![1, 5],
+            id_runs: vec![(1, 3), (3, 1)],
+        };
+        let b = m.encode();
+        assert_eq!(Manifest::decode(&b), Some(m));
+        for i in 0..b.len() {
+            for bit in 0..8 {
+                let mut bad = b.clone();
+                bad[i] ^= 1 << bit;
+                assert_eq!(Manifest::decode(&bad), None, "flip at {i}.{bit}");
+            }
+        }
     }
 }
