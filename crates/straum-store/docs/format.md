@@ -114,7 +114,7 @@ checkpoint will delete the files wholly before the frame it covers
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 16 |
+| 8 | 4 | `version` u32 = 17 |
 | 12 | 8 | `dict_train_bytes` u64: the dictionary training threshold |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -142,7 +142,9 @@ rewritten block per Compact record, 10 one index file per topic
 (`topics/<hex>.idx`), 11 Publish without the publication's key and
 headers, 12 one WAL file, `wal.log`, 13 keys and headers of full index
 blocks only in the WAL (no attribute records), 14 no checkpoint files, 15 reference counts
-checked at open and in Compact replay. The number keeps increasing
+checked at open and in Compact replay, 16 damaged manifests deleted and
+checkpoint numbers reused after a fallback (so an older build must not
+write a directory that holds quarantined manifests). The number keeps increasing
 with each format change on this line; none is reused (D-251 A).
 
 ### Frame
@@ -488,7 +490,7 @@ attribute records and seek pages. A 24-byte header, then records.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 49 44 58 00` (`"STRMIDX\0"`) |
-| 8 | 4 | `version` u32 = 16 (the WAL version) |
+| 8 | 4 | `version` u32 = 17 (the WAL version) |
 | 12 | 8 | `created_at` u64: the number of the first WAL frame its records may describe (the batch's frame for a segment started while writing a batch's records, the frame count for one started at open) |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -637,7 +639,7 @@ Object tables and relocation runs share a 24-byte header and a page layout:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `"STRMOBJ\0"` (table) or `"STRMREL\0"` (run) |
-| 8 | 4 | `version` u32 = 16 (the WAL version) |
+| 8 | 4 | `version` u32 = 17 (the WAL version) |
 | 12 | 8 | `first` u64: the table's first object number, or the number of the checkpoint that wrote the run (also in the file name) |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -670,7 +672,8 @@ and `fdatasync`ed, then the directory is synced; the manifest is written to
 `checkpoint-<n>.tmp`, `fdatasync`ed, renamed to `checkpoint-<n>` and the
 directory synced; then `checkpoint-<n>` is read back and must decode to what was
 written (a manifest that does not is renamed to its quarantine name and
-the directory synced); only then is `checkpoint-<n − 1>` deleted and the directory
+the directory synced; the checkpoint's `CorruptCheckpoint` error is its
+only report, later opens keep it silently); only then is `checkpoint-<n − 1>` deleted and the directory
 synced, so a damaged newest manifest has an older one to fall back to. The
 new table and run are read back, and must hold the entries written, before
 the manifest tmp file is written, so a failure there leaves them unlisted.
