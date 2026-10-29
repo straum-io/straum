@@ -7,7 +7,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use straum_proto::{
-    FRAME_HEADER, FrameHeader, Request, Response, encode_request, encode_response, split_frame,
+    FRAME_HEADER, FrameHeader, Request, Response, encode_request, encode_response, json,
+    split_frame,
 };
 use straum_store::{Config, Message, RecoveryAction, RecoveryReport, Store, WriteMode};
 
@@ -59,6 +60,40 @@ fn decode_all(msg_type: u16, correlation_id: u64, body: &[u8], frame: Option<&[u
         if let Some(f) = frame {
             assert_eq!(out, f);
         }
+    }
+}
+
+/// The JSON reader of the fixtures and scenarios (`straum_proto::json`): a
+/// request or response it accepts survives the wire and JSON round trips.
+pub fn proto_json(data: &[u8]) {
+    let Ok(text) = std::str::from_utf8(data) else {
+        return;
+    };
+    if let Some(b) = json::unhex(text) {
+        assert!(
+            json::hex(&b).eq_ignore_ascii_case(text),
+            "unhex accepted {text:?}"
+        );
+    }
+    let Ok(v) = json::parse(text) else {
+        return;
+    };
+    let m = v.get("message").unwrap_or(&v);
+    if let Ok(req) = json::request_from_json(m) {
+        let mut out = Vec::new();
+        encode_request(&mut out, 1, &req);
+        let (h, body) = split_frame(&out).expect("one frame");
+        assert_eq!(Request::decode(h.msg_type, body).as_ref(), Ok(&req));
+        let back = json::parse(&json::request_to_json(&req).to_pretty()).expect("own JSON");
+        assert_eq!(json::request_from_json(&back).as_ref(), Ok(&req));
+    }
+    if let Ok(resp) = json::response_from_json(m) {
+        let mut out = Vec::new();
+        encode_response(&mut out, 1, &resp);
+        let (h, body) = split_frame(&out).expect("one frame");
+        assert_eq!(Response::decode(h.msg_type, body).as_ref(), Ok(&resp));
+        let back = json::parse(&json::response_to_json(&resp).to_pretty()).expect("own JSON");
+        assert_eq!(json::response_from_json(&back).as_ref(), Ok(&resp));
     }
 }
 
@@ -122,8 +157,11 @@ impl Archive {
     }
 }
 
-/// A relative path of one or two components of `[A-Za-z0-9._+-]`, none
-/// `.` or `..`: a file in the store directory or in a directory of it.
+/// A relative path of one or two components of `[a-z0-9._+-]`, none `.`
+/// or `..`: a file in the store directory or in a directory of it. No upper
+/// case: on a case-insensitive file system (macOS) `checkpoint-0A…` and
+/// the `checkpoint-0a…` the store reports are one file; `+` keeps names the
+/// store's parsers accept but never writes (F2).
 fn valid_name(name: &[u8]) -> Option<String> {
     let name = std::str::from_utf8(name).ok()?;
     let parts: Vec<&str> = name.split('/').collect();
@@ -133,7 +171,7 @@ fn valid_name(name: &[u8]) -> Option<String> {
                 && *p != "."
                 && *p != ".."
                 && p.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._+-".contains(&b))
         });
     ok.then(|| name.to_owned())
 }

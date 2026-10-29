@@ -7,6 +7,7 @@ A cargo-fuzz crate with a workspace of its own: the main workspace and
 | Target | Input | Checks |
 |---|---|---|
 | `proto_frame` | bytes | `split_frame`, `FrameHeader`, every `Request` and `Response` decoder; a decoded value encodes back to the same bytes |
+| `proto_json` | text | the JSON reader of fixtures and scenarios: `parse`, `request_from_json`, `response_from_json`, `unhex`; an accepted message survives the wire and JSON round trips |
 | `store_wal` | archive of store files, mostly WAL files | `Store::open` on the base store's data segments plus the input |
 | `store_checkpoint` | archive of checkpoint files and quarantine directories | `Store::open` on the base store without its checkpoint files plus the input |
 

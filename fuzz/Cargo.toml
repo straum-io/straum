@@ -28,6 +28,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "proto_json"
+path = "fuzz_targets/proto_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "store_wal"
 path = "fuzz_targets/store_wal.rs"
 test = false

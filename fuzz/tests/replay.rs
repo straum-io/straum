@@ -4,11 +4,14 @@
 
 use std::path::Path;
 
-use straum_fuzz::{base_store, checkpoint_base, proto_frame, seeds, store_open, wal_base};
+use straum_fuzz::{
+    base_store, checkpoint_base, proto_frame, proto_json, seeds, store_open, wal_base,
+};
 
 fn run(target: &str, data: &[u8]) {
     match target {
         "proto_frame" => proto_frame(data),
+        "proto_json" => proto_json(data),
         "store_wal" => store_open(&wal_base(base_store()), data),
         "store_checkpoint" => store_open(&checkpoint_base(base_store()), data),
         t => panic!("unknown target {t}"),
@@ -40,7 +43,7 @@ fn base_store_is_deterministic() {
 }
 
 fn replay_dir(root: &Path) {
-    for target in ["proto_frame", "store_wal", "store_checkpoint"] {
+    for target in ["proto_frame", "proto_json", "store_wal", "store_checkpoint"] {
         let Ok(dir) = std::fs::read_dir(root.join(target)) else {
             continue;
         };
