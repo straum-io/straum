@@ -1,12 +1,25 @@
 name: release
 
-# A pushed version tag builds the straum-server image for linux/amd64 and
-# linux/arm64 and publishes it to Docker Hub, builds the Debian packages for
-# both, and creates the GitHub release with the packages, their checksums and
-# provenance (Constitution §12.3: only release versions are published). The
-# Launchpad PPA is paused (D-253 A, job ppa). A pull request that touches
-# the build builds the amd64 image, both packages and the noble source package,
-# without publishing anything.
+# A pushed version tag builds straum-server and publishes the release
+# candidate (Constitution §12.3: only release versions are published;
+# docs/release.md):
+#   - the image for linux/amd64 and linux/arm64, built natively per platform
+#     and merged into one manifest list, pushed to GHCR and Docker Hub, with
+#     buildx provenance and SBOM and a GitHub artifact attestation;
+#   - the Debian packages and straum-server archives for Linux x86_64 and
+#     aarch64 and macOS aarch64 and x86_64;
+#   - SHA256SUMS over the packages and archives, and a GitHub artifact
+#     attestation for each;
+#   - a draft GitHub release with all of it. The owner reviews and publishes
+#     the draft; CI never publishes a release.
+# The Launchpad PPA is paused (D-253 A, job ppa).
+#
+# A pull request that touches the build, and a manual run (workflow_dispatch,
+# on any ref), build all of the above and SHA256SUMS and publish nothing: no
+# registry login, no push, no attestation, no release.
+#
+# Every action is pinned to a commit (tag in the comment); the container
+# images by digest.
 #
 # Needs, in the repository settings:
 #   variable DOCKERHUB_NAMESPACE  the Docker Hub user or organization
@@ -14,6 +27,7 @@ name: release
 #   secrets  DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (an access token with write scope)
 #   secret   PPA_GPG_KEY          an armored private key without passphrase,
 #                                 registered on the Launchpad account
+# GHCR needs no secret: the job's GITHUB_TOKEN with packages: write.
 on:
   push:
     tags: ['v*.*.*']
@@ -26,116 +40,253 @@ on:
       - crates/**
       - debian/**
       - scripts/ppa.sh
+      - scripts/release/**
       - .github/workflows/release.yml
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  PUBLISH: ${{ github.event_name == 'push' }}
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+  # rust:1.95-bookworm (Rust 1.95.0, the workspace's rust-version), as in the
+  # Dockerfile.
+  RUST_TOOLCHAIN: 1.95.0
+
 jobs:
-  image:
+  # A tag must be on main, name a version (vX.Y.Z or vX.Y.Z-pre) and equal
+  # straum-broker's version, so the binaries report the tag. Every publishing
+  # job needs this one. On a dry run it checks nothing.
+  tag:
     runs-on: ubuntu-latest
-    env:
-      PUBLISH: ${{ github.event_name == 'push' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-
-      - name: The tag is on main and names a release
+      - name: The tag is on main, names a release and matches the crate
         if: env.PUBLISH == 'true'
         env:
           NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
         run: |
           set -eu
           [ -n "$NAMESPACE" ] || { echo "release: set the DOCKERHUB_NAMESPACE variable" >&2; exit 1; }
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
-            || { echo "release: $GITHUB_REF_NAME is not on main" >&2; exit 1; }
+          scripts/release/check-tag.sh "$GITHUB_REF_NAME" "$GITHUB_SHA" origin/main
 
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ${{ vars.DOCKERHUB_NAMESPACE || 'straum' }}/straum
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ env.PUBLISH == 'true' && !contains(github.ref_name, '-') }}
-          labels: |
-            org.opencontainers.image.title=straum-server
-            org.opencontainers.image.description=Durable event log for one server (experimental, not production-ready)
-            org.opencontainers.image.licenses=Apache-2.0
-
-      # arm64 builds under QEMU, slow for a Rust workspace; move to
-      # native arm64 runners with a manifest merge if release builds get too long.
-      - uses: docker/setup-qemu-action@v3
-        if: env.PUBLISH == 'true'
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        if: env.PUBLISH == 'true'
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: ${{ env.PUBLISH == 'true' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
-          push: ${{ env.PUBLISH == 'true' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          provenance: mode=max
-          sbom: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # Debian packages for amd64 and arm64, built natively in a Debian 12
-  # container so the package needs only libc6 >= 2.34 (Debian 12, Ubuntu
-  # 22.04 and newer). A pull request builds them as a check.
-  deb:
+  image:
+    needs: tag
     strategy:
       matrix:
         include:
           - { runner: ubuntu-latest, arch: amd64 }
           - { runner: ubuntu-24.04-arm, arch: arm64 }
     runs-on: ${{ matrix.runner }}
-    container: rust:1-bookworm
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@cargo-deb
-      - name: Build the package
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        id: meta
+        with:
+          images: |
+            ${{ env.GHCR_IMAGE }}
+            docker.io/${{ vars.DOCKERHUB_NAMESPACE || 'straum' }}/straum
+          labels: |
+            org.opencontainers.image.title=straum-server
+            org.opencontainers.image.description=Durable event log for one server (experimental, not production-ready)
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        if: env.PUBLISH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        if: env.PUBLISH == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Published by digest only; job image-merge names the version.
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        id: build
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: ${{ env.PUBLISH == 'true' && format('type=image,"name={0},docker.io/{1}/straum",push-by-digest=true,name-canonical=true,push=true', env.GHCR_IMAGE, vars.DOCKERHUB_NAMESPACE) || 'type=cacheonly' }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}
+
+      - name: Keep the digest
+        if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: env.PUBLISH == 'true'
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+
+  # One manifest list over both platform images, tagged X.Y.Z, X.Y and (for a
+  # tag without a "-" suffix) latest, in both registries; then a GitHub
+  # artifact attestation for the GHCR manifest list.
+  image-merge:
+    if: github.event_name == 'push'
+    needs: [tag, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        id: meta
+        with:
+          images: |
+            ${{ env.GHCR_IMAGE }}
+            docker.io/${{ vars.DOCKERHUB_NAMESPACE }}/straum
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+      - name: Push the manifest lists
+        id: push
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          DOCKERHUB_IMAGE: docker.io/${{ vars.DOCKERHUB_NAMESPACE }}/straum
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -eu
+          [ "$(ls | wc -l)" -eq 2 ] || { echo "release: expected 2 platform digests" >&2; ls >&2; exit 1; }
+          for image in "$GHCR_IMAGE" "$DOCKERHUB_IMAGE"; do
+              tags="$(jq -r --arg i "$image:" '.tags[] | select(startswith($i)) | "-t " + .' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
+              # shellcheck disable=SC2046,SC2086 # one word per tag and per digest
+              docker buildx imagetools create $tags $(printf "$image@sha256:%s " *)
+              docker buildx imagetools inspect "$image:$VERSION"
+          done
+          digest="$(docker buildx imagetools inspect "$GHCR_IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)"
+          case "$digest" in sha256:*) ;; *) echo "release: no digest for $GHCR_IMAGE:$VERSION" >&2; exit 1 ;; esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ env.GHCR_IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  # Debian packages and straum-server archives for Linux amd64 and arm64,
+  # built natively in a Debian 12 container, so they need only libc6 >= 2.34
+  # (Debian 12, Ubuntu 22.04 and newer). Native runners, not cross
+  # compilation: ring compiles C, and a native build needs no cross linker or
+  # sysroot. The archive holds the binary the package installs.
+  deb:
+    needs: tag
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-latest, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    container: rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-deb@3.8.0
+      - name: Build the package and the archive
         env:
           REF: ${{ github.ref_name }}
           PR: ${{ github.event.pull_request.number }}
         run: |
           set -eu
-          if [ "${GITHUB_EVENT_NAME}" = push ]; then
-              # v0.1.0-rc.1 -> 0.1.0~rc.1, which sorts before 0.1.0 in dpkg.
-              version="$(printf '%s' "${REF#v}" | tr '-' '~')"
-          else
-              version="0.0.0~pr${PR}"
-          fi
-          cargo deb --locked -p straum-broker --deb-version "$version"
-          ls -l target/debian/
-      - uses: actions/upload-artifact@v4
+          version="$(scripts/release/version.sh)"
+          # v0.1.0-rc.1 -> 0.1.0~rc.1, which sorts before 0.1.0 in dpkg.
+          cargo deb --locked -p straum-broker --deb-version "$(printf '%s' "$version" | tr '-' '~')"
+          scripts/release/archive.sh "$version" "$(rustc -vV | sed -n 's/^host: //p')" target/release/straum-server dist
+          mv target/debian/*.deb dist/
+          ls -l dist/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: deb-${{ matrix.arch }}
-          path: target/debian/*.deb
+          name: dist-linux-${{ matrix.arch }}
+          path: dist/*
           if-no-files-found: error
 
-  # The GitHub release for a version tag: the packages, their checksums and
-  # build provenance. The image is on Docker Hub (job image).
-  github-release:
-    if: github.event_name == 'push'
-    needs: [image, deb]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
+  # macOS archives. aarch64 natively; x86_64 cross-compiled on the same
+  # runner: Apple's toolchain builds both architectures from one SDK, so
+  # rustup's target is the only addition. The x86_64 binary runs only where
+  # Rosetta is present; otherwise only its architecture is checked.
+  macos:
+    needs: tag
+    runs-on: macos-15
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Build the archives
+        env:
+          REF: ${{ github.ref_name }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          version="$(scripts/release/version.sh)"
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+              --target aarch64-apple-darwin --target x86_64-apple-darwin
+          for pair in aarch64-apple-darwin:arm64 x86_64-apple-darwin:x86_64; do
+              target="${pair%%:*}"
+              bin="target/$target/release/straum-server"
+              cargo "+$RUST_TOOLCHAIN" build --release --locked -p straum-broker --bin straum-server --target "$target"
+              [ "$(lipo -archs "$bin")" = "${pair#*:}" ] || { echo "release: $bin is $(lipo -archs "$bin")" >&2; exit 1; }
+              no_smoke=""
+              if [ "$target" = x86_64-apple-darwin ] && ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+                  echo "release: no Rosetta, the $target binary is not run"
+                  no_smoke=1
+              fi
+              NO_SMOKE="$no_smoke" scripts/release/archive.sh "$version" "$target" "$bin" dist
+          done
+          ls -l dist/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          pattern: deb-*
+          name: dist-macos
+          path: dist/*
+          if-no-files-found: error
+
+  # SHA256SUMS over every package and archive, on every run, so a dry run
+  # exercises it too.
+  checksums:
+    needs: [deb, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dist-*
           merge-multiple: true
           path: dist
       # GitHub renames "~" in asset names to "."; rename first so SHA256SUMS
@@ -144,24 +295,64 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
-          for f in *~*.deb; do [ -e "$f" ] && mv "$f" "$(printf %s "$f" | tr "~" .)"; done
-          sha256sum *.deb | tee SHA256SUMS
-      - uses: actions/attest-build-provenance@v2
+          set -eu
+          for f in *~*.deb; do
+              if [ -e "$f" ]; then mv -- "$f" "$(printf %s "$f" | tr "~" .)"; fi
+          done
+          n="$(ls | wc -l)"
+          [ "$n" -eq 6 ] || { echo "release: expected 6 files (2 .deb, 4 .tar.gz), got $n" >&2; ls >&2; exit 1; }
+          sha256sum -- * | tee SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          subject-path: dist/*.deb
-      - name: Create the release
+          name: release-dist
+          path: dist/*
+          if-no-files-found: error
+
+  # The draft GitHub release for a version tag. The owner checks it
+  # (docs/release.md) and publishes it.
+  github-release:
+    if: github.event_name == 'push'
+    needs: [tag, image-merge, checksums]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-dist
+          path: dist
+      - name: Checksums still match
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.tar.gz
+      - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-          IMAGE: ${{ vars.DOCKERHUB_NAMESPACE }}/straum
+          DIGEST: ${{ needs.image-merge.outputs.digest }}
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_NAMESPACE }}/straum
         run: |
           set -eu
           pre=""
           case "$TAG" in *-*) pre="--prerelease" ;; esac
-          gh release create "$TAG" dist/*.deb dist/SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" --verify-tag $pre \
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft $pre \
             --title "$TAG" --generate-notes \
-            --notes "Experimental, not production-ready. Image: \`docker pull ${IMAGE}:${TAG#v}\` (linux/amd64, linux/arm64). Packages: \`sudo apt install ./straum_<version>_<arch>.deb\`, then set cluster_id and node_id in /etc/straum/straum.conf and \`systemctl enable --now straum\`. The broker listens on loopback only until authentication exists. Verify a package: \`sha256sum -c SHA256SUMS\` or \`gh attestation verify <file> -R ${GITHUB_REPOSITORY}\`."
+            --notes "Experimental, not production-ready.
+
+          Image (linux/amd64, linux/arm64): \`docker pull ${GHCR_IMAGE}:${TAG#v}\` or \`docker pull ${DOCKERHUB_IMAGE}:${TAG#v}\`, manifest list \`${DIGEST}\`.
+          Packages: \`sudo apt install ./straum_<version>_<arch>.deb\`, then set cluster_id and node_id in /etc/straum/straum.conf and \`systemctl enable --now straum\`.
+          Archives: \`straum-server-<version>-<target>.tar.gz\` for x86_64 and aarch64 Linux (glibc 2.34 or newer) and macOS.
+          The broker listens on loopback only until authentication exists.
+
+          Verify: \`sha256sum -c SHA256SUMS\`; \`gh attestation verify <file> -R ${GITHUB_REPOSITORY}\`; \`gh attestation verify oci://${GHCR_IMAGE}@${DIGEST} -R ${GITHUB_REPOSITORY}\`. Steps: docs/release.md."
 
   # Ubuntu source packages for the Launchpad PPA, which builds them per series
   # and architecture (scripts/ppa.sh, debian/). A pull request builds the noble
@@ -174,7 +365,7 @@ jobs:
     needs: [image, deb]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Tools
         run: |
           sudo apt-get update -q
