@@ -8,10 +8,7 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::time::Instant;
 
-use compio::BufResult;
-use compio::buf::{IntoInner, IoBuf};
-use compio::fs::{File, OpenOptions};
-use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
+use crate::fs::{self, File, OpenOptions, write_all};
 
 use crate::StoreError;
 use crate::block::{self, Codecs};
@@ -718,7 +715,7 @@ impl Store {
     pub async fn open(dir: impl AsRef<Path>, mut config: Config) -> Result<Self, StoreError> {
         let dir = dir.as_ref().to_path_buf();
         let mut report = RecoveryReport::default();
-        compio::fs::create_dir_all(&dir).await?;
+        fs::create_dir_all(&dir).await?;
         let (files, tmps) = read_wal_files(&dir, &mut report, config.dict_train_bytes).await?;
         let stored = files
             .first()
@@ -958,13 +955,13 @@ impl Store {
 
         // The other changes, each reported where it was found.
         for id in &orphans {
-            compio::fs::remove_file(segment_path(&dir, *id)).await?;
+            fs::remove_file(segment_path(&dir, *id)).await?;
         }
         for tmp in &tmps {
-            compio::fs::remove_file(dir.join(tmp)).await?;
+            fs::remove_file(dir.join(tmp)).await?;
         }
         for file in &checkpoint_orphans {
-            compio::fs::remove_file(dir.join(file)).await?;
+            fs::remove_file(dir.join(file)).await?;
             report
                 .actions
                 .push(RecoveryAction::CheckpointFileRemoved { file: file.clone() });
@@ -1014,7 +1011,7 @@ impl Store {
             seg_buf: Vec::new(),
             stats: Stats::default(),
             inline_bytes: 0,
-            commit_start: Instant::now(),
+            commit_start: fs::now(),
             timing: CommitTiming::default(),
             recovery: report,
             poisoned: false,
@@ -1153,7 +1150,7 @@ impl Store {
         // any manifest lists them: a failure leaves them unlisted orphans.
         self.verify_tables(n, written).await?;
         if let Some(path) = dict_written {
-            let bytes = compio::fs::read(&path).await?;
+            let bytes = fs::read(&path).await?;
             if codec::decode_dict_file(&bytes, 1) != self.dictionary.as_deref() {
                 return Err(StoreError::CorruptCheckpoint {
                     checkpoint: n,
@@ -1164,7 +1161,7 @@ impl Store {
         let path = checkpoint_path(&self.dir, n);
         let tmp = path.with_extension("tmp");
         write_new_synced(&tmp, m.encode()).await?;
-        compio::fs::rename(&tmp, &path).await?;
+        fs::rename(&tmp, &path).await?;
         sync_dir(&self.dir).await?;
         // The previous manifest stays until the new one reads back as
         // written: open falls back to it if the new one is damaged. A
@@ -1184,7 +1181,7 @@ impl Store {
             });
         }
         if prev.n > 0 {
-            compio::fs::remove_file(checkpoint_path(&self.dir, prev.n)).await?;
+            fs::remove_file(checkpoint_path(&self.dir, prev.n)).await?;
             sync_dir(&self.dir).await?;
         }
         self.checkpoint = Some(m);
@@ -1286,7 +1283,7 @@ impl Store {
     ) -> Result<Vec<u64>, StoreError> {
         self.begin_write();
         self.rotate_wal().await?;
-        self.commit_start = Instant::now();
+        self.commit_start = fs::now();
         self.timing = CommitTiming::default();
         // Only between batches: every record in a sealed segment then
         // describes frames before the next segment's `created_at`.
@@ -1780,9 +1777,7 @@ impl Store {
         let Some(plan) = c.sweep.as_mut() else {
             unreachable!("set before the sweep")
         };
-        let file_len = compio::fs::metadata(segment_path(&self.dir, old))
-            .await?
-            .len();
+        let file_len = fs::metadata(segment_path(&self.dir, old)).await?.len();
         let mut blocks = plan.blocks.remove(&old).unwrap_or_default();
         blocks.sort_unstable();
         let raw: Vec<(u64, Vec<(u64, u64)>)> = blocks
@@ -1951,7 +1946,7 @@ impl Store {
         self.files.forget(FileKey::Data(old));
         // Not followed by a directory fsync: if the unlink is lost, the
         // WAL no longer references the file and recovery deletes it.
-        compio::fs::remove_file(segment_path(&self.dir, old)).await?;
+        fs::remove_file(segment_path(&self.dir, old)).await?;
         stats.segments_rewritten += 1;
         stats.bytes_reclaimed += file_len.saturating_sub(new_len);
         Ok(())
@@ -2101,11 +2096,9 @@ impl Store {
                 reason: "WAL file of a key or headers is missing",
             })?;
         let len = a.len as usize;
-        let BufResult(res, buf) = file
-            .read_exact_at(Vec::with_capacity(len).slice(..len), a.at.offset)
-            .await;
+        let (res, buf) = fs::read_exact_at(&file, len, a.at.offset).await;
         res?;
-        Ok(buf.into_inner())
+        Ok(buf)
     }
 
     /// Where full block `block` of `t` lies: from the spine, through the
@@ -2479,15 +2472,12 @@ impl Store {
             block: number,
             reason: "block too large for this platform",
         })?;
-        // `slice` caps the read at `len` even if the allocation is larger.
-        let BufResult(res, buf) = file
-            .read_exact_at(Vec::with_capacity(len).slice(..len), offset)
-            .await;
+        let (res, buf) = fs::read_exact_at(&file, len, offset).await;
         match res {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Err(missing),
             res => {
                 res?;
-                Ok(buf.into_inner())
+                Ok(buf)
             }
         }
     }
@@ -2557,13 +2547,13 @@ impl Store {
         buf.clear();
         self.seg_buf = buf;
         res?;
-        let t = Instant::now();
+        let t = fs::now();
         active.file.sync_data().await?;
         widen(
             &mut self.timing.segment_sync,
             self.commit_start,
             t,
-            Instant::now(),
+            fs::now(),
         );
         active.written += n;
         self.stats.fsyncs += 1;
@@ -2589,14 +2579,9 @@ impl Store {
         let (res, buf) = write_all(&self.wal, buf, self.wal_len).await;
         self.wal_buf = buf;
         res?;
-        let t = Instant::now();
+        let t = fs::now();
         self.wal.sync_data().await?;
-        widen(
-            &mut self.timing.wal_sync,
-            self.commit_start,
-            t,
-            Instant::now(),
-        );
+        widen(&mut self.timing.wal_sync, self.commit_start, t, fs::now());
         self.wal_len += n;
         self.next_frame += 1;
         self.stats.fsyncs += 1;
@@ -2631,9 +2616,9 @@ impl Store {
         let wal_side = async {
             let (res, buf) = write_all(&wal, buf, wal_at).await;
             res?;
-            let t = Instant::now();
+            let t = fs::now();
             wal.sync_data().await?;
-            io::Result::Ok((buf, (t, Instant::now())))
+            io::Result::Ok((buf, (t, fs::now())))
         };
         let seg_side = async {
             let Some((file, at)) = &seg else {
@@ -2641,9 +2626,9 @@ impl Store {
             };
             let (res, buf) = write_all(file, seg_buf, *at).await;
             res?;
-            let t = Instant::now();
+            let t = fs::now();
             file.sync_data().await?;
-            Ok((buf, Some((t, Instant::now()))))
+            Ok((buf, Some((t, fs::now()))))
         };
         let (wal_res, seg_res) = join2(wal_side, seg_side).await;
         let (wal_buf, (w0, w1)) = wal_res?;
@@ -3006,14 +2991,11 @@ impl IndexSegments {
             return Ok(None);
         };
         let len = loc.len as usize;
-        let BufResult(res, buf) = file
-            .read_exact_at(Vec::with_capacity(len).slice(..len), loc.offset)
-            .await;
+        let (res, buf) = fs::read_exact_at(&file, len, loc.offset).await;
         match res {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             res => res?,
         }
-        let buf = buf.into_inner();
         Ok(codec::decode_index_record(&buf)
             .filter(|r| {
                 r.kind == kind && r.topic == topic && r.number == number && r.size == buf.len()
@@ -3367,11 +3349,8 @@ async fn open_segments(
     replay: &mut Replay<'_>,
     report: &mut RecoveryReport,
 ) -> Result<(HashSet<u64>, Vec<u64>), StoreError> {
-    // Blocking directory listing: only at open, and compio 0.19 has no
-    // async read_dir without the extra fs-dir feature.
     let mut on_disk = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let name = entry?.file_name();
+    for name in fs::list(dir)? {
         if let Some(id) = name.to_str().and_then(parse_segment_name) {
             on_disk.push(id);
         }
@@ -3394,8 +3373,12 @@ async fn open_segments(
     // Lengths only: segments are opened for reads on demand (D-227 A).
     let mut segments = HashSet::new();
     let mut lens = HashMap::new();
-    for &id in &replay.segments {
-        match compio::fs::metadata(segment_path(dir, id)).await {
+    // In id order: a HashSet's order differs between runs, and the order of
+    // calls must not (deterministic simulation).
+    let mut ids: Vec<u64> = replay.segments.iter().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        match fs::metadata(segment_path(dir, id)).await {
             Ok(meta) => {
                 lens.insert(id, meta.len());
                 segments.insert(id);
@@ -3468,8 +3451,8 @@ async fn open_index(
 ) -> Result<(IndexSegments, HashMap<Vec<u8>, Topic>), StoreError> {
     let mut index = IndexSegments::new(dir, config);
     let mut ids = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        if let Some(id) = entry?.file_name().to_str().and_then(parse_index_name) {
+    for name in fs::list(dir)? {
+        if let Some(id) = name.to_str().and_then(parse_index_name) {
             ids.push(id);
         }
     }
@@ -3480,8 +3463,8 @@ async fn open_index(
         // again in full below. Ids are not reused.
         for &id in &ids {
             let path = index_path(dir, id);
-            let bytes = compio::fs::metadata(&path).await?.len();
-            compio::fs::remove_file(&path).await?;
+            let bytes = fs::metadata(&path).await?.len();
+            fs::remove_file(&path).await?;
             report
                 .actions
                 .push(RecoveryAction::IndexSegmentDropped { segment: id, bytes });
@@ -3495,7 +3478,7 @@ async fn open_index(
     let mut segs = Vec::new();
     let mut orphans = Vec::new();
     for id in ids {
-        let bytes = compio::fs::read(index_path(dir, id)).await?;
+        let bytes = fs::read(index_path(dir, id)).await?;
         match codec::decode_index_header(&bytes) {
             Some(created_at) => segs.push((id, created_at, bytes)),
             None => orphans.push((id, bytes.len() as u64)),
@@ -3649,7 +3632,7 @@ async fn open_index(
 
     // Changes start here, after every check passed.
     for &(id, bytes) in &orphans {
-        compio::fs::remove_file(index_path(dir, id)).await?;
+        fs::remove_file(index_path(dir, id)).await?;
         report
             .actions
             .push(RecoveryAction::IndexSegmentRemoved { segment: id, bytes });
@@ -3820,13 +3803,12 @@ async fn read_wal_files(
     report: &mut RecoveryReport,
     dict_train_bytes: u64,
 ) -> Result<(Vec<(u64, Vec<u8>)>, Vec<String>), StoreError> {
-    if dir.join(LEGACY_WAL_FILE).exists() {
+    if fs::exists(&dir.join(LEGACY_WAL_FILE)) {
         return Err(StoreError::UnsupportedFormat);
     }
     let (mut ids, mut tmps) = (Vec::new(), Vec::new());
     let mut segments = false;
-    for entry in std::fs::read_dir(dir)? {
-        let name = entry?.file_name();
+    for name in fs::list(dir)? {
         let Some(name) = name.to_str() else { continue };
         if let Some(id) = parse_wal_name(name) {
             ids.push(id);
@@ -3856,14 +3838,14 @@ async fn read_wal_files(
         // A new store: nothing to check, and the first file's creation may
         // have left its tmp file.
         for tmp in tmps.drain(..) {
-            compio::fs::remove_file(dir.join(tmp)).await?;
+            fs::remove_file(dir.join(tmp)).await?;
         }
         create_wal_file(dir, 0, dict_train_bytes).await?;
         ids.push(0);
     }
     let mut files = Vec::with_capacity(ids.len());
     for id in ids {
-        files.push((id, compio::fs::read(wal_path(dir, id)).await?));
+        files.push((id, fs::read(wal_path(dir, id)).await?));
     }
     Ok((files, tmps))
 }
@@ -3884,7 +3866,7 @@ async fn create_wal_file(dir: &Path, first: u64, dict_train_bytes: u64) -> io::R
         .await
         .0?;
     file.sync_all().await?;
-    compio::fs::rename(&tmp, &path).await?;
+    fs::rename(&tmp, &path).await?;
     sync_dir(dir).await?;
     OpenOptions::new().read(true).write(true).open(&path).await
 }
@@ -4029,16 +4011,14 @@ async fn first_bad_object(
                 let Ok(len) = usize::try_from(len) else {
                     return bad(first, DropReason::ObjectMissing, "");
                 };
-                let BufResult(res, buf) = file
-                    .read_exact_at(Vec::with_capacity(len).slice(..len), offset)
-                    .await;
+                let (res, buf) = fs::read_exact_at(&file, len, offset).await;
                 match res {
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                         return bad(first, DropReason::ObjectMissing, "");
                     }
                     res => res?,
                 }
-                buf.into_inner()
+                buf
             }
             (None, None) => continue,
         };
@@ -4061,12 +4041,6 @@ async fn first_bad_object(
         }
     }
     Ok(None)
-}
-
-async fn write_all(file: &File, buf: Vec<u8>, pos: u64) -> (io::Result<()>, Vec<u8>) {
-    let mut file = file;
-    let BufResult(res, buf) = file.write_all_at(buf, pos).await;
-    (res, buf)
 }
 
 async fn create_segment(dir: &Path, id: u64) -> io::Result<File> {
@@ -4175,7 +4149,7 @@ fn free_quarantine_name(dir: &Path, n: u64) -> io::Result<String> {
     let base = format!("quarantine-{n:016x}");
     let mut name = base.clone();
     let mut k = 0u64;
-    while std::fs::symlink_metadata(dir.join(&name)).is_ok() {
+    while fs::name_taken(&dir.join(&name)) {
         k += 1;
         name = format!("{base}.{k}");
     }
@@ -4197,7 +4171,7 @@ async fn move_to_quarantine(
 ) -> io::Result<()> {
     let q = dir.join(quarantine);
     if create {
-        std::fs::create_dir(&q)?;
+        fs::create_dir(&q)?;
     }
     // Also when completing: the directory entry an interrupted open made
     // may not be durable yet.
@@ -4206,7 +4180,7 @@ async fn move_to_quarantine(
         files.iter().partition(|f| f.starts_with("checkpoint-"));
     for group in [others, manifests] {
         for f in &group {
-            compio::fs::rename(dir.join(f), q.join(f)).await?;
+            fs::rename(dir.join(f), q.join(f)).await?;
         }
         sync_dir(&q).await?;
         sync_dir(dir).await?;
@@ -4217,16 +4191,9 @@ async fn move_to_quarantine(
 /// Files inside the store's quarantine directories.
 fn count_quarantined(dir: &Path) -> io::Result<u64> {
     let mut n = 0;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_str()
-            .and_then(parse_quarantine_name)
-            .is_some()
-            && entry.file_type()?.is_dir()
-        {
-            n += std::fs::read_dir(entry.path())?.count() as u64;
+    for name in fs::list(dir)? {
+        if name.to_str().and_then(parse_quarantine_name).is_some() && fs::is_dir(&dir.join(&name)) {
+            n += fs::list(&dir.join(&name))?.len() as u64;
         }
     }
     Ok(n)
@@ -4482,7 +4449,7 @@ async fn read_table(
     count: u64,
     width: usize,
 ) -> Result<Option<Vec<u8>>, StoreError> {
-    let bytes = match compio::fs::read(path).await {
+    let bytes = match fs::read(path).await {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         res => res?,
     };
@@ -4497,7 +4464,7 @@ async fn read_table(
 /// Manifest `checkpoint-<n>` if it is intact (CRC, version) and names
 /// itself `n`.
 async fn read_manifest(dir: &Path, n: u64) -> Result<Option<Manifest>, StoreError> {
-    let bytes = compio::fs::read(checkpoint_path(dir, n)).await?;
+    let bytes = fs::read(checkpoint_path(dir, n)).await?;
     Ok(Manifest::decode(&bytes).filter(|m| m.n == n))
 }
 
@@ -4614,7 +4581,7 @@ async fn load_checkpoint(dir: &Path, manifest: Manifest) -> Result<LoadedCheckpo
     let dict = match manifest.dict {
         0 => None,
         d => {
-            let bytes = match compio::fs::read(dict_path(dir, d)).await {
+            let bytes = match fs::read(dict_path(dir, d)).await {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => None,
                 res => Some(res?),
             };
@@ -4685,8 +4652,7 @@ async fn open_checkpoint(
     report: &mut RecoveryReport,
 ) -> Result<OpenedCheckpoint, StoreError> {
     let mut found = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let name = entry?.file_name();
+    for name in fs::list(dir)? {
         if let Some(f) = name.to_str().and_then(parse_checkpoint_file) {
             found.push((f, name.to_string_lossy().into_owned()));
         }
@@ -4706,15 +4672,15 @@ async fn open_checkpoint(
     for (f, name) in &found {
         if let CheckpointFile::Quarantined(n) = *f {
             let path = dir.join(name);
-            if !path.is_dir() {
+            if !fs::is_dir(&path) {
                 return Err(StoreError::CorruptCheckpoint {
                     checkpoint: n,
                     reason: "a quarantine name that is not a directory",
                 });
             }
             let mut files = Vec::new();
-            for e in std::fs::read_dir(&path)? {
-                files.push(e?.file_name().to_string_lossy().into_owned());
+            for e in fs::list(&path)? {
+                files.push(e.to_string_lossy().into_owned());
             }
             files.sort();
             dirs.push((n, name.clone(), files));

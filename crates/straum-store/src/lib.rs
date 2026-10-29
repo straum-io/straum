@@ -6,6 +6,9 @@
 
 mod block;
 mod codec;
+mod fs;
+#[cfg(feature = "sim")]
+pub mod sim;
 mod store;
 
 pub use codec::{FrameMode, MAX_TOPIC, ObjectId};

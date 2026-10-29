@@ -15,6 +15,11 @@ thiserror.workspace = true
 # bytes, and so on-disk sizes, depend on it.
 zstd = { version = "=0.14.3", default-features = false, features = ["zdict_builder"] }
 
+[features]
+# Deterministic simulation (spike): every file system call and clock read
+# goes to the in-memory disk of `straum_store::sim` instead of compio.
+sim = []
+
 [dev-dependencies]
 proptest.workspace = true
 crc32c.workspace = true
