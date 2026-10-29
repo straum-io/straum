@@ -135,12 +135,13 @@ const CRASH_POINTS: [(&str, &str); 8] = [
 ];
 
 /// Files a checkpoint writes, by name prefix (docs/format.md "Files").
-const CHECKPOINT_FILES: [&str; 6] = [
+const CHECKPOINT_FILES: [&str; 7] = [
     "checkpoint-",
     "objtab-",
     "blktab-",
     "blkrel-",
     "dict-",
+    "idrun-",
     "reloc-",
 ];
 
@@ -148,8 +149,9 @@ const CHECKPOINT_FILES: [&str; 6] = [
 const CKPT_TMP: &str = r"checkpoint-[0-9a-f]{16}\.tmp$";
 
 /// Crash points of a checkpoint: its object and block tables, relocation
-/// runs and manifest, and the deletion of the previous manifest.
-const CHECKPOINT_POINTS: [(&str, &str); 16] = [
+/// and id runs and manifest, the deletion of the previous manifest and of
+/// the id runs a merge replaced.
+const CHECKPOINT_POINTS: [(&str, &str); 20] = [
     ("create", "objtab-"),
     ("write", "objtab-"),
     ("fsync", "objtab-"),
@@ -158,6 +160,10 @@ const CHECKPOINT_POINTS: [(&str, &str); 16] = [
     ("fsync", "blktab-"),
     ("write", "blkrel-"),
     ("fsync", "blkrel-"),
+    ("create", "idrun-"),
+    ("write", "idrun-"),
+    ("fsync", "idrun-"),
+    ("unlink", "idrun-"),
     ("create", "reloc-"),
     ("write", "reloc-"),
     ("fsync", "reloc-"),
@@ -456,9 +462,9 @@ fn next_checkpoint(dir: &Path) -> u64 {
             manifest_number(n.strip_suffix(".tmp").unwrap_or(&n))
                 .or_else(|| quarantine_number(&n))
                 .or_else(|| {
-                    let run = n
-                        .strip_prefix("reloc-")
-                        .or_else(|| n.strip_prefix("blkrel-"))?;
+                    let run = ["reloc-", "blkrel-", "idrun-"]
+                        .iter()
+                        .find_map(|p| n.strip_prefix(p))?;
                     u64::from_str_radix(run.strip_suffix(".run")?, 16).ok()
                 })
         })
