@@ -1584,8 +1584,13 @@ impl Store {
             return Ok(());
         };
         for seq in t.first_live..t.index.seq() {
+            // A live entry the index cannot return would go unmarked and
+            // its object be swept: an error, not the end of the topic.
             let Some((number, _)) = self.topic_entry(name, t, seq).await? else {
-                break;
+                return Err(StoreError::TopicIndexCorrupt {
+                    topic: name.to_vec(),
+                    block: seq / INDEX_BLOCK,
+                });
             };
             if !self.objects.contains_key(&number) {
                 return Err(StoreError::UnknownObjectNumber(number));

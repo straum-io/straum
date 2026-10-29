@@ -327,6 +327,9 @@ old object gives a negative number delta.
 | `topic_number` varint | 1–10 |
 | `topic_seq` varint: always the topic's first live entry | 1–10 |
 
+On replay the released entry's object must still be in the object index (a
+live entry's object is never reclaimed); otherwise `CorruptWal`.
+
 ### 11 — Compact (payload 4–31, + 2–20 per kept block, + per rewritten block)
 
 | Field | Size |

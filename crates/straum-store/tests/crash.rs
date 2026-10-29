@@ -160,10 +160,10 @@ fn crash_child() {
             if round % 5 == 4 {
                 store.checkpoint().await.unwrap();
             }
-            // A whole compaction every third round; otherwise one step, so
-            // batches, releases and checkpoints run between its mark phase
-            // and its sweep.
-            let done = if round % 3 == 2 {
+            // A whole compaction every seventh round; otherwise one step,
+            // so batches, releases, checkpoints and kills land between the
+            // steps of the mark phase (three topics) and of the sweep.
+            let done = if round % 7 == 6 {
                 Some(store.compact().await.unwrap())
             } else {
                 match store.compact_step().await.unwrap() {
