@@ -86,6 +86,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev g++ cmake git pkg-config
       - id: pin
         run: echo "lazyfs=$(sed -n 's/^LAZYFS_PIN=\([0-9a-f]*\).*/\1/p' scripts/power-loss/run.sh)" >> "$GITHUB_OUTPUT"
+      - name: Containerfile pins the same LazyFS commit
+        run: grep -qx "ARG LAZYFS_PIN=${{ steps.pin.outputs.lazyfs }}" scripts/power-loss/Containerfile
       - uses: actions/cache@v4
         id: lazyfs
         with:

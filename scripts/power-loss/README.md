@@ -68,6 +68,37 @@ summary.txt        the table of all scenarios and the overall result
                    recovery (both removed after a passing run)
 ```
 
+## In a container (macOS development)
+
+On the Mac the harness runs on the `straum-test` Podman machine, in an
+image built from `Containerfile` next to this file: the base image of
+`scripts/container/linux.sh` plus FUSE 3 and LazyFS at the pinned commit.
+The image is built without privileges; only the run gets `--device
+/dev/fuse --cap-add SYS_ADMIN`, and it runs nothing but this script
+(Straum `rules.md` §13). Source changes, a planted bug included, are made
+on the host before the run.
+
+```bash
+scripts/container/linux.sh --session -- true    # starts straum-test (unprivileged)
+podman --connection straum-test build -t localhost/straum-power-loss:0.3.1 \
+    -f scripts/power-loss/Containerfile scripts/power-loss
+podman --connection straum-test run --rm \
+    --device /dev/fuse --cap-add SYS_ADMIN \
+    -v "$PWD":/src -w /src \
+    -v straum-container-registry:/usr/local/cargo/registry \
+    -v "straum-container-target-$(printf '%s' "$PWD" | cksum | cut -d ' ' -f 1)":/src/target \
+    localhost/straum-power-loss:0.3.1 \
+    scripts/power-loss/run.sh --quick --out /src/target/power-loss
+scripts/container/linux.sh --end-session         # back to the default machine
+```
+
+The privileged container's command is `run.sh` itself, not
+`scripts/container/linux.sh`, whose wrapper first runs `rustup component
+add`. The volumes are those of `linux.sh` (the registry, and this tree's
+target volume), so the output lands in the tree's target volume; copy it
+out with `podman --connection straum-test cp`. Container runs show whether
+the harness works; they are not the owner's hardware.
+
 ## An iteration
 
 1. LazyFS is mounted over `<scenario>-<mode>/root`.

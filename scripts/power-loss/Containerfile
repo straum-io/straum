@@ -1,0 +1,15 @@
+# The image for running scripts/power-loss/run.sh in a container: the base
+# image of scripts/container/linux.sh plus FUSE 3 and LazyFS built at the
+# commit run.sh pins. Built without privileges; only the run that uses it
+# gets --device /dev/fuse --cap-add SYS_ADMIN (README.md "In a container").
+FROM docker.io/library/rust@sha256:8a2a102d089fbd151137b9473c01b1ed4519a64fb9c032a03609b815701615c8
+# Keep equal to LAZYFS_PIN in run.sh (LazyFS 0.3.1).
+ARG LAZYFS_PIN=045a0b3a1126725e693934e29d3ba15e08cc39ec
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        fuse3 libfuse3-dev g++ cmake git pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone https://github.com/dsrhaslab/lazyfs.git /root/lazyfs \
+    && git -C /root/lazyfs checkout "$LAZYFS_PIN" \
+    && (cd /root/lazyfs/libs/libpcache && ./build.sh) \
+    && (cd /root/lazyfs/lazyfs && ./build.sh)
