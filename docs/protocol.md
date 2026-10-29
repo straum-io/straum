@@ -474,8 +474,10 @@ Test vectors: `conformance/partitioner/vectors.json`.
 Version 1 is version 0 plus TLS, SCRAM-SHA-256 authentication, ACLs and
 their admin requests, idempotent produce, Fetch by timestamp range, and
 responses that can gain fields without a new version. Decisions: ADR-0015
-(D-244 A to D-249 A, D-258 C, D-259 A). Everything sections 1–9 say holds
-in version 1 unless this section says otherwise.
+(D-244 A to D-249 A, D-258 C, D-259 A) for everything but 10.14 and 10.15
+and their error codes 18–21, which wait for the owner's decision, as do
+the points where this section fills a gap of ADR-0015. Everything
+sections 1–9 say holds in version 1 unless this section says otherwise.
 
 ### 10.1 Negotiation
 
@@ -485,15 +487,18 @@ in version 1 unless this section says otherwise.
 - `Hello` has the same layout in every version, since the broker decodes
   it before a version exists (section 4.1; its fields' v1 meaning: 10.5).
 - A connection that negotiates version 0 behaves as sections 1–9 say,
-  with two exceptions that come from the broker's settings, not from the
-  version: the frame bound before authentication (10.4), and a broker
-  with `auth = scram` refuses every version 0 Hello, since version 0 has
-  only `none` (10.5).
+  with exceptions that come from the broker's settings, not from the
+  version: the bounds before authentication of 10.4 (frame size,
+  `auth_timeout_ms`, the unauthenticated-connection caps), which on a
+  version 0 connection end when its `HelloOk` is sent; and a broker with
+  `auth = scram` refuses every version 0 Hello, since version 0 has only
+  `none` (10.5). These bounds apply with `auth = none` too.
 - A client that sends credentials offers `min_version` 1, so a version 0
   broker answers `UnsupportedVersion` instead of accepting `none`.
-- Every error that answers a `Hello` has exactly the seven fields of
-  section 5, with nothing appended, whatever versions the Hello offered:
-  the client decodes it before a version is fixed.
+- Every error sent before `HelloOk` (an answer to `Hello`, to a request
+  before `Hello`, `FrameTooLarge`, `MalformedRequest` for a short frame)
+  has exactly the seven fields of section 5, with nothing appended: the
+  client decodes it before a version is fixed.
 
 ### 10.2 Encoding
 
@@ -763,7 +768,9 @@ ServerSignature = HMAC(ServerKey, AuthMessage)
   once the broker offers it, `y,,` becomes a failure.
 - **Client checks.** The client aborts and closes the connection unless
   the server nonce starts with its `c-nonce` and is longer, `iterations`
-  is at least 4 096, and `ServerSignature` equals the one it computes.
+  is from 4 096 to 1 000 000 (the range of `auth_scram_iterations`, so a
+  broker cannot make the client run an unbounded PBKDF2), and
+  `ServerSignature` equals the one it computes.
 
 ### 10.8 AuthContinue
 
@@ -832,8 +839,9 @@ credential.
   replaces its own credential.
 
 **DeletePrincipal**: `name string` → `DeletePrincipalOk`, empty. The
-principal's ACL entries go with it, and its open connections are closed
-as above. An unknown name gets `UnknownPrincipal`.
+principal's ACL entries and producer ids (10.14) go with it, so a later
+principal of the same name inherits neither, and its open connections
+are closed as above. An unknown name gets `UnknownPrincipal`.
 
 **ListPrincipals**: principals by name, bytewise order, one page per
 request, paged as `ListTopics` (section 4.9).
@@ -985,8 +993,9 @@ holder of an id.
 
 | Field | Type | |
 |---|---|---|
-| `producer_id` | `u64` | never 0, never issued twice |
+| `producer_id` | `u64` | never 0, never issued twice (the highest id issued is in the WAL) |
 | `producer_epoch` | `u32` | |
+| `producer_window` | `u32` | the broker's `producer_window`: the most requests a client may keep in flight per partition and still get each original `ProduceOk` back |
 
 - `producer_id` 0: a new id with epoch 0, bound to the requesting
   principal (with `auth = none`, to no principal).
@@ -1017,7 +1026,7 @@ checks of section 4.7 and before the write:
 |---|---|
 | id not held by the broker, or of another principal; epoch above the current | `UnknownProducer` |
 | epoch below the current | `ProducerFenced` |
-| no request accepted on this partition in this epoch, and `producer_seq` ≠ 0 | `UnknownProducer` |
+| no request accepted on this partition in this epoch, and `producer_seq` ≠ 0 | `OutOfOrderSequence`; not written (state is dropped only per whole id, so the earlier numbers were never used) |
 | `producer_seq` = last accepted + 1 (or 0 for the first) | written; `ProduceOk` |
 | `producer_seq` among the last `producer_window` accepted | not written; the `ProduceOk` the original got (same `base_seq`, `count`, `leader_epoch`, `timestamp_ms`) |
 | `producer_seq` accepted earlier, but older than the window | `DuplicateSequence`: committed, its `ProduceOk` no longer held |
@@ -1038,20 +1047,26 @@ principal, its epoch, and per partition written to in this epoch the last
 `producer_window` accepted `producer_seq` values with their `ProduceOk`.
 The state is recorded in the WAL with the messages it describes, in the
 same commit, so it survives a restart and replay rebuilds it. Broker
-settings, each with a hard range in code (`broker-rules.md` §3):
+settings, each with a hard range in code (`broker-rules.md` §3), checked
+when state is written, never when it is replayed:
 
 | Setting | Default | Range | Bounds |
 |---|---|---|---|
 | `producer_window` | 5 | 1–16 | accepted requests remembered per producer and partition |
 | `max_producers` | 10 000 | 100–1 000 000 | producer ids held |
+| `max_producers_per_principal` | 1 000 | 1 – `max_producers` | producer ids held for one principal |
 | `max_producer_states` | 100 000 | 1 000–1 000 000 | (producer, partition) states held, all producers together |
 
 When an `InitProducer` or an accepted Produce would exceed a bound, the
-broker drops the whole state of the producer id used least recently (by
-WAL order, so replay drops the same ones); that id then gets
-`UnknownProducer`. Memory, estimated from the layouts: about 64 bytes per
-id and 60 + 28 × `producer_window` bytes per state, about 20 MB at the
-defaults and about 0.6 GB at the upper ends.
+broker drops the whole state of the producer id used least recently (of
+the same principal, for `max_producers_per_principal`); that id then gets
+`UnknownProducer`. Each drop is a record in the WAL, written in the same
+commit as the request that caused it, and replay applies these records
+without reading the bounds, so every node and every restart rebuilds the
+same state whatever its configuration. Memory, estimated from the
+layouts: about 64 bytes per id and 60 + 32 × `producer_window` bytes per
+state (`producer_seq` and the `ProduceOk`), about 23 MB at the defaults
+and about 0.64 GB at the upper ends.
 
 Overhead: 4 bytes per Produce request; nothing per message.
 
@@ -1064,15 +1079,16 @@ Overhead: 4 bytes per Produce request; nothing per message.
 | `from_timestamp_ms` | `u64` | 0: no lower bound |
 | `to_timestamp_ms` | `u64` | exclusive; 0: no upper bound. Non-zero and ≤ `from_timestamp_ms` is `MalformedRequest` |
 
-The response holds the messages that version 0 would return (section
-4.8) whose `timestamp_ms` is ≥ `from_timestamp_ms` and <
-`to_timestamp_ms`. Timestamps never decrease within a partition (section
-4.7), so the messages of a range have consecutive seqs: the broker starts
-at the first seq ≥ max(`from_seq`, `start_seq`) whose timestamp is ≥
-`from_timestamp_ms`, found by a binary search over the partition's
-index, and stops before the first message at or after `to_timestamp_ms`.
-To read a range, a client sends `from_seq` 0 with both timestamps, then
-continues from the last seq + 1 with the same timestamps.
+Timestamps never decrease within a partition (section 4.7), so the
+messages of a range have consecutive seqs. The broker seeks to the first
+seq ≥ max(`from_seq`, `start_seq`) whose timestamp is ≥
+`from_timestamp_ms` (the **seek point**), found by a binary search over
+the partition's index, and returns messages from there, in seq order,
+under the limits of section 4.8 (`max_bytes`, `max_fetch_messages`), up
+to the first message with a timestamp ≥ `to_timestamp_ms`, which it does
+not return. To read a range, a client sends `from_seq` 0 with both
+timestamps, then continues from the last seq + 1 with the same
+timestamps until `range_complete` is 1.
 
 `FetchOk`, version 1:
 
@@ -1082,7 +1098,7 @@ continues from the last seq + 1 with the same timestamps.
 | `start_seq` | `u64` | |
 | `next_seq` | `u64` | |
 | `messages` | `array<FetchedMessage>` | `FetchedMessage` is an item |
-| `range_complete` | `u8` | 1: a message with a timestamp ≥ `to_timestamp_ms` exists at or after the position, so no later message is in the range; 0 otherwise, and always with `to_timestamp_ms` = 0 |
+| `range_complete` | `u8` | 1: the message after the last one returned (after the seek point, if none is returned) exists and has a timestamp ≥ `to_timestamp_ms`, so no later message is in the range. 0 otherwise, and always with `to_timestamp_ms` = 0 |
 
 - The broker waits up to `max_wait_ms` as in version 0 when the response
   would hold no message and `range_complete` would be 0; with
@@ -1104,7 +1120,7 @@ become 22. A 100-byte body: 121 → 122 bytes (+0.8 %); 1 KiB: 1 045 →
 
 `Error` has the layout of section 5, follows the rules of 10.2 and may
 gain fields; version 1 appends none, so its bytes equal version 0's. An
-error answering `Hello` never carries appended fields (10.1).
+error sent before `HelloOk` never carries appended fields (10.1).
 
 Codes added in version 1, none retryable:
 
@@ -1112,10 +1128,10 @@ Codes added in version 1, none retryable:
 |---|---|---|
 | 16 | `UnknownPrincipal` | `DeletePrincipal` or `AddAcl` names a principal that does not exist |
 | 17 | `LimitExceeded` | a write of 10.10 or 10.11 would exceed `max_principals`, `max_acl_entries` or `max_acl_prefixes_per_principal` |
-| 18 | `OutOfOrderSequence` | a `producer_seq` above the last accepted + 1 (10.14) |
+| 18 | `OutOfOrderSequence` | a `producer_seq` above the last accepted + 1, or ≠ 0 on a partition with no accepted request (10.14) |
 | 19 | `DuplicateSequence` | a `producer_seq` accepted earlier and older than the window |
 | 20 | `ProducerFenced` | an epoch below the producer id's current epoch |
-| 21 | `UnknownProducer` | an id the broker does not hold for this principal, an epoch it never issued, or a partition state it does not hold |
+| 21 | `UnknownProducer` | an id the broker does not hold for this principal, or an epoch it never issued |
 
 Codes with more uses in version 1:
 
@@ -1143,12 +1159,14 @@ Section 6 applies, with:
    producer and keeps one `producer_seq` per partition, from 0. A retry
    (section 6, rules 1–3) resends the same messages with the same
    `producer_id`, `producer_epoch` and `producer_seq`. It keeps at most
-   `producer_window` requests in flight per partition; the default 5 is
-   the most it can assume. On errors:
+   the `producer_window` of `InitProducerOk` requests in flight per
+   partition. If an `InitProducer` response is lost, the client calls
+   `InitProducer` with id 0 rather than repeating the request: a repeat
+   with the old epoch would get `ProducerFenced`. On errors:
    - `DuplicateSequence`: the request was stored; its seqs are unknown.
-   - `OutOfOrderSequence`: not stored. It follows a request that failed;
-     the client resends it with the next number not used, after that
-     failure is handled.
+   - `OutOfOrderSequence`: not stored. It follows a request that failed
+     (on a new partition, the first one); the client resends it with the
+     next number not used, after that failure is handled.
    - `ProducerFenced`: another holder of the id took over; the producer
      stops and returns the error.
    - `UnknownProducer`: the client calls `InitProducer` with id 0 and
@@ -1162,3 +1180,10 @@ was lost is stored once when it is retried with the same `producer_id`,
 `producer_epoch` and `producer_seq`, across broker restarts, while the
 broker holds the producer's state (10.14). Without `producer_id`, or
 after `UnknownProducer`, a retry may store its messages twice.
+
+### 10.19 Consumer groups (not yet specified)
+
+Placeholder. Committed offsets (`OffsetCommit`, `OffsetFetch`) and the
+listing and description of groups are to be specified here, with their
+message types, before version 1 is frozen; the decision is pending.
+Until then version 1 defines no consumer-group request.
