@@ -47,8 +47,9 @@ checks every seed, that the base store is deterministic and that the CRC
 recompute matches every checksum the store writes; `-- --include-ignored`
 also replays the open ones and runs `tests/findings.rs`, the open store
 findings built through the API. A saved store input names its format
-version and goes stale (`UnsupportedFormat`) when it changes; the API-built
-form does not.
+version and would only give `UnsupportedFormat` after a format change, so
+the replay fails on one from another version; the API-built form does not
+go stale.
 Protocol findings are regression tests in `crates/straum-proto/tests`.
 
 To save a crash: `xxd -p -c 64 artifacts/<target>/crash-<hash> >

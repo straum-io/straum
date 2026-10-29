@@ -42,6 +42,27 @@ fn base_store_is_deterministic() {
     assert_eq!(again.files, base_store().files);
 }
 
+/// A saved store input in another format version would only give
+/// `UnsupportedFormat` and pass without testing anything.
+fn assert_current_format(path: &Path, data: &[u8]) {
+    let version = |b: &[u8]| b.get(8..12).map(<[u8]>::to_vec);
+    let (_, wal) = base_store()
+        .files
+        .iter()
+        .find(|(n, _)| n.starts_with("wal-"))
+        .unwrap();
+    for (name, bytes) in straum_fuzz::Archive::parse(data).files {
+        if name.starts_with("wal-") {
+            assert_eq!(
+                version(&bytes),
+                version(wal),
+                "{}: {name} is stale; rebuild the finding",
+                path.display()
+            );
+        }
+    }
+}
+
 fn replay_dir(root: &Path) {
     for target in ["proto_frame", "proto_json", "store_wal", "store_checkpoint"] {
         let Ok(dir) = std::fs::read_dir(root.join(target)) else {
@@ -50,7 +71,11 @@ fn replay_dir(root: &Path) {
         for entry in dir {
             let path = entry.unwrap().path();
             eprintln!("{}", path.display());
-            run(target, &unhex(&std::fs::read_to_string(&path).unwrap()));
+            let data = unhex(&std::fs::read_to_string(&path).unwrap());
+            if target.starts_with("store_") {
+                assert_current_format(&path, &data);
+            }
+            run(target, &data);
         }
     }
 }
