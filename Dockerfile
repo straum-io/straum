@@ -17,8 +17,8 @@
 # setting of crates/straum-broker/README.md can follow as a flag, or come
 # from a file mounted into the container and passed with --config.
 
-# Rust 1.95 or later: compio-executor 0.1.4 uses cfg_select! (stable in 1.95),
-# above the workspace's rust-version.
+# Rust 1.95, the workspace's rust-version: compio-executor 0.1.4 uses
+# cfg_select! (stable in 1.95).
 FROM rust:1.95-bookworm AS build
 WORKDIR /src
 COPY . .

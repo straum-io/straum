@@ -2,7 +2,8 @@
 # The Launchpad source package, assembled by scripts/ppa.sh. Launchpad
 # builders have no network, so cargo builds from the crates vendored in
 # vendor/, with Ubuntu's versioned Rust toolchain (the default rustc is
-# older than the 1.85 the workspace needs).
+# older than the workspace's rust-version). The workspace needs 1.95 and no
+# Ubuntu series ships it yet, so the PPA is paused (D-253 A).
 export PATH := /usr/lib/rust-1.91/bin:$(PATH)
 export CARGO_HOME := $(CURDIR)/debian/cargo-home
 
