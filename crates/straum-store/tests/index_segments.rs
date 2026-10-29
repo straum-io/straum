@@ -10,36 +10,64 @@ mod common;
 use std::path::Path;
 
 use common::{
-    INDEX_BLOCK_RECORD, TempDir, edit, find_index_record, index_segments, snapshot,
-    wal_frame_starts,
+    INDEX_ATTRS_RECORD, INDEX_BLOCK_RECORD, TempDir, edit, find_index_record, index_segments,
+    reseal_index_record, snapshot, wal_frame_starts,
 };
-use straum_store::{Config, Message, RecoveryAction, Store, WriteMode};
+use straum_store::{Config, Message, RecoveryAction, Store, StoreError, WriteMode};
 
 fn payload(tag: u8, i: u64) -> Vec<u8> {
     format!("{tag}-{i}").into_bytes()
 }
 
+/// Every third message has a key and a header (in the index's attribute
+/// records once its block is full).
+fn key(tag: u8, i: u64) -> Option<Vec<u8>> {
+    i.is_multiple_of(3)
+        .then(|| format!("k{tag}-{i}").into_bytes())
+}
+
+const HEADERS: [(&[u8], &[u8]); 1] = [(b"h", b"v")];
+
 /// Writes messages `from..to` of `tag` to topic "t", one batch.
 async fn put(store: &mut Store, tag: u8, from: u64, to: u64) {
-    let bodies: Vec<Vec<u8>> = (from..to).map(|i| payload(tag, i)).collect();
+    let bodies: Vec<(Vec<u8>, Option<Vec<u8>>)> =
+        (from..to).map(|i| (payload(tag, i), key(tag, i))).collect();
     let batch: Vec<Message> = bodies
         .iter()
-        .map(|p| Message {
+        .map(|(p, k)| Message {
             topic: b"t",
             payload: p,
-            ..Default::default()
+            key: k.as_deref(),
+            headers: if k.is_some() { &HEADERS } else { &[] },
         })
         .collect();
     store.put_batch(&batch, from).await.unwrap();
 }
 
-async fn assert_reads(store: &Store, tags: &[(u8, std::ops::Range<u64>)]) {
-    for (tag, range) in tags {
+/// Each seq's payload, key and headers; message `seq` of `tag` was written
+/// as message `seq - offset`.
+async fn assert_entries(store: &Store, tags: &[(u8, std::ops::Range<u64>, u64)]) {
+    for (tag, range, offset) in tags {
         for seq in range.clone() {
-            let got = store.read(b"t", seq).await.unwrap();
-            assert_eq!(got, Some(payload(*tag, seq)), "seq {seq}");
+            let got = store.read_entry(b"t", seq).await.unwrap().unwrap();
+            let key = key(*tag, seq - offset);
+            let headers = if key.is_some() {
+                vec![(b"h".to_vec(), b"v".to_vec())]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                (got.payload, got.key, got.headers),
+                (payload(*tag, seq - offset), key, headers),
+                "seq {seq}"
+            );
         }
     }
+}
+
+async fn assert_reads(store: &Store, tags: &[(u8, std::ops::Range<u64>)]) {
+    let tags: Vec<_> = tags.iter().map(|(t, r)| (*t, r.clone(), 0)).collect();
+    assert_entries(store, &tags).await;
 }
 
 /// A WAL tail cut by recovery took the frame that completed block 0, whose
@@ -73,8 +101,9 @@ async fn records_of_a_cut_wal_tail_stay_stale() {
     );
     assert_eq!(
         actions[1..],
+        // Block 0's record and its attribute record.
         [RecoveryAction::StaleIndexRecordsFenced {
-            records: 1,
+            records: 2,
             segment: 1
         }]
     );
@@ -155,10 +184,7 @@ async fn a_damaged_fence_header_fails_open() {
             .any(|a| matches!(a, RecoveryAction::TopicIndexRepaired { .. })),
         "{actions:?}"
     );
-    for seq in 0..70 {
-        let want = payload(1, if seq < 60 { seq } else { seq - 60 });
-        assert_eq!(store.read(b"t", seq).await.unwrap(), Some(want), "{seq}");
-    }
+    assert_entries(&store, &[(1, 0..60, 0), (1, 60..70, 60)]).await;
     drop(store);
     let after = snapshot(&dir.0);
     for (path, bytes) in &before {
@@ -258,5 +284,113 @@ async fn damaged_index_segments_are_repaired_and_reported() {
             );
             assert!(snapshot(&dir.0) == before, "{mode:?} {what}: files changed");
         }
+    }
+}
+
+/// Keys and headers of a full block live in its attribute record, whose CRC
+/// is checked on every read (D-235 A, D-250 A): damage after open is an
+/// error for that entry, never wrong data, and the store stays usable.
+#[compio::test]
+async fn a_damaged_attribute_record_fails_the_read() {
+    let dir = TempDir::new("index-attrs-read");
+    let mut store = Store::open(&dir.0, Config::default()).await.unwrap();
+    put(&mut store, 1, 0, 130).await;
+    let rec = find_index_record(&dir.0, INDEX_ATTRS_RECORD, 0, 1);
+    // A byte of a key ("k1-…") of block 1.
+    edit(&rec.path, |b| {
+        let at = rec.body.start + b[rec.body.clone()].iter().position(|&x| x == b'k').unwrap();
+        b[at] ^= 1;
+    });
+    let err = store.read_entry(b"t", 66).await.unwrap_err();
+    assert!(
+        matches!(err, StoreError::TopicIndexCorrupt { block: 1, .. }),
+        "{err}"
+    );
+    // Its payload, block 0 and the incomplete block still read.
+    assert_eq!(store.read(b"t", 66).await.unwrap(), Some(payload(1, 66)));
+    assert_reads(&store, &[(1, 0..64), (1, 128..130)]).await;
+    put(&mut store, 1, 130, 131).await;
+}
+
+/// At open the attribute records are checked against the WAL like their
+/// blocks: a damaged one is re-derived and reported, one that is intact
+/// but disagrees fails open with `TopicMismatch` and changes no file.
+#[compio::test]
+async fn attribute_records_are_checked_at_open() {
+    let config = Config::default();
+    let fresh = |tag: &'static str| async move {
+        let dir = TempDir::new(tag);
+        let mut store = Store::open(&dir.0, config).await.unwrap();
+        put(&mut store, 1, 0, 130).await;
+        drop(store);
+        dir
+    };
+    // Damaged (CRC fails): the segment is read up to it, and the blocks
+    // from there on are repaired from the WAL.
+    let dir = fresh("index-attrs-damaged").await;
+    let rec = find_index_record(&dir.0, INDEX_ATTRS_RECORD, 0, 0);
+    edit(&rec.path, |b| b[rec.body.end - 1] ^= 1);
+    let wal = std::fs::read(dir.0.join(common::WAL0)).unwrap();
+    let store = Store::open(&dir.0, config).await.unwrap();
+    assert!(
+        store.recovery_report().actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::TopicIndexRepaired {
+                blocks_rewritten: 2,
+                ..
+            }
+        )),
+        "{:?}",
+        store.recovery_report()
+    );
+    assert_reads(&store, &[(1, 0..130)]).await;
+    drop(store);
+    assert_eq!(std::fs::read(dir.0.join(common::WAL0)).unwrap(), wal);
+    let store = Store::open(&dir.0, config).await.unwrap();
+    assert!(store.recovery_report().is_empty());
+    drop(store);
+
+    type Change = fn(&Path);
+    let cases: [(&str, Change, u64); 2] = [
+        // Another key byte, CRC recomputed: written that way.
+        (
+            "an intact attribute record that disagrees",
+            |d| {
+                let rec = find_index_record(d, INDEX_ATTRS_RECORD, 0, 1);
+                edit(&rec.path, |b| {
+                    let at = rec.body.start
+                        + b[rec.body.clone()].iter().position(|&x| x == b'k').unwrap();
+                    b[at] ^= 1;
+                    reseal_index_record(b, rec.offset, rec.size);
+                })
+            },
+            66,
+        ),
+        // The block record without its attribute record's location.
+        (
+            "a block record that lost its attribute location",
+            |d| {
+                let rec = find_index_record(d, INDEX_BLOCK_RECORD, 0, 1);
+                edit(&rec.path, |b| {
+                    let loc = rec.body.end - 16;
+                    // Shorten the body by 16 bytes: `len` is one byte here.
+                    b[rec.offset + 1] -= 16;
+                    b.drain(loc..rec.body.end);
+                    reseal_index_record(b, rec.offset, rec.size - 16);
+                })
+            },
+            66,
+        ),
+    ];
+    for (what, change, seq) in cases {
+        let dir = fresh("index-attrs-mismatch").await;
+        change(&dir.0);
+        let before = snapshot(&dir.0);
+        let err = Store::open(&dir.0, config).await.err().unwrap();
+        assert!(
+            matches!(err, StoreError::TopicMismatch { seq: s, .. } if s == seq),
+            "{what}: {err}"
+        );
+        assert!(snapshot(&dir.0) == before, "{what}: files changed");
     }
 }

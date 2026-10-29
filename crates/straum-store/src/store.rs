@@ -16,11 +16,12 @@ use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use crate::StoreError;
 use crate::block::{self, Codecs};
 use crate::codec::{
-    self, FRAME_HEADER, FrameBuilder, FrameMode, INDEX_BLOCK, INDEX_HEADER, INDEX_RECORD_BLOCK,
-    INDEX_RECORD_SEEK_PAGE, IndexLoc, IndexWriter, MAX_TOPIC, MAX_VARINT, NO_DICT, NO_SEGMENT,
-    ObjectId, RECORD_COMPACT_BASE, RECORD_COMPACT_KEPT, RECORD_COMPACT_REWRITTEN, RECORD_PUBLISH,
-    RECORD_PUT_BLOCK, RECORD_PUT_DICT_BASE, RECORD_PUT_INLINE_BLOCK_BASE, RECORD_PUT_OBJECT,
-    RECORD_PUT_TOPIC_BASE, RECORD_RELEASE, Record, Rewritten, WAL_FILE_HEADER,
+    self, FRAME_HEADER, FrameBuilder, FrameMode, INDEX_BLOCK, INDEX_HEADER, INDEX_RECORD_ATTRS,
+    INDEX_RECORD_BLOCK, INDEX_RECORD_SEEK_PAGE, IndexLoc, IndexWriter, MAX_TOPIC, MAX_VARINT,
+    NO_DICT, NO_SEGMENT, ObjectId, RECORD_COMPACT_BASE, RECORD_COMPACT_KEPT,
+    RECORD_COMPACT_REWRITTEN, RECORD_PUBLISH, RECORD_PUT_BLOCK, RECORD_PUT_DICT_BASE,
+    RECORD_PUT_INLINE_BLOCK_BASE, RECORD_PUT_OBJECT, RECORD_PUT_TOPIC_BASE, RECORD_RELEASE, Record,
+    Rewritten, WAL_FILE_HEADER,
 };
 
 /// The single WAL file of formats before 13: refused, never read.
@@ -476,9 +477,9 @@ struct Object {
     refs: u64,
 }
 
-/// A topic index block's number and its `(object number, timestamp)`
-/// entries.
-type CachedBlock = (u64, Vec<(u64, u64)>);
+/// A topic index block's number, its `(object number, timestamp)` entries
+/// and the location of its attribute record.
+type CachedBlock = (u64, Vec<(u64, u64)>, Option<IndexLoc>);
 
 struct Topic {
     /// Topic number from the topic's PutTopic record.
@@ -501,9 +502,11 @@ struct Topic {
     read_cache: RefCell<Option<CachedBlock>>,
     /// Bytes of the topic's index records (blocks and seek pages).
     record_bytes: u64,
-    /// Where the key and headers of each live entry that has them lie in
-    /// the WAL: `(seq, offset, length)`, in seq order. Entries without
-    /// either are not listed.
+    /// Where the key and headers of each entry of the incomplete block
+    /// that has them lie in the WAL (released ones included), in seq order;
+    /// at most 63, plus those of blocks a batch completes until their
+    /// attribute record is written. Full blocks keep theirs in an
+    /// attribute record next to the block record.
     attrs: VecDeque<AttrsAt>,
 }
 
@@ -1088,9 +1091,6 @@ impl Store {
         // Their records describe this batch's frame: the stamp is the frame
         // number after it.
         let stamp = self.next_frame + 1;
-        for (name, block, body) in filled {
-            self.add_index_block(name, block, &body, stamp).await?;
-        }
         match self.config.write_mode {
             // InlineSmall keeps Sequential's order for a segment block; with
             // an inline block the segment flush is a no-op.
@@ -1107,7 +1107,11 @@ impl Store {
             WriteMode::ParallelSync => self.commit_parallel(wal_buf, frame).await?,
         }
         // Index records are derived from the WAL and re-derived at open:
-        // written after the WAL fsync, not synced.
+        // built after the WAL write (an attribute record reads its keys and
+        // headers from the WAL), written after the WAL fsync, not synced.
+        for (name, block, body) in filled {
+            self.add_index_block(name, block, &body, stamp).await?;
+        }
         self.stats.topic_bytes += self.index.flush().await?;
         self.in_flight = false;
         // Recent objects are the likeliest reads.
@@ -1227,13 +1231,6 @@ impl Store {
             };
             frame.record(&mut wal_buf, &release)?;
             topic.first_live += 1;
-            if topic
-                .attrs
-                .front()
-                .is_some_and(|a| a.seq < topic.first_live)
-            {
-                topic.attrs.pop_front();
-            }
             if let Some(object) = self.objects.get_mut(&number) {
                 object.refs -= 1;
             }
@@ -1529,22 +1526,84 @@ impl Store {
             let entries = codec::decode_index_entries(&t.tail).ok_or_else(|| corrupt(block))?;
             return Ok(entries.get(at).copied());
         }
-        if let Some((b, entries)) = t.read_cache.borrow().as_ref()
+        let (entries, _) = self.full_block(name, t, block).await?;
+        Ok(entries.get(at).copied())
+    }
+
+    /// Full block `block` of topic `name`: its entries and the location of
+    /// its attribute record, from the read cache or its index record, which
+    /// must match its CRC, topic and block number (`TopicIndexCorrupt`
+    /// otherwise).
+    async fn full_block(
+        &self,
+        name: &[u8],
+        t: &Topic,
+        block: u64,
+    ) -> Result<codec::IndexBlock, StoreError> {
+        if let Some((b, entries, attrs)) = t.read_cache.borrow().as_ref()
             && *b == block
         {
-            return Ok(entries.get(at).copied());
+            return Ok((entries.clone(), *attrs));
         }
-        let loc = self.locate(t, block).await?.ok_or_else(|| corrupt(block))?;
-        let entries = self
+        let corrupt = || StoreError::TopicIndexCorrupt {
+            topic: name.to_vec(),
+            block,
+        };
+        let loc = self.locate(t, block).await?.ok_or_else(corrupt)?;
+        let (entries, attrs) = self
             .index
             .record(loc, INDEX_RECORD_BLOCK, t.number, block)
             .await?
-            .and_then(|body| codec::decode_index_entries(&body))
-            .filter(|e| e.len() as u64 == INDEX_BLOCK)
-            .ok_or_else(|| corrupt(block))?;
-        let entry = entries.get(at).copied();
-        *t.read_cache.borrow_mut() = Some((block, entries));
-        Ok(entry)
+            .and_then(|body| codec::decode_index_block(&body))
+            .ok_or_else(corrupt)?;
+        *t.read_cache.borrow_mut() = Some((block, entries.clone(), attrs));
+        Ok((entries, attrs))
+    }
+
+    /// The key and headers of entry `seq` (a full block's) from its block's
+    /// attribute record at `loc`, which must be intact (CRC), the block's,
+    /// and well-formed (`TopicIndexCorrupt` otherwise).
+    async fn block_attrs(
+        &self,
+        name: &[u8],
+        t: &Topic,
+        seq: u64,
+        loc: IndexLoc,
+    ) -> Result<codec::Attrs, StoreError> {
+        let block = seq / INDEX_BLOCK;
+        let corrupt = || StoreError::TopicIndexCorrupt {
+            topic: name.to_vec(),
+            block,
+        };
+        let body = self
+            .index
+            .record(loc, INDEX_RECORD_ATTRS, t.number, block)
+            .await?
+            .ok_or_else(corrupt)?;
+        let items = codec::decode_attrs_record(&body).ok_or_else(corrupt)?;
+        let position = (seq % INDEX_BLOCK) as u8;
+        match items.binary_search_by_key(&position, |&(p, _)| p) {
+            Ok(i) => codec::decode_attrs(items[i].1).map_err(|_| corrupt()),
+            Err(_) => Ok((None, Vec::new())),
+        }
+    }
+
+    /// The encoded key and headers at `a` in the WAL.
+    async fn wal_attrs(&self, a: AttrsAt) -> Result<Vec<u8>, StoreError> {
+        let file = self
+            .wal_file(a.at.file)
+            .await?
+            .ok_or(StoreError::CorruptWal {
+                file: a.at.file,
+                offset: a.at.offset,
+                reason: "WAL file of a key or headers is missing",
+            })?;
+        let len = a.len as usize;
+        let BufResult(res, buf) = file
+            .read_exact_at(Vec::with_capacity(len).slice(..len), a.at.offset)
+            .await;
+        res?;
+        Ok(buf.into_inner())
     }
 
     /// Where full block `block` of `t` lies: from the spine, through the
@@ -1614,31 +1673,41 @@ impl Store {
         if seq < t.first_live {
             return Ok(None);
         }
-        let Some((number, timestamp)) = self.topic_entry(topic, t, seq).await? else {
+        let next = t.index.seq();
+        if seq >= next {
             return Ok(None);
+        }
+        let block = seq / INDEX_BLOCK;
+        let ((number, timestamp), (key, headers)) = if block == next / INDEX_BLOCK {
+            let Some(entry) = self.topic_entry(topic, t, seq).await? else {
+                return Ok(None);
+            };
+            let attrs = match t.attrs.binary_search_by_key(&seq, |a| a.seq) {
+                Err(_) => (None, Vec::new()),
+                Ok(i) => {
+                    let a = t.attrs[i];
+                    codec::decode_attrs(&self.wal_attrs(a).await?).map_err(|reason| {
+                        StoreError::CorruptWal {
+                            file: a.at.file,
+                            offset: a.at.offset,
+                            reason,
+                        }
+                    })?
+                }
+            };
+            (entry, attrs)
+        } else {
+            let (entries, loc) = self.full_block(topic, t, block).await?;
+            let Some(&entry) = entries.get((seq % INDEX_BLOCK) as usize) else {
+                return Ok(None);
+            };
+            let attrs = match loc {
+                Some(loc) => self.block_attrs(topic, t, seq, loc).await?,
+                None => (None, Vec::new()),
+            };
+            (entry, attrs)
         };
         let (_, payload) = self.read_object(number).await?;
-        let (key, headers) = match t.attrs.binary_search_by_key(&seq, |a| a.seq) {
-            Err(_) => (None, Vec::new()),
-            Ok(i) => {
-                let AttrsAt { at, len, .. } = t.attrs[i];
-                let corrupt = |reason| StoreError::CorruptWal {
-                    file: at.file,
-                    offset: at.offset,
-                    reason,
-                };
-                let file = self
-                    .wal_file(at.file)
-                    .await?
-                    .ok_or(corrupt("WAL file of a key or headers is missing"))?;
-                let len = len as usize;
-                let BufResult(res, buf) = file
-                    .read_exact_at(Vec::with_capacity(len).slice(..len), at.offset)
-                    .await;
-                res?;
-                codec::decode_attrs(&buf.into_inner()).map_err(corrupt)?
-            }
-        };
         Ok(Some(Entry {
             timestamp,
             key,
@@ -2103,14 +2172,46 @@ impl Store {
         body: &[u8],
         stamp: u64,
     ) -> Result<(), StoreError> {
-        let created_at = self.next_frame;
-        let Some(number) = self.topics.get(name).map(|t| t.number) else {
+        // Called after the batch's frame was written: a segment started
+        // now gets the frame's number, as if created before it.
+        let created_at = stamp - 1;
+        let Some(t) = self.topics.get(name) else {
             unreachable!("the batch created the topic")
         };
+        let number = t.number;
+        // The block's entries with a key or headers lead the topic's list.
+        let end = (block + 1) * INDEX_BLOCK;
+        let keyed: Vec<AttrsAt> = t
+            .attrs
+            .iter()
+            .take_while(|a| a.seq < end)
+            .copied()
+            .collect();
+        let mut items = Vec::with_capacity(keyed.len());
+        for a in &keyed {
+            items.push(((a.seq % INDEX_BLOCK) as u8, self.wal_attrs(*a).await?));
+        }
+        let attrs = if items.is_empty() {
+            None
+        } else {
+            let items: Vec<(u8, &[u8])> = items.iter().map(|(p, b)| (*p, &b[..])).collect();
+            let body = codec::attrs_record_body(&items);
+            Some(
+                self.index
+                    .append(INDEX_RECORD_ATTRS, number, block, stamp, &body, created_at)
+                    .await?,
+            )
+        };
+        let body = codec::index_block_body(body, attrs);
         let mut loc = self
             .index
-            .append(INDEX_RECORD_BLOCK, number, block, stamp, body, created_at)
+            .append(INDEX_RECORD_BLOCK, number, block, stamp, &body, created_at)
             .await?;
+        let Some(t) = self.topics.get_mut(name) else {
+            unreachable!("the batch created the topic")
+        };
+        t.attrs.drain(..keyed.len());
+        t.record_bytes += attrs.map_or(0, |l| u64::from(l.len));
         let fan = self.index.fanout;
         for level in 0u32.. {
             let Some(t) = self.topics.get_mut(name) else {
@@ -2418,7 +2519,7 @@ struct Replay<'a> {
     dicts: Vec<&'a [u8]>,
     /// Raw bytes of batch blocks stored without a dictionary.
     dictless_raw: u64,
-    topics: HashMap<&'a [u8], ReplayTopic>,
+    topics: HashMap<&'a [u8], ReplayTopic<'a>>,
     /// Topic number → name, from PutTopic records; numbers are contiguous.
     topic_names: Vec<&'a [u8]>,
     topic_numbers: HashMap<&'a [u8], u64>,
@@ -2431,15 +2532,15 @@ struct Replay<'a> {
 }
 
 #[derive(Default)]
-struct ReplayTopic {
+struct ReplayTopic<'a> {
     number: u64,
     /// Every published entry, released ones included:
     /// `(object number, timestamp)`.
     entries: Vec<(u64, u64)>,
     first_live: u64,
     /// Key and headers of the entries that have them, released ones
-    /// included.
-    attrs: Vec<AttrsAt>,
+    /// included: where they lie and their bytes.
+    attrs: Vec<(AttrsAt, &'a [u8])>,
 }
 
 impl<'a> Replay<'a> {
@@ -2622,7 +2723,7 @@ impl<'a> Replay<'a> {
                         file: self.file,
                         offset: body_at + attrs_at as u64,
                     };
-                    t.attrs.push(AttrsAt { seq, at, len });
+                    t.attrs.push((AttrsAt { seq, at, len }, attrs));
                 }
             }
             Record::Release { topic, seq } => {
@@ -2839,7 +2940,11 @@ async fn open_segments(
 
 /// A topic at open: its name, its entries from the WAL, its first live
 /// seq and where its entries' key and headers lie.
-type WalTopic<'r> = (&'r [u8], &'r [(u64, u64)], u64, &'r [AttrsAt]);
+type WalTopic<'r> = (&'r [u8], &'r [(u64, u64)], u64, &'r [(AttrsAt, &'r [u8])]);
+
+/// A block record found intact at open: its location and its attribute
+/// record's.
+type FoundBlock = (IndexLoc, Option<IndexLoc>);
 
 /// A seek page found in an index segment: its location and body.
 type FoundPage<'b> = (IndexLoc, &'b [u8]);
@@ -2912,7 +3017,8 @@ async fn open_index(
         })
         .collect();
     let block = INDEX_BLOCK as usize;
-    let mut blocks: Vec<Vec<Option<IndexLoc>>> = topics
+    // Per full block: its record's location and its attribute record's.
+    let mut blocks: Vec<Vec<Option<FoundBlock>>> = topics
         .iter()
         .map(|(_, entries, _, _)| vec![None; entries.len() / block])
         .collect();
@@ -2922,6 +3028,12 @@ async fn open_index(
     for i in (1..segs.len()).rev() {
         fence[i - 1] = fence[i].min(segs[i].1);
     }
+    // The record at `loc`, if intact and exactly there.
+    let record_at = |loc: IndexLoc| {
+        let (_, _, bytes) = segs.iter().find(|s| s.0 == u64::from(loc.segment))?;
+        let at = usize::try_from(loc.offset).ok()?;
+        codec::decode_index_record(bytes.get(at..)?).filter(|r| r.size == loc.len as usize)
+    };
     let mut unfenced = 0;
     for (i, (id, _, bytes)) in segs.iter().enumerate() {
         let limit = fence[i].min(next_frame);
@@ -2958,21 +3070,62 @@ async fn open_index(
                         .and_then(|b| blocks[t].get_mut(b))
                         .ok_or_else(|| corrupt("index block beyond the topic's full blocks"))?;
                     let first = rec.number as usize * block;
-                    let (name, entries, _, _) = topics[t];
+                    let (name, entries, _, attrs) = topics[t];
                     let want = &entries[first..first + block];
-                    let got = codec::decode_index_entries(rec.body)
+                    let (got, attrs_loc) = codec::decode_index_block(rec.body)
                         .ok_or_else(|| corrupt("index block does not decode"))?;
+                    // Written that way: the record describes durable frames
+                    // only.
+                    let mismatch = |at: usize| StoreError::TopicMismatch {
+                        topic: name.to_vec(),
+                        seq: (first + at) as u64,
+                    };
                     if got != want {
-                        // Written that way: the record describes durable
-                        // frames only.
                         let at = got.iter().zip(want).take_while(|(a, b)| a == b).count();
-                        return Err(StoreError::TopicMismatch {
-                            topic: name.to_vec(),
-                            seq: (first + at) as u64,
-                        });
+                        return Err(mismatch(at));
                     }
-                    slot.get_or_insert(loc);
+                    let want = block_attrs(attrs, rec.number);
+                    let intact = match (attrs_loc, want.first()) {
+                        (None, None) => true,
+                        (None, Some(&(p, _))) => return Err(mismatch(p.into())),
+                        (Some(_), None) => return Err(mismatch(0)),
+                        (Some(l), Some(_)) => match record_at(l) {
+                            Some(r)
+                                if r.kind == INDEX_RECORD_ATTRS
+                                    && r.topic == rec.topic
+                                    && r.number == rec.number =>
+                            {
+                                let got = codec::decode_attrs_record(r.body).ok_or(
+                                    StoreError::IndexSegmentCorrupt {
+                                        segment: u64::from(l.segment),
+                                        offset: l.offset,
+                                        reason: "attribute record does not decode",
+                                    },
+                                )?;
+                                if got != want {
+                                    let k =
+                                        got.iter().zip(&want).take_while(|(a, b)| a == b).count();
+                                    let p = [got.get(k), want.get(k)]
+                                        .into_iter()
+                                        .flatten()
+                                        .map(|&(p, _)| p)
+                                        .min()
+                                        .unwrap_or(0);
+                                    return Err(mismatch(p.into()));
+                                }
+                                true
+                            }
+                            // Lost or damaged with the unsynced index:
+                            // re-derived with its block.
+                            _ => false,
+                        },
+                    };
+                    if intact {
+                        slot.get_or_insert((loc, attrs_loc));
+                    }
                 }
+                // Checked through its block record.
+                INDEX_RECORD_ATTRS => {}
                 INDEX_RECORD_SEEK_PAGE => {
                     let (level, _) = codec::seek_page_shape(rec.body)
                         .ok_or_else(|| corrupt("seek page does not decode"))?;
@@ -3015,25 +3168,40 @@ async fn open_index(
     {
         let mut blocks_rewritten = 0;
         let mut locs = Vec::with_capacity(found.len());
+        let mut record_bytes = 0;
         for (b, slot) in (0u64..).zip(found) {
-            let loc = match slot {
-                Some(loc) => loc,
+            let (loc, attrs_loc) = match slot {
+                Some(found) => found,
                 None => {
                     let first = b as usize * block;
-                    let mut body = Vec::new();
+                    let mut encoded = Vec::new();
                     let mut w = IndexWriter::resume(b * INDEX_BLOCK, 0, 0);
                     for &(n, ts) in &entries[first..first + block] {
-                        w.push(&mut body, n, ts);
+                        w.push(&mut encoded, n, ts);
                     }
+                    let items = block_attrs(attrs, b);
+                    let attrs_loc = if items.is_empty() {
+                        None
+                    } else {
+                        let body = codec::attrs_record_body(&items);
+                        let kind = INDEX_RECORD_ATTRS;
+                        Some(
+                            index
+                                .append(kind, number, b, next_frame, &body, next_frame)
+                                .await?,
+                        )
+                    };
+                    let body = codec::index_block_body(&encoded, attrs_loc);
                     blocks_rewritten += 1;
-                    index
+                    let loc = index
                         .append(INDEX_RECORD_BLOCK, number, b, next_frame, &body, next_frame)
-                        .await?
+                        .await?;
+                    (loc, attrs_loc)
                 }
             };
+            record_bytes += u64::from(loc.len) + attrs_loc.map_or(0, |l| u64::from(l.len));
             locs.push(loc);
         }
-        let mut record_bytes: u64 = locs.iter().map(|l| u64::from(l.len)).sum();
         // Seek pages level by level; a page is reused if a segment holds
         // one with exactly the expected locations.
         let mut pages_rewritten = 0;
@@ -3098,8 +3266,8 @@ async fn open_index(
                 record_bytes,
                 attrs: attrs
                     .iter()
-                    .filter(|a| a.seq >= *first_live)
-                    .copied()
+                    .map(|&(a, _)| a)
+                    .filter(|a| a.seq >= tail_start as u64)
                     .collect(),
             },
         );
@@ -3108,6 +3276,18 @@ async fn open_index(
     // Recovery work is not counted in `Stats`.
     index.fsyncs = 0;
     Ok((index, out))
+}
+
+/// The key and headers of full block `block`'s entries that have them, as
+/// its attribute record lists them: `(position, attributes)`.
+fn block_attrs<'r>(attrs: &[(AttrsAt, &'r [u8])], block: u64) -> Vec<(u8, &'r [u8])> {
+    let first = block * INDEX_BLOCK;
+    let lo = attrs.partition_point(|(a, _)| a.seq < first);
+    let hi = attrs.partition_point(|(a, _)| a.seq < first + INDEX_BLOCK);
+    attrs[lo..hi]
+        .iter()
+        .map(|&(a, b)| ((a.seq - first) as u8, b))
+        .collect()
 }
 
 /// Refcounts from WAL replay (Publish +1, Release -1) must equal the number

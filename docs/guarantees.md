@@ -133,13 +133,16 @@ At startup the store replays the WAL from the beginning
   (`IndexSegmentDropped`) and rebuilt topic (D-229 A).
 - **Detected on read.** At open, earlier frames' bodies are checked only
   for presence and length. Every read checks a body's block (length,
-  CRC32C, layout) and the body's BLAKE3 id, and every full index block or
-  seek page read against its CRC, topic and number (`TopicIndexCorrupt`);
+  CRC32C, layout) and the body's BLAKE3 id, and every full index block,
+  seek page or attribute record (the keys and headers of a full index
+  block's messages, one CRC per block) read against its CRC, topic and
+  number (`TopicIndexCorrupt`);
   a failure is `StorageError` in the Fetch response, and the broker keeps
   serving other reads and writes.
-- **Not detected on read.** Keys and headers are read from the WAL at
-  fetch time and checked only for a valid encoding; the WAL frame's CRC
-  is checked at open, not on each read. Damage to them after open that
+- **Not detected on read.** Keys and headers of the newest messages of a
+  partition (those not yet in a full index block of 64) are read from the
+  WAL at fetch time and checked only for a valid encoding; the WAL frame's
+  CRC is checked at open, not on each read. Damage to them after open that
   keeps a valid encoding is returned to the client as is. Timestamps and
   seqs are served from memory built at open.
 
@@ -193,8 +196,8 @@ At startup the store replays the WAL from the beginning
 - **Memory grows with stored data.** The store keeps, per stored body,
   entries in memory (the object index), and nothing bounds them: the
   broker does not refuse writes as memory grows. Topic entries are read
-  from disk; a live message with a key or headers keeps 32 bytes in
-  memory. Measured with 100-byte bodies (store alone, batches of 512,
+  from disk; a message with a key or headers keeps 32 bytes in memory
+  only until its index block of 64 is full (at most 63 per partition). Measured with 100-byte bodies (store alone, batches of 512,
   10 million unique messages, macOS) before topic entries moved to disk:
   the object index took about 178 bytes allocated per stored body with
   compressed blocks (ADR-0014). A Linux process limited to 2 GiB was

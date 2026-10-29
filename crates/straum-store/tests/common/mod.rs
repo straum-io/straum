@@ -105,6 +105,7 @@ pub struct IndexRecord {
 
 pub const INDEX_BLOCK_RECORD: u8 = 1;
 pub const INDEX_SEEK_PAGE: u8 = 2;
+pub const INDEX_ATTRS_RECORD: u8 = 3;
 
 fn varint(b: &[u8], pos: &mut usize) -> u64 {
     let mut v = 0u64;

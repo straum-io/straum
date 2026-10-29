@@ -37,9 +37,11 @@ macOS (development only). No tokio, including transitively.
   and `Store::read_entry` returns each publication with its own key,
   headers and timestamp. Without key and headers a publication costs no
   extra byte (measured with `examples/meta_bytes`); with them, the key and
-  headers are neither deduplicated nor compressed, and each live entry
-  that has them keeps their WAL position and length in memory (32 bytes)
-  until shared attribute segments replace it (ADR-0014 §8).
+  headers are neither deduplicated nor compressed. Once a topic's index
+  block of 64 entries is full, their keys and headers go to one attribute
+  record in the shared index segments, CRC-checked on every read
+  (D-250 A); until then each entry that has them keeps their WAL position
+  and length in memory (32 bytes, at most 63 per topic).
 - `Store::topic_stats` (first and next seq, index bytes) and
   `Store::batch_frame_bytes` (the frame bound `put_batch` checks before any
   I/O, additive over messages) let a caller size its batches.
@@ -127,11 +129,11 @@ Test variables: `STRAUM_STORE_CRASH_ITERATIONS` (default 200),
 
 | File | Covers |
 |---|---|
-| `src/codec.rs` | BLAKE3; WAL record encoding, one-byte deltas in batch records; rejection of every flipped bit and every truncated prefix; raw block layout; topic index entries; index records (every flipped bit and a cut rejected), seek pages and the index segment header |
+| `src/codec.rs` | BLAKE3; WAL record encoding, one-byte deltas in batch records; rejection of every flipped bit and every truncated prefix; raw block layout; topic index entries; index records (every flipped bit and a cut rejected), block bodies with an attribute location, attribute records (malformed ones rejected), seek pages and the index segment header |
 | `src/block.rs` | compression round trip with and without a dictionary; deterministic training; a damaged block, a wrong length or CRC is rejected |
 | `src/store.rs` | reference count reconciliation; replay rejecting an inconsistent WAL (block and object order, dictionaries); applying and rejecting Compact; file names |
 | `tests/index_reads.rs` | live entries read from the index segments: reads across full blocks and the in-memory tail, before and after reopen; release across a block boundary; a full block damaged after open fails `read`, `entry`, `index_entry` and `release_before` with `TopicIndexCorrupt`, writing nothing; seek pages of 2 locations (four levels for 20 blocks) find every entry, and a damaged page fails exactly the blocks under it; reading across 20 index segments keeps at most `index_open_files` + 1 open; a release too large for a frame fails with `FrameTooLarge` before writing |
-| `tests/index_segments.rs` | index records of a cut WAL tail stay stale after new frames reuse their numbers (no false `TopicMismatch`); a damaged fence header fails open with `TopicMismatch`, no file changed even with a torn tail, a tmp file and an orphan segment due (the documented limit), and opens with `rebuild_index`; in every write mode, a deleted segment, all segments deleted, a damaged header, a cut record and zeroed unsynced pages are repaired from the WAL and reported, the WAL unchanged, and the next open is clean |
+| `tests/index_segments.rs` | index records of a cut WAL tail stay stale after new frames reuse their numbers (no false `TopicMismatch`); a damaged fence header fails open with `TopicMismatch`, no file changed even with a torn tail, a tmp file and an orphan segment due (the documented limit), and opens with `rebuild_index`; in every write mode, a deleted segment, all segments deleted, a damaged header, a cut record and zeroed unsynced pages are repaired from the WAL and reported, the WAL unchanged, and the next open is clean; every case with keys and headers on every third message, read back with `read_entry`; a damaged attribute record fails that read with `TopicIndexCorrupt` and the store stays usable; at open a damaged one is re-derived and reported, an intact one that disagrees, or a block record that lost its attribute location, is `TopicMismatch` with no file changed |
 | `tests/store.rs` | deduplication; one fsync per file per batch; restart; rotation; compaction; orphans; a corrupted block fails the read; an intact index block disagreeing with the WAL (`TopicMismatch`) or beyond it (`IndexSegmentCorrupt`) with no file changed; a lost or cut index segment rebuilt byte for byte; a damaged record ends the scan of its segment; WAL truncation at every byte of the last record (Publish, Release, Compact) |
 | `tests/model.rs` | proptest: random publish (with no key, an empty key, or a key and headers), release, compact and restart against an in-memory model, 128 cases per write mode, with dictionary training, a small block cache, seek pages of 2 locations, index segments rotating every 256 bytes, two open index files and WAL files of 512 bytes |
 | `tests/crash.rs` | a writer in a child process killed with SIGKILL at a random moment, checked after each restart; one test per write mode; the dictionary is trained during the run; index segments rotate, seek pages (2 locations) fill and WAL files (16 KiB) rotate during it |

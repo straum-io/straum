@@ -18,7 +18,7 @@ impl ObjectId {
 /// start of every WAL file.
 pub const WAL_FILE_HEADER: usize = 24;
 pub const WAL_MAGIC: [u8; 8] = *b"STRMWAL\0";
-pub const WAL_VERSION: u32 = 13;
+pub const WAL_VERSION: u32 = 14;
 /// Header bytes covered by the header CRC (everything before it).
 const WAL_HEADER_CRC_AT: usize = 20;
 /// `len u32 | seq u64 | count u32 | mode u8 | crc32c u32`.
@@ -1001,6 +1001,9 @@ pub fn decode_index_header(buf: &[u8]) -> Option<u64> {
 /// Index record kinds.
 pub const INDEX_RECORD_BLOCK: u8 = 1;
 pub const INDEX_RECORD_SEEK_PAGE: u8 = 2;
+/// The keys and headers of one full block's entries that have them; its
+/// record CRC is the group CRC of those attributes.
+pub const INDEX_RECORD_ATTRS: u8 = 3;
 
 /// Where an index record lies: `segment u32 | len u32 | offset u64`, 16
 /// bytes in a seek page.
@@ -1092,6 +1095,75 @@ pub fn decode_index_record(buf: &[u8]) -> Option<IndexRecord<'_>> {
         body: &buf[pos..end],
         size: end + 4,
     })
+}
+
+/// A full block record's body: its 64 encoded entries, then, if any entry
+/// has a key or headers, the location of the block's attribute record.
+pub fn index_block_body(entries: &[u8], attrs: Option<IndexLoc>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(entries.len() + INDEX_LOC);
+    out.extend_from_slice(entries);
+    if let Some(loc) = attrs {
+        loc.put(&mut out);
+    }
+    out
+}
+
+/// A full block's `(object number, timestamp)` entries and the location
+/// of its attribute record.
+pub type IndexBlock = (Vec<(u64, u64)>, Option<IndexLoc>);
+
+/// The 64 entries of a full block record's body and the location of its
+/// attribute record; `None` if malformed.
+pub fn decode_index_block(body: &[u8]) -> Option<IndexBlock> {
+    let mut pos = 0;
+    for _ in 0..INDEX_BLOCK {
+        let (_, n) = get_uvarint(body.get(pos..)?).ok()?;
+        let (_, m) = get_uvarint(body.get(pos + n..)?).ok()?;
+        pos += n + m;
+    }
+    let entries = decode_index_entries(&body[..pos])?;
+    match body.len() - pos {
+        0 => Some((entries, None)),
+        INDEX_LOC => Some((entries, Some(IndexLoc::at(&body[pos..])))),
+        _ => None,
+    }
+}
+
+/// An attribute record's body: `count varint`, then per entry with a key
+/// or headers, in position order: `position u8 | len varint | attributes`
+/// (`encode_attrs`'s bytes, never empty).
+pub fn attrs_record_body(items: &[(u8, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_uvarint(&mut out, items.len() as u64);
+    for (position, attrs) in items {
+        out.push(*position);
+        put_uvarint(&mut out, attrs.len() as u64);
+        out.extend_from_slice(attrs);
+    }
+    out
+}
+
+/// The entries of an attribute record's body: `(position, attributes)`;
+/// `None` if malformed (no entry, positions not increasing or not below
+/// 64, empty or trailing bytes).
+pub fn decode_attrs_record(body: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+    let mut r = Reader(body);
+    let count = r.uvarint().ok()?;
+    if count == 0 || count > INDEX_BLOCK {
+        return None;
+    }
+    let mut items: Vec<(u8, &[u8])> = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let position = *r.take(1).ok()?.first()?;
+        let len = usize::try_from(r.uvarint().ok()?).ok()?;
+        let attrs = r.take(len).ok()?;
+        let after = items.last().is_none_or(|&(p, _)| position > p);
+        if !after || u64::from(position) >= INDEX_BLOCK || attrs.is_empty() {
+            return None;
+        }
+        items.push((position, attrs));
+    }
+    r.0.is_empty().then_some(items)
 }
 
 /// A seek page's body: `level u8 | locations, 16 bytes each`.
@@ -1680,6 +1752,41 @@ mod tests {
         }
         assert_eq!(out, blocks[1]);
         assert_eq!((w.seq(), w.last_timestamp()), (128, entries[127].1));
+    }
+
+    #[test]
+    fn block_bodies_and_attribute_records_round_trip() {
+        let entries: Vec<(u64, u64)> = (0..64u64).map(|i| (500 + i, 9 + i)).collect();
+        let encoded = &index_of(&entries)[0];
+        let loc = IndexLoc {
+            segment: 3,
+            len: 40,
+            offset: 1 << 33,
+        };
+        for attrs in [None, Some(loc)] {
+            let body = index_block_body(encoded, attrs);
+            assert_eq!(decode_index_block(&body), Some((entries.clone(), attrs)));
+            assert_eq!(decode_index_block(&body[..body.len() - 1]), None);
+            assert_eq!(decode_index_block(&[&body[..], &[0]].concat()), None);
+        }
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        encode_attrs(&mut a, Some(b"k"), &[]);
+        encode_attrs(&mut b, None, &[(b"h", b"v")]);
+        let items = [(0u8, &a[..]), (63, &b[..])];
+        let body = attrs_record_body(&items);
+        assert_eq!(decode_attrs_record(&body).unwrap(), items);
+        // No entry, positions out of order or at 64, an empty or a cut
+        // entry, trailing bytes.
+        for bad in [
+            attrs_record_body(&[]),
+            attrs_record_body(&[(5, &a), (5, &b)]),
+            attrs_record_body(&[(64, &a)]),
+            attrs_record_body(&[(1, &[])]),
+            body[..body.len() - 1].to_vec(),
+            [&body[..], &[0]].concat(),
+        ] {
+            assert_eq!(decode_attrs_record(&bad), None, "{bad:?}");
+        }
     }
 
     #[test]

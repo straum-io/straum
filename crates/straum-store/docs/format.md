@@ -109,7 +109,7 @@ checkpoint will delete the files wholly before the frame it covers
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 13 |
+| 8 | 4 | `version` u32 = 14 |
 | 12 | 8 | `dict_train_bytes` u64: the dictionary training threshold |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -135,7 +135,9 @@ headers; 8 is two versions: on `main` version 7 with key and headers, on
 the block branch a 16-byte header without `dict_train_bytes`; 9 at most one
 rewritten block per Compact record, 10 one index file per topic
 (`topics/<hex>.idx`), 11 Publish without the publication's key and
-headers, 12 one WAL file, `wal.log`.
+headers, 12 one WAL file, `wal.log`, 13 keys and headers of full index
+blocks only in the WAL (no attribute records). The number keeps increasing
+with each format change on this line; none is reused (D-251 A).
 
 ### Frame
 
@@ -458,19 +460,20 @@ objects come in order (number delta +1), so an entry is usually 2 bytes and
 the first entry of a block about 3 + 6 bytes. The encoding is
 deterministic: the same entries always give the same bytes.
 
-A full block is stored once, as a record in the shared index segments. The
-last, incomplete block (at most 63 entries) is kept in memory, encoded, and
-read from there; it is rebuilt from the WAL at open.
+A full block is stored once, as a record in the shared index segments,
+with the keys and headers of its entries in an attribute record beside it.
+The last, incomplete block (at most 63 entries) is kept in memory, encoded,
+and read from there; it is rebuilt from the WAL at open.
 
 ## Index segment `idx-<id>.dat`
 
-Append-only files shared by all topics: full topic index blocks and seek
-pages. A 24-byte header, then records.
+Append-only files shared by all topics: full topic index blocks, their
+attribute records and seek pages. A 24-byte header, then records.
 
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 49 44 58 00` (`"STRMIDX\0"`) |
-| 8 | 4 | `version` u32 = 13 (the WAL version) |
+| 8 | 4 | `version` u32 = 14 (the WAL version) |
 | 12 | 8 | `created_at` u64: the store's next WAL frame number when the segment was created |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -478,16 +481,26 @@ Record:
 
 | Field | Size |
 |---|---|
-| `kind` u8: 1 block, 2 seek page | 1 |
+| `kind` u8: 1 block, 2 seek page, 3 attributes | 1 |
 | `len` varint: body length | 1–10 |
 | `topic` varint: topic number | 1–10 |
-| `number` varint: block number, or the seek page's number within its level | 1–10 |
+| `number` varint: block number (kinds 1 and 3), or the seek page's number within its level | 1–10 |
 | `stamp` varint: the WAL frame number after the frames the record describes | 1–10 |
 | body | `len` |
 | `crc` u32: CRC32C of every byte of the record before it | 4 |
 
-A block's body is its 64 encoded entries. The CRC covers the topic and
-block number, so a record is never taken for another block. A seek page's
+A block's body is its 64 encoded entries, followed, if any of them has a
+key or headers, by the 16-byte location of the block's attribute record
+(`segment u32 | len u32 | offset u64`, as in a seek page). The CRC covers
+the topic and block number, so a record is never taken for another block.
+An attribute record (kind 3, the block's topic and number) holds the keys
+and headers of the block's entries that have them (D-235 A, D-250 A):
+`count varint` (1–64), then per such entry, in position order,
+`position u8` (0–63, the entry's index in the block), `len varint` and the
+`len` bytes of its attributes, encoded as in a Publish record (never
+empty). Its CRC is the group CRC of those keys and headers: one per full
+block, checked on every read. It is written just before its block record,
+in the same write and with the same stamp. A seek page's
 body is `level u8` followed by `Config::seek_page_entries` (default 256)
 locations of 16 bytes: `segment u32 | len u32 | offset u64`, the whole
 record's length included. A level-0 page holds the locations of blocks
@@ -517,13 +530,18 @@ recently used closed first, plus the segment being written; a read in
 progress holds its handle until it completes, so concurrent reads can each
 add one.
 
-The index holds no key or headers. In memory each live entry that has
-them keeps the WAL position and length of its Publish record's attributes
-(`(seq, WAL file, offset, length)`, 32 bytes per such entry);
-`Store::read_entry` reads them from that WAL file, which is never
-rewritten and not yet deleted. Replay rebuilds those positions from the
-WAL.
-`Store::index_entry(topic, seq)`.
+**Keys and headers.** `Store::read_entry` of an entry of a full block
+reads the block, then its attribute record, which must be intact and be
+the block's (kind, topic, number) and well-formed; otherwise the read fails
+with `TopicIndexCorrupt` (that entry only; the store stays usable).
+`Store::read`, `Store::index_entry` and `release_before` read the block
+only. For the incomplete block, each entry with a key or headers keeps the
+WAL position and length of its Publish record's attributes in memory
+(`(seq, WAL file, offset, length)`, at most 63 per topic, released ones
+included); `read_entry` reads them from that WAL file, which is not yet
+deleted. When a batch completes a block, its attribute record is built from
+those positions after the batch's WAL write and the positions are dropped.
+Replay rebuilds the positions from the WAL.
 
 **Recovery.** Index segments are derived from the WAL. At open:
 
@@ -545,7 +563,16 @@ WAL.
    entries: otherwise `TopicMismatch` (other entries) or
    `IndexSegmentCorrupt` (an unknown topic, a block beyond the topic's full
    blocks, an unknown kind, a body that does not decode), and no file is
-   changed. Its location is used (the first, if several).
+   changed. Its attribute location must be present exactly when the WAL
+   gives one of its entries a key or headers (otherwise `TopicMismatch`).
+   An attribute record found intact at that location, of the block's topic
+   and number, must hold exactly the WAL's keys and headers
+   (`TopicMismatch` otherwise; `IndexSegmentCorrupt` if it does not
+   decode); one that is not there intact (unwritten, torn or damaged, like
+   any unsynced record) makes the block count as not found, so both are
+   re-derived (step 6). The block's location is used (the first intact
+   one, if several). Attribute records are checked only through their
+   block record.
 5. Seek pages are rebuilt from the block locations, level by level; a page
    found intact with exactly the expected locations is reused.
 6. Blocks and pages not found are re-encoded from the WAL and appended with
