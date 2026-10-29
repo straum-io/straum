@@ -4070,16 +4070,26 @@ fn free_quarantine_name(dir: &Path, n: u64) -> io::Result<String> {
 }
 
 /// Moves `files` of the store directory, unchanged, into the new
-/// directory `quarantine`, then syncs it (the caller syncs the store
-/// directory).
+/// directory `quarantine`: the tables and runs first, synced with both
+/// directories, then the manifest, synced again (the caller syncs the store
+/// directory once more). While the damaged manifest is still in the store
+/// directory, an interrupted move is finished by the next open, which finds
+/// the manifest again and quarantines it with the files still in place (in
+/// the next free name); so a table or run it may list is never deleted.
 async fn move_to_quarantine(dir: &Path, quarantine: &str, files: &[String]) -> io::Result<()> {
     let q = dir.join(quarantine);
     std::fs::create_dir(&q)?;
     sync_dir(dir).await?;
-    for f in files {
-        compio::fs::rename(dir.join(f), q.join(f)).await?;
+    let (manifests, others): (Vec<&String>, Vec<&String>) =
+        files.iter().partition(|f| f.starts_with("checkpoint-"));
+    for group in [others, manifests] {
+        for f in &group {
+            compio::fs::rename(dir.join(f), q.join(f)).await?;
+        }
+        sync_dir(&q).await?;
+        sync_dir(dir).await?;
     }
-    sync_dir(&q).await
+    Ok(())
 }
 
 /// Files inside the store's quarantine directories.

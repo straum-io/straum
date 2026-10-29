@@ -52,8 +52,8 @@ authentication exists.
   stored, and recorded through the store.
 - **Startup**: identity check, store open, the store's recovery report on
   stderr once, a `straum-server: warning: <n> quarantined checkpoint
-  file(s) …` line at every start while the store holds quarantine
-  directories (damaged checkpoint manifests kept for diagnosis; remove
+  file(s) …` line at every start while the store holds quarantined
+  files (damaged checkpoint manifests kept for diagnosis; remove
   them once examined), `straum-server: compio driver <driver>`, then
   `straum-server: listening on <address>`. The broker is ready when it
   answers Hello; clients and runners detect that through the protocol, not

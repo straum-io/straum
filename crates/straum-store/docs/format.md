@@ -115,7 +115,7 @@ checkpoint will delete the files wholly before the frame it covers
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 17 |
+| 8 | 4 | `version` u32 = 18 |
 | 12 | 8 | `dict_train_bytes` u64: the dictionary training threshold |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -145,7 +145,8 @@ headers, 12 one WAL file, `wal.log`, 13 keys and headers of full index
 blocks only in the WAL (no attribute records), 14 no checkpoint files, 15 reference counts
 checked at open and in Compact replay, 16 damaged manifests deleted and
 checkpoint numbers reused after a fallback (so an older build must not
-write a directory that holds quarantine directories). The number keeps increasing
+write a directory that holds quarantined manifests), 17 a damaged manifest
+quarantined alone as `checkpoint-<n>.damaged` (its tables and runs deleted). The number keeps increasing
 with each format change on this line; none is reused (D-251 A).
 
 ### Frame
@@ -452,7 +453,7 @@ report means recovery changed nothing. No change is made without an entry.
 | `StaleIndexRecordsFenced { records, segment }` | index records of cut WAL frames were found; index segment `segment` was created to keep them stale |
 | `IndexSegmentDropped { segment, bytes }` | an index segment was deleted because `Config::rebuild_index` was set (the index is rebuilt from the WAL) |
 | `TopicIndexRepaired { topic, blocks_rewritten, pages_rewritten }` | a topic's index blocks or seek pages were re-encoded from the WAL and appended |
-| `CheckpointFileRemoved { file }` | a checkpoint file the checkpoint used does not list was deleted: an earlier manifest, a `checkpoint-<n>.tmp`, or a table or run of a checkpoint that did not complete or whose manifest is damaged |
+| `CheckpointFileRemoved { file }` | a checkpoint file the checkpoint used does not list was deleted: an earlier manifest, a `checkpoint-<n>.tmp`, or a table or run of a checkpoint that did not complete |
 | `CheckpointManifestDamaged { checkpoint, fallback, quarantine }` | manifest `checkpoint-<checkpoint>` failed its CRC, version or name check, or did not decode; open used manifest `fallback` instead, or none (`None`: the state is rebuilt from the WAL, which holds every frame); the manifest and the files it may list moved, unchanged, into the directory `quarantine` |
 | `CheckpointFileQuarantined { file, quarantine }` | checkpoint file `file` was moved, unchanged, into the quarantine directory `quarantine` (one entry per file) |
 
@@ -492,7 +493,7 @@ attribute records and seek pages. A 24-byte header, then records.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 49 44 58 00` (`"STRMIDX\0"`) |
-| 8 | 4 | `version` u32 = 17 (the WAL version) |
+| 8 | 4 | `version` u32 = 18 (the WAL version) |
 | 12 | 8 | `created_at` u64: the number of the first WAL frame its records may describe (the batch's frame for a segment started while writing a batch's records, the frame count for one started at open) |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -641,7 +642,7 @@ Object tables and relocation runs share a 24-byte header and a page layout:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `"STRMOBJ\0"` (table) or `"STRMREL\0"` (run) |
-| 8 | 4 | `version` u32 = 17 (the WAL version) |
+| 8 | 4 | `version` u32 = 18 (the WAL version) |
 | 12 | 8 | `first` u64: the table's first object number, or the number of the checkpoint that wrote the run (also in the file name) |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -710,7 +711,11 @@ After every check, the checkpoint files the manifest in use does not list
 are deleted (`CheckpointFileRemoved`): earlier manifests, tmp manifests,
 tables and runs of an interrupted checkpoint. Each damaged manifest moves,
 unchanged, into a quarantine directory `quarantine-<n>` (D-257 A as
-amended by the owner), created and synced before the moves; a name that
+amended by the owner), created and synced before the moves; the tables and
+runs move first and are synced, then the manifest, so an open interrupted
+during the move leaves the manifest in place and the next open quarantines
+it again with the files not yet moved (in the next free name), deleting
+none; a name that
 is taken gets the next free suffix (`quarantine-<n>.1`, `.2`, …), so an
 existing quarantine is never overwritten. Tables and runs are cumulative,
 so the tables at or above the used manifest's `next_object` and the runs

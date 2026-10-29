@@ -552,22 +552,24 @@ async fn a_damaged_only_manifest_is_ignored_while_the_wal_is_whole() {
 /// the newest one the tables and runs (they are cumulative).
 #[compio::test]
 async fn two_damaged_manifests_are_ignored_while_the_wal_is_whole() {
-    let dir = TempDir::new("checkpoint-two-damaged");
-    let live = build_with_both_manifests(&dir.0, WriteMode::Sequential).await;
-    for n in ["checkpoint-0000000000000001", "checkpoint-0000000000000002"] {
-        edit(&dir.0.join(n), |b| b[13] ^= 1);
+    for mode in MODES {
+        let dir = TempDir::new("checkpoint-two-damaged");
+        let live = build_with_both_manifests(&dir.0, mode).await;
+        for n in ["checkpoint-0000000000000001", "checkpoint-0000000000000002"] {
+            edit(&dir.0.join(n), |b| b[13] ^= 1);
+        }
+        let store = Store::open(&dir.0, config(mode)).await.unwrap();
+        let acts = actions(&store);
+        let q1 = "quarantine-0000000000000001";
+        assert_eq!(acts[0], damaged(2, None, Q2));
+        assert!(acts.contains(&damaged(1, None, q1)));
+        assert_eq!(moved(&acts, q1), ["checkpoint-0000000000000001"]);
+        assert!(moved(&acts, Q2).len() >= 3, "{acts:?}");
+        assert_eq!(store.checkpoint_number(), None);
+        check(&store, live).await;
+        assert!(names(&dir.0, "checkpoint-").is_empty());
+        assert!(names(&dir.0, "objtab-").is_empty());
     }
-    let store = Store::open(&dir.0, Config::default()).await.unwrap();
-    let acts = actions(&store);
-    let q1 = "quarantine-0000000000000001";
-    assert_eq!(acts[0], damaged(2, None, Q2));
-    assert!(acts.contains(&damaged(1, None, q1)));
-    assert_eq!(moved(&acts, q1), ["checkpoint-0000000000000001"]);
-    assert!(moved(&acts, Q2).len() >= 3, "{acts:?}");
-    assert_eq!(store.checkpoint_number(), None);
-    check(&store, live).await;
-    assert!(names(&dir.0, "checkpoint-").is_empty());
-    assert!(names(&dir.0, "objtab-").is_empty());
 }
 
 /// An existing quarantine is never overwritten: a second quarantine of the
@@ -576,24 +578,26 @@ async fn two_damaged_manifests_are_ignored_while_the_wal_is_whole() {
 /// other checkpoint files.
 #[compio::test]
 async fn a_taken_quarantine_name_takes_the_next_suffix() {
-    let dir = TempDir::new("checkpoint-quarantine-taken");
-    build_with_both_manifests(&dir.0, WriteMode::Sequential).await;
-    edit(&dir.0.join("checkpoint-0000000000000002"), |b| b[13] ^= 1);
-    for q in [Q2, "quarantine-0000000000000002.1"] {
-        std::fs::create_dir(dir.0.join(q)).unwrap();
-        std::fs::write(dir.0.join(q).join("earlier"), b"old").unwrap();
+    for mode in MODES {
+        let dir = TempDir::new("checkpoint-quarantine-taken");
+        build_with_both_manifests(&dir.0, mode).await;
+        edit(&dir.0.join("checkpoint-0000000000000002"), |b| b[13] ^= 1);
+        for q in [Q2, "quarantine-0000000000000002.1"] {
+            std::fs::create_dir(dir.0.join(q)).unwrap();
+            std::fs::write(dir.0.join(q).join("earlier"), b"old").unwrap();
+        }
+        let store = Store::open(&dir.0, config(mode)).await.unwrap();
+        let q = "quarantine-0000000000000002.2";
+        assert_eq!(actions(&store)[0], damaged(2, Some(1), q));
+        assert!(quarantine_files(&dir.0, q).contains(&"checkpoint-0000000000000002".to_owned()));
+        for old in [Q2, "quarantine-0000000000000002.1"] {
+            assert_eq!(quarantine_files(&dir.0, old), ["earlier"], "untouched");
+        }
+        assert_eq!(
+            store.quarantined_files(),
+            2 + quarantine_files(&dir.0, q).len() as u64
+        );
     }
-    let store = Store::open(&dir.0, Config::default()).await.unwrap();
-    let q = "quarantine-0000000000000002.2";
-    assert_eq!(actions(&store)[0], damaged(2, Some(1), q));
-    assert!(quarantine_files(&dir.0, q).contains(&"checkpoint-0000000000000002".to_owned()));
-    for old in [Q2, "quarantine-0000000000000002.1"] {
-        assert_eq!(quarantine_files(&dir.0, old), ["earlier"], "untouched");
-    }
-    assert_eq!(
-        store.quarantined_files(),
-        2 + quarantine_files(&dir.0, q).len() as u64
-    );
 
     let work = TempDir::new("checkpoint-quarantine-no-wal");
     std::fs::create_dir(work.0.join(Q2)).unwrap();
@@ -646,5 +650,43 @@ async fn a_fallback_to_a_damaged_older_checkpoint_fails_open_and_changes_nothing
         };
         assert!(expect(&err), "{what}: {err}");
         assert!(snapshot(&work.0) == before, "{what}: files changed");
+    }
+}
+
+/// An open interrupted while quarantining: the tables and runs move first,
+/// the manifest last, so a crash in between leaves the damaged manifest in
+/// place with some of its files already moved. The next open quarantines
+/// it again (in the next free name) with the files still in place: none is
+/// deleted, in every write mode.
+#[compio::test]
+async fn an_interrupted_quarantine_is_finished_by_the_next_open() {
+    for mode in MODES {
+        let dir = TempDir::new("checkpoint-quarantine-interrupted");
+        let live = build_with_both_manifests(&dir.0, mode).await;
+        edit(&dir.0.join("checkpoint-0000000000000002"), |b| b[13] ^= 1);
+        let tables: Vec<String> = names(&dir.0, "objtab-")
+            .into_iter()
+            .filter(|n| n != "objtab-0000000000000000.tab")
+            .collect();
+        let mut rest: Vec<String> = names(&dir.0, "reloc-");
+        rest.push("checkpoint-0000000000000002".to_owned());
+        rest.sort();
+        // The state the crash left: the directory and the table moved.
+        std::fs::create_dir(dir.0.join(Q2)).unwrap();
+        for t in &tables {
+            std::fs::rename(dir.0.join(t), dir.0.join(Q2).join(t)).unwrap();
+        }
+        let store = Store::open(&dir.0, config(mode)).await.unwrap();
+        let q = "quarantine-0000000000000002.1";
+        let acts = actions(&store);
+        assert_eq!(acts[0], damaged(2, Some(1), q), "{mode:?}");
+        assert!(removed(&acts).is_empty(), "{mode:?}: {acts:?}");
+        assert_eq!(quarantine_files(&dir.0, Q2), tables, "{mode:?}");
+        assert_eq!(quarantine_files(&dir.0, q), rest, "{mode:?}");
+        assert_eq!(
+            store.quarantined_files(),
+            (tables.len() + rest.len()) as u64
+        );
+        check(&store, live).await;
     }
 }
