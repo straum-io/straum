@@ -27,6 +27,7 @@ use crate::codec::{
     BLKREL_ENTRY, BLKREL_MAGIC, BLKTAB_MAGIC, BLOCK_ENTRY, BlockPlace, ID_ENTRY, IDRUN_MAGIC,
     Manifest, OBJECT_ENTRY, OBJTAB_MAGIC, Placement, RELOC_ENTRY, RELOC_MAGIC,
 };
+use crate::fault::{self, FaultPoint};
 use crate::fuse::Fuse8;
 use crate::recent::RecentIds;
 
@@ -1036,6 +1037,7 @@ impl Store {
             wal.sync_all().await?;
         }
 
+        fault::check(FaultPoint::OpenBeforeReport)?;
         let files = OpenFiles::new(&dir, config.data_open_files);
         Ok(Self {
             dir,
@@ -1141,6 +1143,7 @@ impl Store {
             let count = self.next_object - first;
             m.tables.push((first, count));
             written.push((path, OBJTAB_MAGIC, first, count, OBJECT_ENTRY, entries));
+            fault::check(FaultPoint::CheckpointObjectTable)?;
         }
         if !self.relocated.is_empty() {
             let mut entries = Vec::with_capacity(self.relocated.len() * RELOC_ENTRY);
@@ -1156,6 +1159,7 @@ impl Store {
             let count = self.relocated.len() as u64;
             m.runs.push((n, count));
             written.push((path, RELOC_MAGIC, n, count, RELOC_ENTRY, entries));
+            fault::check(FaultPoint::CheckpointRelocationRun)?;
         }
         if self.next_block > prev.next_block {
             let first = prev.next_block;
@@ -1171,6 +1175,7 @@ impl Store {
             let count = self.next_block - first;
             m.block_tables.push((first, count));
             written.push((path, BLKTAB_MAGIC, first, count, BLOCK_ENTRY, entries));
+            fault::check(FaultPoint::CheckpointBlockTable)?;
         }
         if !self.relocated_blocks.is_empty() {
             let mut entries = Vec::with_capacity(self.relocated_blocks.len() * BLKREL_ENTRY);
@@ -1190,6 +1195,7 @@ impl Store {
             let count = self.relocated_blocks.len() as u64;
             m.block_runs.push((n, count));
             written.push((path, BLKREL_MAGIC, n, count, BLKREL_ENTRY, entries));
+            fault::check(FaultPoint::CheckpointBlockRun)?;
         }
         // The memtable as an id run, merged with the runs of its tier when
         // that tier is full (size-tiered, `TIER_RUNS`), dropping ids whose
@@ -1218,6 +1224,7 @@ impl Store {
             m.id_runs.retain(|(k, _)| !merged.contains(k));
             m.id_runs.push((n, run.count));
             id_written = Some((path, run));
+            fault::check(FaultPoint::CheckpointIdRun)?;
         }
         // The dictionary, once: the first checkpoint after training.
         let mut dict_written = None;
@@ -1229,9 +1236,11 @@ impl Store {
             names.push(file_name(&path));
             m.dict = 1;
             dict_written = Some(path);
+            fault::check(FaultPoint::CheckpointDictionary)?;
         }
         if !written.is_empty() || dict_written.is_some() || id_written.is_some() {
             sync_dir(&self.dir).await?;
+            fault::check(FaultPoint::CheckpointFilesSynced)?;
         }
         if let Some((path, run)) = &id_written {
             verify_id_run(path, run).await?;
@@ -1251,13 +1260,18 @@ impl Store {
         let path = checkpoint_path(&self.dir, n);
         let tmp = path.with_extension("tmp");
         write_new_synced(&tmp, m.encode()).await?;
+        fault::check(FaultPoint::CheckpointManifestTmp)?;
         compio::fs::rename(&tmp, &path).await?;
+        fault::check(FaultPoint::CheckpointRenamed)?;
         sync_dir(&self.dir).await?;
+        fault::check(FaultPoint::CheckpointRenameSynced)?;
         // The previous manifest stays until the new one reads back as
         // written: open falls back to it if the new one is damaged. A
         // failed read-back removes the new manifest, so the previous one
         // stays the one in use.
-        if read_manifest(&self.dir, n).await?.as_ref() != Some(&m) {
+        if read_manifest(&self.dir, n).await?.as_ref() != Some(&m)
+            || fault::hit(FaultPoint::CheckpointReadBackMismatch)
+        {
             // Quarantined with this checkpoint's files, like a damaged
             // manifest at open.
             names.push(file_name(&path));
@@ -1272,7 +1286,9 @@ impl Store {
         }
         if prev.n > 0 {
             compio::fs::remove_file(checkpoint_path(&self.dir, prev.n)).await?;
+            fault::check(FaultPoint::CheckpointPreviousDeleted)?;
             sync_dir(&self.dir).await?;
+            fault::check(FaultPoint::CheckpointPreviousDeleteSynced)?;
         }
         if let Some((_, run)) = id_written {
             if !merged.is_empty() {
@@ -1284,6 +1300,7 @@ impl Store {
                 }
                 sync_dir(&self.dir).await?;
                 self.id_runs.retain(|r| !merged.contains(&r.n));
+                fault::check(FaultPoint::CheckpointMergedRunsDeleted)?;
             }
             self.id_runs.insert(0, run);
             self.memtable.clear();
@@ -4454,6 +4471,7 @@ async fn move_to_quarantine(
     let q = dir.join(quarantine);
     if create {
         std::fs::create_dir(&q)?;
+        fault::check(FaultPoint::QuarantineDirCreated)?;
     }
     // Also when completing: the directory entry an interrupted open made
     // may not be durable yet.
@@ -4463,9 +4481,11 @@ async fn move_to_quarantine(
     for group in [others, manifests] {
         for f in &group {
             compio::fs::rename(dir.join(f), q.join(f)).await?;
+            fault::check(FaultPoint::QuarantineMoved)?;
         }
         sync_dir(&q).await?;
         sync_dir(dir).await?;
+        fault::check(FaultPoint::QuarantineGroupSynced)?;
     }
     Ok(())
 }
