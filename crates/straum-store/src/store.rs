@@ -4553,7 +4553,7 @@ async fn open_checkpoint(
             resumed: Some(inside.clone()),
         });
     }
-    quarantine.sort_unstable_by(|a, b| b.checkpoint.cmp(&a.checkpoint));
+    quarantine.sort_unstable_by_key(|q| std::cmp::Reverse(q.checkpoint));
     let newest = quarantine
         .first()
         .map(|q| q.checkpoint)
