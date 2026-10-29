@@ -1,0 +1,56 @@
+# Fuzz targets (cargo-fuzz, nightly). A workspace of its own, so the main
+# workspace, its stable builds and scripts/validate.sh never build it.
+[package]
+name = "straum-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+straum-proto = { path = "../crates/straum-proto" }
+straum-store = { path = "../crates/straum-store" }
+compio = { version = "=0.19.2", default-features = false, features = ["runtime", "fs", "macros", "io-uring"] }
+crc32c = "0.6"
+
+[[bin]]
+name = "proto_frame"
+path = "fuzz_targets/proto_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_json"
+path = "fuzz_targets/proto_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store_wal"
+path = "fuzz_targets/store_wal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store_checkpoint"
+path = "fuzz_targets/store_checkpoint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gen_corpus"
+path = "src/gen_corpus.rs"
+test = false
+doc = false
+bench = false

@@ -296,7 +296,8 @@ pub fn hex(b: &[u8]) -> String {
 }
 
 pub fn unhex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    // `from_str_radix` alone would take a sign: `"+f"` is 15.
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     (0..s.len())
