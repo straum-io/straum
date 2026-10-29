@@ -671,6 +671,11 @@ pub struct Store {
     /// the runs' filters cover never gets a second number (ADR-0014 §5).
     #[cfg(debug_assertions)]
     debug_ids: HashMap<ObjectId, u64>,
+    /// Debug builds: object number → the id run holding its pair, so the
+    /// assertion can tell that an id's earlier number lives only in a run
+    /// whose filter the budget dropped.
+    #[cfg(debug_assertions)]
+    debug_runs: HashMap<u64, u64>,
     next_object: u64,
     /// Block number → block. Numbers are never reused.
     blocks: HashMap<u64, Block>,
@@ -1037,6 +1042,10 @@ impl Store {
                 .collect()
         });
         #[cfg(debug_assertions)]
+        let debug_runs: HashMap<u64, u64> = checkpoint.as_ref().map_or_else(HashMap::new, |c| {
+            c.id_entries.iter().map(|&(_, x, r)| (x, r)).collect()
+        });
+        #[cfg(debug_assertions)]
         let replay_ids: HashMap<ObjectId, u64> =
             replay.objects.iter().map(|(&n, o)| (o.id, n)).collect();
         // The memtable holds the live objects the checkpoint does not cover;
@@ -1103,6 +1112,8 @@ impl Store {
 
         fault::check(FaultPoint::OpenBeforeReport)?;
         let files = OpenFiles::new(&dir, config.data_open_files);
+        // Frame numbers index `sizes` while no WAL file is deleted; step 6b,
+        // which deletes them, must count from the first frame held.
         let covered = checkpoint.as_ref().map_or(0, |c| c.manifest.covered) as usize;
         let wal_since_checkpoint = sizes[covered..].iter().sum();
         let mut store = Self {
@@ -1121,6 +1132,8 @@ impl Store {
             recent: RefCell::new(RecentIds::new(config.recent_id_cache_entries)),
             #[cfg(debug_assertions)]
             debug_ids: replay_ids,
+            #[cfg(debug_assertions)]
+            debug_runs,
             next_object: replay.next_object,
             blocks: replay.blocks,
             next_block: replay.next_block,
@@ -1371,6 +1384,16 @@ impl Store {
                 self.id_runs.retain(|r| !merged.contains(&r.n));
                 fault::check(FaultPoint::CheckpointMergedRunsDeleted)?;
             }
+            #[cfg(debug_assertions)]
+            {
+                for r in self.debug_runs.values_mut() {
+                    if merged.contains(r) {
+                        *r = run.n;
+                    }
+                }
+                self.debug_runs
+                    .extend(self.memtable.values().map(|&x| (x, run.n)));
+            }
             self.id_runs.insert(0, run);
             self.memtable.clear();
         }
@@ -1399,7 +1422,8 @@ impl Store {
     /// Runs a checkpoint before a write when one is due (D-209 A): the WAL
     /// since the last one reached `checkpoint_wal_bytes`, or the memtable
     /// its share of the memory budget. Its error is the write's, before
-    /// the write changed anything.
+    /// the write changed anything; a failed checkpoint poisons the store,
+    /// as `Store::checkpoint` does.
     async fn checkpoint_if_due(&mut self) -> Result<(), StoreError> {
         let wal = self.config.checkpoint_wal_bytes;
         let due = (wal > 0 && self.wal_since_checkpoint >= wal)
@@ -1496,6 +1520,10 @@ impl Store {
             self.recent.borrow_mut().remove(id, n);
         }
         let (key, fence) = (codec::id_key(id), codec::id_fence(id));
+        // The newest live number over every run (§5): a merged run can hold
+        // numbers older and newer than a run it leaves in place, so no run
+        // order settles it. Only runs whose filter answers yes are read.
+        let mut newest = None;
         for run in &self.id_runs {
             if !run.filter.contains(key) {
                 continue;
@@ -1512,24 +1540,33 @@ impl Store {
                     codec::id_entry(&page, i).is_some_and(|(x, _)| x < *id)
                 });
                 // An id may repeat under several numbers (degraded
-                // deduplication, ADR-0014 §4): any live one.
+                // deduplication, ADR-0014 §4), sorted by number: this run's
+                // newest live one is the last live one in the last page
+                // that holds one.
+                let mut found = false;
                 for i in i..count {
                     match codec::id_entry(&page, i) {
                         Some((x, n)) if x == *id => {
                             if self.objects.contains_key(&n) {
-                                self.recent.borrow_mut().insert(*id, n);
-                                return Ok(Some(n));
+                                newest = newest.max(Some(n));
+                                found = true;
                             }
                         }
                         _ => break,
                     }
+                }
+                if found {
+                    break;
                 }
                 if run.fences[p] < fence {
                     break;
                 }
             }
         }
-        Ok(None)
+        if let Some(n) = newest {
+            self.recent.borrow_mut().insert(*id, n);
+        }
+        Ok(newest)
     }
 
     /// Page `p` of id run `run`, checked against its CRC
@@ -1711,8 +1748,15 @@ impl Store {
                     .debug_ids
                     .get(&id)
                     .is_some_and(|n| self.objects.contains_key(n));
+                let unsearched = |n: &u64| {
+                    self.debug_runs
+                        .get(n)
+                        .and_then(|r| self.id_runs.iter().find(|x| x.n == *r))
+                        .is_some_and(|x| x.filter.bytes() == 0)
+                };
+                let earlier = self.debug_ids.get(&id);
                 debug_assert!(
-                    !live || (self.unsearched_id_runs() > 0 && !self.memtable.contains_key(&id)),
+                    !live || (!self.memtable.contains_key(&id) && earlier.is_some_and(unsearched)),
                     "a live id got a second number"
                 );
                 self.debug_ids.insert(id, self.next_object);
@@ -4972,10 +5016,11 @@ struct LoadedCheckpoint {
     dict: Option<Vec<u8>>,
     /// The id runs, newest first.
     id_runs: Vec<IdRun>,
-    /// Every id run entry `(id, number)`, for the comparison with the WAL.
+    /// Every id run entry `(id, number, run)`, for the comparison with the
+    /// WAL.
     // ponytail: every entry read at open, while open replays the whole WAL
     // anyway; from step 6b open reads only the footers.
-    id_entries: Vec<(ObjectId, u64)>,
+    id_entries: Vec<(ObjectId, u64, u64)>,
 }
 
 impl LoadedCheckpoint {
@@ -5072,7 +5117,7 @@ impl LoadedCheckpoint {
         // Every live object below `next_object` in exactly one run, under
         // its id; an entry of an object reclaimed since is allowed.
         let mut seen = HashSet::with_capacity(self.id_entries.len());
-        for &(id, number) in &self.id_entries {
+        for &(id, number, _) in &self.id_entries {
             let wrong = number >= m.next_object
                 || !seen.insert(number)
                 || replay.objects.get(&number).is_some_and(|o| o.id != id);
@@ -5304,7 +5349,7 @@ async fn load_checkpoint(dir: &Path, manifest: Manifest) -> Result<LoadedCheckpo
         ))?;
         last = run;
         id_runs.push(r);
-        id_entries.extend(entries);
+        id_entries.extend(entries.into_iter().map(|(id, x)| (id, x, run)));
     }
     id_runs.reverse();
     Ok(LoadedCheckpoint {

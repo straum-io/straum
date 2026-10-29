@@ -189,3 +189,76 @@ async fn beyond_the_filters_share_a_repeat_is_stored_again() {
         assert_eq!(store.object_count(), 1, "{mode:?}");
     }
 }
+
+/// One id under 256 live numbers (every write of it after a checkpoint
+/// whose run the 16-byte budget no longer searches), merged by tier into a
+/// run whose pairs of that id fill several pages. With the default budget a
+/// repeat deduplicates onto the newest live number, through a checkpoint
+/// and a reopen; once every number but the oldest is reclaimed, onto the
+/// oldest, read from the run's first page past reclaimed pairs.
+#[compio::test]
+async fn a_repeated_id_deduplicates_onto_its_newest_live_number() {
+    let dir = TempDir::new("budget-newest");
+    let tiny = Config {
+        memory_budget_bytes: 16,
+        recent_id_cache_entries: 0,
+        ..manual(WriteMode::Sequential)
+    };
+    let x = body(7);
+    let id = ObjectId::of(&x);
+    let put_at = async |store: &mut Store, topic: &[u8], ts: u64| {
+        let m = Message {
+            topic,
+            payload: &x,
+            ..Default::default()
+        };
+        store.put_batch(&[m], ts).await.unwrap()[0]
+    };
+    let number = async |store: &Store, topic: &[u8], seq: u64| {
+        store.index_entry(topic, seq).await.unwrap().unwrap().0
+    };
+    let mut store = Store::open(&dir.0, tiny).await.unwrap();
+    put_at(&mut store, b"old", 1).await;
+    for ts in 1..=255 {
+        put_at(&mut store, b"a", ts).await;
+    }
+    assert_eq!(store.object_count(), 256, "a new number every time");
+    assert_eq!(number(&store, b"a", 254).await, 255);
+    store.checkpoint().await.unwrap();
+    drop(store);
+    // A run of more than two 4 KiB pages: the id's pairs straddle pages.
+    let largest = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("idrun-"))
+        .map(|e| e.metadata().unwrap().len())
+        .max()
+        .unwrap();
+    assert!(largest > 2 * 4096, "largest id run {largest} bytes");
+
+    let searched = Config {
+        recent_id_cache_entries: 0,
+        ..manual(WriteMode::Sequential)
+    };
+    let mut store = Store::open(&dir.0, searched).await.unwrap();
+    assert_eq!(store.unsearched_id_runs(), 0);
+    let seq = put_at(&mut store, b"c", 1).await;
+    assert_eq!(number(&store, b"c", seq).await, 255, "the newest");
+    store.checkpoint().await.unwrap();
+    drop(store);
+
+    let mut store = Store::open(&dir.0, searched).await.unwrap();
+    assert!(store.recovery_report().is_empty());
+    assert_eq!(store.object_count(), 256);
+    assert_eq!(store.entry(b"a", 0).await.unwrap(), Some(id));
+    assert_eq!(store.release_before(b"a", 256).await.unwrap(), 255);
+    assert_eq!(store.release_before(b"c", 2).await.unwrap(), 1);
+    assert_eq!(store.compact().await.unwrap().objects_dropped, 255);
+    let seq = put_at(&mut store, b"b", 1).await;
+    assert_eq!(number(&store, b"b", seq).await, 0, "the only live one");
+    assert_eq!(store.read(b"b", seq).await.unwrap(), Some(x.clone()));
+    drop(store);
+    let store = Store::open(&dir.0, searched).await.unwrap();
+    assert!(store.recovery_report().is_empty());
+    assert_eq!(store.read(b"old", 0).await.unwrap(), Some(x.clone()));
+}

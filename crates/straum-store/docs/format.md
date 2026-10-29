@@ -655,7 +655,8 @@ one and either the WAL bytes since it reached
 frames past the covered one) or the memtable reached its share of
 `Config::memory_budget_bytes` (a quarter: 112 bytes per new id with its
 dense-table entry, 16 per relocated number); its error is the call's, with
-nothing of the call written. `Store::close` checkpoints if a frame was
+nothing of the call written, and, as after any failed checkpoint, the
+store is then poisoned (`Poisoned` until reopened). `Store::close` checkpoints if a frame was
 written since the last one.
 
 Memory budget (ADR-0014 §4, D-207 B): the id runs' fences and, newest
