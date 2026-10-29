@@ -4,7 +4,7 @@ name: release
 # linux/arm64 and publishes it to Docker Hub, builds the Debian packages for
 # both, and creates the GitHub release with the packages, their checksums and
 # provenance (Constitution §12.3: only release versions are published). The
-# Launchpad PPA upload is off until D-251 (job ppa). A pull request that touches
+# Launchpad PPA is paused (D-253 A, job ppa). A pull request that touches
 # the build builds the amd64 image, both packages and the noble source package,
 # without publishing anything.
 #
@@ -168,7 +168,7 @@ jobs:
   # source package; the binary build with the network cut off, as Launchpad
   # does, and the upload are off: the workspace needs Rust 1.95 and the
   # newest versioned Rust in Ubuntu is 1.93, so Launchpad cannot build the
-  # package until the owner decides D-251 (straum-dev-plan).
+  # package; the PPA is paused (D-253 A, straum-dev-plan).
   ppa:
     if: github.event_name == 'pull_request'
     needs: [image, deb]
