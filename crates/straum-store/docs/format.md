@@ -474,7 +474,7 @@ attribute records and seek pages. A 24-byte header, then records.
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 49 44 58 00` (`"STRMIDX\0"`) |
 | 8 | 4 | `version` u32 = 14 (the WAL version) |
-| 12 | 8 | `created_at` u64: the store's next WAL frame number when the segment was created |
+| 12 | 8 | `created_at` u64: the number of the first WAL frame its records may describe (the batch's frame for a segment started while writing a batch's records, the frame count for one started at open) |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
 Record:
@@ -539,8 +539,12 @@ only. For the incomplete block, each entry with a key or headers keeps the
 WAL position and length of its Publish record's attributes in memory
 (`(seq, WAL file, offset, length)`, at most 63 per topic, released ones
 included); `read_entry` reads them from that WAL file, which is not yet
-deleted. When a batch completes a block, its attribute record is built from
-those positions after the batch's WAL write and the positions are dropped.
+deleted. When a batch completes a block, its attribute record is built
+after the batch's WAL write, from the frame still in memory for that
+batch's entries and by one WAL read per entry of earlier batches, and the
+positions are dropped. An error there (a read or a segment creation) comes
+after the frame is durable: the batch fails and the store refuses further
+use, and the next open recovers the batch from the WAL.
 Replay rebuilds the positions from the WAL.
 
 **Recovery.** Index segments are derived from the WAL. At open:
@@ -568,7 +572,8 @@ Replay rebuilds the positions from the WAL.
    An attribute record found intact at that location, of the block's topic
    and number, must hold exactly the WAL's keys and headers
    (`TopicMismatch` otherwise; `IndexSegmentCorrupt` if it does not
-   decode); one that is not there intact (unwritten, torn or damaged, like
+   decode or the location holds another intact record); one that is not
+   there intact (unwritten, torn or damaged, like
    any unsynced record) makes the block count as not found, so both are
    re-derived (step 6). The block's location is used (the first intact
    one, if several). Attribute records are checked only through their

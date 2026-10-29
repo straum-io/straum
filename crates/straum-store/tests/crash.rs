@@ -81,6 +81,16 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// The key of a published payload: one for payloads of even length, so a
+/// key needs no line of its own in the ACK protocol; its one header holds
+/// the same bytes.
+fn key_of(payload: &[u8]) -> Option<Vec<u8>> {
+    payload
+        .len()
+        .is_multiple_of(2)
+        .then(|| format!("k{}", payload.len()).into_bytes())
+}
+
 /// The writer. A no-op unless started by `sigkill_at_random_points`.
 #[test]
 fn crash_child() {
@@ -114,13 +124,20 @@ fn crash_child() {
                 topics.push(topic);
                 payloads.push(payload);
             }
+            let keys: Vec<Option<Vec<u8>>> = payloads.iter().map(|p| key_of(p)).collect();
+            let headers: Vec<[(&[u8], &[u8]); 1]> = keys
+                .iter()
+                .map(|k| [(&b"h"[..], k.as_deref().unwrap_or_default())])
+                .collect();
             let batch: Vec<Message> = topics
                 .iter()
                 .zip(&payloads)
-                .map(|(&topic, payload)| Message {
+                .zip(keys.iter().zip(&headers))
+                .map(|((&topic, payload), (key, headers))| Message {
                     topic,
                     payload,
-                    ..Default::default()
+                    key: key.as_deref(),
+                    headers: if key.is_some() { headers } else { &[] },
                 })
                 .collect();
             let now = std::time::SystemTime::now()
@@ -261,10 +278,15 @@ fn verify(
         let mut sorted: Vec<_> = acked.iter().collect();
         sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
         for ((topic, seq), payload) in sorted {
-            let got = store.read(topic.as_bytes(), *seq).await.unwrap();
+            let got = store.read_entry(topic.as_bytes(), *seq).await.unwrap();
+            let key = key_of(payload);
+            let headers = match &key {
+                Some(k) => vec![(b"h".to_vec(), k.clone())],
+                None => vec![],
+            };
             assert_eq!(
-                got.as_ref(),
-                Some(payload),
+                got.map(|e| (e.payload, e.key, e.headers)),
+                Some((payload.clone(), key, headers)),
                 "iteration {i}: acked {topic}/{seq}"
             );
         }

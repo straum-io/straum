@@ -42,7 +42,11 @@ describes `durable`.
   so does every later Produce, CreateTopic, and Fetch that reads a stored
   message, until the broker is restarted (the store refuses all use after
   a failed write; a Fetch with nothing to read still waits and answers
-  empty). At restart the store is recovered from disk (section 3).
+  empty). At restart the store is recovered from disk (section 3). A group
+  answered with `StorageError` may still be stored: the failed write can
+  come after its WAL frame was durable (for example while its index
+  records were written), and restart then recovers the group, as for any
+  request whose answer was lost.
 
 ### Write modes
 

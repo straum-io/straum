@@ -393,4 +393,38 @@ async fn attribute_records_are_checked_at_open() {
         );
         assert!(snapshot(&dir.0) == before, "{what}: files changed");
     }
+
+    // Intact records that a writer cannot have produced: an attribute
+    // record that does not decode, and a block whose attribute location
+    // names another intact record. Both `IndexSegmentCorrupt`.
+    let cases: [(&str, Change); 2] = [
+        ("an attribute record that does not decode", |d| {
+            let rec = find_index_record(d, INDEX_ATTRS_RECORD, 0, 1);
+            edit(&rec.path, |b| {
+                b[rec.body.start] = 0;
+                reseal_index_record(b, rec.offset, rec.size);
+            })
+        }),
+        ("an attribute location naming another record", |d| {
+            let other = find_index_record(d, INDEX_ATTRS_RECORD, 0, 0);
+            let rec = find_index_record(d, INDEX_BLOCK_RECORD, 0, 1);
+            edit(&rec.path, |b| {
+                let loc = rec.body.end - 16;
+                b[loc + 4..loc + 8].copy_from_slice(&(other.size as u32).to_le_bytes());
+                b[loc + 8..loc + 16].copy_from_slice(&(other.offset as u64).to_le_bytes());
+                reseal_index_record(b, rec.offset, rec.size);
+            })
+        }),
+    ];
+    for (what, change) in cases {
+        let dir = fresh("index-attrs-corrupt").await;
+        change(&dir.0);
+        let before = snapshot(&dir.0);
+        let err = Store::open(&dir.0, config).await.err().unwrap();
+        assert!(
+            matches!(err, StoreError::IndexSegmentCorrupt { .. }),
+            "{what}: {err}"
+        );
+        assert!(snapshot(&dir.0) == before, "{what}: files changed");
+    }
 }

@@ -1110,7 +1110,12 @@ impl Store {
         // built after the WAL write (an attribute record reads its keys and
         // headers from the WAL), written after the WAL fsync, not synced.
         for (name, block, body) in filled {
-            self.add_index_block(name, block, &body, stamp).await?;
+            let frame_at = WalPos {
+                file: wal_id,
+                offset: wal_len,
+            };
+            self.add_index_block(name, block, &body, stamp, frame_at)
+                .await?;
         }
         self.stats.topic_bytes += self.index.flush().await?;
         self.in_flight = false;
@@ -1526,24 +1531,24 @@ impl Store {
             let entries = codec::decode_index_entries(&t.tail).ok_or_else(|| corrupt(block))?;
             return Ok(entries.get(at).copied());
         }
-        let (entries, _) = self.full_block(name, t, block).await?;
-        Ok(entries.get(at).copied())
+        Ok(self.full_block(name, t, block, at).await?.0)
     }
 
-    /// Full block `block` of topic `name`: its entries and the location of
-    /// its attribute record, from the read cache or its index record, which
-    /// must match its CRC, topic and block number (`TopicIndexCorrupt`
-    /// otherwise).
+    /// Entry `at` of full block `block` of topic `name` and the location
+    /// of the block's attribute record, from the read cache or the block's
+    /// index record, which must match its CRC, topic and block number
+    /// (`TopicIndexCorrupt` otherwise).
     async fn full_block(
         &self,
         name: &[u8],
         t: &Topic,
         block: u64,
-    ) -> Result<codec::IndexBlock, StoreError> {
+        at: usize,
+    ) -> Result<(Option<(u64, u64)>, Option<IndexLoc>), StoreError> {
         if let Some((b, entries, attrs)) = t.read_cache.borrow().as_ref()
             && *b == block
         {
-            return Ok((entries.clone(), *attrs));
+            return Ok((entries.get(at).copied(), *attrs));
         }
         let corrupt = || StoreError::TopicIndexCorrupt {
             topic: name.to_vec(),
@@ -1556,8 +1561,9 @@ impl Store {
             .await?
             .and_then(|body| codec::decode_index_block(&body))
             .ok_or_else(corrupt)?;
-        *t.read_cache.borrow_mut() = Some((block, entries.clone(), attrs));
-        Ok((entries, attrs))
+        let entry = entries.get(at).copied();
+        *t.read_cache.borrow_mut() = Some((block, entries, attrs));
+        Ok((entry, attrs))
     }
 
     /// The key and headers of entry `seq` (a full block's) from its block's
@@ -1697,8 +1703,10 @@ impl Store {
             };
             (entry, attrs)
         } else {
-            let (entries, loc) = self.full_block(topic, t, block).await?;
-            let Some(&entry) = entries.get((seq % INDEX_BLOCK) as usize) else {
+            let (entry, loc) = self
+                .full_block(topic, t, block, (seq % INDEX_BLOCK) as usize)
+                .await?;
+            let Some(entry) = entry else {
                 return Ok(None);
             };
             let attrs = match loc {
@@ -2171,9 +2179,11 @@ impl Store {
         block: u64,
         body: &[u8],
         stamp: u64,
+        frame_at: WalPos,
     ) -> Result<(), StoreError> {
-        // Called after the batch's frame was written: a segment started
-        // now gets the frame's number, as if created before it.
+        // Called after the batch's frame (at `frame_at`, still in
+        // `wal_buf`) was written: a segment started now gets the frame's
+        // number, as if created before it.
         let created_at = stamp - 1;
         let Some(t) = self.topics.get(name) else {
             unreachable!("the batch created the topic")
@@ -2189,7 +2199,20 @@ impl Store {
             .collect();
         let mut items = Vec::with_capacity(keyed.len());
         for a in &keyed {
-            items.push(((a.seq % INDEX_BLOCK) as u8, self.wal_attrs(*a).await?));
+            // This batch's attributes are taken from its frame in memory;
+            // earlier batches' are read from the WAL, one read each.
+            // ponytail: one positional read per keyed entry of earlier
+            // batches at block fill; coalesce if the milestone shows it.
+            let in_frame = (a.at.file == frame_at.file)
+                .then(|| a.at.offset.checked_sub(frame_at.offset))
+                .flatten()
+                .and_then(|at| usize::try_from(at).ok())
+                .and_then(|at| self.wal_buf.get(at..at + a.len as usize));
+            let bytes = match in_frame {
+                Some(b) => b.to_vec(),
+                None => self.wal_attrs(*a).await?,
+            };
+            items.push(((a.seq % INDEX_BLOCK) as u8, bytes));
         }
         let attrs = if items.is_empty() {
             None
@@ -3115,9 +3138,17 @@ async fn open_index(
                                 }
                                 true
                             }
+                            // Intact but another record: written that way.
+                            Some(_) => {
+                                return Err(StoreError::IndexSegmentCorrupt {
+                                    segment: u64::from(l.segment),
+                                    offset: l.offset,
+                                    reason: "attribute location holds another record",
+                                });
+                            }
                             // Lost or damaged with the unsynced index:
                             // re-derived with its block.
-                            _ => false,
+                            None => false,
                         },
                     };
                     if intact {
