@@ -181,9 +181,9 @@ const PREV_MANIFEST: &str = r"checkpoint-[0-9a-f]{16}$";
 /// <arm_at> <damage>`. Each iteration draws from its own generator, so an
 /// iteration is reproduced from the seed and its number alone. `damage`
 /// (checkpoint scenario, else `none`): after the power loss the newest
-/// manifest is damaged (`manifest`), and with `rc-before` / `rc-after` the
-/// first recovery is then killed before or after its first move into the
-/// quarantine.
+/// manifest is damaged (`manifest`); with `rc-<timing>` the first
+/// recovery is then killed before or after its first move into the
+/// quarantine, with `rcm-<timing>` before or after the manifest's move.
 fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
     let scenario = opt(opts, "scenario")?;
     let seed = num(opts, "seed")?;
@@ -260,7 +260,13 @@ fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
         let damage = if scenario != "checkpoint" {
             "none"
         } else if two_manifests || rng.below(3) == 0 {
-            ["manifest", "rc-before", "rc-after"][rng.below(3) as usize]
+            [
+                "manifest",
+                "rc-before",
+                "rc-after",
+                "rcm-before",
+                "rcm-after",
+            ][rng.below(5) as usize]
         } else {
             "none"
         };

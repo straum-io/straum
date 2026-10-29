@@ -99,9 +99,9 @@ scripts/container/linux.sh --end-session         # back to the default machine
 
 Inside the container git cannot read a worktree's metadata, so the host
 passes the commit and its number of uncommitted changes (`git status
---porcelain` lines) as `STRAUM_COMMIT` and `STRAUM_UNCOMMITTED`; `env.txt`
-marks them `from the host`. Without them run.sh asks git, and prints
-`unknown` if git fails.
+--porcelain` lines) as `STRAUM_COMMIT` and `STRAUM_UNCOMMITTED`. run.sh
+uses them only when git fails, and `env.txt` then marks them `from the
+host`; with neither it prints `unknown`.
 
 The privileged container's command is `run.sh` itself, not
 `scripts/container/linux.sh`, whose wrapper first runs `rustup component
@@ -206,11 +206,13 @@ one. To run the fallback and the quarantine (D-257 A), the harness damages
 the newest manifest itself, on the unmounted root after the power loss: it
 cuts it to a random length or flips one bit (`damage.log`). This happens
 after every crash before the previous manifest's `unlink` (two manifests
-on disk: open must fall back to the older one) and in a quarter of the
-other iterations. Half of those then run a first recovery on LazyFS
-(`store-open`) and kill it before or after its first rename into the
-quarantine directory (`rc-before`, `rc-after`), leaving an interrupted or
-a completed quarantine for the verifier's open. The iteration line says
+on disk: open must fall back to the older one) and in a third of the
+other iterations. Four in five of those then run a first recovery on
+LazyFS (`store-open`) and kill it before or after its first rename into
+the quarantine directory (`rc-before`, `rc-after`) or the manifest's
+rename, which comes after the tables and runs (`rcm-before`,
+`rcm-after`), leaving an interrupted or a completed quarantine for the
+verifier's open. The iteration line says
 `where=in-checkpoint` or `outside-checkpoint`, and
 `damaged=<manifest>_<how> rc=<when>:<outcome>`.
 

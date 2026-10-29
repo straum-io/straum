@@ -104,12 +104,12 @@ BROKER="$ROOT/target/release/straum-server"
     echo "date_utc: $(date -u +%FT%TZ)"
     echo "command: $0 --out $OUT --iterations $ITERATIONS --seed $SEED --scenarios $SCENARIOS --modes $MODES"
     # STRAUM_COMMIT and STRAUM_UNCOMMITTED (the number of changed files),
-    # set on the host, win: inside a container git cannot read a worktree's
-    # metadata (README.md "In a container").
-    if [ -n "${STRAUM_COMMIT:-}" ]; then
-        echo "straum_commit: $STRAUM_COMMIT (${STRAUM_UNCOMMITTED:-unknown} uncommitted changes, from the host)"
-    elif commit="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"; then
+    # set on the host, for when git cannot read the tree's metadata: a
+    # worktree mounted into a container (README.md "In a container").
+    if commit="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"; then
         echo "straum_commit: $commit ($(git -C "$ROOT" status --porcelain | wc -l | tr -d ' ') uncommitted changes)"
+    elif [ -n "${STRAUM_COMMIT:-}" ]; then
+        echo "straum_commit: $STRAUM_COMMIT (${STRAUM_UNCOMMITTED:-unknown} uncommitted changes, from the host)"
     else
         echo "straum_commit: unknown (uncommitted changes: unknown)"
     fi
@@ -367,9 +367,10 @@ write_phase() {
 
 # damage_phase <run> <iter dir> <damage> <seed> <mode>: after the power
 # loss, with LazyFS unmounted, damages the newest checkpoint manifest under
-# root/ (sets DAMAGED to its name, empty without one); with rc-before or
-# rc-after, a first recovery then runs on LazyFS and is killed before or
-# after its first rename into a quarantine directory. Sets DAMAGE_OUT.
+# root/ (sets DAMAGED to its name, empty without one); with rc-<timing>,
+# a first recovery then runs on LazyFS and is killed before or after its
+# first rename into a quarantine directory, with rcm-<timing> at the
+# manifest's rename (the tables and runs move first). Sets DAMAGE_OUT.
 damage_phase() {
     local run="$1" it="$2" damage="$3" wseed="$4" mode="$5" res
     res="$("$BIN" damage --dir "$run/root/store" --seed "$wseed")"
@@ -377,13 +378,18 @@ damage_phase() {
     DAMAGED="$(sed -n 's/^RESULT ok \(checkpoint-[0-9a-f]\{16\}\) .*/\1/p' <<<"$res")"
     DAMAGE_OUT="${res#RESULT ok }"
     DAMAGE_OUT="${DAMAGE_OUT// /_}"
-    case "$damage" in rc-before | rc-after) ;; *) return 0 ;; esac
+    local to=/quarantine-
+    case "$damage" in
+        rc-*) ;;
+        rcm-*) to='/quarantine-[^/]*/checkpoint-' ;;
+        *) return 0 ;;
+    esac
     [ -n "$DAMAGED" ] || return 0
     mount_lazyfs "$run" "$it/lazyfs-rc.log" || { ERR="remount for the interrupted recovery"; return 1; }
     # LazyFS 0.3.1 matches a rename by to_rgx only, and only when from_rgx
     # is given and does not match the word "none".
-    printf 'lazyfs::crash::timing=%s::op=rename::from_rgx=/store/::to_rgx=/quarantine-\n' \
-        "${damage#rc-}" >"$run/faults.fifo"
+    printf 'lazyfs::crash::timing=%s::op=rename::from_rgx=/store/::to_rgx=%s\n' \
+        "${damage#*-}" "$to" >"$run/faults.fifo"
     # LazyFS reads the FIFO on its own thread.
     sleep 0.2
     "$BIN" store-open --dir "$run/mnt/store" --mode "$mode" >"$it/store-open.log" 2>&1 &
