@@ -180,7 +180,7 @@ fn disk_usage(dir: &Path) -> std::io::Result<(u64, u64, u64)> {
         let name = name.to_string_lossy();
         if name.starts_with("seg-") {
             seg += entry.metadata()?.len();
-        } else if name == "wal.log" {
+        } else if name.starts_with("wal-") && name.ends_with(".log") {
             wal += entry.metadata()?.len();
         } else if name.starts_with("idx-") {
             idx += entry.metadata()?.len();
