@@ -687,14 +687,26 @@ entries (40 bytes, 102 per page) sorted by id, then a footer: `pages u64 |
 fence u64 per page | filter | len u32 | crc u32` (`len` the footer's
 bytes before it; the CRC32C over the footer and `len`). A fence is the
 first 8 bytes of a page's first id, big-endian. The filter is a binary
-fuse filter with 8-bit fingerprints over each id's bytes 8 to 16
-(`seed u64 | segment_length u32 | segment_count_length u32 | len u32 |
-fingerprints`): about 9 bits per id, 0.39 % false positives. A
-checkpoint writes the memtable (the live ids allocated since the last
-one) as a run; past eight runs it merges every run and the memtable into
-one, dropping ids whose objects compaction reclaimed, and deletes the
-merged runs after the new manifest (a crash before leaves them unlisted:
-deleted at open). A lookup checks the memtable, then each run from newest
+fuse filter with 8-bit fingerprints (Graf and Lemire, arity 3) over each
+id's key, its bytes 8 to 16 read little-endian (`seed u64 | segment_length
+u32 | segment_count_length u32 | len u32 | fingerprints`, `len` =
+`segment_count_length + 2 × segment_length`, `segment_length` a power of
+two dividing `segment_count_length`): with `h = fmix64(key + seed)`
+(MurmurHash3's finalizer: `h ^= h >> 33; h *= 0xff51afd7ed558ccd; h ^= h >>
+33; h *= 0xc4ceb9fe1a85ec53; h ^= h >> 33`, wrapping), positions `h0 =
+(h × segment_count_length) >> 64`, `h1 = (h0 + segment_length) ^ ((h >> 18)
+& (segment_length − 1))`, `h2 = (h0 + 2 × segment_length) ^ (h &
+(segment_length − 1))`, and fingerprint `f = (h ^ (h >> 32)) as u8`, the
+key may be in the run if `f ^ fp[h0] ^ fp[h1] ^ fp[h2] == 0`; about 9 bits
+per id, 0.39 % false positives. A checkpoint writes the memtable (the live
+ids allocated since the last one) as a run. Runs merge by size tier
+(ADR-0014 §1): a run's tier is `floor(log4(entries))`; when the new run's
+tier would hold four runs, the new run absorbs the other three, and the
+result absorbs the three of its own tier the same way, one k-way merge
+over their pages that drops ids whose objects compaction reclaimed, the
+output written page by page. Each tier keeps at most three runs. The
+merged runs are deleted after the new manifest (a crash before leaves them
+unlisted: deleted at open, `CheckpointFileRemoved`). A lookup checks the memtable, then each run from newest
 to oldest whose filter answers yes: the run's fences give the one page to
 read (a page whose CRC fails is `CorruptCheckpoint`), and a number found
 whose object compaction reclaimed is a miss.

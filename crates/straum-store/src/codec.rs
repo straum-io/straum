@@ -1230,7 +1230,7 @@ pub fn decode_table_header(magic: [u8; 8], buf: &[u8]) -> Option<u64> {
     (*h == table_header(magic, first)).then_some(first)
 }
 
-fn page_crc(page: u64, entries: &[u8]) -> u32 {
+pub fn page_crc(page: u64, entries: &[u8]) -> u32 {
     crc32c::crc32c_append(crc32c::crc32c(&page.to_le_bytes()), entries)
 }
 

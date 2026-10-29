@@ -61,19 +61,20 @@ impl Fuse8 {
     }
 
     /// The filter of `keys` (duplicates allowed). Construction is retried
-    /// with new seeds and, if needed, a larger array; it always succeeds.
-    pub fn build(keys: &[u64]) -> Self {
+    /// with new seeds and, if needed, a larger array. `None` only past
+    /// about 3.8 G distinct keys, where positions no longer fit a u32.
+    pub fn build(keys: &[u64]) -> Option<Self> {
         let mut keys = keys.to_vec();
         keys.sort_unstable();
         keys.dedup();
         let size = keys.len();
         if size == 0 {
-            return Self {
+            return Some(Self {
                 seed: 0,
                 segment_length: 1,
                 segment_count_length: 0,
                 fingerprints: Vec::new(),
-            };
+            });
         }
         let sized = size.max(2) as f64;
         let segment_length: u32 =
@@ -84,11 +85,14 @@ impl Fuse8 {
         let mut segment_count = capacity.div_ceil(sl).saturating_sub(2).max(1);
         let mut seed_state = 0x9e37_79b9_7f4a_7c15u64;
         loop {
+            if (segment_count + 2).checked_mul(sl)? > u64::from(u32::MAX) {
+                return None;
+            }
             for _ in 0..100 {
                 seed_state = seed_state.wrapping_add(0x9e37_79b9_7f4a_7c15);
                 let seed = mix(seed_state);
                 if let Some(f) = Self::try_build(&keys, seed, segment_length, segment_count) {
-                    return f;
+                    return Some(f);
                 }
             }
             segment_count += 1;
@@ -180,9 +184,13 @@ impl Fuse8 {
         let segment_count_length = u32::from_le_bytes(head[12..16].try_into().ok()?);
         let len = u32::from_le_bytes(head[16..20].try_into().ok()?) as usize;
         let fingerprints = buf.get(20..20 + len)?.to_vec();
+        // Every position `hashes` can produce must lie in the array.
         let consistent = segment_length.is_power_of_two()
             && (len == 0
-                || u64::from(segment_count_length) + 2 * u64::from(segment_length) == len as u64);
+                || (segment_count_length > 0
+                    && segment_count_length % segment_length == 0
+                    && u64::from(segment_count_length) + 2 * u64::from(segment_length)
+                        == len as u64));
         consistent.then(|| {
             (
                 Self {
@@ -209,7 +217,7 @@ mod tests {
     fn every_member_is_found_at_every_size() {
         for n in [0, 1, 2, 3, 5, 10, 31, 100, 1000, 4096, 50_000] {
             let k = keys(n, 1);
-            let f = Fuse8::build(&k);
+            let f = Fuse8::build(&k).unwrap();
             assert!(k.iter().all(|&x| f.contains(x)), "{n}");
             let mut enc = Vec::new();
             f.encode(&mut enc);
@@ -217,15 +225,26 @@ mod tests {
             let (g, rest) = Fuse8::decode(&enc).unwrap();
             assert_eq!((g, rest), (f, &b"rest"[..]), "{n}");
         }
-        assert!(!Fuse8::build(&[]).contains(7));
-        let dup = Fuse8::build(&[5, 5, 9]);
+        assert!(!Fuse8::build(&[]).unwrap().contains(7));
+        let dup = Fuse8::build(&[5, 5, 9]).unwrap();
+        // A resealed footer whose parameters would index past the array is
+        // refused, not trusted.
+        let f = Fuse8::build(&keys(1000, 4)).unwrap();
+        let mut enc = Vec::new();
+        f.encode(&mut enc);
+        let scl = u32::from_le_bytes(enc[12..16].try_into().unwrap());
+        enc[12..16].copy_from_slice(&(scl + 1).to_le_bytes());
+        let len = u32::from_le_bytes(enc[16..20].try_into().unwrap());
+        enc[16..20].copy_from_slice(&(len + 1).to_le_bytes());
+        enc.push(0);
+        assert!(Fuse8::decode(&enc).is_none());
         assert!(dup.contains(5) && dup.contains(9));
     }
 
     #[test]
     fn false_positives_and_size_match_the_design() {
         let k = keys(100_000, 2);
-        let f = Fuse8::build(&k);
+        let f = Fuse8::build(&k).unwrap();
         let absent = keys(1_000_000, 3);
         let fp = absent.iter().filter(|&&x| f.contains(x)).count();
         // 0.39 % expected.

@@ -7,9 +7,13 @@
 mod block;
 mod codec;
 mod fuse;
+mod recent;
 mod store;
 
 pub use codec::{FrameMode, MAX_TOPIC, ObjectId};
+/// The recent-id cache, public for its measurement (`straum-store-bench`'s
+/// `recent-ids`).
+pub use recent::RecentIds;
 pub use store::{
     CommitTiming, CompactStats, CompactStep, Config, ConfigOverride, DropReason, Entry, Message,
     RecoveryAction, RecoveryReport, Stats, Store, TopicStats, WriteMode,

@@ -1,8 +1,8 @@
 //! Id runs (ADR-0014 step 6): the memtable of ids since the last
 //! checkpoint goes to `idrun-<n>.run` (sorted entries in pages, fences and a
 //! binary fuse filter in the footer); deduplication looks ids up in the
-//! memtable, then in each run whose filter answers yes. Past eight runs a
-//! checkpoint merges them, dropping reclaimed ids. In every write mode.
+//! memtable, then in each run whose filter answers yes. Runs merge by size
+//! tier (four per tier), dropping reclaimed ids. In every write mode.
 
 #![allow(clippy::unwrap_used)] // test crate: helpers outside #[test] fns panic on failure by design
 
@@ -93,8 +93,8 @@ async fn repeats_are_found_in_the_runs_and_reclaimed_ids_are_misses() {
     }
 }
 
-/// Past eight runs a checkpoint merges every run into one and deletes the
-/// others; old content still deduplicates, and reopening is clean.
+/// Tiny runs merge as their tier fills (four per tier); old content still
+/// deduplicates through the merged runs, and reopening is clean.
 #[compio::test]
 async fn runs_are_merged_past_the_bound() {
     for mode in MODES {
@@ -199,4 +199,80 @@ async fn a_run_page_damaged_after_open_fails_the_lookup() {
         store.put_batch(&batch, 1).await,
         Err(StoreError::Poisoned)
     ));
+}
+
+/// Entries of an id run file, from its layout: the pages between the
+/// 24-byte header and the footer (whose length precedes its CRC), 40 bytes
+/// per entry and 4 per page CRC.
+fn run_entries(path: &Path) -> u64 {
+    let b = std::fs::read(path).unwrap();
+    let n = b.len();
+    let footer = u32::from_le_bytes(b[n - 8..n - 4].try_into().unwrap()) as usize;
+    let pages = u64::from_le_bytes(b[n - 8 - footer..n - footer].try_into().unwrap());
+    let body = (n - 8 - footer - 24) as u64;
+    (body - 4 * pages) / 40
+}
+
+/// A merge drops the ids whose objects compaction reclaimed: after it, the
+/// runs hold exactly the live objects. Runs it superseded and that a crash
+/// left behind are orphans, deleted and reported at open.
+#[compio::test]
+async fn a_merge_drops_reclaimed_ids_and_leftover_runs_are_orphans() {
+    for mode in [WriteMode::Sequential, WriteMode::ParallelSync] {
+        let dir = TempDir::new("idruns-merge-reclaimed");
+        let mut store = Store::open(&dir.0, config(mode)).await.unwrap();
+        put(&mut store, b"x", &[1, 2, 3]).await;
+        store.checkpoint().await.unwrap();
+        let first_run = std::fs::read(dir.0.join(&names(&dir.0, "idrun-")[0])).unwrap();
+        let first_name = names(&dir.0, "idrun-")[0].clone();
+        store.release_before(b"x", 2).await.unwrap();
+        store.compact().await.unwrap();
+        for k in 0..3u64 {
+            put(&mut store, b"a", &[100 + k * 3, 101 + k * 3, 102 + k * 3]).await;
+            store.checkpoint().await.unwrap();
+        }
+        let runs = names(&dir.0, "idrun-");
+        assert_eq!(runs.len(), 1, "{mode:?}: four tier-0 runs merged: {runs:?}");
+        let total: u64 = runs.iter().map(|r| run_entries(&dir.0.join(r))).sum();
+        assert_eq!(total, 9, "{mode:?}: the three reclaimed ids dropped");
+        assert_eq!(store.object_count(), 9);
+        drop(store);
+        // A crash between the manifest and the unlink of a merged run.
+        std::fs::write(dir.0.join(&first_name), first_run).unwrap();
+        let store = Store::open(&dir.0, config(mode)).await.unwrap();
+        assert_eq!(
+            store.recovery_report().actions,
+            [straum_store::RecoveryAction::CheckpointFileRemoved {
+                file: first_name.clone()
+            }],
+            "{mode:?}"
+        );
+        drop(store);
+        let store = Store::open(&dir.0, config(mode)).await.unwrap();
+        assert!(store.recovery_report().is_empty(), "{mode:?}");
+    }
+}
+
+/// Many checkpoints: the run count stays within three per tier, and every
+/// id ever stored is still found.
+#[compio::test]
+async fn runs_stay_few_across_many_checkpoints() {
+    let dir = TempDir::new("idruns-tiers");
+    let mut store = Store::open(&dir.0, Config::default()).await.unwrap();
+    let mut next = 0u64;
+    for _ in 0..40 {
+        let ids: Vec<u64> = (next..next + 50).collect();
+        next += 50;
+        put(&mut store, b"a", &ids).await;
+        store.checkpoint().await.unwrap();
+        // 2 000 ids at most: tiers 2 to 5, at most 3 runs each.
+        assert!(names(&dir.0, "idrun-").len() <= 12);
+    }
+    drop(store);
+    let mut store = Store::open(&dir.0, Config::default()).await.unwrap();
+    assert!(store.recovery_report().is_empty());
+    let all: Vec<u64> = (0..next).step_by(7).collect();
+    put(&mut store, b"a", &all).await;
+    assert_eq!(store.stats().messages_deduplicated, all.len() as u64);
+    assert_eq!(store.object_count() as u64, next);
 }
