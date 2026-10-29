@@ -42,7 +42,7 @@ scripts/power-loss/run.sh --out /tmp/pl-smoke --quick      # 5 iterations each
 | `--iterations N` | 200 | per scenario and mode |
 | `--quick` | | 5 iterations |
 | `--seed N` | 24301 | printed in `env.txt` and in every iteration line |
-| `--scenarios` | `store,broker,compaction,dictionary` | |
+| `--scenarios` | `store,broker,compaction,dictionary,checkpoint` | |
 | `--modes` | `sequential,parallel,inline` | |
 | `--lazyfs DIR` | `$LAZYFS_DIR` or `~/lazyfs` | the LazyFS checkout |
 | `--keep` | | keep the store data of passing runs |
@@ -55,17 +55,20 @@ Output in `--out`:
 
 ```text
 env.txt            kernel, OS, CPU, file system under LazyFS, LazyFS and
-                   libfuse versions, Straum commit, rustc, seed
+                   libfuse versions, Straum commit and the number of
+                   uncommitted changes, rustc, seed
 iterations.log     one line per iteration: PASS/FAIL, fault, outcome, result
 summary.txt        the table of all scenarios and the overall result
 <scenario>-<mode>/
   plan.txt         the iterations drawn from the seed
   iter-NNNNNN/     writer.log (TRY/ACK lines), writer.err, verify.log,
                    lazyfs.log; broker: broker.log, producer.log,
-                   verify-broker.log
+                   verify-broker.log; checkpoint: damage.log, and for an
+                   interrupted recovery store-open.log, lazyfs-rc.log
   root/            the store's files after the last recovery
-  pre-recovery/    a copy of root/ taken after the last fault, before
-                   recovery (both removed after a passing run)
+  pre-recovery/    a copy of root/ taken after the last fault (checkpoint:
+                   and the damage and interrupted recovery), before the
+                   verifier's recovery (both removed after a passing run)
 ```
 
 ## In a container (macOS development)
@@ -84,6 +87,8 @@ podman --connection straum-test build -t localhost/straum-power-loss:0.3.1 \
     -f scripts/power-loss/Containerfile scripts/power-loss
 podman --connection straum-test run --rm \
     --device /dev/fuse --cap-add SYS_ADMIN \
+    -e STRAUM_COMMIT="$(git rev-parse HEAD)" \
+    -e STRAUM_UNCOMMITTED="$(git status --porcelain | wc -l | tr -d ' ')" \
     -v "$PWD":/src -w /src \
     -v straum-container-registry:/usr/local/cargo/registry \
     -v "straum-container-target-$(printf '%s' "$PWD" | cksum | cut -d ' ' -f 1)":/src/target \
@@ -91,6 +96,12 @@ podman --connection straum-test run --rm \
     scripts/power-loss/run.sh --quick --out /src/target/power-loss
 scripts/container/linux.sh --end-session         # back to the default machine
 ```
+
+Inside the container git cannot read a worktree's metadata, so the host
+passes the commit and its number of uncommitted changes (`git status
+--porcelain` lines) as `STRAUM_COMMIT` and `STRAUM_UNCOMMITTED`. run.sh
+uses them only when git fails, and `env.txt` then marks them `from the
+host`; with neither it prints `unknown`.
 
 The privileged container's command is `run.sh` itself, not
 `scripts/container/linux.sh`, whose wrapper first runs `rustup component
@@ -155,10 +166,11 @@ iterations also recover stores that were recovered before.
 | `broker` | `straum-server` (crate `straum-broker`) with `store_write_mode` set to the mode and 64 KiB segments; two producers with keys, headers and repeated bodies, 10 ms apart between requests | as `store` |
 | `compaction` | as `store`, compacting after every round | the writer sends a `crash` or `torn` (WAL) fault just before its 1st–4th compaction; the summary counts the iterations whose writer died inside the compaction |
 | `dictionary` | as `store`, on a fresh store per iteration with `dict_train_bytes` 64 KiB | the writer sends a `crash` or `torn` (WAL) fault just before the batch that trains the dictionary (`Store::trains_next_batch`) |
+| `checkpoint` | as `store`, with `Store::checkpoint` after every 4th round | `clear` at a random moment; or the writer sends a `crash` or `torn` (manifest) fault just before its 1st–4th checkpoint; then, in some iterations, the newest manifest is damaged and the first recovery may be interrupted (below) |
 
 The summary's `in-op` column counts the iterations whose writer died
-inside the compaction (`compaction`) or inside the training batch
-(`dictionary`).
+inside the compaction (`compaction`), inside the training batch
+(`dictionary`) or inside `Store::checkpoint` (`checkpoint`).
 
 ### Dictionary
 
@@ -173,6 +185,56 @@ dictionary is in the store after recovery. The iteration line says
 `where=in-training` when the writer died before the training batch was
 acknowledged, `after-training` or `before-training` otherwise.
 
+### Checkpoint
+
+A checkpoint writes an object table (`objtab-*.tab`) and a block table
+(`blktab-*.tab`), relocation runs (`reloc-*.run`, `blkrel-*.run`) when
+compaction moved covered objects or blocks, an id run (`idrun-*.run`,
+merging older ones of its size tier), the dictionary file once after
+training, the manifest through `checkpoint-<n>.tmp` and a rename, then
+deletes the previous manifest and the id runs the merge replaced
+(`crates/straum-store/docs/format.md` "Checkpoint"). The `crash` points
+are `create`, `write` and `fsync` of both tables, the object run, the id
+run and the tmp manifest, `write` and `fsync` of the block run, the tmp
+manifest's `rename`, and the `unlink` of the previous manifest and of a
+replaced id run, each `before` or `after`; the dictionary file has none
+(it is written once per store). Checkpoint files a recovery deletes or
+quarantines are checked whatever their kind. `torn` splits the write of the tmp manifest (the
+writer names `checkpoint-<n>.tmp`, `n` the next checkpoint number on
+disk).
+
+A manifest is synced before its rename, so no LazyFS fault can damage
+one. To run the fallback and the quarantine (D-257 A), the harness damages
+the newest manifest itself, on the unmounted root after the power loss: it
+cuts it to a random length or flips one bit (`damage.log`). This happens
+after every crash before the previous manifest's `unlink` (two manifests
+on disk: open must fall back to the older one) and in a third of the
+other iterations. Four in five of those then run a first recovery on
+LazyFS (`store-open`) and kill it before or after its first rename into
+the quarantine directory (`rc-before`, `rc-after`) or the manifest's
+rename, which comes after the tables and runs (`rcm-before`,
+`rcm-after`), leaving an interrupted or a completed quarantine for the
+verifier's open. The iteration line says
+`where=in-checkpoint` or `outside-checkpoint`, and
+`damaged=<manifest>_<how> rc=<when>:<outcome>`.
+
+The verifier's checks are those of `store`, plus, from the files before
+its recovery:
+
+- each manifest whose quarantine directory exists without it is
+  completed (`CheckpointQuarantineResumed`, `found` the files in that
+  directory); the damaged manifest, if newer than every intact one, is
+  quarantined (`CheckpointManifestDamaged`, the directory
+  `quarantine-<n>` or the next free `.k`); no other manifest is reported
+  damaged: one would have been renamed before it was durable;
+- `fallback` in those entries and `Store::checkpoint_number` are the
+  newest other manifest;
+- each `CheckpointFileQuarantined` is a move of that file, unchanged, into
+  its directory, every quarantined manifest is in it, and
+  `Store::quarantined_files` matches the files in quarantine directories;
+- each deleted checkpoint file is a `CheckpointFileRemoved`;
+- the open succeeds: a state these rules explain never makes it fail.
+
 ## Reproducing a failure
 
 `iterations.log` names the seed and the iteration. The seed reproduces
@@ -184,7 +246,8 @@ recovery. To repeat the check on a copy, without LazyFS:
 
 ```bash
 cp -a <scenario>-<mode>/pre-recovery /tmp/repro
-straum-power-loss store-verify --dir /tmp/repro/store --mode <mode> --logs <scenario>-<mode>
+straum-power-loss store-verify --dir /tmp/repro/store --mode <mode> --logs <scenario>-<mode> \
+    [--damaged <the manifest in damage.log>]
 ```
 
 ## What LazyFS does not model
@@ -195,6 +258,9 @@ straum-power-loss store-verify --dir /tmp/repro/store --mode <mode> --logs <scen
 - A drive that acknowledges a flush and loses or reorders the data.
 - Unsynced writes reaching the disk partly and in any order: `clear` drops
   all of them, `torn` persists parts of one write.
-- A fault during recovery itself.
+- A fault during recovery itself, except the one rename into a
+  quarantine that the `checkpoint` scenario interrupts.
+- A synced file damaged later: the `checkpoint` scenario damages a
+  manifest itself, outside LazyFS.
 - Concurrency inside LazyFS: it runs single-threaded (`-s`), so the two
   syncs of ParallelSync reach it one after the other.
