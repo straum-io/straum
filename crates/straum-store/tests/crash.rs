@@ -5,7 +5,7 @@
 //! * every acknowledged publish is readable with the right bytes
 //! * no WAL reference points to a missing object (recovery and reads verify)
 //! * no topic_seq is assigned twice
-//! * refcounts equal the live topic entries pointing at each object
+//! * every live topic entry's object is in the object index
 //!
 //! One test per write mode, each with its own directory and the same seed.
 //! Iterations: `STRAUM_STORE_CRASH_ITERATIONS` (default 200). Seed:
@@ -20,7 +20,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::{Rng, TempDir};
-use straum_store::{Config, Message, ObjectId, Store, WriteMode};
+use straum_store::{CompactStep, Config, Message, ObjectId, Store, WriteMode};
 
 const CHILD_DIR: &str = "STRAUM_STORE_CRASH_CHILD_DIR";
 const CHILD_SEED: &str = "STRAUM_STORE_CRASH_CHILD_SEED";
@@ -160,8 +160,18 @@ fn crash_child() {
             if round % 5 == 4 {
                 store.checkpoint().await.unwrap();
             }
-            if round % 3 == 2 {
-                let stats = store.compact().await.unwrap();
+            // A whole compaction every third round; otherwise one step, so
+            // batches, releases and checkpoints run between its mark phase
+            // and its sweep.
+            let done = if round % 3 == 2 {
+                Some(store.compact().await.unwrap())
+            } else {
+                match store.compact_step().await.unwrap() {
+                    CompactStep::Done(stats) => Some(stats),
+                    _ => None,
+                }
+            };
+            if let Some(stats) = done {
                 writeln!(out, "COMPACTED {} END", stats.segments_rewritten).unwrap();
                 out.flush().unwrap();
             }
@@ -294,8 +304,7 @@ fn verify(
             );
         }
         // Every live entry resolves to an existing object with matching
-        // bytes, and refcounts equal the live entries per object.
-        let mut counts: HashMap<ObjectId, u64> = HashMap::new();
+        // bytes, held by the object index.
         let topics: Vec<Vec<u8>> = store.topics().map(<[u8]>::to_vec).collect();
         for topic in &topics {
             let (first, next) = store.topic_range(topic).unwrap();
@@ -303,11 +312,11 @@ fn verify(
                 let id = store.entry(topic, seq).await.unwrap().unwrap();
                 let bytes = store.read(topic, seq).await.unwrap().unwrap();
                 assert_eq!(ObjectId::of(&bytes), id);
-                *counts.entry(id).or_default() += 1;
+                assert!(
+                    store.contains(&id),
+                    "iteration {i}: {topic:?}/{seq} indexed"
+                );
             }
-        }
-        for (id, n) in &counts {
-            assert_eq!(store.refcount(id), Some(*n), "iteration {i}: refcount");
         }
         store.dictionary_bytes()
     })

@@ -36,8 +36,8 @@ async fn dedup_counts_references_and_keeps_every_sequence() {
         [0, 1, 0, 2],
         "repeated bytes get new topic_seq entries"
     );
-    assert_eq!(store.refcount(&ObjectId::of(b"x")), Some(3));
-    assert_eq!(store.refcount(&ObjectId::of(b"y")), Some(1));
+    assert!(store.contains(&ObjectId::of(b"x")));
+    assert!(store.contains(&ObjectId::of(b"y")));
     assert_eq!(store.object_count(), 2);
     assert_eq!(
         store.stats().payload_bytes_new,
@@ -60,7 +60,7 @@ async fn dedup_counts_references_and_keeps_every_sequence() {
     // A later batch with known bytes writes nothing to the segment.
     store.put_batch(&[msg("c", b"y")], 2).await.unwrap();
     assert_eq!(store.stats().segment_bytes, block_bytes);
-    assert_eq!(store.refcount(&ObjectId::of(b"y")), Some(2));
+    assert!(store.contains(&ObjectId::of(b"y")));
 }
 
 #[compio::test]
@@ -156,7 +156,7 @@ async fn compaction_reclaims_released_objects() {
     // Shared with a live entry: must survive.
     store.put_batch(&[msg("a", b"live-1")], 3).await.unwrap();
     assert_eq!(store.release_before(b"a", 3).await.unwrap(), 2);
-    assert_eq!(store.refcount(&ObjectId::of(b"dead-1")), Some(0));
+    assert!(store.contains(&ObjectId::of(b"dead-1")));
 
     // Each batch block is now partly dead: its live object is recompressed
     // into a new block.
@@ -164,8 +164,8 @@ async fn compaction_reclaims_released_objects() {
     assert_eq!(stats.objects_dropped, 2);
     assert_eq!(stats.segments_rewritten, 2);
     assert!(stats.bytes_reclaimed > 0);
-    assert_eq!(store.refcount(&ObjectId::of(b"dead-1")), None);
-    assert_eq!(store.refcount(&ObjectId::of(b"live-1")), Some(2));
+    assert!(!store.contains(&ObjectId::of(b"dead-1")));
+    assert!(store.contains(&ObjectId::of(b"live-1")));
     assert_eq!(store.object_count(), 2);
     assert_eq!(
         store.compact().await.unwrap().segments_rewritten,
@@ -374,7 +374,7 @@ async fn inline_small_stores_small_objects_in_the_wal() {
             .unwrap();
         assert_eq!(store.segment_count(), 1);
         // Dedup does not care where the bytes live.
-        assert_eq!(store.refcount(&ObjectId::of(b"small")), Some(2));
+        assert!(store.contains(&ObjectId::of(b"small")));
         assert_eq!(read(&store, "t", 0).await.as_deref(), Some(&b"small"[..]));
         assert_eq!(read(&store, "t", 2).await, Some(big.clone()));
         assert_eq!(store.release_before(b"t", 2).await.unwrap(), 3);
@@ -382,14 +382,14 @@ async fn inline_small_stores_small_objects_in_the_wal() {
         let stats = store.compact().await.unwrap();
         assert_eq!(stats.objects_dropped, 1, "only the segment block's object");
         // Inline blocks are not reclaimed: still indexed with no references.
-        assert_eq!(store.refcount(&ObjectId::of(b"tiny")), Some(0));
-        assert_eq!(store.refcount(&ObjectId::of(&big)), None);
+        assert!(store.contains(&ObjectId::of(b"tiny")));
+        assert!(!store.contains(&ObjectId::of(&big)));
         store.put_batch(&[msg("v", b"tiny")], 3).await.unwrap();
     }
     let store = Store::open(&dir.0, config).await.unwrap();
     assert_eq!(read(&store, "v", 0).await.as_deref(), Some(&b"tiny"[..]));
-    assert_eq!(store.refcount(&ObjectId::of(b"tiny")), Some(1));
-    assert_eq!(store.refcount(&ObjectId::of(b"small")), Some(0));
+    assert!(store.contains(&ObjectId::of(b"tiny")));
+    assert!(store.contains(&ObjectId::of(b"small")));
 }
 
 /// topic_seq is implicit in the index: an entry moved to another position

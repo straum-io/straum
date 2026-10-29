@@ -104,7 +104,7 @@ async fn duplicates_across_the_blocks_of_a_batch_are_one_object() {
     );
     assert_eq!(store.stats().messages_deduplicated, 12);
     for p in &distinct {
-        assert_eq!(store.refcount(&ObjectId::of(p)), Some(2));
+        assert!(store.contains(&ObjectId::of(p)));
     }
     for (seq, &i) in order.iter().enumerate() {
         assert_eq!(
@@ -248,8 +248,8 @@ async fn a_batch_can_mix_inline_and_segment_blocks() {
     assert_eq!(inline(&store, &c), Some(true));
     assert_eq!(store.release_before(b"t2", 2).await.unwrap(), 1);
     store.compact().await.unwrap();
-    assert_eq!(store.refcount(&ObjectId::of(&c)), Some(0));
-    assert_eq!(store.refcount(&ObjectId::of(&a)), Some(1));
+    assert!(store.contains(&ObjectId::of(&c)));
+    assert!(store.contains(&ObjectId::of(&a)));
     assert_eq!(store.read(b"t0", 1).await.unwrap().as_deref(), Some(&b[..]));
 }
 

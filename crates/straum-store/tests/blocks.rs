@@ -85,8 +85,8 @@ async fn duplicates_within_and_across_blocks() {
             after_first,
             "{mode:?}: no new block"
         );
-        assert_eq!(store.refcount(&ObjectId::of(&a)), Some(4));
-        assert_eq!(store.refcount(&ObjectId::of(&b)), Some(2));
+        assert!(store.contains(&ObjectId::of(&a)));
+        assert!(store.contains(&ObjectId::of(&b)));
         // A third batch mixes a known and a new payload: a block of one.
         let c = line(3);
         store
@@ -156,7 +156,7 @@ async fn compaction_rewrites_partly_dead_blocks() {
             assert_eq!(got.as_ref(), Some(l), "{mode:?}: live/{seq}");
         }
         for l in lines[..4].iter().chain(&lines[8..]) {
-            assert_eq!(store.refcount(&ObjectId::of(l)), None, "dead reclaimed");
+            assert!(!store.contains(&ObjectId::of(l)), "dead reclaimed");
         }
 
         drop(store);
@@ -228,10 +228,10 @@ async fn compaction_in_inline_small_keeps_inline_blocks() {
     assert_eq!(store.segment_count(), 1);
     assert_eq!(store.object_count(), 4 + 3);
     for p in &small[..2] {
-        assert_eq!(store.refcount(&ObjectId::of(p)), Some(0));
+        assert!(store.contains(&ObjectId::of(p)));
     }
     for p in big[..4].iter().chain(&big[8..]) {
-        assert_eq!(store.refcount(&ObjectId::of(p)), None, "dead reclaimed");
+        assert!(!store.contains(&ObjectId::of(p)), "dead reclaimed");
     }
     let live: Vec<&Vec<u8>> = big[4..8].iter().chain([&small[2]]).collect();
     for (seq, p) in live.iter().enumerate() {
@@ -254,7 +254,7 @@ async fn compaction_in_inline_small_keeps_inline_blocks() {
     }
     // An unreferenced inline object is referenced again, not stored twice.
     store.put_batch(&[msg(b"x", &small[0])], 11).await.unwrap();
-    assert_eq!(store.refcount(&ObjectId::of(&small[0])), Some(1));
+    assert!(store.contains(&ObjectId::of(&small[0])));
     assert_eq!(store.read(b"x", 0).await.unwrap(), Some(small[0].clone()));
     assert_eq!(store.release_before(b"live", 10).await.unwrap(), 5);
     store.compact().await.unwrap();

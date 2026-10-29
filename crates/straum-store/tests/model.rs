@@ -1,15 +1,17 @@
-//! Random sequences of publish, release, compact and restart, checked after
-//! every step against an in-memory model: same reads, same refcounts, same
-//! topic sequences.
+//! Random sequences of publish, release, compaction steps, checkpoints and
+//! restart, checked after every step against an in-memory model: same
+//! reads, same object index, same topic sequences. Compaction steps
+//! interleave with puts (ADR-0014 step 5): an object a batch references
+//! during a compaction survives it.
 
 #![allow(clippy::unwrap_used)] // test crate: helpers outside #[test] fns panic on failure by design
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use common::TempDir;
 use proptest::prelude::*;
-use straum_store::{Config, Entry, Message, ObjectId, Store, WriteMode};
+use straum_store::{CompactStep, Config, Entry, Message, ObjectId, Store, WriteMode};
 
 const TOPICS: [&[u8]; 3] = [b"a", b"b", b"c"];
 
@@ -32,6 +34,8 @@ enum Op {
         age: u64,
     },
     Compact,
+    /// One `compact_step`; batches and other ops run between steps.
+    CompactStep,
     Checkpoint,
     Restart,
 }
@@ -43,6 +47,7 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(Op::Put),
         2 => (0..TOPICS.len(), 0..6u64).prop_map(|(topic, age)| Op::Release { topic, age }),
         1 => Just(Op::Compact),
+        3 => Just(Op::CompactStep),
         1 => Just(Op::Checkpoint),
         1 => Just(Op::Restart),
     ]
@@ -76,17 +81,60 @@ struct Model {
     /// inline block. Dead objects in segment blocks leave it at compaction;
     /// those in inline blocks never do.
     indexed: HashMap<usize, bool>,
+    compaction: Option<ModelCompaction>,
+}
+
+/// A compaction in progress, as the model follows it.
+struct ModelCompaction {
+    /// Payloads in the object index when the mark phase began.
+    candidates: HashSet<usize>,
+    /// Topics still to mark, in the store's (name) order.
+    topics: Vec<usize>,
+    /// Payloads marked: live in a marked topic, or put since the start.
+    marked: HashSet<usize>,
 }
 
 impl Model {
-    fn live_counts(&self) -> HashMap<usize, u64> {
-        let mut counts = HashMap::new();
-        for t in self.topics.values() {
-            for &(p, _, _) in &t.entries[t.first_live as usize..] {
-                *counts.entry(p).or_default() += 1;
+    fn start_compaction(&mut self) {
+        if self.compaction.is_none() {
+            let mut topics: Vec<usize> = self.topics.keys().copied().collect();
+            topics.sort_by_key(|&t| TOPICS[t]);
+            self.compaction = Some(ModelCompaction {
+                candidates: self.indexed.keys().copied().collect(),
+                topics,
+                marked: HashSet::new(),
+            });
+        }
+    }
+
+    /// The next topic's live payloads are marked.
+    fn mark_next(&mut self) {
+        let Some(c) = self.compaction.as_mut() else {
+            unreachable!("started")
+        };
+        let t = c.topics.remove(0);
+        if let Some(mt) = self.topics.get(&t) {
+            for &(p, _, _) in &mt.entries[mt.first_live as usize..] {
+                c.marked.insert(p);
             }
         }
-        counts
+    }
+
+    /// Done: unmarked candidates in segment blocks were reclaimed.
+    fn finish_compaction(&mut self) {
+        if let Some(c) = self.compaction.take() {
+            self.indexed
+                .retain(|p, inline| *inline || !c.candidates.contains(p) || c.marked.contains(p));
+        }
+    }
+
+    /// A payload the sweep in progress may or may not have reclaimed yet.
+    fn uncertain(&self, p: usize) -> bool {
+        self.compaction.as_ref().is_some_and(|c| {
+            c.candidates.contains(&p)
+                && !c.marked.contains(&p)
+                && self.indexed.get(&p) == Some(&false)
+        })
     }
 }
 
@@ -126,19 +174,15 @@ async fn check(store: &Store, model: &Model, payloads: &[Vec<u8>]) {
             );
         }
     }
-    let counts = model.live_counts();
+    let mut present = 0;
     for (i, p) in payloads.iter().enumerate() {
-        let want = model
-            .indexed
-            .contains_key(&i)
-            .then(|| counts.get(&i).copied().unwrap_or(0));
-        assert_eq!(
-            store.refcount(&ObjectId::of(p)),
-            want,
-            "refcount of payload {i}"
-        );
+        let has = store.contains(&ObjectId::of(p));
+        present += usize::from(has);
+        if !model.uncertain(i) {
+            assert_eq!(has, model.indexed.contains_key(&i), "payload {i} stored");
+        }
     }
-    assert_eq!(store.object_count(), model.indexed.len());
+    assert_eq!(store.object_count(), present, "one number per payload");
 }
 
 fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
@@ -185,6 +229,9 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
                         .collect();
                     let seqs = store.put_batch(&batch, now).await.unwrap();
                     for (&(t, p, a), seq) in msgs.iter().zip(seqs) {
+                        if let Some(c) = model.compaction.as_mut() {
+                            c.marked.insert(p);
+                        }
                         // Whether an object's block went inline depends on
                         // the block's compressed size, and a batch can have
                         // both kinds: the model reads it from the store.
@@ -211,16 +258,38 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
                     assert_eq!(released, want);
                 }
                 Op::Compact => {
+                    model.start_compaction();
+                    while model
+                        .compaction
+                        .as_ref()
+                        .is_some_and(|c| !c.topics.is_empty())
+                    {
+                        model.mark_next();
+                    }
+                    model.finish_compaction();
                     store.compact().await.unwrap();
-                    let live = model.live_counts();
-                    model
-                        .indexed
-                        .retain(|p, inline| *inline || live.contains_key(p));
+                }
+                Op::CompactStep => {
+                    model.start_compaction();
+                    match store.compact_step().await.unwrap() {
+                        CompactStep::Marked => model.mark_next(),
+                        CompactStep::Swept => {}
+                        CompactStep::Done(_) => model.finish_compaction(),
+                    }
+                    assert_eq!(store.compacting(), model.compaction.is_some());
                 }
                 Op::Checkpoint => store.checkpoint().await.unwrap(),
                 Op::Restart => {
                     drop(store);
                     store = Store::open(&dir.0, config).await.unwrap();
+                    // A compaction in progress ends; what its sweep had
+                    // reclaimed so far stays reclaimed.
+                    for (i, p) in payloads.iter().enumerate() {
+                        if model.uncertain(i) && !store.contains(&ObjectId::of(p)) {
+                            model.indexed.remove(&i);
+                        }
+                    }
+                    model.compaction = None;
                 }
             }
             check(&store, &model, &payloads).await;

@@ -113,7 +113,7 @@ checkpoint will delete the files wholly before the frame it covers
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 15 |
+| 8 | 4 | `version` u32 = 16 |
 | 12 | 8 | `dict_train_bytes` u64: the dictionary training threshold |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -140,7 +140,8 @@ the block branch a 16-byte header without `dict_train_bytes`; 9 at most one
 rewritten block per Compact record, 10 one index file per topic
 (`topics/<hex>.idx`), 11 Publish without the publication's key and
 headers, 12 one WAL file, `wal.log`, 13 keys and headers of full index
-blocks only in the WAL (no attribute records), 14 no checkpoint files. The number keeps increasing
+blocks only in the WAL (no attribute records), 14 no checkpoint files, 15 reference counts
+checked at open and in Compact replay. The number keeps increasing
 with each format change on this line; none is reused (D-251 A).
 
 ### Frame
@@ -200,7 +201,7 @@ order, never reused (the number of an object removed by compaction is not
 reused either). Compaction does not change it (only the block and index).
 The full BLAKE3 id is written once, in PutObject; Publish and the topic
 index refer to the number. In memory: id → number (deduplication), number →
-(block, index, refcount), and block number → (location, lengths, dictionary,
+(block, index), and block number → (location, lengths, dictionary,
 CRC, object count); all are rebuilt from the WAL. The next number after open
 is the highest in the WAL plus one (the WAL is never cut; a future WAL
 checkpoint has to store it explicitly).
@@ -338,13 +339,17 @@ old object gives a negative number delta.
 | per rewritten block: `block_number`, `offset`, `len`, `raw_len`, `dict` varints, `crc` u32 | 9–54 |
 | per rewritten block: `count` varint, then `count` object numbers, varints, in index order | 1–10 + 1–10 each |
 
-On replay, with `B` the blocks of `old`: every kept block is in `B` and holds
-only live objects (refcount > 0); the objects of the rewritten blocks
-together, each listed once, are exactly the live objects of the other blocks
-of `B`, and no rewritten block is empty; every other object of `B` is
-dead and is removed with its id. Blocks of `B` not kept are removed. Any
-other combination is `CorruptWal`. With `new` = `u64::MAX` there are no kept
-or rewritten blocks.
+On replay, with `B` the blocks of `old`: every kept block is in `B`; the
+objects of the rewritten blocks, each listed once, are objects of the blocks
+of `B` that are not kept, and no rewritten block is empty; every other
+object of `B` is reclaimed and removed with its id. Blocks of `B` not kept
+are removed. Any other combination is `CorruptWal`. With `new` =
+`u64::MAX` there are no kept or rewritten blocks. No reference counts are
+kept (ADR-0014 step 5, D-206 A), so replay does not check which objects
+were live: a kept block may hold dead objects and a moved object may be
+dead (a compaction keeps what it marked). After replay every live topic
+entry's object must be in the object index; otherwise
+`UnknownObjectNumber`, and no file is changed.
 
 ### Example: frame 9 (ParallelSync) with a new topic `ab` and two Publish records, next object number 300 at the frame start
 
@@ -479,7 +484,7 @@ attribute records and seek pages. A 24-byte header, then records.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 49 44 58 00` (`"STRMIDX\0"`) |
-| 8 | 4 | `version` u32 = 15 (the WAL version) |
+| 8 | 4 | `version` u32 = 16 (the WAL version) |
 | 12 | 8 | `created_at` u64: the number of the first WAL frame its records may describe (the batch's frame for a segment started while writing a batch's records, the frame count for one started at open) |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -608,7 +613,7 @@ topic's blocks and seek pages from the WAL into new index segments
 (`TopicIndexRepaired`). The rebuild changes no other file; the repairs
 of every open (a torn tail, orphans) apply as usual. It is safe whenever
 the WAL itself opens, since the index holds nothing the WAL does not, and
-every WAL, refcount and segment check runs before the first deletion. If
+every WAL, live-object and segment check runs before the first deletion. If
 the rebuilding open is interrupted (some segments deleted, others not),
 open again with the setting. Without the setting, open never deletes an
 intact index segment.
@@ -628,7 +633,7 @@ Object tables and relocation runs share a 24-byte header and a page layout:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `"STRMOBJ\0"` (table) or `"STRMREL\0"` (run) |
-| 8 | 4 | `version` u32 = 15 (the WAL version) |
+| 8 | 4 | `version` u32 = 16 (the WAL version) |
 | 12 | 8 | `first` u64: the table's first object number, or the number of the checkpoint that wrote the run (also in the file name) |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -761,10 +766,31 @@ block. `Stats::metadata_bytes` counts WAL and topic index bytes except inline
 blocks (index records are counted in `topic_bytes`); the dictionary counts as metadata. `examples/meta_bytes.rs` measures
 these from the store's write counters (a 5-byte topic, millisecond time).
 
-## Compaction order (per rewritten segment)
+## Compaction (mark and sweep, ADR-0014 step 5)
 
-A segment is rewritten when one of its blocks holds a dead object or the
-file holds bytes no block covers.
+`Store::compact_step` runs one step; `Store::compact` runs steps until the
+compaction is done. Batches, releases and checkpoints may run between
+steps; the compaction's state is in memory only, so a restart ends it
+(what it completed is in the WAL).
+
+1. **Mark**, one topic per step, in name order (topics that existed when
+   the mark phase began): the object number of every live entry, read
+   from the topic index, gets a bit in a bitmap over the numbers below
+   `threshold`, the next object number when the mark phase began. A full
+   index block that fails its check is `TopicIndexCorrupt`, a number the
+   object index lacks `UnknownObjectNumber`; either ends the compaction
+   with nothing written and the store usable.
+2. **Live** during the compaction: a marked number, every number at or
+   above `threshold`, and every number a Publish of a batch references
+   while the compaction is in progress (marked as the batch is built), so
+   a batch written between the mark and the sweep never loses an object,
+   new or old (D-206 A with the owner's requirement).
+3. **Sweep**, one data segment per step, in id order: the segments that
+   exist once the mark phase is complete (the active segment is sealed
+   then). Each is rewritten as below if one of its blocks holds an object
+   that is not live, or the file holds bytes no block covers.
+
+A segment is rewritten as follows.
 
 ```text
 1. blocks whose objects are all live → copied unchanged to seg-<new>.dat

@@ -698,9 +698,8 @@ fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
         }
 
         // Every live entry resolves to its object with matching bytes,
-        // refcounts equal the live entries per object, and a tracked entry
+        // the object index holds it, and a tracked entry
         // that was never acknowledged holds a body that writer did send.
-        let mut counts: HashMap<ObjectId, u64> = HashMap::new();
         let mut unacked_present = 0;
         let topics: Vec<Vec<u8>> = store.topics().map(<[u8]>::to_vec).collect();
         for topic in &topics {
@@ -720,7 +719,9 @@ fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
                 if ObjectId::of(&bytes) != id {
                     return Err(format!("{t}/{seq}: bytes do not match the entry's id"));
                 }
-                *counts.entry(id).or_default() += 1;
+                if !store.contains(&id) {
+                    return Err(format!("{t}/{seq}: object not in the object index"));
+                }
                 if topic != SCRATCH && !log.acked.contains_key(&(topic.clone(), seq)) {
                     if !candidates.get(&id).is_some_and(|ts| ts.contains(topic.as_slice())) {
                         return Err(format!(
@@ -729,11 +730,6 @@ fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
                     }
                     unacked_present += 1;
                 }
-            }
-        }
-        for (id, n) in &counts {
-            if store.refcount(id) != Some(*n) {
-                return Err(format!("refcount of {id:?}: {:?}, live entries {n}", store.refcount(id)));
             }
         }
         // An acknowledged training batch, or one after it, makes the

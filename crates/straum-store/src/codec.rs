@@ -18,7 +18,7 @@ impl ObjectId {
 /// start of every WAL file.
 pub const WAL_FILE_HEADER: usize = 24;
 pub const WAL_MAGIC: [u8; 8] = *b"STRMWAL\0";
-pub const WAL_VERSION: u32 = 15;
+pub const WAL_VERSION: u32 = 16;
 /// Header bytes covered by the header CRC (everything before it).
 const WAL_HEADER_CRC_AT: usize = 20;
 /// `len u32 | seq u64 | count u32 | mode u8 | crc32c u32`.

@@ -124,7 +124,7 @@ async fn the_same_payload_with_other_keys_is_one_object() {
             .await
             .unwrap();
         assert_eq!(store.object_count(), 1, "{mode:?}");
-        assert_eq!(store.refcount(&ObjectId::of(b"same")), Some(2));
+        assert!(store.contains(&ObjectId::of(b"same")));
         assert_eq!(store.stats().messages_deduplicated, 1);
         assert_eq!(
             store.read_entry(b"t", 0).await.unwrap(),

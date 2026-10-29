@@ -10,8 +10,8 @@ mod store;
 
 pub use codec::{FrameMode, MAX_TOPIC, ObjectId};
 pub use store::{
-    CommitTiming, CompactStats, Config, ConfigOverride, DropReason, Entry, Message, RecoveryAction,
-    RecoveryReport, Stats, Store, TopicStats, WriteMode,
+    CommitTiming, CompactStats, CompactStep, Config, ConfigOverride, DropReason, Entry, Message,
+    RecoveryAction, RecoveryReport, Stats, Store, TopicStats, WriteMode,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -65,7 +65,9 @@ pub enum StoreError {
     #[error("block {block} is corrupt: {reason}")]
     CorruptBlock { block: u64, reason: &'static str },
     /// A topic entry or Publish record refers to an object number the
-    /// object index does not hold.
+    /// object index does not hold: at open, a live entry whose object a
+    /// Compact record reclaimed; in compaction's mark phase, a live entry
+    /// read from the topic index.
     #[error("object number {0} is not in the object index")]
     UnknownObjectNumber(u64),
     /// An intact index block record of a durable WAL frame holds other
@@ -102,6 +104,4 @@ pub enum StoreError {
     /// checkpoint covers. No file is changed.
     #[error("checkpoint {checkpoint} disagrees with the WAL on object number {number}")]
     CheckpointMismatch { checkpoint: u64, number: u64 },
-    #[error("refcount of {id:?}: WAL replay says {wal}, topic indexes say {topics}")]
-    RefcountMismatch { id: ObjectId, wal: u64, topics: u64 },
 }

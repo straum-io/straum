@@ -83,8 +83,8 @@ Residual risks:
 random moments and check every acknowledged write after each restart:
 
 - the store alone, in each of the three write modes: every acknowledged
-  message is read back with its bytes, no seq is assigned twice, reference
-  counts match the topic entries;
+  message is read back with its bytes, no seq is assigned twice, every
+  live entry's body is stored (compaction steps run between batches);
 - the broker binary, in the default `sequential` mode, with two producers
   sending messages with keys, headers and repeated bodies: every
   acknowledged message is fetched with its seq, timestamp, key, headers

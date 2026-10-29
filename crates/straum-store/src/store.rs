@@ -486,8 +486,6 @@ struct Object {
     block: u64,
     /// Position in the block.
     index: u64,
-    /// Live topic entries pointing at this object.
-    refs: u64,
 }
 
 /// A topic index block's number, its `(object number, timestamp)` entries
@@ -603,6 +601,68 @@ pub struct Store {
     /// Object numbers the last checkpoint covers whose place compaction
     /// changed since: the next checkpoint's relocation run.
     relocated: BTreeSet<u64>,
+    /// A compaction in progress (`compact_step`).
+    compaction: Option<Compaction>,
+}
+
+/// What a `Store::compact_step` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactStep {
+    /// Marked one topic's live entries (the mark phase).
+    Marked,
+    /// Swept one segment: rewritten, dropped or left as it was.
+    Swept,
+    /// The compaction is complete; its totals.
+    Done(CompactStats),
+}
+
+/// A compaction in progress: the mark phase, then the sweep.
+struct Compaction {
+    /// The next object number when the mark phase began: every number at
+    /// or above it is live.
+    threshold: u64,
+    /// One bit per number below `threshold`: marked live.
+    // ponytail: one bitmap over every number below the threshold; ADR-0014
+    // §1's number ranges within the bitmap's budget share come with the
+    // memory budget (step 7).
+    marks: Vec<u64>,
+    /// Topics still to mark, popped from the end.
+    topics: Vec<Vec<u8>>,
+    /// Taken once every topic is marked.
+    sweep: Option<SweepPlan>,
+    stats: CompactStats,
+}
+
+impl Compaction {
+    fn new(threshold: u64, topics: Vec<Vec<u8>>) -> Self {
+        Self {
+            threshold,
+            marks: vec![0; threshold.div_ceil(64) as usize],
+            topics,
+            sweep: None,
+            stats: CompactStats::default(),
+        }
+    }
+
+    fn mark(&mut self, number: u64) {
+        if number < self.threshold {
+            self.marks[(number / 64) as usize] |= 1 << (number % 64);
+        }
+    }
+
+    fn live(&self, number: u64) -> bool {
+        number >= self.threshold || self.marks[(number / 64) as usize] >> (number % 64) & 1 == 1
+    }
+}
+
+/// The sweep's work list.
+struct SweepPlan {
+    /// Segments still to sweep, popped from the end.
+    segments: Vec<u64>,
+    /// Segment → its blocks `(offset, block number)`.
+    blocks: HashMap<u64, Vec<(u64, u64)>>,
+    /// Block → its objects `(index, object number)`.
+    members: HashMap<u64, Vec<(u64, u64)>>,
 }
 
 impl Store {
@@ -619,7 +679,8 @@ impl Store {
     /// earlier frames are checked for presence and bounds only; their content
     /// is verified on read. Recovery then deletes segment files the WAL does
     /// not reference, checks the index segments against the WAL, appends
-    /// the index blocks and seek pages they lack, and recomputes refcounts.
+    /// the index blocks and seek pages they lack, and checks that every live
+    /// entry's object is in the object index.
     /// Every check runs before the first change, so an error leaves every
     /// file as it was. Every change is listed in `recovery_report()`.
     pub async fn open(dir: impl AsRef<Path>, mut config: Config) -> Result<Self, StoreError> {
@@ -842,8 +903,8 @@ impl Store {
         let dictionary = replay.dicts.last().map(|d| d.len());
 
         // Every check runs before the first change, so an error leaves every
-        // file as it was: replay, refcounts, segment bounds, the index.
-        check_refcounts(
+        // file as it was: replay, live objects, segment bounds, the index.
+        check_live_objects(
             &replay.objects,
             replay.topics.values().flat_map(|t| {
                 let first_live = usize::try_from(t.first_live).unwrap_or(usize::MAX);
@@ -910,6 +971,7 @@ impl Store {
             poisoned: false,
             checkpoint: checkpoint.map(|c| c.manifest),
             relocated,
+            compaction: None,
         })
     }
 
@@ -1112,7 +1174,6 @@ impl Store {
                 id,
                 block: 0,
                 index: 0,
-                refs: 0,
             };
             self.objects.insert(number, object);
             self.ids.insert(id, number);
@@ -1224,10 +1285,14 @@ impl Store {
         }
 
         for (m, (number, new)) in batch.iter().zip(numbers) {
-            let Some(object) = self.objects.get_mut(&number) else {
+            // A compaction in progress keeps every object a Publish written
+            // since its mark phase began references (D-206 A).
+            if let Some(c) = self.compaction.as_mut() {
+                c.mark(number);
+            }
+            let Some(object) = self.objects.get(&number) else {
                 unreachable!("found or inserted above")
             };
-            object.refs += 1;
             if new {
                 let put = Record::PutObject {
                     id: object.id,
@@ -1377,7 +1442,7 @@ impl Store {
     /// (a prefix, since timestamps are non-decreasing per topic). One WAL
     /// frame and one `fdatasync` for all of them; a release that would not
     /// fit in `max_frame_bytes` fails with `FrameTooLarge` before any change. Returns how many were
-    /// released. Objects whose refcount drops to zero are reclaimed by
+    /// released. Objects no live entry points at any more are reclaimed by
     /// [`Store::compact`].
     pub async fn release_before(
         &mut self,
@@ -1416,16 +1481,13 @@ impl Store {
         wal_buf.clear();
         let mut frame = FrameBuilder::begin(&mut wal_buf, self.next_object, self.next_block);
         let mut released = 0;
-        for &number in numbers {
+        for _ in numbers {
             let release = Record::Release {
                 topic: topic.number,
                 seq: topic.first_live,
             };
             frame.record(&mut wal_buf, &release)?;
             topic.first_live += 1;
-            if let Some(object) = self.objects.get_mut(&number) {
-                object.refs -= 1;
-            }
             released += 1;
         }
         self.append_frame(wal_buf, frame, FrameMode::Sequential)
@@ -1444,12 +1506,12 @@ impl Store {
         }
     }
 
-    /// Mark and sweep. Marks objects with a non-zero refcount. Every segment
-    /// holding a block with a dead object, or unreferenced bytes (orphans of
-    /// a crash), is rewritten: blocks whose objects are all live are copied
-    /// unchanged, blocks whose objects are all dead are dropped, and the
-    /// live objects of partly dead blocks are recompressed together into one
-    /// new block:
+    /// Mark and sweep (ADR-0014 step 5): `compact_step` until it is done.
+    /// Every segment holding a block with a dead object, or unreferenced
+    /// bytes (orphans of a crash), is rewritten: blocks whose objects are
+    /// all live are copied unchanged, blocks whose objects are all dead are
+    /// dropped, and the live objects of partly dead blocks are recompressed
+    /// together into new blocks:
     ///
     /// 1. write the new segment, `fdatasync` it, `fsync` the directory
     /// 2. append a frame with one Compact record to the WAL, `fdatasync` it
@@ -1457,197 +1519,290 @@ impl Store {
     ///
     /// A crash before step 2 leaves an unreferenced new segment and a crash
     /// after it a stale old one; recovery deletes either. Inline blocks stay
-    /// in the WAL: reclaiming them needs a WAL checkpoint.
+    /// in the WAL: reclaiming them needs a WAL checkpoint (step 8).
     pub async fn compact(&mut self) -> Result<CompactStats, StoreError> {
-        self.usable()?;
-        let res = self.compact_inner().await;
-        self.poison_on_err(res)
+        loop {
+            if let CompactStep::Done(stats) = self.compact_step().await? {
+                return Ok(stats);
+            }
+        }
     }
 
-    async fn compact_inner(&mut self) -> Result<CompactStats, StoreError> {
-        let mut stats = CompactStats::default();
-        // Seal the active segment so it can be compacted too. Every batch
-        // flushed it, so nothing is buffered.
+    /// One step of a compaction, starting one if none is in progress.
+    /// Batches, releases and checkpoints may run between steps.
+    ///
+    /// The mark phase marks one topic per step: every object number its
+    /// live entries point at, read from its index (`TopicIndexCorrupt` for
+    /// a damaged full block, `UnknownObjectNumber` for a number the object
+    /// index does not hold; either ends the compaction, nothing written,
+    /// and the store stays usable). Numbers at or above the next object
+    /// number when the mark phase began are live, and so is every number a
+    /// batch's Publish references while the compaction is in progress
+    /// (D-206 A, with the owner's mark-phase requirement): a batch written
+    /// between the mark and the sweep never loses an object, new or old.
+    /// The sweep then rewrites one segment per step, as `compact`
+    /// describes.
+    pub async fn compact_step(&mut self) -> Result<CompactStep, StoreError> {
+        self.usable()?;
+        let mut c = match self.compaction.take() {
+            Some(c) => c,
+            None => {
+                let mut topics: Vec<Vec<u8>> = self.topics.keys().cloned().collect();
+                // Popped from the end: marked in name order.
+                topics.sort_unstable_by(|a, b| b.cmp(a));
+                Compaction::new(self.next_object, topics)
+            }
+        };
+        if let Some(name) = c.topics.pop() {
+            // A read only: on error nothing changed, so the store stays
+            // usable and the compaction is abandoned.
+            self.mark_topic(&name, &mut c).await?;
+            self.compaction = Some(c);
+            return Ok(CompactStep::Marked);
+        }
+        if c.sweep.is_none() {
+            c.sweep = Some(self.sweep_plan());
+        }
+        let Some(old) = c.sweep.as_mut().and_then(|p| p.segments.pop()) else {
+            return Ok(CompactStep::Done(c.stats));
+        };
+        let res = self.sweep_segment(old, &mut c).await;
+        self.compaction = Some(c);
+        self.poison_on_err(res)?;
+        Ok(CompactStep::Swept)
+    }
+
+    /// Whether a compaction is in progress (between its first and its last
+    /// `compact_step`).
+    pub fn compacting(&self) -> bool {
+        self.compaction.is_some()
+    }
+
+    /// Marks the objects of `name`'s live entries.
+    async fn mark_topic(&self, name: &[u8], c: &mut Compaction) -> Result<(), StoreError> {
+        let Some(t) = self.topics.get(name) else {
+            return Ok(());
+        };
+        for seq in t.first_live..t.index.seq() {
+            let Some((number, _)) = self.topic_entry(name, t, seq).await? else {
+                break;
+            };
+            if !self.objects.contains_key(&number) {
+                return Err(StoreError::UnknownObjectNumber(number));
+            }
+            c.mark(number);
+        }
+        Ok(())
+    }
+
+    /// The sweep's segments and their blocks' objects, taken when the mark
+    /// phase is complete. The active segment is sealed so it is swept too.
+    /// Only the sweep moves objects of these segments, so the membership
+    /// stays valid while batches add objects in later segments.
+    fn sweep_plan(&mut self) -> SweepPlan {
+        // Every batch flushed it, so nothing is buffered.
         self.active = None;
-        let mut by_segment: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+        let mut segments: Vec<u64> = self.segments.iter().copied().collect();
+        // Popped from the end: swept in ascending order.
+        segments.sort_unstable_by(|a, b| b.cmp(a));
+        let mut blocks: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
         for (&number, b) in &self.blocks {
             if let Location::Segment { id, offset } = b.loc {
-                by_segment.entry(id).or_default().push((offset, number));
+                blocks.entry(id).or_default().push((offset, number));
             }
         }
-        // Block → its objects: `(index, object number, live)`.
-        let mut members: HashMap<u64, Vec<(u64, u64, bool)>> = HashMap::new();
+        // ponytail: the membership of every block, O(objects) while the
+        // object map is in memory; step 6's dense table replaces it.
+        let mut members: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
         for (&number, o) in &self.objects {
-            members
-                .entry(o.block)
-                .or_default()
-                .push((o.index, number, o.refs > 0));
+            members.entry(o.block).or_default().push((o.index, number));
         }
-        let mut ids: Vec<u64> = self.segments.iter().copied().collect();
-        ids.sort_unstable();
-        for old in ids {
-            let file_len = compio::fs::metadata(segment_path(&self.dir, old))
-                .await?
-                .len();
-            let mut blocks = by_segment.remove(&old).unwrap_or_default();
-            blocks.sort_unstable();
-            let (mut kept, mut partial, mut dead) = (Vec::new(), Vec::new(), Vec::new());
-            let mut stored = 0;
-            for &(_, n) in &blocks {
-                stored += self.blocks.get(&n).map_or(0, |b| b.len);
-                let objs = members.get(&n).map_or(&[][..], Vec::as_slice);
-                let live = objs.iter().filter(|o| o.2).count();
-                if live == 0 {
-                    dead.push(n);
-                } else if live == objs.len() {
-                    kept.push(n);
-                } else {
-                    partial.push(n);
-                }
-            }
-            // Blocks never overlap, so equal sizes mean no unreferenced byte.
-            if partial.is_empty() && dead.is_empty() && stored == file_len {
-                continue;
-            }
-            // Live objects of partly dead blocks, in block then index order.
-            let mut moved = Vec::new();
-            for n in &partial {
-                let mut objs: Vec<_> = members
-                    .get(n)
-                    .map_or(&[][..], Vec::as_slice)
-                    .iter()
-                    .filter(|o| o.2)
-                    .copied()
-                    .collect();
-                objs.sort_unstable();
-                moved.extend(objs.into_iter().map(|(_, number, _)| number));
-            }
-            // At most one rewritten block per moved object.
-            let rewrite_bound = (RECORD_COMPACT_REWRITTEN + MAX_VARINT) * moved.len();
-            self.check_frame(
-                FRAME_HEADER
-                    + RECORD_COMPACT_BASE
-                    + RECORD_COMPACT_KEPT * kept.len()
-                    + rewrite_bound,
-            )?;
-            self.begin_write();
-            self.rotate_wal().await?;
-            let mut kept_at = Vec::with_capacity(kept.len());
-            let mut rewritten = Vec::new();
-            let mut new_len = 0;
-            let new = if kept.is_empty() && moved.is_empty() {
-                NO_SEGMENT
+        SweepPlan {
+            segments,
+            blocks,
+            members,
+        }
+    }
+
+    /// Rewrites segment `old` if one of its blocks holds an object that is
+    /// not live, or it holds bytes no block covers.
+    async fn sweep_segment(&mut self, old: u64, c: &mut Compaction) -> Result<(), StoreError> {
+        let Some(plan) = c.sweep.as_mut() else {
+            unreachable!("set before the sweep")
+        };
+        let file_len = compio::fs::metadata(segment_path(&self.dir, old))
+            .await?
+            .len();
+        let mut blocks = plan.blocks.remove(&old).unwrap_or_default();
+        blocks.sort_unstable();
+        let raw: Vec<(u64, Vec<(u64, u64)>)> = blocks
+            .iter()
+            .map(|&(_, n)| (n, plan.members.remove(&n).unwrap_or_default()))
+            .collect();
+        // Block → its objects: `(index, object number, live)`.
+        let members: HashMap<u64, Vec<(u64, u64, bool)>> = raw
+            .into_iter()
+            .map(|(n, objs)| {
+                (
+                    n,
+                    objs.into_iter().map(|(i, x)| (i, x, c.live(x))).collect(),
+                )
+            })
+            .collect();
+        let stats = &mut c.stats;
+        let (mut kept, mut partial, mut dead) = (Vec::new(), Vec::new(), Vec::new());
+        let mut stored = 0;
+        for &(_, n) in &blocks {
+            stored += self.blocks.get(&n).map_or(0, |b| b.len);
+            let objs = members.get(&n).map_or(&[][..], Vec::as_slice);
+            let live = objs.iter().filter(|o| o.2).count();
+            if live == 0 {
+                dead.push(n);
+            } else if live == objs.len() {
+                kept.push(n);
             } else {
-                let new = self.next_segment;
-                self.next_segment += 1;
-                let mut buf = Vec::new();
-                for &n in &kept {
-                    // Verified first: corruption is not copied forward.
-                    let objs = members.get(&n).map_or(&[][..], Vec::as_slice);
-                    let stored = self.load_verified(n, objs).await?;
-                    kept_at.push((n, buf.len() as u64));
-                    buf.extend_from_slice(&stored);
-                }
-                let mut objects = Vec::with_capacity(moved.len());
-                for &number in &moved {
-                    // Verifies the hash.
-                    objects.push(self.read_object(number).await?.1);
-                }
-                // The same limit as for new blocks.
-                for range in block_ranges(
-                    objects.iter().map(|b| codec::block_entry_len(b)),
-                    self.config.max_block_raw_bytes,
-                ) {
-                    let mut raw = Vec::new();
-                    for bytes in &objects[range.clone()] {
-                        codec::push_block_object(&mut raw, bytes);
-                    }
-                    let codecs = self.codecs.get_mut();
-                    let packed = codecs.compress(&raw)?;
-                    let block = self.next_block;
-                    self.next_block += 1;
-                    rewritten.push(Rewritten {
-                        block,
-                        offset: buf.len() as u64,
-                        len: packed.len() as u64,
-                        raw_len: raw.len() as u64,
-                        dict: codecs.dict(),
-                        crc: crc32c::crc32c(&raw),
-                        objects: moved[range].to_vec(),
-                    });
-                    buf.extend_from_slice(&packed);
-                }
-                let file = create_segment(&self.dir, new).await?;
-                new_len = buf.len() as u64;
-                write_all(&file, buf, 0).await.0?;
-                file.sync_data().await?;
-                sync_dir(&self.dir).await?;
-                self.stats.fsyncs += 2;
-                self.stats.segment_bytes += new_len;
-                self.segments.insert(new);
-                new
-            };
-
-            let mut wal_buf = std::mem::take(&mut self.wal_buf);
-            wal_buf.clear();
-            let mut frame = FrameBuilder::begin(&mut wal_buf, self.next_object, self.next_block);
-            let compact = Record::Compact {
-                old,
-                new,
-                kept: kept_at.clone(),
-                rewritten: rewritten.clone(),
-            };
-            frame.record(&mut wal_buf, &compact)?;
-            self.append_frame(wal_buf, frame, FrameMode::Sequential)
-                .await?;
-            self.in_flight = false;
-
-            for n in dead.iter().chain(&partial) {
-                for &(_, number, live) in members.get(n).map_or(&[][..], Vec::as_slice) {
-                    if !live && let Some(o) = self.objects.remove(&number) {
-                        self.ids.remove(&o.id);
-                        stats.objects_dropped += 1;
-                        self.relocate(number);
-                    }
-                }
-                self.blocks.remove(n);
-                self.uncache(*n);
+                partial.push(n);
             }
-            for (n, offset) in kept_at {
-                if let Some(b) = self.blocks.get_mut(&n) {
-                    b.loc = Location::Segment { id: new, offset };
-                }
-            }
-            for r in rewritten {
-                for (index, number) in (0..).zip(&r.objects) {
-                    if let Some(o) = self.objects.get_mut(number) {
-                        o.block = r.block;
-                        o.index = index;
-                        self.relocate(*number);
-                    }
-                }
-                let b = Block {
-                    loc: Location::Segment {
-                        id: new,
-                        offset: r.offset,
-                    },
-                    len: r.len,
-                    raw_len: r.raw_len,
-                    dict: r.dict,
-                    crc: r.crc,
-                    objects: r.objects.len() as u64,
-                };
-                self.blocks.insert(r.block, b);
-            }
-            self.segments.remove(&old);
-            self.files.forget(FileKey::Data(old));
-            // Not followed by a directory fsync: if the unlink is lost, the
-            // WAL no longer references the file and recovery deletes it.
-            compio::fs::remove_file(segment_path(&self.dir, old)).await?;
-            stats.segments_rewritten += 1;
-            stats.bytes_reclaimed += file_len.saturating_sub(new_len);
         }
-        Ok(stats)
+        // Blocks never overlap, so equal sizes mean no unreferenced byte.
+        if partial.is_empty() && dead.is_empty() && stored == file_len {
+            return Ok(());
+        }
+        // Live objects of partly dead blocks, in block then index order.
+        let mut moved = Vec::new();
+        for n in &partial {
+            let mut objs: Vec<_> = members
+                .get(n)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter(|o| o.2)
+                .copied()
+                .collect();
+            objs.sort_unstable();
+            moved.extend(objs.into_iter().map(|(_, number, _)| number));
+        }
+        // At most one rewritten block per moved object.
+        let rewrite_bound = (RECORD_COMPACT_REWRITTEN + MAX_VARINT) * moved.len();
+        self.check_frame(
+            FRAME_HEADER + RECORD_COMPACT_BASE + RECORD_COMPACT_KEPT * kept.len() + rewrite_bound,
+        )?;
+        self.begin_write();
+        self.rotate_wal().await?;
+        let mut kept_at = Vec::with_capacity(kept.len());
+        let mut rewritten = Vec::new();
+        let mut new_len = 0;
+        let new = if kept.is_empty() && moved.is_empty() {
+            NO_SEGMENT
+        } else {
+            let new = self.next_segment;
+            self.next_segment += 1;
+            let mut buf = Vec::new();
+            for &n in &kept {
+                // Verified first: corruption is not copied forward.
+                let objs = members.get(&n).map_or(&[][..], Vec::as_slice);
+                let stored = self.load_verified(n, objs).await?;
+                kept_at.push((n, buf.len() as u64));
+                buf.extend_from_slice(&stored);
+            }
+            let mut objects = Vec::with_capacity(moved.len());
+            for &number in &moved {
+                // Verifies the hash.
+                objects.push(self.read_object(number).await?.1);
+            }
+            // The same limit as for new blocks.
+            for range in block_ranges(
+                objects.iter().map(|b| codec::block_entry_len(b)),
+                self.config.max_block_raw_bytes,
+            ) {
+                let mut raw = Vec::new();
+                for bytes in &objects[range.clone()] {
+                    codec::push_block_object(&mut raw, bytes);
+                }
+                let codecs = self.codecs.get_mut();
+                let packed = codecs.compress(&raw)?;
+                let block = self.next_block;
+                self.next_block += 1;
+                rewritten.push(Rewritten {
+                    block,
+                    offset: buf.len() as u64,
+                    len: packed.len() as u64,
+                    raw_len: raw.len() as u64,
+                    dict: codecs.dict(),
+                    crc: crc32c::crc32c(&raw),
+                    objects: moved[range].to_vec(),
+                });
+                buf.extend_from_slice(&packed);
+            }
+            let file = create_segment(&self.dir, new).await?;
+            new_len = buf.len() as u64;
+            write_all(&file, buf, 0).await.0?;
+            file.sync_data().await?;
+            sync_dir(&self.dir).await?;
+            self.stats.fsyncs += 2;
+            self.stats.segment_bytes += new_len;
+            self.segments.insert(new);
+            new
+        };
+
+        let mut wal_buf = std::mem::take(&mut self.wal_buf);
+        wal_buf.clear();
+        let mut frame = FrameBuilder::begin(&mut wal_buf, self.next_object, self.next_block);
+        let compact = Record::Compact {
+            old,
+            new,
+            kept: kept_at.clone(),
+            rewritten: rewritten.clone(),
+        };
+        frame.record(&mut wal_buf, &compact)?;
+        self.append_frame(wal_buf, frame, FrameMode::Sequential)
+            .await?;
+        self.in_flight = false;
+
+        for n in dead.iter().chain(&partial) {
+            for &(_, number, live) in members.get(n).map_or(&[][..], Vec::as_slice) {
+                if !live && let Some(o) = self.objects.remove(&number) {
+                    self.ids.remove(&o.id);
+                    stats.objects_dropped += 1;
+                    self.relocate(number);
+                }
+            }
+            self.blocks.remove(n);
+            self.uncache(*n);
+        }
+        for (n, offset) in kept_at {
+            if let Some(b) = self.blocks.get_mut(&n) {
+                b.loc = Location::Segment { id: new, offset };
+            }
+        }
+        for r in rewritten {
+            for (index, number) in (0..).zip(&r.objects) {
+                if let Some(o) = self.objects.get_mut(number) {
+                    o.block = r.block;
+                    o.index = index;
+                    self.relocate(*number);
+                }
+            }
+            let b = Block {
+                loc: Location::Segment {
+                    id: new,
+                    offset: r.offset,
+                },
+                len: r.len,
+                raw_len: r.raw_len,
+                dict: r.dict,
+                crc: r.crc,
+                objects: r.objects.len() as u64,
+            };
+            self.blocks.insert(r.block, b);
+        }
+        self.segments.remove(&old);
+        self.files.forget(FileKey::Data(old));
+        // Not followed by a directory fsync: if the unlink is lost, the
+        // WAL no longer references the file and recovery deletes it.
+        compio::fs::remove_file(segment_path(&self.dir, old)).await?;
+        stats.segments_rewritten += 1;
+        stats.bytes_reclaimed += file_len.saturating_sub(new_len);
+        Ok(())
     }
 
     pub fn stats(&self) -> Stats {
@@ -1963,10 +2118,11 @@ impl Store {
         self.config.max_frame_bytes
     }
 
-    /// `None` if the object is not in the index (never stored, or reclaimed).
-    pub fn refcount(&self, id: &ObjectId) -> Option<u64> {
-        let number = self.ids.get(id)?;
-        self.objects.get(number).map(|o| o.refs)
+    /// Whether the object is in the index: stored and not reclaimed.
+    /// Reference counts are not kept (ADR-0014 step 5): compaction marks
+    /// live objects from the topic indexes instead.
+    pub fn contains(&self, id: &ObjectId) -> bool {
+        self.ids.contains_key(id)
     }
 
     pub fn object_count(&self) -> usize {
@@ -2892,12 +3048,7 @@ impl<'a> Replay<'a> {
                     return Err("object index out of order");
                 }
                 b.objects += 1;
-                let object = Object {
-                    id,
-                    block,
-                    index,
-                    refs: 0,
-                };
+                let object = Object { id, block, index };
                 self.add_object(number, object)?;
             }
             Record::PutTopic { number, name } => {
@@ -2923,11 +3074,9 @@ impl<'a> Replay<'a> {
                 if seq != t.entries.len() as u64 {
                     return Err("Publish out of sequence");
                 }
-                let object = self
-                    .objects
-                    .get_mut(&number)
-                    .ok_or("Publish references an object not in the index")?;
-                object.refs += 1;
+                if !self.objects.contains_key(&number) {
+                    return Err("Publish references an object not in the index");
+                }
                 t.entries.push((number, timestamp));
                 if !attrs.is_empty() {
                     let len = u32::try_from(attrs.len()).map_err(|_| "attributes too long")?;
@@ -2950,12 +3099,10 @@ impl<'a> Replay<'a> {
                     .filter(|_| seq == t.first_live)
                     .ok_or("Release out of order")?;
                 t.first_live += 1;
-                let object = self
-                    .objects
-                    .get_mut(&number)
-                    .filter(|o| o.refs > 0)
-                    .ok_or("Release of an entry whose object has no references")?;
-                object.refs -= 1;
+                // A live entry's object is never reclaimed.
+                if !self.objects.contains_key(&number) {
+                    return Err("Release of an entry whose object is not in the index");
+                }
             }
             Record::Compact {
                 old,
@@ -2967,10 +3114,13 @@ impl<'a> Replay<'a> {
         Ok(())
     }
 
-    /// Applies a Compact record. The writer copies blocks whose objects are
-    /// all live (`kept`), drops blocks whose objects are all dead, and moves
-    /// the live objects of the other blocks of `old` into `rewritten`; any
-    /// other combination is corruption.
+    /// Applies a Compact record: blocks of `old` in `kept` stay with their
+    /// objects, objects in `rewritten` move there, and every other object
+    /// of `old` is reclaimed. Without reference counts (ADR-0014 step 5,
+    /// D-206 A) replay cannot check which objects were live; that a live
+    /// entry's object survives is checked after replay
+    /// (`check_live_objects`). A kept block or moved object that is not
+    /// `old`'s, or an object moved twice, is corruption.
     fn compact(
         &mut self,
         old: u64,
@@ -3012,40 +3162,26 @@ impl<'a> Replay<'a> {
             return Err("Compact rewrites a block with no or repeated objects");
         }
         let mut relocated = 0;
-        let mut bad = None;
         let ids = &mut self.ids;
         self.objects.retain(|number, o| {
-            if !old_blocks.contains(&o.block) {
+            if !old_blocks.contains(&o.block) || kept_set.contains_key(&o.block) {
                 return true;
             }
-            if kept_set.contains_key(&o.block) {
-                if o.refs == 0 {
-                    bad = Some("Compact keeps a block with dead objects");
-                }
-                return true;
-            }
-            match (moved.get(number), o.refs > 0) {
-                (Some(&(block, index)), true) => {
+            match moved.get(number) {
+                Some(&(block, index)) => {
                     o.block = block;
                     o.index = index;
                     relocated += 1;
                     true
                 }
-                (None, false) => {
+                None => {
                     ids.remove(&o.id);
                     false
                 }
-                _ => {
-                    bad = Some("Compact moved set differs from the live objects of the segment");
-                    true
-                }
             }
         });
-        if let Some(reason) = bad {
-            return Err(reason);
-        }
         if relocated != moved.len() {
-            return Err("Compact moved set differs from the live objects of the segment");
+            return Err("Compact moves an object that is not in a dropped block of the segment");
         }
         self.blocks
             .retain(|n, _| !old_blocks.contains(n) || kept_set.contains_key(n));
@@ -3510,28 +3646,14 @@ fn block_attrs<'r>(attrs: &[(AttrsAt, &'r [u8])], block: u64) -> Vec<(u8, &'r [u
         .collect()
 }
 
-/// Refcounts from WAL replay (Publish +1, Release -1) must equal the number
-/// of live topic index entries pointing at each object.
-fn check_refcounts<'a>(
+/// Every live topic entry's object must be in the object index: a Compact
+/// record that reclaimed it is corruption (`UnknownObjectNumber`).
+fn check_live_objects<'a>(
     objects: &HashMap<u64, Object>,
-    live: impl Iterator<Item = &'a u64>,
+    mut live: impl Iterator<Item = &'a u64>,
 ) -> Result<(), StoreError> {
-    let mut counted: HashMap<u64, u64> = HashMap::new();
-    for number in live {
-        *counted.entry(*number).or_default() += 1;
-    }
-    for (number, o) in objects {
-        let topics = counted.remove(number).unwrap_or(0);
-        if topics != o.refs {
-            return Err(StoreError::RefcountMismatch {
-                id: o.id,
-                wal: o.refs,
-                topics,
-            });
-        }
-    }
-    match counted.into_keys().next() {
-        Some(number) => Err(StoreError::UnknownObjectNumber(number)),
+    match live.find(|n| !objects.contains_key(n)) {
+        Some(&number) => Err(StoreError::UnknownObjectNumber(number)),
         None => Ok(()),
     }
 }
@@ -4176,38 +4298,24 @@ async fn open_checkpoint(
 mod tests {
     use super::*;
 
-    fn object(id: ObjectId, refs: u64) -> Object {
-        Object {
+    #[test]
+    fn a_live_entry_whose_object_is_gone_fails_the_check() {
+        let object = |id| Object {
             id,
             block: 0,
             index: 0,
-            refs,
-        }
-    }
-
-    #[test]
-    fn refcount_check_fails_loudly_on_mismatch() {
-        let (a, b) = (ObjectId::of(b"a"), ObjectId::of(b"b"));
-        let objects = HashMap::from([(0, object(a, 2)), (1, object(b, 0))]);
-        assert!(check_refcounts(&objects, [0, 0].iter()).is_ok());
+        };
+        let objects = HashMap::from([
+            (0, object(ObjectId::of(b"a"))),
+            (1, object(ObjectId::of(b"b"))),
+        ]);
+        assert!(check_live_objects(&objects, [0, 0, 1].iter()).is_ok());
+        assert!(
+            check_live_objects(&objects, [].iter()).is_ok(),
+            "dead objects are fine"
+        );
         assert!(matches!(
-            check_refcounts(&objects, [0].iter()),
-            Err(StoreError::RefcountMismatch {
-                wal: 2,
-                topics: 1,
-                ..
-            })
-        ));
-        assert!(matches!(
-            check_refcounts(&objects, [0, 0, 1].iter()),
-            Err(StoreError::RefcountMismatch {
-                id,
-                wal: 0,
-                topics: 1,
-            }) if id == b
-        ));
-        assert!(matches!(
-            check_refcounts(&objects, [0, 0, 7].iter()),
+            check_live_objects(&objects, [0, 7].iter()),
             Err(StoreError::UnknownObjectNumber(7))
         ));
     }
@@ -4334,15 +4442,15 @@ mod tests {
         let release = |seq| Record::Release { topic: 0, seq };
         assert_eq!(r.apply(release(1), 0), Err("Release out of order"));
         r.apply(release(0), 0).unwrap();
-        // The object is dead now: a Compact that keeps its block is
-        // inconsistent.
+        // Without reference counts, keeping a block whose object is dead is
+        // a conservative compaction, not an inconsistency.
         let keep = Record::Compact {
             old: 0,
             new: 1,
             kept: vec![(0, 0)],
             rewritten: vec![],
         };
-        assert!(r.apply(keep, 0).is_err());
+        r.apply(keep, 0).unwrap();
 
         let mut r = Replay::default();
         r.apply(put_block(3, 0, 0), 0).unwrap();
@@ -4411,7 +4519,7 @@ mod tests {
         assert!(!r.objects.contains_key(&3), "dead block's object dropped");
         assert!(!r.ids.contains_key(&ids[1]), "and its id");
         let a = &r.objects[&0];
-        assert_eq!((a.id, a.block, a.index, a.refs), (ids[0], 3, 0, 1));
+        assert_eq!((a.id, a.block, a.index), (ids[0], 3, 0));
         let c = &r.objects[&2];
         assert_eq!((c.block, c.index), (1, 0), "kept block keeps its objects");
         assert_eq!(r.blocks[&1].loc, Location::Segment { id: 1, offset: 0 });
@@ -4432,15 +4540,6 @@ mod tests {
             rewritten,
         };
         for (what, rec) in [
-            ("live object left behind", compact(vec![(1, 0)], vec![])),
-            (
-                "dead object moved",
-                compact(vec![(1, 0)], rewritten(vec![0, 1])),
-            ),
-            (
-                "block with a dead object kept",
-                compact(vec![(0, 0), (1, 0)], vec![]),
-            ),
             (
                 "block of another segment",
                 compact(vec![(1, 0), (9, 0)], rewritten(vec![0])),
@@ -4449,10 +4548,56 @@ mod tests {
                 "object moved twice",
                 compact(vec![(1, 0)], rewritten(vec![0, 0])),
             ),
-            ("live block dropped", compact(vec![], rewritten(vec![0]))),
+            (
+                "object of a kept block moved",
+                compact(vec![(1, 0)], rewritten(vec![0, 2])),
+            ),
+            (
+                "object of another segment moved",
+                compact(vec![(1, 0)], rewritten(vec![0, 99])),
+            ),
         ] {
             let (mut r, _) = replay_for_compaction();
             assert!(r.apply(rec, 0).is_err(), "{what}");
+        }
+    }
+
+    /// Without reference counts replay cannot tell live from dead objects
+    /// (D-206 A); a Compact that reclaimed an object a live entry still
+    /// points at is caught by the check after replay.
+    #[test]
+    fn a_compaction_that_drops_a_live_object_is_caught_after_replay() {
+        for (what, rec) in [
+            (
+                "live object left behind",
+                Record::Compact {
+                    old: 0,
+                    new: 1,
+                    kept: vec![(1, 0)],
+                    rewritten: vec![],
+                },
+            ),
+            (
+                "live block dropped",
+                Record::Compact {
+                    old: 0,
+                    new: 1,
+                    kept: vec![],
+                    rewritten: rewritten(vec![0]),
+                },
+            ),
+        ] {
+            let (mut r, _) = replay_for_compaction();
+            r.apply(rec, 0).unwrap();
+            let t = &r.topics[&b"t"[..]];
+            let live = t.entries.iter().skip(t.first_live as usize).map(|(n, _)| n);
+            assert!(
+                matches!(
+                    check_live_objects(&r.objects, live),
+                    Err(StoreError::UnknownObjectNumber(_))
+                ),
+                "{what}"
+            );
         }
     }
 
