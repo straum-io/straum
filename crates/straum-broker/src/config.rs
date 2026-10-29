@@ -35,6 +35,9 @@ pub struct Config {
     pub store_write_mode: WriteMode,
     pub store_segment_max_bytes: u64,
     pub store_max_frame_bytes: u32,
+    /// Rebuild the store's derived topic index from its WAL at this start
+    /// (`straum_store::Config::rebuild_index`).
+    pub store_rebuild_index: bool,
 }
 
 impl Default for Config {
@@ -65,6 +68,7 @@ impl Default for Config {
             store_write_mode: WriteMode::Sequential,
             store_segment_max_bytes: 64 << 20,
             store_max_frame_bytes: 64 << 20,
+            store_rebuild_index: false,
         }
     }
 }
@@ -119,6 +123,13 @@ impl Config {
             }
             "store_segment_max_bytes" => self.store_segment_max_bytes = num(&key, value)?,
             "store_max_frame_bytes" => self.store_max_frame_bytes = num(&key, value)?,
+            "store_rebuild_index" => {
+                self.store_rebuild_index = match value.trim() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(format!("{key}: true or false")),
+                }
+            }
             _ => return Err(format!("unknown setting {key}")),
         }
         Ok(())
@@ -267,6 +278,17 @@ mod tests {
         );
         assert_eq!(c.cluster_id, "c1");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn store_rebuild_index_is_a_boolean() {
+        let mut c = Config::default();
+        assert!(!c.store_rebuild_index);
+        c.set("store-rebuild-index", "true").unwrap();
+        assert!(c.store_rebuild_index);
+        c.set("store_rebuild_index", "false").unwrap();
+        assert!(!c.store_rebuild_index);
+        assert!(c.set("store_rebuild_index", "yes").is_err());
     }
 
     #[test]

@@ -123,6 +123,44 @@ async fn a_damaged_fence_header_fails_open() {
         "{err}"
     );
     assert!(snapshot(&dir.0) == before, "files changed");
+
+    // The operator's way out (D-229 A): rebuild the index from the WAL.
+    let segments = index_segments(&dir.0);
+    let rebuild = Config {
+        rebuild_index: true,
+        ..config
+    };
+    let store = Store::open(&dir.0, rebuild).await.unwrap();
+    let actions = &store.recovery_report().actions;
+    let dropped = actions
+        .iter()
+        .filter(|a| matches!(a, RecoveryAction::IndexSegmentDropped { .. }))
+        .count();
+    assert_eq!(dropped, segments.len(), "{actions:?}");
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, RecoveryAction::TopicIndexRepaired { .. })),
+        "{actions:?}"
+    );
+    for seq in 0..70 {
+        let want = payload(1, if seq < 60 { seq } else { seq - 60 });
+        assert_eq!(store.read(b"t", seq).await.unwrap(), Some(want), "{seq}");
+    }
+    drop(store);
+    let after = snapshot(&dir.0);
+    for (path, bytes) in &before {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        if !name.starts_with("idx-") {
+            assert_eq!(after.get(path), Some(bytes), "{name} changed");
+        }
+    }
+    let store = Store::open(&dir.0, config).await.unwrap();
+    assert!(
+        store.recovery_report().is_empty(),
+        "{:?}",
+        store.recovery_report()
+    );
 }
 
 fn modes() -> [WriteMode; 3] {

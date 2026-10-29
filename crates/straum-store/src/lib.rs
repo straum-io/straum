@@ -69,7 +69,10 @@ pub enum StoreError {
     #[error("object number {0} is not in the object index")]
     UnknownObjectNumber(u64),
     /// An intact index block record of a durable WAL frame holds other
-    /// entries than the WAL: it was written that way.
+    /// entries than the WAL: it was written that way, or a damaged index
+    /// segment header lost a fence (docs/format.md, "Index segment"). The
+    /// index is derived from the WAL: `Config::rebuild_index` rebuilds it
+    /// (the broker's `--store-rebuild-index true`).
     #[error("index of topic {topic:?} disagrees with the WAL at entry {seq}")]
     TopicMismatch { topic: Vec<u8>, seq: u64 },
     /// A full block of a topic index, or a seek page leading to it, read

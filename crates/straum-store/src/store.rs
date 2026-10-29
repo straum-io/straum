@@ -114,6 +114,13 @@ pub struct Config {
     /// file can exceed it by one frame. A file always holds at least one
     /// frame before the next starts.
     pub wal_file_max_bytes: u64,
+    /// The operator's rebuild of the derived topic index (D-229 A): open
+    /// deletes every index segment (`IndexSegmentDropped`) and re-derives
+    /// every topic's index blocks and seek pages from the WAL
+    /// (`TopicIndexRepaired`). The way out of a `TopicMismatch` at open
+    /// caused by damaged index segments. Every open with it set rebuilds;
+    /// set it for one open.
+    pub rebuild_index: bool,
 }
 
 impl Default for Config {
@@ -130,6 +137,7 @@ impl Default for Config {
             dict_train_bytes: 1 << 20,
             max_block_raw_bytes: 16 << 10,
             wal_file_max_bytes: 64 << 20,
+            rebuild_index: false,
         }
     }
 }
@@ -434,6 +442,10 @@ pub enum RecoveryAction {
     /// stay recognised as stale once new frames reuse those frame numbers.
     /// The records themselves are not changed.
     StaleIndexRecordsFenced { records: u64, segment: u64 },
+    /// An index segment was deleted because `Config::rebuild_index` asked
+    /// for the index to be rebuilt from the WAL; `bytes` its length. The
+    /// rebuilt blocks and pages follow as `TopicIndexRepaired`.
+    IndexSegmentDropped { segment: u64, bytes: u64 },
     /// Full index blocks and seek pages of a topic that no index segment
     /// held intact were re-encoded from the WAL and appended.
     TopicIndexRepaired {
@@ -2844,6 +2856,22 @@ async fn open_index(
     }
     ids.sort_unstable();
     index.next_id = ids.last().map_or(0, |m| m + 1);
+    if config.rebuild_index {
+        // Nothing of the old index is read: it is derived from the WAL
+        // again in full below. Ids are not reused.
+        for &id in &ids {
+            let path = index_path(dir, id);
+            let bytes = compio::fs::metadata(&path).await?.len();
+            compio::fs::remove_file(&path).await?;
+            report
+                .actions
+                .push(RecoveryAction::IndexSegmentDropped { segment: id, bytes });
+        }
+        if !ids.is_empty() {
+            sync_dir(dir).await?;
+        }
+        ids.clear();
+    }
     // (id, created_at, bytes)
     let mut segs = Vec::new();
     let mut orphans = Vec::new();

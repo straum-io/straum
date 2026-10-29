@@ -424,6 +424,7 @@ report means recovery changed nothing. No change is made without an entry.
 | `OrphanSegmentRemoved { segment }` | a segment file the WAL does not refer to was deleted |
 | `IndexSegmentRemoved { segment, bytes }` | an index segment without an intact header was deleted (`bytes` its length) |
 | `StaleIndexRecordsFenced { records, segment }` | index records of cut WAL frames were found; index segment `segment` was created to keep them stale |
+| `IndexSegmentDropped { segment, bytes }` | an index segment was deleted because `Config::rebuild_index` was set (the index is rebuilt from the WAL) |
 | `TopicIndexRepaired { topic, blocks_rewritten, pages_rewritten }` | a topic's index blocks or seek pages were re-encoded from the WAL and appended |
 
 `config_overrides` lists `Config` values the WAL replaced, which change no
@@ -551,9 +552,17 @@ records before it are stale. If the header of a fencing segment is damaged
 after new frames reused the stale records' frame numbers, those records
 look current at the next open, disagree with the WAL, and open fails with
 `TopicMismatch` (no file changed): an error, never wrong data
-(`tests/index_segments.rs`, `a_damaged_fence_header_fails_open`). Deleting
-every `idx-*.dat` file then lets open re-derive the whole index from the
-WAL (reported).
+(`tests/index_segments.rs`, `a_damaged_fence_header_fails_open`).
+
+**Rebuild (D-229 A).** The operator's way out: open with
+`Config::rebuild_index` set (the broker: `--store-rebuild-index true` for
+one start). Open then deletes every index segment before reading any
+(`IndexSegmentDropped { segment, bytes }` each) and re-derives every
+topic's blocks and seek pages from the WAL into a new segment
+(`TopicIndexRepaired`). The WAL, data segments and every other file are
+unchanged; the rebuild is safe whenever the WAL itself opens, since the
+index holds nothing the WAL does not. Without the setting, open never
+deletes an intact index segment.
 
 ## Write order (one batch)
 

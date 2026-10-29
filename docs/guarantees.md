@@ -107,6 +107,7 @@ At startup the store replays the WAL from the beginning
   | `FrameDropped` | a complete last ParallelSync frame whose bodies are missing or wrong is cut |
   | `OrphanSegmentRemoved` | a data segment the WAL does not refer to is deleted |
   | `IndexSegmentRemoved` | an index segment without an intact header is deleted; the index records it held are rewritten from the WAL (`TopicIndexRepaired`) |
+  | `IndexSegmentDropped` | only when the operator asked for a rebuild (`--store-rebuild-index true`): every index segment is deleted and the index rewritten from the WAL (`TopicIndexRepaired`) |
   | `StaleIndexRecordsFenced` | index records of WAL frames that recovery cut were found; a new, empty index segment is created so they stay ignored once new frames reuse those frame numbers |
   | `TopicIndexRepaired` | full index blocks and seek pages of a topic that no index segment holds intact (the index is derived from the WAL and not synced) are re-encoded from the WAL and appended to a new index segment |
   | `WalTmpRemoved` | a `wal-<seq>.log.tmp` of an interrupted WAL file creation is deleted |
@@ -124,8 +125,10 @@ At startup the store replays the WAL from the beginning
   (`TopicMismatch`) or that the WAL cannot have (`IndexSegmentCorrupt`), a
   WAL of another format version (`UnsupportedFormat`). The broker then
   does not start. A damaged header of an index segment that fences stale
-  records also fails open with `TopicMismatch` (D-229: a documented
-  rebuild path is to follow).
+  records also fails open with `TopicMismatch`; the operator then starts the
+  broker once with `--store-rebuild-index true`, which rebuilds the index
+  from the WAL and reports each deleted index segment
+  (`IndexSegmentDropped`) and rebuilt topic (D-229 A).
 - **Detected on read.** At open, earlier frames' bodies are checked only
   for presence and length. Every read checks a body's block (length,
   CRC32C, layout) and the body's BLAKE3 id, and every full index block or

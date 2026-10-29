@@ -89,6 +89,7 @@ also a flag, `--key value`, with `-` or `_`; flags win.
 | `store_write_mode` | `sequential` | `sequential`, `parallel` (ParallelSync; not recommended on disks without power-loss protection, see the store's README), `inline` (InlineSmall, experimental) |
 | `store_segment_max_bytes` | 64 MiB | |
 | `store_max_frame_bytes` | 64 MiB | the store's WAL frame limit; at least `max_frame_bytes` |
+| `store_rebuild_index` | `false` | `true`: rebuild the store's topic index from its WAL at this start, the way out of a `TopicMismatch` at startup (D-229 A). The index segments are deleted and re-derived; the WAL and data are not touched. The startup line counts the recovery actions, one per deleted segment and per rebuilt topic. Use as a flag for one start (`--store-rebuild-index true`), not in the configuration file |
 
 ## Tests
 

@@ -143,6 +143,7 @@ pub async fn serve(
         segment_max_bytes: config.store_segment_max_bytes,
         max_frame_bytes: config.store_max_frame_bytes,
         write_mode: config.store_write_mode,
+        rebuild_index: config.store_rebuild_index,
         ..straum_store::Config::default()
     };
     let store = Store::open(config.data_dir.join("store"), store_config).await?;
