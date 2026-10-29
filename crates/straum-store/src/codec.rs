@@ -2311,9 +2311,11 @@ mod tests {
             assert_eq!(decode_dict_file(&f, 1), Some(data));
             assert_eq!(decode_dict_file(&f, 2), None, "another number");
             for i in 0..f.len() {
-                let mut bad = f.clone();
-                bad[i] ^= 1;
-                assert_eq!(decode_dict_file(&bad, 1), None, "flip at {i}");
+                for bit in 0..8 {
+                    let mut bad = f.clone();
+                    bad[i] ^= 1 << bit;
+                    assert_eq!(decode_dict_file(&bad, 1), None, "flip at {i}.{bit}");
+                }
             }
             assert_eq!(decode_dict_file(&f[..f.len() - 1], 1), None);
         }
@@ -2337,9 +2339,11 @@ mod tests {
         let b = m.encode();
         assert_eq!(Manifest::decode(&b), Some(m));
         for i in 0..b.len() {
-            let mut bad = b.clone();
-            bad[i] ^= 1;
-            assert_eq!(Manifest::decode(&bad), None, "flip at {i}");
+            for bit in 0..8 {
+                let mut bad = b.clone();
+                bad[i] ^= 1 << bit;
+                assert_eq!(Manifest::decode(&bad), None, "flip at {i}.{bit}");
+            }
         }
     }
 }

@@ -175,7 +175,7 @@ async fn damaged_checkpoint_files_fail_open_and_change_nothing() {
     type Expect = fn(&StoreError) -> bool;
     let block_mismatch =
         |e: &StoreError| matches!(e, StoreError::CheckpointBlockMismatch { checkpoint: 2, .. });
-    let cases: [(&str, Change, Expect); 17] = [
+    let cases: [(&str, Change, Expect); 24] = [
         (
             "table missing",
             |d| std::fs::remove_file(path_of(d, "objtab-", 1)).unwrap(),
@@ -262,6 +262,67 @@ async fn damaged_checkpoint_files_fail_open_and_change_nothing() {
                 edit(&path_of(d, "blktab-", 0), |b| {
                     b[24 + 45 * 3] = 7;
                     reseal_page(b, 0, 45);
+                })
+            },
+            corrupt,
+        ),
+        (
+            "block table cut",
+            |d| edit(&path_of(d, "blktab-", 0), |b| b.truncate(b.len() - 3)),
+            corrupt,
+        ),
+        (
+            "block run page damaged",
+            |d| edit(&path_of(d, "blkrel-", 0), |b| b[30] ^= 1),
+            corrupt,
+        ),
+        (
+            "next segment number not above the live segments",
+            |d| {
+                edit(&path_of(d, "checkpoint-", 0), |b| {
+                    b[52..60].fill(0);
+                    reseal_manifest(b);
+                })
+            },
+            corrupt,
+        ),
+        (
+            "dict_train_bytes",
+            |d| {
+                edit(&path_of(d, "checkpoint-", 0), |b| {
+                    b[60] ^= 1;
+                    reseal_manifest(b);
+                })
+            },
+            corrupt,
+        ),
+        (
+            "dictless_raw",
+            |d| {
+                edit(&path_of(d, "checkpoint-", 0), |b| {
+                    b[68] ^= 1;
+                    reseal_manifest(b);
+                })
+            },
+            corrupt,
+        ),
+        (
+            "a dictionary the WAL does not have",
+            |d| {
+                edit(&path_of(d, "checkpoint-", 0), |b| {
+                    b[76] = 1;
+                    reseal_manifest(b);
+                })
+            },
+            corrupt,
+        ),
+        (
+            "a live segment the WAL does not reference",
+            |d| {
+                edit(&path_of(d, "checkpoint-", 0), |b| {
+                    let at = b.len() - 12;
+                    b[at] ^= 0x40;
+                    reseal_manifest(b);
                 })
             },
             corrupt,
@@ -989,6 +1050,13 @@ async fn the_dictionary_file_is_written_once_and_checked() {
                 (|p: &Path| std::fs::remove_file(p).unwrap()) as fn(&Path),
             ),
             ("damaged", |p: &Path| edit(p, |b| b[30] ^= 1)),
+            // Intact, but other bytes than the WAL's PutDict.
+            ("resealed with other bytes", |p: &Path| {
+                edit(p, |b| {
+                    b[30] ^= 1;
+                    reseal_manifest(b);
+                })
+            }),
         ] {
             let work = TempDir::new("checkpoint-dict-work");
             common::copy_dir(&dir.0, &work.0);
@@ -1008,5 +1076,47 @@ async fn the_dictionary_file_is_written_once_and_checked() {
                 "{mode:?} {what}: files changed"
             );
         }
+    }
+}
+
+/// A block allocated after a checkpoint and reclaimed before the next is a
+/// number with no block in the next block table (all ones); the open
+/// matches it with the WAL. In every write mode.
+#[compio::test]
+async fn a_block_reclaimed_between_checkpoints_is_a_hole_in_the_table() {
+    for mode in MODES {
+        let dir = TempDir::new("checkpoint-block-hole");
+        let mut store = Store::open(&dir.0, config(mode)).await.unwrap();
+        put(&mut store, 0, 30).await;
+        store.checkpoint().await.unwrap();
+        // Unique bodies, released and compacted away before the next one.
+        let bodies: Vec<Vec<u8>> = (0..3)
+            .map(|i| format!("short-lived {i} {}", "z".repeat(5000)).into_bytes())
+            .collect();
+        let batch: Vec<Message> = bodies
+            .iter()
+            .map(|p| Message {
+                topic: b"u",
+                payload: p,
+                ..Default::default()
+            })
+            .collect();
+        store.put_batch(&batch, 1).await.unwrap();
+        store.release_before(b"u", 2).await.unwrap();
+        store.compact().await.unwrap();
+        put(&mut store, 30, 40).await;
+        store.checkpoint().await.unwrap();
+        drop(store);
+        let table = std::fs::read(path_of(&dir.0, "blktab-", 1)).unwrap();
+        let holes = table[24..]
+            .chunks(45)
+            .filter(|e| e.len() == 45 && e.iter().all(|&b| b == 0xff))
+            .count();
+        if mode != WriteMode::INLINE_SMALL {
+            assert!(holes >= 1, "{mode:?}: no hole in {} bytes", table.len());
+        }
+        let store = Store::open(&dir.0, config(mode)).await.unwrap();
+        assert!(store.recovery_report().is_empty(), "{mode:?}");
+        check(&store, 0..40).await;
     }
 }
