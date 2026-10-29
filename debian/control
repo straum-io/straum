@@ -13,7 +13,8 @@ Rules-Requires-Root: no
 Package: straum
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
-Description: replicated log (experimental)
- A replicated log: nodes commit records by majority under a scheduled
- sequencer. Its client protocol is not built yet.
+Description: durable event log for one server (experimental)
+ A single broker with the data model of a partitioned log. Messages are
+ acknowledged only after their group commit is written and fdatasynced.
+ Version 0 listens on loopback only (no authentication yet).
  Experimental, not production-ready.

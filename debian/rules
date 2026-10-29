@@ -12,13 +12,14 @@ export CARGO_HOME := $(CURDIR)/debian/cargo-home
 override_dh_auto_build:
 	mkdir -p $(CARGO_HOME)
 	printf '[source.crates-io]\nreplace-with = "vendor"\n[source.vendor]\ndirectory = "%s/vendor"\n' '$(CURDIR)' > $(CARGO_HOME)/config.toml
-	cargo build --release --locked --offline -p server --bin straum-server
+	cargo build --release --locked --offline -p straum-broker --bin straum-server
 
 # The tests run in CI on every pull request.
 override_dh_auto_test:
 
 override_dh_auto_install:
 	install -D -m 755 target/release/straum-server debian/straum/usr/bin/straum-server
+	install -D -m 644 debian/straum.conf debian/straum/etc/straum/straum.conf
 
 # Like the cargo-deb package: installed, not enabled or started.
 override_dh_installsystemd:

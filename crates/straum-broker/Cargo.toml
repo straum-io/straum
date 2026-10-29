@@ -27,3 +27,22 @@ straum-conformance = { path = "../straum-conformance" }
 
 [lints]
 workspace = true
+
+# The Debian package of release.yml (cargo deb -p straum-broker), laid out
+# as the Launchpad build of debian/rules.
+[package.metadata.deb]
+name = "straum"
+maintainer = "straum-io <https://github.com/straum-io/straum/issues>"
+copyright = "straum-io"
+license-file = ["../../LICENSE", "0"]
+extended-description = "A single broker with the data model of a partitioned log. Messages are acknowledged only after their group commit is written and fdatasynced. Version 0 listens on loopback only (no authentication yet). Experimental, not production-ready."
+section = "net"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/straum-server", "usr/bin/", "755"],
+    ["../../debian/straum.conf", "etc/straum/straum.conf", "644"],
+    ["../../README.md", "usr/share/doc/straum/README.md", "644"],
+]
+conf-files = ["/etc/straum/straum.conf"]
+systemd-units = { unit-name = "straum", unit-scripts = "../../debian", enable = false, start = false }
