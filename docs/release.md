@@ -183,4 +183,3 @@ In the repository settings, by the owner:
 - the PPA settings (`LAUNCHPAD_PPA`, `PPA_GPG_KEY`) are not needed while
   the PPA is paused (D-253 A).
 
-Agents never read or print the secrets.
