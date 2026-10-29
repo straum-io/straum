@@ -361,6 +361,38 @@ scripts/bench/block-cap.sh --out ~/block-cap
 those of `format7-vs-8.sh`. Its duration on a bare-metal machine has not
 been measured.
 
+### The checkpoint milestone on a Linux machine
+
+`scripts/bench/checkpoint.sh` is ADR-0014's milestone benchmark (step 9,
+D-239): the checked-out commit (`head`) against `540c887` (`base`, the
+block branch with the 16 KiB cap before the checkpoint work), both with
+`max_block_raw_bytes` 16 KiB and InlineSmall's threshold at it. It is
+`block-cap.sh` with these differences:
+
+- Two worktrees and builds: the checked-out commit's bench (its main
+  binary) built against `540c887` with `cap` only, and against the
+  checked-out commit with its defaults (feature `checkpoint`).
+- Matrix within the benchmark budget (D-239): `random` (unique) at
+  100 B × batches {64, 512}, 1 KiB × {64, 512} and 10 KiB × 64, and the
+  timestamp-stripped SSH and BGL lines (`--payload lines:`, duplicate-heavy)
+  padded to 256 B × {64, 512}; modes `sequential` and `inline`; 5
+  repetitions, the first variant alternating; per run at most 256 MiB of
+  bodies and at least 300 batches; the four read workloads with the block
+  cache on and off. No raw or hashcopy baselines, no ParallelSync.
+- `head` checkpoints on its own triggers during the writes, so the batch
+  latency includes them; its rows add the last checkpoint's number, one
+  more checkpoint's duration (`final_checkpoint_ns`), and, in both
+  variants, the time to reopen the store (`open_ns`).
+
+```bash
+scripts/bench/checkpoint.sh --out ~/checkpoint
+```
+
+`--quick`, `--keep`, the preconditions, the outputs and the cleanup are
+those of `block-cap.sh`. Not covered: duplicate lookups with the page
+cache dropped (needs root) or a working set larger than RAM (beyond the
+budget's 256 MiB per run). Its duration has not been measured.
+
 ### The recent-id cache (ADR-0014 step 6a)
 
 ```bash

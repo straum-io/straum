@@ -13,7 +13,7 @@
 //! straum-store-bench --dir <dir on the measured disk> [--out results.csv]
 //!     [--mode raw,hashcopy,sequential,parallel,inline] [--sizes 100,1024,10240] [--batches 1,8,64,512]
 //!     [--reps 5] [--min-batches 100] [--max-batches 1000] [--max-bytes 1073741824]
-//!     [--payload pattern|random|file:<path>] [--seed 1] [--label <text>] [--rep-offset 0] [--no-header]
+//!     [--payload pattern|random|file:<path>|lines:<openstack|ssh|bgl>:<path>] [--seed 1] [--label <text>] [--rep-offset 0] [--no-header]
 //!     [--reads 0] [--read-seconds 5] [--read-cache default,off] [--reads-out reads.csv] [--clk-tck 100]
 //! ```
 //!
@@ -34,6 +34,16 @@
 //! * `file:<path>`: consecutive `size`-byte windows of the file. At the end
 //!   of the file the windows start again one byte further in, so a payload
 //!   repeats only where the file itself repeats.
+//! * `lines:<format>:<path>`: the Loghub log's lines in order, cycled, each
+//!   without its timestamp (`strip.rs`, as `tools/dedup-survey`), cut or
+//!   padded to `size` bytes: repeated lines repeat, so writes deduplicate
+//!   as the log does.
+//!
+//! With the `checkpoint` feature (ADR-0014; the engine checkpoints on its
+//! own triggers during the writes), a store run also records the last
+//! checkpoint's number after the writes and times one more
+//! `Store::checkpoint` covering the rest; every store run times reopening
+//! the store (`open_ns`) after the writes.
 //!
 //! With `--reads N` (store modes only) the store is reopened after the
 //! writes and read twice: a sequential scan from the first `topic_seq`, and
@@ -62,10 +72,12 @@ use compio::fs::OpenOptions;
 use compio::io::AsyncWriteAtExt;
 use straum_store::{Config, Message, ObjectId, Store, WriteMode};
 
-const HEADER: &str = "label,payload,mode,msg_size,batch,rep,messages,batches,elapsed_ns,msgs_per_s,fsyncs,fsyncs_per_batch,bytes_written,bytes_per_msg,wal_bytes_per_msg,disk_bytes_per_msg,batch_p50_ns,batch_p99_ns,cpu_ns_per_msg,peak_rss_bytes,rep_min_msgs_per_s,rep_max_msgs_per_s,spread_pct,dedup_msgs,bytes_saved,meta_bytes_per_msg,seg_sync_p50_ns,seg_sync_p99_ns,wal_sync_p50_ns,wal_sync_p99_ns,overlap_pct,max_block_raw_bytes";
+mod strip;
+
+const HEADER: &str = "label,payload,mode,msg_size,batch,rep,messages,batches,elapsed_ns,msgs_per_s,fsyncs,fsyncs_per_batch,bytes_written,bytes_per_msg,wal_bytes_per_msg,disk_bytes_per_msg,batch_p50_ns,batch_p99_ns,cpu_ns_per_msg,peak_rss_bytes,rep_min_msgs_per_s,rep_max_msgs_per_s,spread_pct,dedup_msgs,bytes_saved,meta_bytes_per_msg,seg_sync_p50_ns,seg_sync_p99_ns,wal_sync_p50_ns,wal_sync_p99_ns,overlap_pct,max_block_raw_bytes,checkpoints,final_checkpoint_ns,open_ns";
 const READ_HEADER: &str = "label,payload,mode,msg_size,batch,rep,workload,cache,messages,reads,elapsed_ns,msgs_per_s,read_p50_ns,read_p99_ns,cpu_ns_per_read";
 /// Columns of `Run::columns`.
-const COLUMNS: usize = 22;
+const COLUMNS: usize = 25;
 /// Planned bytes per message on top of the payload, for the free-space
 /// check: above the store's metadata (WAL records, frame header share,
 /// topic index entry) for every mode.
@@ -167,6 +179,10 @@ enum Payload {
         file: std::fs::File,
         len: u64,
     },
+    Lines {
+        path: PathBuf,
+        lines: Vec<Vec<u8>>,
+    },
 }
 
 impl Payload {
@@ -177,6 +193,11 @@ impl Payload {
             Self::File { path, .. } => path
                 .file_name()
                 .map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned()),
+            Self::Lines { path, .. } => format!(
+                "lines-{}",
+                path.file_name()
+                    .map_or_else(|| "file".into(), |n| n.to_string_lossy())
+            ),
         }
     }
 }
@@ -235,11 +256,29 @@ impl<'a> Source<'a> {
                     file.read_exact_at(buf, self.offset)?;
                     self.offset += size;
                 }
+                Payload::Lines { lines, .. } => {
+                    let line = &lines[(self.next % lines.len() as u64) as usize];
+                    let n = line.len().min(self.size);
+                    buf[..n].copy_from_slice(&line[..n]);
+                }
             }
             self.next += 1;
         }
         Ok(())
     }
+}
+
+/// A message without key or headers. `540c887` (feature `checkpoint` off)
+/// has neither field.
+fn message<'a>(topic: &'a [u8], payload: &'a [u8]) -> Message<'a> {
+    #[cfg(feature = "checkpoint")]
+    return Message {
+        topic,
+        payload,
+        ..Default::default()
+    };
+    #[cfg(not(feature = "checkpoint"))]
+    Message { topic, payload }
 }
 
 /// xorshift64*: a fixed, dependency-free stream for payloads and read order.
@@ -318,6 +357,12 @@ struct Run {
     /// Per-batch sync durations (feature `cap`): segment p50, p99, WAL p50,
     /// p99 (ns), and the percentage of batches whose two syncs overlapped.
     syncs: Option<[f64; 5]>,
+    /// The last checkpoint's number after the writes, and one more
+    /// checkpoint's duration (feature `checkpoint`).
+    checkpoints: Option<u64>,
+    checkpoint_ns: Option<u64>,
+    /// Reopening the store after the writes; `None` for the baselines.
+    open_ns: Option<u64>,
 }
 
 impl Run {
@@ -346,6 +391,9 @@ impl Run {
             self.syncs.map_or(f64::NAN, |s| s[2]),
             self.syncs.map_or(f64::NAN, |s| s[3]),
             self.syncs.map_or(f64::NAN, |s| s[4]),
+            self.checkpoints.map_or(f64::NAN, |c| c as f64),
+            self.checkpoint_ns.map_or(f64::NAN, |c| c as f64),
+            self.open_ns.map_or(f64::NAN, |c| c as f64),
         ]
     }
 }
@@ -367,7 +415,7 @@ fn main() {
         Ok(args) => args,
         Err(e) => {
             eprintln!(
-                "{e}\nusage: straum-store-bench --dir <dir> [--out file.csv] [--mode raw,hashcopy,sequential,parallel,inline] [--sizes 100,1024,10240] [--batches 1,8,64,512] [--reps 5] [--min-batches 100] [--max-batches 1000] [--max-bytes 1073741824] [--payload pattern|random|file:<path>] [--seed 1] [--label <text>] [--rep-offset 0] [--no-header] [--reads 0] [--read-seconds 5] [--read-cache default,off] [--reads-out reads.csv] [--clk-tck 100]"
+                "{e}\nusage: straum-store-bench --dir <dir> [--out file.csv] [--mode raw,hashcopy,sequential,parallel,inline] [--sizes 100,1024,10240] [--batches 1,8,64,512] [--reps 5] [--min-batches 100] [--max-batches 1000] [--max-bytes 1073741824] [--payload pattern|random|file:<path>|lines:<openstack|ssh|bgl>:<path>] [--seed 1] [--label <text>] [--rep-offset 0] [--no-header] [--reads 0] [--read-seconds 5] [--read-cache default,off] [--reads-out reads.csv] [--clk-tck 100]"
             );
             std::process::exit(2);
         }
@@ -614,14 +662,7 @@ async fn run_store(
     while sent < messages {
         let n = batch;
         source.fill(&mut bufs[..n])?;
-        let msgs: Vec<Message> = bufs[..n]
-            .iter()
-            .map(|p| Message {
-                topic: TOPIC,
-                payload: p,
-                ..Default::default()
-            })
-            .collect();
+        let msgs: Vec<Message> = bufs[..n].iter().map(|p| message(TOPIC, p)).collect();
         let start = Instant::now();
         store
             .put_batch(std::hint::black_box(&msgs), sent as u64)
@@ -635,6 +676,22 @@ async fn run_store(
     let cpu = cpu_ns(clk_tck).zip(cpu_start).map(|(b, a)| b - a);
     let rss = peak_rss();
     let s = store.stats();
+    #[cfg(feature = "checkpoint")]
+    let (checkpoints, checkpoint_ns) = {
+        let n = store.checkpoint_number().unwrap_or(0);
+        let start = Instant::now();
+        store.checkpoint().await.map_err(std::io::Error::other)?;
+        (Some(n), Some(start.elapsed().as_nanos() as u64))
+    };
+    #[cfg(not(feature = "checkpoint"))]
+    let (checkpoints, checkpoint_ns) = (None, None);
+    drop(store);
+    let start = Instant::now();
+    let reopened = Store::open(dir, store_config(write_mode, args))
+        .await
+        .map_err(std::io::Error::other)?;
+    let open_ns = start.elapsed().as_nanos() as u64;
+    drop(reopened);
     let mut run = finish(
         lat,
         messages,
@@ -649,6 +706,9 @@ async fn run_store(
     );
     run.cpu_ns = cpu;
     run.peak_rss = rss;
+    run.checkpoints = checkpoints;
+    run.checkpoint_ns = checkpoint_ns;
+    run.open_ns = Some(open_ns);
     #[cfg(feature = "cap")]
     {
         let dur = |s: Option<(u64, u64)>| s.map(|(a, b)| b - a);
@@ -775,14 +835,7 @@ async fn prepare_dedup(
                 bodies.push(fresh[0].clone());
             }
         }
-        let msgs: Vec<Message> = bodies
-            .iter()
-            .map(|p| Message {
-                topic: DEDUP_TOPIC,
-                payload: p,
-                ..Default::default()
-            })
-            .collect();
+        let msgs: Vec<Message> = bodies.iter().map(|p| message(DEDUP_TOPIC, p)).collect();
         store
             .put_batch(&msgs, written as u64)
             .await
@@ -934,7 +987,7 @@ fn write_row(
     };
     writeln!(
         out,
-        "{label},{payload},{mode},{size},{batch},{rep},{:.0},{:.0},{:.0},{:.1},{:.0},{:.3},{:.0},{:.1},{:.1},{:.1},{:.0},{:.0},{:.0},{:.0},{spread},{:.0},{:.0},{:.1},{:.0},{:.0},{:.0},{:.0},{:.1},{cap}",
+        "{label},{payload},{mode},{size},{batch},{rep},{:.0},{:.0},{:.0},{:.1},{:.0},{:.3},{:.0},{:.1},{:.1},{:.1},{:.0},{:.0},{:.0},{:.0},{spread},{:.0},{:.0},{:.1},{:.0},{:.0},{:.0},{:.0},{:.1},{cap},{:.0},{:.0},{:.0}",
         c[0],
         c[1],
         c[2],
@@ -956,7 +1009,10 @@ fn write_row(
         c[18],
         c[19],
         c[20],
-        c[21]
+        c[21],
+        c[22],
+        c[23],
+        c[24]
     )
 }
 
@@ -1014,6 +1070,31 @@ fn parse_args() -> Result<Args, String> {
                 args.payload = match value.as_str() {
                     "pattern" => Payload::Pattern,
                     "random" => Payload::Random,
+                    v if v.starts_with("lines:") => {
+                        let (format, path) = v["lines:".len()..]
+                            .split_once(':')
+                            .ok_or_else(|| format!("bad payload {v}"))?;
+                        let format = match format {
+                            "openstack" => strip::Format::OpenStack,
+                            "ssh" => strip::Format::Ssh,
+                            "bgl" => strip::Format::Bgl,
+                            f => return Err(format!("unknown log format {f}")),
+                        };
+                        let path = PathBuf::from(path);
+                        let data =
+                            std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                        let lines: Vec<Vec<u8>> = data
+                            .split(|&b| b == b'\n')
+                            .filter(|l| !l.is_empty())
+                            .map(|l| {
+                                strip::strip_timestamp(format, l).unwrap_or_else(|| l.to_vec())
+                            })
+                            .collect();
+                        if lines.is_empty() {
+                            return Err(format!("{}: no lines", path.display()));
+                        }
+                        Payload::Lines { path, lines }
+                    }
                     v => {
                         let path = PathBuf::from(
                             v.strip_prefix("file:")

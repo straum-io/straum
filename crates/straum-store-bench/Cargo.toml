@@ -18,10 +18,14 @@ crc32c.workspace = true
 # `cap`: the engine has `Config::max_block_raw_bytes` and
 # `Store::last_commit_timing` (WAL format 10). Off, with `blocks` on, the
 # bench builds against the uncapped block format (scripts/bench/block-cap.sh).
+# `checkpoint`: the engine has `Store::checkpoint` and its triggers
+# (ADR-0014). Off, with `cap` on, the bench builds against `540c887`, the
+# block branch before the checkpoint work (scripts/bench/checkpoint.sh).
 [features]
-default = ["blocks", "cap"]
+default = ["blocks", "cap", "checkpoint"]
 blocks = []
 cap = ["blocks"]
+checkpoint = ["cap"]
 
 [lints]
 workspace = true
