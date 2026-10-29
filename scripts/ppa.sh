@@ -39,6 +39,9 @@ sed -i "s|@MAINTAINER@|$maintainer|" "$src/debian/control"
 # The orig tarball goes up with the first series only; Launchpad keeps one
 # copy per PPA.
 include_orig=-sa
+# STALE: the Launchpad (PPA) build is paused until Launchpad has Rust 1.95,
+# which the broker needs; the Rust 1.91 toolchain named here and in debian/
+# cannot build it (D-253 A).
 for series in "$@"; do
     case $series in
         jammy) release=22.04 ;;
