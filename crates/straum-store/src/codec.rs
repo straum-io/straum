@@ -1366,8 +1366,10 @@ pub fn decode_id_run_footer(file: &[u8]) -> Option<(Vec<u64>, crate::fuse::Fuse8
     let fences_end = 8usize.checked_add(pages.checked_mul(8)?)?;
     let fences: Vec<u64> = footer
         .get(8..fences_end)?
-        .chunks_exact(8)
-        .map(|c| u64_at(c, 0))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .collect();
     let (filter, rest) = crate::fuse::Fuse8::decode(&footer[fences_end..])?;
     rest.is_empty().then_some((fences, filter, start))
