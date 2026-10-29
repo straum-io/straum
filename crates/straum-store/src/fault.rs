@@ -69,10 +69,15 @@ pub fn arm(point: FaultPoint, nth: u32) {
     });
 }
 
-/// Disarms every point.
+/// Disarms every point; returns whether any armed point had not fired.
 #[doc(hidden)]
-pub fn disarm() {
-    ARMED.with(|a| a.borrow_mut().clear());
+pub fn disarm() -> bool {
+    ARMED.with(|a| {
+        let mut a = a.borrow_mut();
+        let unfired = !a.is_empty();
+        a.clear();
+        unfired
+    })
 }
 
 /// Whether `point` is armed and this is its n-th arrival (disarming it

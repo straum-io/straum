@@ -182,7 +182,8 @@ async fn a_crash_at_every_checkpoint_step_recovers() {
             let (mut store, live) = prepare(&dir.0, mode).await;
             arm_fault(point, 1);
             let res = store.checkpoint().await;
-            if res.is_err() {
+            if !disarm_fault() {
+                assert!(res.is_err(), "{mode:?} {point:?}");
                 fired.push(point);
                 assert!(
                     matches!(store.checkpoint().await, Err(StoreError::Poisoned)),
@@ -257,6 +258,7 @@ async fn the_write_time_quarantine_recovers_at_every_step() {
                 arm_fault(p, k);
             }
             assert!(store.checkpoint().await.is_err(), "{mode:?} {what}");
+            assert!(!disarm_fault(), "{mode:?} {what}: a point did not fire");
             drop(store);
             let what = format!("{mode:?} write-time quarantine {what} {then:?}");
             reopen_and_verify(&dir.0, mode, &live, &what).await;
@@ -300,7 +302,10 @@ async fn a_quarantine_at_open_recovers_at_every_step() {
             let what = format!("{mode:?} open quarantine {point:?} {k}");
             // Every case stops the open: the quarantine moves the manifest,
             // its tables and runs, at least four files.
-            assert!(res.is_err(), "{what}: the fault did not fire");
+            assert!(
+                res.is_err() && !disarm_fault(),
+                "{what}: the fault did not fire"
+            );
             drop(res);
             let complete = point == FaultPoint::OpenBeforeReport
                 || (point == FaultPoint::QuarantineGroupSynced && k == 2);
