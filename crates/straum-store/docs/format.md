@@ -715,7 +715,9 @@ amended by the owner), created and synced before the moves; the tables and
 runs move first and are synced, then the manifest, so an open interrupted
 during the move leaves the manifest in place and the next open quarantines
 it again with the files not yet moved (in the next free name), deleting
-none; a name that
+none (the files the interrupted open moved are in no recovery report,
+since that open's report was lost; `quarantined_files` and the broker's
+warning count them); a name that
 is taken gets the next free suffix (`quarantine-<n>.1`, `.2`, …), so an
 existing quarantine is never overwritten. Tables and runs are cumulative,
 so the tables at or above the used manifest's `next_object` and the runs

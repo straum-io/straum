@@ -165,8 +165,7 @@ pub async fn serve(
         eprintln!("straum-server: recovery: {action:?}");
     }
     // Not a recovery line: a quarantine is reported once, by the open that
-    // made it; this repeats at every start while quarantine directories
-    // exist.
+    // made it; this repeats at every start while quarantined files exist.
     let quarantined = store.quarantined_files();
     if quarantined > 0 {
         eprintln!(
