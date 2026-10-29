@@ -79,7 +79,7 @@ Clients in other languages can be built against the
 
 ## Development
 
-Rust (see `rust-version` in `Cargo.toml`). Linux is the target (io_uring);
+Rust 1.95 or later (`rust-version` in `Cargo.toml`). Linux is the target (io_uring);
 macOS works for development with the polling driver.
 
 ```bash
@@ -101,8 +101,7 @@ scripts/validate.sh push    # adds the long tests, and the io_uring container (s
   PR body check, the Issue and PR templates.
 - `Dockerfile`, `debian/`: the image and the Debian package of
   `straum-server` (loopback only, so the image runs with `--network host`;
-  see the Dockerfile). `deploy/kubernetes/`: not yet working with the
-  current broker.
+  see the Dockerfile).
 
 The previous code, a replicated log with scheduled leadership, is kept
 under the tag
