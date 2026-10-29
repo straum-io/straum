@@ -104,4 +104,9 @@ pub enum StoreError {
     /// checkpoint covers. No file is changed.
     #[error("checkpoint {checkpoint} disagrees with the WAL on object number {number}")]
     CheckpointMismatch { checkpoint: u64, number: u64 },
+    /// A checkpoint's block table or block relocation run gives block
+    /// `block` another place, layout or dictionary (or none) than the WAL
+    /// has at the frames the checkpoint covers. No file is changed.
+    #[error("checkpoint {checkpoint} disagrees with the WAL on block {block}")]
+    CheckpointBlockMismatch { checkpoint: u64, block: u64 },
 }

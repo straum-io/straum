@@ -62,6 +62,16 @@ fn names(dir: &Path, prefix: &str) -> Vec<String> {
     names
 }
 
+/// The checkpoint tables and runs (objects and blocks) and dictionary files.
+fn all_tables(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = ["objtab-", "reloc-", "blktab-", "blkrel-", "dict-"]
+        .iter()
+        .flat_map(|p| names(dir, p))
+        .collect();
+    v.sort();
+    v
+}
+
 fn config(mode: WriteMode) -> Config {
     Config {
         write_mode: mode,
@@ -100,9 +110,11 @@ async fn checkpoints_reopen_clean_in_every_mode() {
             ["checkpoint-0000000000000002"]
         );
         assert_eq!(names(&dir.0, "objtab-").len(), 2, "{mode:?}");
+        assert_eq!(names(&dir.0, "blktab-").len(), 2, "{mode:?}");
         if mode != WriteMode::INLINE_SMALL {
             // Inline blocks are not compacted; segment blocks are.
             assert_eq!(names(&dir.0, "reloc-"), ["reloc-0000000000000002.run"]);
+            assert_eq!(names(&dir.0, "blkrel-"), ["blkrel-0000000000000002.run"]);
         }
         // No WAL file is deleted (the interim rule).
         assert_eq!(names(&dir.0, "wal-")[0], common::WAL0);
@@ -161,7 +173,9 @@ async fn damaged_checkpoint_files_fail_open_and_change_nothing() {
     let mismatch =
         |e: &StoreError| matches!(e, StoreError::CheckpointMismatch { checkpoint: 2, .. });
     type Expect = fn(&StoreError) -> bool;
-    let cases: [(&str, Change, Expect); 10] = [
+    let block_mismatch =
+        |e: &StoreError| matches!(e, StoreError::CheckpointBlockMismatch { checkpoint: 2, .. });
+    let cases: [(&str, Change, Expect); 24] = [
         (
             "table missing",
             |d| std::fs::remove_file(path_of(d, "objtab-", 1)).unwrap(),
@@ -231,6 +245,120 @@ async fn damaged_checkpoint_files_fail_open_and_change_nothing() {
                 })
             },
             corrupt,
+        ),
+        (
+            "block table missing",
+            |d| std::fs::remove_file(path_of(d, "blktab-", 1)).unwrap(),
+            corrupt,
+        ),
+        (
+            "block table page damaged",
+            |d| edit(&path_of(d, "blktab-", 0), |b| b[40] ^= 1),
+            corrupt,
+        ),
+        (
+            "block table entry of an unknown kind",
+            |d| {
+                edit(&path_of(d, "blktab-", 0), |b| {
+                    b[24 + 45 * 3] = 7;
+                    reseal_page(b, 0, 45);
+                })
+            },
+            corrupt,
+        ),
+        (
+            "block table cut",
+            |d| edit(&path_of(d, "blktab-", 0), |b| b.truncate(b.len() - 3)),
+            corrupt,
+        ),
+        (
+            "block run page damaged",
+            |d| edit(&path_of(d, "blkrel-", 0), |b| b[30] ^= 1),
+            corrupt,
+        ),
+        (
+            "next segment number not above the live segments",
+            |d| {
+                edit(&path_of(d, "checkpoint-", 0), |b| {
+                    b[52..60].fill(0);
+                    reseal_manifest(b);
+                })
+            },
+            corrupt,
+        ),
+        (
+            "dict_train_bytes",
+            |d| {
+                edit(&path_of(d, "checkpoint-", 0), |b| {
+                    b[60] ^= 1;
+                    reseal_manifest(b);
+                })
+            },
+            corrupt,
+        ),
+        (
+            "dictless_raw",
+            |d| {
+                edit(&path_of(d, "checkpoint-", 0), |b| {
+                    b[68] ^= 1;
+                    reseal_manifest(b);
+                })
+            },
+            corrupt,
+        ),
+        (
+            "a dictionary the WAL does not have",
+            |d| {
+                edit(&path_of(d, "checkpoint-", 0), |b| {
+                    b[76] = 1;
+                    reseal_manifest(b);
+                })
+            },
+            corrupt,
+        ),
+        (
+            "a live segment the WAL does not reference",
+            |d| {
+                edit(&path_of(d, "checkpoint-", 0), |b| {
+                    let at = b.len() - 12;
+                    b[at] ^= 0x40;
+                    reseal_manifest(b);
+                })
+            },
+            corrupt,
+        ),
+        (
+            "block run missing",
+            |d| std::fs::remove_file(path_of(d, "blkrel-", 0)).unwrap(),
+            corrupt,
+        ),
+        (
+            "block run cut",
+            |d| edit(&path_of(d, "blkrel-", 0), |b| b.truncate(b.len() - 2)),
+            corrupt,
+        ),
+        // A block's CRC changed in its table entry, resealed: only the
+        // comparison with the WAL finds it.
+        (
+            "block table entry disagrees",
+            |d| {
+                edit(&path_of(d, "blktab-", 0), |b| {
+                    b[24 + 45 * 3 + 37] ^= 1;
+                    reseal_page(b, 0, 45);
+                })
+            },
+            block_mismatch,
+        ),
+        // A block run entry with another offset, resealed.
+        (
+            "block run entry disagrees",
+            |d| {
+                edit(&path_of(d, "blkrel-", 0), |b| {
+                    b[24 + 16] ^= 1;
+                    reseal_page(b, 0, 24);
+                })
+            },
+            block_mismatch,
         ),
     ];
     for (what, change, expect) in cases {
@@ -318,6 +446,7 @@ async fn tables_without_a_manifest_are_orphans_while_the_wal_is_whole() {
     let dir = TempDir::new("checkpoint-no-manifest");
     build(&dir.0, WriteMode::Sequential).await;
     std::fs::remove_file(path_of(&dir.0, "checkpoint-", 0)).unwrap();
+    let files = all_tables(&dir.0).len();
     let store = Store::open(&dir.0, Config::default()).await.unwrap();
     let removed = store
         .recovery_report()
@@ -325,7 +454,7 @@ async fn tables_without_a_manifest_are_orphans_while_the_wal_is_whole() {
         .iter()
         .filter(|a| matches!(a, RecoveryAction::CheckpointFileRemoved { .. }))
         .count();
-    assert_eq!(removed, 3, "{:?}", store.recovery_report());
+    assert_eq!(removed, files, "{:?}", store.recovery_report());
     assert_eq!(store.checkpoint_number(), None);
     check(&store, 60..160).await;
 }
@@ -453,14 +582,8 @@ async fn a_damaged_newest_manifest_falls_back_to_the_older_one() {
             let live = build_with_both_manifests(&dir.0, mode).await;
             damage(&dir.0.join("checkpoint-0000000000000002"));
             let bad = std::fs::read(dir.0.join("checkpoint-0000000000000002")).unwrap();
-            let mut expect: Vec<String> = names(&dir.0, "")
-                .into_iter()
-                .filter(|n| {
-                    n == "checkpoint-0000000000000002"
-                        || n == "reloc-0000000000000002.run"
-                        || (n.starts_with("objtab-") && n != "objtab-0000000000000000.tab")
-                })
-                .collect();
+            let mut expect = own_files(&dir.0);
+            expect.push("checkpoint-0000000000000002".to_owned());
             expect.sort();
             let mut store = Store::open(&dir.0, config(mode)).await.unwrap();
             let acts = actions(&store);
@@ -480,8 +603,11 @@ async fn a_damaged_newest_manifest_falls_back_to_the_older_one() {
                 names(&dir.0, "checkpoint-"),
                 ["checkpoint-0000000000000001"]
             );
-            assert_eq!(names(&dir.0, "objtab-"), ["objtab-0000000000000000.tab"]);
-            assert!(names(&dir.0, "reloc-").is_empty(), "{mode:?} {what}");
+            assert_eq!(
+                all_tables(&dir.0),
+                ["blktab-0000000000000000.tab", "objtab-0000000000000000.tab"],
+                "{mode:?} {what}"
+            );
             check(&store, live.clone()).await;
             store.checkpoint().await.unwrap();
             assert_eq!(store.checkpoint_number(), Some(3), "never repeats 2");
@@ -522,9 +648,16 @@ async fn a_damaged_only_manifest_is_ignored_while_the_wal_is_whole() {
             let mut expect: Vec<String> = names(&dir.0, "")
                 .into_iter()
                 .filter(|n| {
-                    ["checkpoint-", "objtab-", "reloc-"]
-                        .iter()
-                        .any(|p| n.starts_with(p))
+                    [
+                        "checkpoint-",
+                        "objtab-",
+                        "reloc-",
+                        "blktab-",
+                        "blkrel-",
+                        "dict-",
+                    ]
+                    .iter()
+                    .any(|p| n.starts_with(p))
                 })
                 .collect();
             expect.sort();
@@ -568,7 +701,7 @@ async fn two_damaged_manifests_are_ignored_while_the_wal_is_whole() {
         assert_eq!(store.checkpoint_number(), None);
         check(&store, live).await;
         assert!(names(&dir.0, "checkpoint-").is_empty());
-        assert!(names(&dir.0, "objtab-").is_empty());
+        assert!(all_tables(&dir.0).is_empty());
     }
 }
 
@@ -673,12 +806,11 @@ fn resumed(
 }
 
 /// The files the newest checkpoint of `build_with_both_manifests` alone
-/// lists: its object table and (with segment blocks) its run.
+/// lists: its object and block tables and (with segment blocks) its runs.
 fn own_files(dir: &Path) -> Vec<String> {
-    let mut v: Vec<String> = names(dir, "objtab-")
+    let mut v: Vec<String> = all_tables(dir)
         .into_iter()
-        .filter(|n| n != "objtab-0000000000000000.tab")
-        .chain(names(dir, "reloc-"))
+        .filter(|n| n != "objtab-0000000000000000.tab" && n != "blktab-0000000000000000.tab")
         .collect();
     v.sort();
     v
@@ -841,10 +973,7 @@ async fn an_interrupted_and_a_new_quarantine_in_one_open() {
         let q1 = "quarantine-0000000000000001";
         std::fs::create_dir(dir.0.join(q1)).unwrap();
         edit(&dir.0.join("checkpoint-0000000000000002"), |b| b[13] ^= 1);
-        let mut tables: Vec<String> = names(&dir.0, "objtab-")
-            .into_iter()
-            .chain(names(&dir.0, "reloc-"))
-            .collect();
+        let mut tables: Vec<String> = all_tables(&dir.0);
         tables.push("checkpoint-0000000000000002".to_owned());
         tables.sort();
         let store = Store::open(&dir.0, config(mode)).await.unwrap();
@@ -881,4 +1010,133 @@ async fn a_quarantine_name_that_is_not_a_directory_fails_open() {
         res.err()
     );
     assert!(snapshot(&dir.0) == before, "files changed");
+}
+
+/// The dictionary goes to `dict-<n>.bin` at the first checkpoint after
+/// training, listed by every later manifest; the next open compares it with
+/// the WAL. A missing or damaged dictionary file fails open with no file
+/// changed. In every write mode.
+#[compio::test]
+async fn the_dictionary_file_is_written_once_and_checked() {
+    for mode in MODES {
+        let dir = TempDir::new("checkpoint-dict");
+        let cfg = Config {
+            dict_train_bytes: 2048,
+            ..config(mode)
+        };
+        let mut store = Store::open(&dir.0, cfg).await.unwrap();
+        put(&mut store, 0, 60).await;
+        store.checkpoint().await.unwrap();
+        assert!(
+            names(&dir.0, "dict-").is_empty(),
+            "{mode:?}: no training yet"
+        );
+        for b in 1..6 {
+            put(&mut store, b * 60, (b + 1) * 60).await;
+        }
+        assert!(store.dictionary_bytes().is_some(), "{mode:?}: trained");
+        store.checkpoint().await.unwrap();
+        put(&mut store, 360, 400).await;
+        store.checkpoint().await.unwrap();
+        assert_eq!(names(&dir.0, "dict-"), ["dict-0000000000000001.bin"]);
+        drop(store);
+        let store = Store::open(&dir.0, cfg).await.unwrap();
+        assert!(store.recovery_report().is_empty(), "{mode:?}");
+        check(&store, 0..400).await;
+        drop(store);
+        // The newest manifest claims no dictionary on a trained store.
+        {
+            let work = TempDir::new("checkpoint-dict-none");
+            common::copy_dir(&dir.0, &work.0);
+            edit(&path_of(&work.0, "checkpoint-", 0), |b| {
+                b[76..84].fill(0);
+                reseal_manifest(b);
+            });
+            let before = snapshot(&work.0);
+            let res = Store::open(&work.0, cfg).await;
+            assert!(
+                matches!(
+                    res,
+                    Err(StoreError::CorruptCheckpoint { checkpoint: 3, .. })
+                ),
+                "{mode:?}: {:?}",
+                res.err()
+            );
+            assert!(snapshot(&work.0) == before, "{mode:?}: files changed");
+        }
+        for (what, change) in [
+            (
+                "missing",
+                (|p: &Path| std::fs::remove_file(p).unwrap()) as fn(&Path),
+            ),
+            ("damaged", |p: &Path| edit(p, |b| b[30] ^= 1)),
+            // Intact, but other bytes than the WAL's PutDict.
+            ("resealed with other bytes", |p: &Path| {
+                edit(p, |b| {
+                    b[30] ^= 1;
+                    reseal_manifest(b);
+                })
+            }),
+        ] {
+            let work = TempDir::new("checkpoint-dict-work");
+            common::copy_dir(&dir.0, &work.0);
+            change(&work.0.join("dict-0000000000000001.bin"));
+            let before = snapshot(&work.0);
+            let res = Store::open(&work.0, cfg).await;
+            assert!(
+                matches!(
+                    res,
+                    Err(StoreError::CorruptCheckpoint { checkpoint: 3, .. })
+                ),
+                "{mode:?} {what}: {:?}",
+                res.err()
+            );
+            assert!(
+                snapshot(&work.0) == before,
+                "{mode:?} {what}: files changed"
+            );
+        }
+    }
+}
+
+/// A block allocated after a checkpoint and reclaimed before the next is a
+/// number with no block in the next block table (all ones); the open
+/// matches it with the WAL. In every write mode.
+#[compio::test]
+async fn a_block_reclaimed_between_checkpoints_is_a_hole_in_the_table() {
+    for mode in MODES {
+        let dir = TempDir::new("checkpoint-block-hole");
+        let mut store = Store::open(&dir.0, config(mode)).await.unwrap();
+        put(&mut store, 0, 30).await;
+        store.checkpoint().await.unwrap();
+        // Unique bodies, released and compacted away before the next one.
+        let bodies: Vec<Vec<u8>> = (0..3)
+            .map(|i| format!("short-lived {i} {}", "z".repeat(5000)).into_bytes())
+            .collect();
+        let batch: Vec<Message> = bodies
+            .iter()
+            .map(|p| Message {
+                topic: b"u",
+                payload: p,
+                ..Default::default()
+            })
+            .collect();
+        store.put_batch(&batch, 1).await.unwrap();
+        store.release_before(b"u", 2).await.unwrap();
+        store.compact().await.unwrap();
+        put(&mut store, 30, 40).await;
+        store.checkpoint().await.unwrap();
+        drop(store);
+        let table = std::fs::read(path_of(&dir.0, "blktab-", 1)).unwrap();
+        let holes = table[24..]
+            .chunks(45)
+            .filter(|e| e.len() == 45 && e.iter().all(|&b| b == 0xff))
+            .count();
+        if mode != WriteMode::INLINE_SMALL {
+            assert!(holes >= 1, "{mode:?}: no hole in {} bytes", table.len());
+        }
+        let store = Store::open(&dir.0, config(mode)).await.unwrap();
+        assert!(store.recovery_report().is_empty(), "{mode:?}");
+        check(&store, 0..40).await;
+    }
 }
