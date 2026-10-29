@@ -51,7 +51,10 @@ authentication exists.
 - **Timestamps** are assigned at group commit, never below the last one
   stored, and recorded through the store.
 - **Startup**: identity check, store open, the store's recovery report on
-  stderr once, `straum-server: compio driver <driver>`, then
+  stderr once, a `straum-server: warning: <n> quarantined checkpoint
+  file(s) …` line at every start while the store holds quarantine
+  directories (damaged checkpoint manifests kept for diagnosis; remove
+  them once examined), `straum-server: compio driver <driver>`, then
   `straum-server: listening on <address>`. The broker is ready when it
   answers Hello; clients and runners detect that through the protocol, not
   from these lines (conformance/README.md, Readiness). **SIGTERM or
@@ -112,6 +115,7 @@ never repeats at every start unnoticed.
 |---|---|
 | unit tests | configuration, identity file, topic records and placement, the single-threaded mutex, event and one-shot |
 | `tests/broker.rs` | produce and fetch with keys and headers; concurrent producers get distinct contiguous seqs; fetch waiting and timeout; admin requests agree; a restart keeps topics, messages and timestamps; another identity refuses to start |
+| `tests/quarantine.rs` | the quarantine warning at every start while a quarantine directory exists, never as a `recovery:` line |
 | `tests/errors.rs` | every error code version 0 sends, each from a request; `StorageError` from damaged object bytes |
 | `tests/backpressure.rs` | a client that never reads: pending bytes within the bound (from BrokerStats), reading stops, other connections served |
 | `tests/durability.rs` (long) | the binary as a child process, killed with SIGKILL at random moments while producing, restarted: every acknowledged message is fetched with its seq, timestamp, key, headers and body; `STRAUM_BROKER_CRASH_ITERATIONS` (200), `STRAUM_BROKER_CRASH_SEED` (24301) |

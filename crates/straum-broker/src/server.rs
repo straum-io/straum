@@ -164,6 +164,16 @@ pub async fn serve(
     for action in &report.actions {
         eprintln!("straum-server: recovery: {action:?}");
     }
+    // Not a recovery line: a quarantine is reported once, by the open that
+    // made it; this repeats at every start while quarantine directories
+    // exist.
+    let quarantined = store.quarantined_files();
+    if quarantined > 0 {
+        eprintln!(
+            "straum-server: warning: {quarantined} quarantined checkpoint file(s) under {}, kept for diagnosis; remove them once examined",
+            config.data_dir.join("store").display()
+        );
+    }
     let (catalog, clock_floor) = load_catalog(&store, config.node_id).await?;
 
     let listener = TcpListener::bind(config.listen).await?;

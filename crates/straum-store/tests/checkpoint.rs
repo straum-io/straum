@@ -408,20 +408,43 @@ async fn build_with_both_manifests(dir: &Path, mode: WriteMode) -> std::ops::Ran
     60..160
 }
 
-fn quarantined(checkpoint: u64, fallback: Option<u64>) -> RecoveryAction {
+fn damaged(checkpoint: u64, fallback: Option<u64>, quarantine: &str) -> RecoveryAction {
     RecoveryAction::CheckpointManifestDamaged {
         checkpoint,
         fallback,
-        quarantined: format!("checkpoint-{checkpoint:016x}.damaged"),
+        quarantine: quarantine.to_owned(),
     }
 }
 
+/// The files `actions` report as moved into `quarantine`, sorted.
+fn moved(actions: &[RecoveryAction], quarantine: &str) -> Vec<String> {
+    let mut files: Vec<String> = actions
+        .iter()
+        .filter_map(|a| match a {
+            RecoveryAction::CheckpointFileQuarantined {
+                file,
+                quarantine: q,
+            } if q == quarantine => Some(file.clone()),
+            _ => None,
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// The files in quarantine directory `q`, sorted.
+fn quarantine_files(dir: &Path, q: &str) -> Vec<String> {
+    names(&dir.join(q), "")
+}
+
+const Q2: &str = "quarantine-0000000000000002";
+
 /// A damaged newest manifest with an intact older one: open uses the older
 /// checkpoint (checked against the WAL as always), reports the fallback,
-/// renames the damaged manifest to its quarantine name unchanged, and
-/// deletes the tables and runs no intact manifest lists. The quarantined
-/// manifest is never read or reported again, and the next checkpoint takes
-/// a new number.
+/// and moves the damaged manifest, unchanged, with the table and run only
+/// it lists into `quarantine-<n>`, each moved file reported. Later opens do
+/// not report it again; `quarantined_files` counts it until an operator
+/// removes it. The next checkpoint takes a new number.
 #[compio::test]
 async fn a_damaged_newest_manifest_falls_back_to_the_older_one() {
     for mode in MODES {
@@ -430,30 +453,35 @@ async fn a_damaged_newest_manifest_falls_back_to_the_older_one() {
             let live = build_with_both_manifests(&dir.0, mode).await;
             damage(&dir.0.join("checkpoint-0000000000000002"));
             let bad = std::fs::read(dir.0.join("checkpoint-0000000000000002")).unwrap();
+            let mut expect: Vec<String> = names(&dir.0, "")
+                .into_iter()
+                .filter(|n| {
+                    n == "checkpoint-0000000000000002"
+                        || n == "reloc-0000000000000002.run"
+                        || (n.starts_with("objtab-") && n != "objtab-0000000000000000.tab")
+                })
+                .collect();
+            expect.sort();
             let mut store = Store::open(&dir.0, config(mode)).await.unwrap();
             let acts = actions(&store);
-            assert_eq!(acts[0], quarantined(2, Some(1)), "{mode:?} {what}");
-            assert_eq!(store.checkpoint_number(), Some(1), "{mode:?} {what}");
+            assert_eq!(acts[0], damaged(2, Some(1), Q2), "{mode:?} {what}");
+            assert_eq!(moved(&acts, Q2), expect, "{mode:?} {what}");
+            assert!(removed(&acts).is_empty(), "{mode:?} {what}: {acts:?}");
+            assert_eq!(acts.len(), 1 + expect.len(), "{mode:?} {what}: {acts:?}");
+            assert_eq!(quarantine_files(&dir.0, Q2), expect);
             assert_eq!(
-                names(&dir.0, "checkpoint-"),
-                [
-                    "checkpoint-0000000000000001",
-                    "checkpoint-0000000000000002.damaged"
-                ]
-            );
-            assert_eq!(
-                std::fs::read(dir.0.join("checkpoint-0000000000000002.damaged")).unwrap(),
+                std::fs::read(dir.0.join(Q2).join("checkpoint-0000000000000002")).unwrap(),
                 bad,
                 "kept as it was"
             );
+            assert_eq!(store.quarantined_files(), expect.len() as u64);
+            assert_eq!(store.checkpoint_number(), Some(1), "{mode:?} {what}");
+            assert_eq!(
+                names(&dir.0, "checkpoint-"),
+                ["checkpoint-0000000000000001"]
+            );
             assert_eq!(names(&dir.0, "objtab-"), ["objtab-0000000000000000.tab"]);
             assert!(names(&dir.0, "reloc-").is_empty(), "{mode:?} {what}");
-            let files = removed(&acts);
-            assert!(
-                files.iter().all(|f| !f.starts_with("checkpoint-")),
-                "{files:?}"
-            );
-            assert_eq!(acts.len(), 1 + files.len(), "{mode:?} {what}: {acts:?}");
             check(&store, live.clone()).await;
             store.checkpoint().await.unwrap();
             assert_eq!(store.checkpoint_number(), Some(3), "never repeats 2");
@@ -461,25 +489,29 @@ async fn a_damaged_newest_manifest_falls_back_to_the_older_one() {
             for _ in 0..2 {
                 let store = Store::open(&dir.0, config(mode)).await.unwrap();
                 assert!(store.recovery_report().is_empty(), "{mode:?} {what}");
+                assert_eq!(store.quarantined_files(), expect.len() as u64);
                 assert_eq!(store.checkpoint_number(), Some(3));
                 check(&store, live.clone()).await;
             }
             assert_eq!(
                 names(&dir.0, "checkpoint-"),
-                [
-                    "checkpoint-0000000000000002.damaged",
-                    "checkpoint-0000000000000003"
-                ]
+                ["checkpoint-0000000000000003"]
             );
+            assert_eq!(quarantine_files(&dir.0, Q2), expect, "unchanged");
+            // Removed by an operator: no longer counted.
+            std::fs::remove_dir_all(dir.0.join(Q2)).unwrap();
+            let store = Store::open(&dir.0, config(mode)).await.unwrap();
+            assert!(store.recovery_report().is_empty());
+            assert_eq!(store.quarantined_files(), 0);
         }
     }
 }
 
 /// The only manifest damaged: while the WAL holds every frame (until
 /// ADR-0014 step 6b), the checkpoint is ignored and the state rebuilt from
-/// the WAL, reported; the manifest is quarantined, its tables and runs
-/// deleted. In every write mode. (From step 6b the same state
-/// with WAL files deleted is `CorruptCheckpoint`: tested with step 6b.)
+/// the WAL, reported; the manifest moves into quarantine with every table
+/// and run, in every write mode. (From step 6b the same state with WAL
+/// files deleted is `CorruptCheckpoint`: tested with step 6b.)
 #[compio::test]
 async fn a_damaged_only_manifest_is_ignored_while_the_wal_is_whole() {
     for mode in MODES {
@@ -487,16 +519,20 @@ async fn a_damaged_only_manifest_is_ignored_while_the_wal_is_whole() {
             let dir = TempDir::new("checkpoint-damaged-only");
             let live = build(&dir.0, mode).await;
             damage(&path_of(&dir.0, "checkpoint-", 0));
-            let before = names(&dir.0, "");
+            let mut expect: Vec<String> = names(&dir.0, "")
+                .into_iter()
+                .filter(|n| {
+                    ["checkpoint-", "objtab-", "reloc-"]
+                        .iter()
+                        .any(|p| n.starts_with(p))
+                })
+                .collect();
+            expect.sort();
             let mut store = Store::open(&dir.0, config(mode)).await.unwrap();
             let acts = actions(&store);
-            assert_eq!(acts[0], quarantined(2, None), "{mode:?} {what}");
-            let expect: Vec<String> = before
-                .into_iter()
-                .filter(|n| ["objtab-", "reloc-"].iter().any(|p| n.starts_with(p)))
-                .collect();
-            assert_eq!(removed(&acts), expect, "{mode:?} {what}");
-            assert_eq!(acts.len(), 1 + expect.len(), "{mode:?} {what}: {acts:?}");
+            assert_eq!(acts[0], damaged(2, None, Q2), "{mode:?} {what}");
+            assert_eq!(moved(&acts, Q2), expect, "{mode:?} {what}");
+            assert!(removed(&acts).is_empty(), "{mode:?} {what}");
             assert_eq!(store.checkpoint_number(), None);
             check(&store, live.clone()).await;
             store.checkpoint().await.unwrap();
@@ -505,13 +541,15 @@ async fn a_damaged_only_manifest_is_ignored_while_the_wal_is_whole() {
             let store = Store::open(&dir.0, config(mode)).await.unwrap();
             assert!(store.recovery_report().is_empty(), "{mode:?} {what}");
             assert_eq!(store.checkpoint_number(), Some(3));
+            assert_eq!(store.quarantined_files(), expect.len() as u64);
             check(&store, live.clone()).await;
         }
     }
 }
 
 /// Both manifests damaged: none is intact, and while the WAL is whole the
-/// checkpoint is ignored, each damaged manifest reported.
+/// checkpoint is ignored; each damaged manifest gets its own quarantine,
+/// the newest one the tables and runs (they are cumulative).
 #[compio::test]
 async fn two_damaged_manifests_are_ignored_while_the_wal_is_whole() {
     let dir = TempDir::new("checkpoint-two-damaged");
@@ -521,42 +559,45 @@ async fn two_damaged_manifests_are_ignored_while_the_wal_is_whole() {
     }
     let store = Store::open(&dir.0, Config::default()).await.unwrap();
     let acts = actions(&store);
-    assert_eq!(acts[..2], [quarantined(2, None), quarantined(1, None)]);
+    let q1 = "quarantine-0000000000000001";
+    assert_eq!(acts[0], damaged(2, None, Q2));
+    assert!(acts.contains(&damaged(1, None, q1)));
+    assert_eq!(moved(&acts, q1), ["checkpoint-0000000000000001"]);
+    assert!(moved(&acts, Q2).len() >= 3, "{acts:?}");
     assert_eq!(store.checkpoint_number(), None);
     check(&store, live).await;
-    assert_eq!(
-        names(&dir.0, "checkpoint-"),
-        [
-            "checkpoint-0000000000000001.damaged",
-            "checkpoint-0000000000000002.damaged"
-        ]
-    );
+    assert!(names(&dir.0, "checkpoint-").is_empty());
+    assert!(names(&dir.0, "objtab-").is_empty());
 }
 
-/// A damaged manifest whose quarantine name is already taken (a file
-/// another process put there: numbers never repeat) fails open with no
-/// file changed; quarantined manifests alone with no WAL file are
-/// `CorruptWal`, as other checkpoint files.
+/// An existing quarantine is never overwritten: a second quarantine of the
+/// same manifest number takes the next free suffix (`.1`, then `.2`).
+/// Quarantine directories alone, with no WAL file, are `CorruptWal`, as
+/// other checkpoint files.
 #[compio::test]
-async fn a_taken_quarantine_name_fails_open_and_changes_nothing() {
+async fn a_taken_quarantine_name_takes_the_next_suffix() {
     let dir = TempDir::new("checkpoint-quarantine-taken");
     build_with_both_manifests(&dir.0, WriteMode::Sequential).await;
     edit(&dir.0.join("checkpoint-0000000000000002"), |b| b[13] ^= 1);
-    std::fs::write(dir.0.join("checkpoint-0000000000000002.damaged"), b"old").unwrap();
-    let before = snapshot(&dir.0);
-    let res = Store::open(&dir.0, Config::default()).await;
-    assert!(
-        matches!(
-            res,
-            Err(StoreError::CorruptCheckpoint { checkpoint: 2, .. })
-        ),
-        "{:?}",
-        res.err()
+    for q in [Q2, "quarantine-0000000000000002.1"] {
+        std::fs::create_dir(dir.0.join(q)).unwrap();
+        std::fs::write(dir.0.join(q).join("earlier"), b"old").unwrap();
+    }
+    let store = Store::open(&dir.0, Config::default()).await.unwrap();
+    let q = "quarantine-0000000000000002.2";
+    assert_eq!(actions(&store)[0], damaged(2, Some(1), q));
+    assert!(quarantine_files(&dir.0, q).contains(&"checkpoint-0000000000000002".to_owned()));
+    for old in [Q2, "quarantine-0000000000000002.1"] {
+        assert_eq!(quarantine_files(&dir.0, old), ["earlier"], "untouched");
+    }
+    assert_eq!(
+        store.quarantined_files(),
+        2 + quarantine_files(&dir.0, q).len() as u64
     );
-    assert!(snapshot(&dir.0) == before, "files changed");
 
     let work = TempDir::new("checkpoint-quarantine-no-wal");
-    std::fs::write(work.0.join("checkpoint-0000000000000002.damaged"), b"old").unwrap();
+    std::fs::create_dir(work.0.join(Q2)).unwrap();
+    std::fs::write(work.0.join(Q2).join("checkpoint-0000000000000002"), b"x").unwrap();
     let before = snapshot(&work.0);
     let res = Store::open(&work.0, Config::default()).await;
     assert!(
