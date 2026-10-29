@@ -146,8 +146,9 @@ pub struct Config {
     pub rebuild_index: bool,
     /// Entries of the recent-id cache (ADR-0014 step 6a): ids written or
     /// deduplicated recently, so a repeat of them reads no id-run page.
-    /// 80 to 150 bytes each, measured (`straum-store-bench`'s `recent-ids`;
-    /// hash-map load varies). 0 keeps none.
+    /// The default, 2^18, is provisional until the owner sets the cache's
+    /// share of the memory budget (step 7): about 20.5 MiB at capacity,
+    /// computed from the maps' capacity (`RecentIds::bytes`). 0 keeps none.
     pub recent_id_cache_entries: usize,
 }
 

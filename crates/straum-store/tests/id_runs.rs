@@ -19,9 +19,12 @@ const MODES: [WriteMode; 3] = [
     WriteMode::INLINE_SMALL,
 ];
 
+/// No recent-id cache: every repeat of a checkpointed id goes through the
+/// runs (the cache would answer most of them first).
 fn config(mode: WriteMode) -> Config {
     Config {
         write_mode: mode,
+        recent_id_cache_entries: 0,
         ..Config::default()
     }
 }
@@ -122,7 +125,9 @@ async fn runs_are_merged_past_the_bound() {
 #[compio::test]
 async fn damaged_id_runs_fail_open_and_change_nothing() {
     let dir = TempDir::new("idruns-damage");
-    let mut store = Store::open(&dir.0, Config::default()).await.unwrap();
+    let mut store = Store::open(&dir.0, config(WriteMode::Sequential))
+        .await
+        .unwrap();
     put(&mut store, b"a", &(0..20).collect::<Vec<_>>()).await;
     store.checkpoint().await.unwrap();
     put(&mut store, b"a", &(20..40).collect::<Vec<_>>()).await;
@@ -176,11 +181,15 @@ async fn damaged_id_runs_fail_open_and_change_nothing() {
 #[compio::test]
 async fn a_run_page_damaged_after_open_fails_the_lookup() {
     let dir = TempDir::new("idruns-damage-after-open");
-    let mut store = Store::open(&dir.0, Config::default()).await.unwrap();
+    let mut store = Store::open(&dir.0, config(WriteMode::Sequential))
+        .await
+        .unwrap();
     put(&mut store, b"a", &(0..20).collect::<Vec<_>>()).await;
     store.checkpoint().await.unwrap();
     drop(store);
-    let mut store = Store::open(&dir.0, Config::default()).await.unwrap();
+    let mut store = Store::open(&dir.0, config(WriteMode::Sequential))
+        .await
+        .unwrap();
     let path = dir.0.join(&names(&dir.0, "idrun-")[0]);
     edit(&path, |b| b[40] ^= 1);
     let payload = body(3);
@@ -258,7 +267,9 @@ async fn a_merge_drops_reclaimed_ids_and_leftover_runs_are_orphans() {
 #[compio::test]
 async fn runs_stay_few_across_many_checkpoints() {
     let dir = TempDir::new("idruns-tiers");
-    let mut store = Store::open(&dir.0, Config::default()).await.unwrap();
+    let mut store = Store::open(&dir.0, config(WriteMode::Sequential))
+        .await
+        .unwrap();
     let mut next = 0u64;
     for _ in 0..40 {
         let ids: Vec<u64> = (next..next + 50).collect();
@@ -269,7 +280,9 @@ async fn runs_stay_few_across_many_checkpoints() {
         assert!(names(&dir.0, "idrun-").len() <= 12);
     }
     drop(store);
-    let mut store = Store::open(&dir.0, Config::default()).await.unwrap();
+    let mut store = Store::open(&dir.0, config(WriteMode::Sequential))
+        .await
+        .unwrap();
     assert!(store.recovery_report().is_empty());
     let all: Vec<u64> = (0..next).step_by(7).collect();
     put(&mut store, b"a", &all).await;

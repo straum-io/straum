@@ -11,8 +11,10 @@
 //! The directory holds openstack_normal1.log, openstack_normal2.log,
 //! openstack_abnormal.log, SSH.log and BGL.log (the files of ADR-0014's
 //! algorithm selection). Timestamps are stripped as `tools/dedup-survey`
-//! does. Synthetic streams cover reuse distances from one batch to the
-//! whole history.
+//! does. Synthetic streams cover reuse distances from 512 ids (one batch of
+//! `straum-store-bench`'s default 512 messages) to the whole history. The
+//! cache's bytes are computed from its maps' capacity (`RecentIds::bytes`);
+//! the peak over the run is what a budget share must hold.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -168,13 +170,8 @@ fn report(name: &str, ids: &[ObjectId], intervals: &[usize], capacities: &[usize
             let (c, len, bytes) = simulate(ids, capacity, interval);
             let repeats = c.memtable + c.cache + c.runs;
             let pct = |x: u64| 100.0 * x as f64 / repeats.max(1) as f64;
-            let per_entry = if len > 0 {
-                bytes as f64 / len as f64
-            } else {
-                0.0
-            };
             println!(
-                "{name}\tinterval={interval}\tcapacity={capacity}\tlookups={}\tnew={}\trepeats={repeats}\tmemtable={:.2}%\tcache={:.2}%\truns(page read)={:.2}%\tcache_entries={len}\tcache_peak_bytes={bytes}\tbytes_per_entry={per_entry:.1}",
+                "{name}\tinterval={interval}\tcapacity={capacity}\tlookups={}\tnew={}\trepeats={repeats}\tmemtable={:.2}%\tcache={:.2}%\truns(page read)={:.2}%\tcache_entries_at_end={len}\tcache_peak_bytes={bytes}",
                 c.lookups,
                 c.new,
                 pct(c.memtable),
@@ -198,9 +195,10 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(usize::MAX);
     let dir = Path::new(dir);
-    // Checkpoint every 1 M new ids (the memtable's 64 MiB share at about
-    // 64 bytes per entry) and every 100 000 (a short interval).
-    let intervals = [100_000, 1_000_000];
+    // Checkpoint every 100 000, 600 000 (the memtable's 64 MiB share at
+    // about 64 bytes per id plus a 48–56-byte dense-table entry) and
+    // 1 000 000 new ids.
+    let intervals = [100_000, 600_000, 1_000_000];
     let capacities = [0, 1 << 14, 1 << 16, 1 << 18, 1 << 20, 1 << 22];
     let sets: [(&str, &[&str], Format); 3] = [
         (

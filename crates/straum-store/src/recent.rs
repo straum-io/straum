@@ -19,9 +19,10 @@ pub struct RecentIds {
 impl RecentIds {
     /// A cache of at most `capacity` entries; 0 or 1 keeps none.
     pub fn new(capacity: usize) -> Self {
+        let half = capacity / 2;
         Self {
-            half: capacity / 2,
-            young: HashMap::new(),
+            half,
+            young: HashMap::with_capacity(half),
             old: HashMap::new(),
         }
     }
@@ -42,7 +43,10 @@ impl RecentIds {
         }
         self.young.insert(id, number);
         if self.young.len() >= self.half {
-            self.old = std::mem::take(&mut self.young);
+            // The young map is reserved at its full size, so a swap costs
+            // one deallocation and no rehashing as the new one fills.
+            let fresh = HashMap::with_capacity(self.half);
+            self.old = std::mem::replace(&mut self.young, fresh);
         }
     }
 
@@ -63,8 +67,8 @@ impl RecentIds {
         self.len() == 0
     }
 
-    /// Heap bytes the maps hold: every bucket's entry and its control byte
-    /// (hashbrown), whether filled or not.
+    /// Heap bytes the maps hold, computed from their capacity: every
+    /// bucket's entry and its control byte (hashbrown), filled or not.
     pub fn bytes(&self) -> usize {
         let bucket = size_of::<(ObjectId, u64)>() + 1;
         (buckets(&self.young) + buckets(&self.old)) * bucket
