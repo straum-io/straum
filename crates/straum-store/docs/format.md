@@ -667,8 +667,10 @@ new table and run are read back, and must hold the entries written, before
 the manifest tmp file is written, so a failure there leaves them unlisted.
 A crash before the rename leaves the previous checkpoint valid and the new
 files unlisted; after it, the previous manifest is unlisted. A checkpoint
-that fails (a read-back included) makes the store refuse further use, with
-the previous manifest still the one in use.
+that fails makes the store refuse further use. After a read-back mismatch
+the previous manifest is the one in use; after another failure (an I/O
+error, or one after the previous manifest's deletion) either the new or
+the previous manifest is, both intact.
 
 **Recovery.** Before replay, the manifests are read newest first. A
 manifest that fails its CRC, is of another version or does not name
