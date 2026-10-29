@@ -599,12 +599,13 @@ impl Store {
     /// is verified on read. Recovery then deletes segment files the WAL does
     /// not reference, checks the index segments against the WAL, appends
     /// the index blocks and seek pages they lack, and recomputes refcounts.
-    /// Every change is listed in `recovery_report()`.
+    /// Every check runs before the first change, so an error leaves every
+    /// file as it was. Every change is listed in `recovery_report()`.
     pub async fn open(dir: impl AsRef<Path>, mut config: Config) -> Result<Self, StoreError> {
         let dir = dir.as_ref().to_path_buf();
         let mut report = RecoveryReport::default();
         compio::fs::create_dir_all(&dir).await?;
-        let files = read_wal_files(&dir, &mut report, config.dict_train_bytes).await?;
+        let (files, tmps) = read_wal_files(&dir, &mut report, config.dict_train_bytes).await?;
         let stored = files
             .first()
             .and_then(|(_, bytes)| codec::decode_wal_header(bytes))
@@ -764,10 +765,6 @@ impl Store {
             .open(wal_path(&dir, last_id))
             .await?;
         let wal_len = pos as u64;
-        if pos < last_len {
-            wal.set_len(wal_len).await?;
-            wal.sync_all().await?;
-        }
 
         let mut replay = Replay::default();
         let next_frame = frames.len() as u64;
@@ -787,7 +784,8 @@ impl Store {
         let codecs = codecs_for(&replay.dicts)?;
         let dictionary = replay.dicts.last().map(|d| d.len());
 
-        // Before any file is changed: a mismatch is corruption.
+        // Every check runs before the first change, so an error leaves every
+        // file as it was: replay, refcounts, segment bounds, the index.
         check_refcounts(
             &replay.objects,
             replay.topics.values().flat_map(|t| {
@@ -795,8 +793,24 @@ impl Store {
                 t.entries.iter().skip(first_live).map(|(number, _)| number)
             }),
         )?;
-        let segments = open_segments(&dir, &mut replay, &mut report).await?;
+        let (segments, orphans) = open_segments(&dir, &mut replay, &mut report).await?;
+        // Changes the index needs follow its own checks.
         let (index, topics) = open_index(&dir, &replay, next_frame, &config, &mut report).await?;
+
+        // The other changes, each reported where it was found.
+        for id in &orphans {
+            compio::fs::remove_file(segment_path(&dir, *id)).await?;
+        }
+        for tmp in &tmps {
+            compio::fs::remove_file(dir.join(tmp)).await?;
+        }
+        if !orphans.is_empty() || !tmps.is_empty() {
+            sync_dir(&dir).await?;
+        }
+        if pos < last_len {
+            wal.set_len(wal_len).await?;
+            wal.sync_all().await?;
+        }
 
         let files = OpenFiles::new(&dir, config.data_open_files);
         Ok(Self {
@@ -2751,7 +2765,7 @@ async fn open_segments(
     dir: &Path,
     replay: &mut Replay<'_>,
     report: &mut RecoveryReport,
-) -> Result<HashSet<u64>, StoreError> {
+) -> Result<(HashSet<u64>, Vec<u64>), StoreError> {
     // Blocking directory listing: only at open, and compio 0.19 has no
     // async read_dir without the extra fs-dir feature.
     let mut on_disk = Vec::new();
@@ -2761,22 +2775,19 @@ async fn open_segments(
             on_disk.push(id);
         }
     }
-    let mut removed = false;
+    // Bytes no durable WAL record points at: a crash before the WAL fsync
+    // of a batch or of a compaction, or after a compaction's WAL record but
+    // before the old file was unlinked. Deleted by `Store::open` after
+    // every check.
+    let mut orphans = Vec::new();
     for &id in &on_disk {
         replay.see(id);
         if !replay.segments.contains(&id) {
-            // Bytes no durable WAL record points at: a crash before the WAL
-            // fsync of a batch or of a compaction, or after a compaction's
-            // WAL record but before the old file was unlinked.
-            compio::fs::remove_file(segment_path(dir, id)).await?;
             report
                 .actions
                 .push(RecoveryAction::OrphanSegmentRemoved { segment: id });
-            removed = true;
+            orphans.push(id);
         }
-    }
-    if removed {
-        sync_dir(dir).await?;
     }
 
     // Lengths only: segments are opened for reads on demand (D-227 A).
@@ -2823,7 +2834,7 @@ async fn open_segments(
             });
         }
     }
-    Ok(segments)
+    Ok((segments, orphans))
 }
 
 /// A topic at open: its name, its entries from the WAL, its first live
@@ -3134,7 +3145,7 @@ async fn read_wal_files(
     dir: &Path,
     report: &mut RecoveryReport,
     dict_train_bytes: u64,
-) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
+) -> Result<(Vec<(u64, Vec<u8>)>, Vec<String>), StoreError> {
     if dir.join(LEGACY_WAL_FILE).exists() {
         return Err(StoreError::UnsupportedFormat);
     }
@@ -3159,23 +3170,25 @@ async fn read_wal_files(
             reason: "no WAL file, but data or index segments exist",
         });
     }
-    for tmp in &tmps {
-        compio::fs::remove_file(dir.join(tmp)).await?;
+    // Deleted by `Store::open` after every check.
+    for _ in &tmps {
         report.actions.push(RecoveryAction::WalTmpRemoved);
     }
     ids.sort_unstable();
     if ids.is_empty() {
+        // A new store: nothing to check, and the first file's creation may
+        // have left its tmp file.
+        for tmp in tmps.drain(..) {
+            compio::fs::remove_file(dir.join(tmp)).await?;
+        }
         create_wal_file(dir, 0, dict_train_bytes).await?;
         ids.push(0);
-    } else {
-        // Makes a removed tmp file, and the directory, durable.
-        sync_dir(dir).await?;
     }
     let mut files = Vec::with_capacity(ids.len());
     for id in ids {
         files.push((id, compio::fs::read(wal_path(dir, id)).await?));
     }
-    Ok(files)
+    Ok((files, tmps))
 }
 
 /// Creates WAL file `wal-<first>.log` holding only its file header: written

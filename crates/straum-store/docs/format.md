@@ -365,14 +365,18 @@ only the last frame of the last file can be unacknowledged.
 
 ### Recovery
 
-`wal-*.log.tmp` files are deleted (`WalTmpRemoved`). The WAL files are
-read in sequence-number order; the first must be named 0, and each later
-one must be named by the frame after the previous file's last; otherwise
+Every check below runs before recovery changes any file: when open fails,
+every file is as it was, including the repairs it found due on the way
+(a torn tail, a leftover tmp file, an orphan segment). `wal-*.log.tmp`
+files are deleted (`WalTmpRemoved`). The WAL files are read in
+sequence-number order; the first must be named 0, and each later one must
+be named by the frame after the previous file's last; otherwise
 `CorruptWal { file, offset: 0, .. }` (a missing, extra or renamed file),
 and no file is changed. A directory with no WAL file but data or index
 segments is `CorruptWal` as well (a new WAL would make the segments
-orphans); with neither, open creates `wal-0000000000000000.log`. In each file reading starts at byte 24. A frame
-is bad if its header or body is short or its CRC does not match.
+orphans); with neither, open creates `wal-0000000000000000.log`. In each
+file reading starts at byte 24. A frame is bad if its header or body is
+short or its CRC does not match.
 
 1. A bad frame in the last WAL file with no frame with a valid CRC readable
    from any later byte up to the end of the file is a torn tail: the file
@@ -563,12 +567,13 @@ look current at the next open, disagree with the WAL, and open fails with
 one start). Open then deletes every index segment before reading any
 (`IndexSegmentDropped { segment, bytes }` each) and re-derives every
 topic's blocks and seek pages from the WAL into a new segment
-(`TopicIndexRepaired`). The WAL, data segments and every other file are
-unchanged; the rebuild is safe whenever the WAL itself opens, since the
-index holds nothing the WAL does not, and every WAL and refcount check
-runs before the first deletion. If the rebuilding open is interrupted
-(some segments deleted, others not), open again with the setting. Without the setting, open never
-deletes an intact index segment.
+(`TopicIndexRepaired`). The rebuild changes no other file; the repairs
+of every open (a torn tail, orphans) apply as usual. It is safe whenever
+the WAL itself opens, since the index holds nothing the WAL does not, and
+every WAL, refcount and segment check runs before the first deletion. If
+the rebuilding open is interrupted (some segments deleted, others not),
+open again with the setting. Without the setting, open never deletes an
+intact index segment.
 
 ## Write order (one batch)
 

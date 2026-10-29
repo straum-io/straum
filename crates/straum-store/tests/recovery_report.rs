@@ -99,6 +99,41 @@ async fn orphans_and_lost_files_are_reported() {
     assert_eq!(store.read(b"t", 2).await.unwrap(), Some(vec![2; 32]));
 }
 
+/// An error found after a repair was due (here a torn tail, a leftover
+/// tmp file and an orphan segment, then a missing earlier segment) leaves
+/// every file as it was: every check runs before the first change.
+#[compio::test]
+async fn an_error_after_due_repairs_changes_nothing() {
+    let dir = TempDir::new("report-check-first");
+    let config = Config {
+        segment_max_bytes: 1,
+        ..Config::default()
+    };
+    let mut store = Store::open(&dir.0, config).await.unwrap();
+    for i in 0..3u8 {
+        let p = [i; 32];
+        let batch = [Message {
+            topic: b"t",
+            payload: &p,
+            ..Default::default()
+        }];
+        store.put_batch(&batch, u64::from(i)).await.unwrap();
+    }
+    drop(store);
+    let path = dir.0.join(common::WAL0);
+    let wal = std::fs::read(&path).unwrap();
+    let last = *wal_frame_starts(&wal).last().unwrap();
+    std::fs::write(&path, &wal[..last + 10]).unwrap();
+    std::fs::write(dir.0.join("seg-00000000000000ff.dat"), b"orphan").unwrap();
+    std::fs::write(dir.0.join(format!("{}.tmp", common::WAL0)), b"half-created").unwrap();
+    // The first batch's segment; the last complete frame's is intact.
+    std::fs::remove_file(dir.0.join("seg-0000000000000000.dat")).unwrap();
+    let before = snapshot(&dir.0);
+    let err = Store::open(&dir.0, config).await.err().unwrap();
+    assert!(matches!(err, StoreError::MissingObject(_)), "{err}");
+    assert!(snapshot(&dir.0) == before, "files changed");
+}
+
 #[compio::test]
 async fn old_format_version_is_unsupported() {
     let dir = TempDir::new("report-old");

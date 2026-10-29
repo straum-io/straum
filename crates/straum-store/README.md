@@ -142,7 +142,7 @@ Test variables: `STRAUM_STORE_CRASH_ITERATIONS` (default 200),
 | `tests/fault_injection.rs` | hand-built states: a missing, short or damaged block of the last frame drops the frame in ParallelSync and is an error otherwise; a missing block of an earlier frame gives `MissingObject`, a damaged one `CorruptBlock` on read; every write mode |
 | `tests/multi_block.rs` | `max_block_raw_bytes`: a batch split in order, an oversized object alone, duplicates across a batch's blocks, compaction within the limit, a frame of several blocks with one missing in every write mode; a batch mixing inline and segment blocks; `last_commit_timing` in every write mode |
 | `tests/blocks.rs` | duplicates within one block and across blocks; compaction of partly dead blocks, before and after restart; dictionary training once, read back from the WAL; a failed training recorded once; reads without a block cache |
-| `tests/recovery_report.rs` | a clean open reports and changes nothing; a torn tail, orphan segments, an orphan index segment and a WAL temp file are reported; an old format version gives `UnsupportedFormat` |
+| `tests/recovery_report.rs` | a clean open reports and changes nothing; a torn tail, orphan segments, an orphan index segment and a WAL temp file are reported; an error found after such repairs were due (a missing earlier segment) changes no file; an old format version gives `UnsupportedFormat` |
 
 ### Platform-specific tests
 
