@@ -8,7 +8,10 @@
 //! store-write   --dir D --mode M --seed N [--compact-every C]
 //!               [--arm-at-compaction K --fifo F --fault CMD]
 //!               [--dict-train-bytes B [--arm-at-train --fifo F --fault CMD]]
-//! store-verify  --dir D --mode M --logs DIR [--dict-train-bytes B]
+//!               [--checkpoint-every C [--arm-at-checkpoint K --fifo F --fault CMD]]
+//! store-verify  --dir D --mode M --logs DIR [--dict-train-bytes B] [--damaged NAME]
+//! store-open    --dir D --mode M   (opens the store once: a recovery to interrupt)
+//! damage        --dir D --seed N   (damages the newest checkpoint manifest)
 //! broker-produce --addr A --base N --seed N
 //! broker-verify --broker BIN --data-dir D --mode M --logs DIR --stderr FILE
 //! free-addr     (prints `RESULT ok 127.0.0.1:<free port>`)
@@ -73,7 +76,7 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(cmd) = args.next() else {
         eprintln!(
-            "usage: straum-power-loss <plan|store-write|store-verify|broker-produce|broker-verify|free-addr> --key value ..."
+            "usage: straum-power-loss <plan|store-write|store-verify|store-open|damage|broker-produce|broker-verify|free-addr> --key value ..."
         );
         return ExitCode::from(2);
     };
@@ -86,6 +89,8 @@ fn main() -> ExitCode {
         "plan" => plan(&opts),
         "store-write" => store_write(&opts),
         "store-verify" => store_verify(&opts),
+        "store-open" => store_open(&opts),
+        "damage" => damage(&opts),
         "broker-produce" => broker_produce(&opts),
         "broker-verify" => broker_verify(&opts),
         "free-addr" => straum_conformance::broker::free_addr(),
@@ -129,9 +134,41 @@ const CRASH_POINTS: [(&str, &str); 8] = [
     ("create", "wal-"),
 ];
 
+/// The manifest's tmp file, written, synced and renamed by a checkpoint.
+const CKPT_TMP: &str = r"checkpoint-[0-9a-f]{16}\.tmp$";
+
+/// Crash points of a checkpoint: its object table, relocation run and
+/// manifest, and the deletion of the previous manifest.
+const CHECKPOINT_POINTS: [(&str, &str); 11] = [
+    ("create", "objtab-"),
+    ("write", "objtab-"),
+    ("fsync", "objtab-"),
+    ("create", "reloc-"),
+    ("write", "reloc-"),
+    ("fsync", "reloc-"),
+    ("create", CKPT_TMP),
+    ("write", CKPT_TMP),
+    ("fsync", CKPT_TMP),
+    // LazyFS 0.3.1 matches a rename by `to_rgx` alone once `from_rgx`
+    // does not match the word "none" (and never without `from_rgx`): the
+    // tmp manifest renamed to `checkpoint-<n>`.
+    (
+        "rename",
+        r"checkpoint-[0-9a-f]{16}\.tmp$::to_rgx=checkpoint-[0-9a-f]{16}$",
+    ),
+    ("unlink", PREV_MANIFEST),
+];
+
+/// The previous manifest, deleted once the new one reads back.
+const PREV_MANIFEST: &str = r"checkpoint-[0-9a-f]{16}$";
+
 /// One line per iteration: `<i> <delay_ms> <writer_seed> <kind> <command>
-/// <arm_at_compaction>`. Each iteration draws from its own generator, so an
-/// iteration is reproduced from the seed and its number alone.
+/// <arm_at> <damage>`. Each iteration draws from its own generator, so an
+/// iteration is reproduced from the seed and its number alone. `damage`
+/// (checkpoint scenario, else `none`): after the power loss the newest
+/// manifest is damaged (`manifest`), and with `rc-before` / `rc-after` the
+/// first recovery is then killed before or after its first move into the
+/// quarantine.
 fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
     let scenario = opt(opts, "scenario")?;
     let seed = num(opts, "seed")?;
@@ -149,10 +186,22 @@ fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
             0 | 1 => "crash",
             _ => "torn",
         };
+        // The checkpoint scenario cycles its cases, so that a few
+        // iterations cover each: clear, crash, torn, and a crash before the
+        // previous manifest's deletion.
+        let two_manifests = scenario == "checkpoint" && i % 4 == 3;
+        let kind = match scenario {
+            "checkpoint" => ["clear", "crash", "torn", "crash"][(i % 4) as usize],
+            _ => kind,
+        };
         let command = match kind {
+            _ if two_manifests => {
+                format!("lazyfs::crash::timing=before::op=unlink::from_rgx={PREV_MANIFEST}")
+            }
             "clear" => "lazyfs::clear-cache".to_owned(),
             "crash" => {
                 let points = match scenario {
+                    "checkpoint" => &CHECKPOINT_POINTS[..],
                     // Operations a compaction or a training batch issues.
                     "compaction" | "dictionary" => &CRASH_POINTS[..4],
                     // The broker never compacts: no segment is unlinked.
@@ -169,7 +218,10 @@ fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
                 // appended to when the fault is armed; `@IDX@` the index
                 // segment the writer will append to, named by run.sh
                 // before the writer starts.
-                let file = if compaction || rng.below(3) > 0 {
+                let file = if scenario == "checkpoint" {
+                    // The manifest's tmp file, named by the writer.
+                    "@CKPT@"
+                } else if compaction || rng.below(3) > 0 {
                     "@WAL@"
                 } else {
                     "@IDX@"
@@ -188,7 +240,16 @@ fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
             }
         };
         let arm_at = 1 + rng.below(4);
-        println!("{i} {delay} {writer_seed} {kind} {command} {arm_at}");
+        // A crash before the previous manifest's deletion leaves two
+        // manifests: damaging the newest then must fall back to the other.
+        let damage = if scenario != "checkpoint" {
+            "none"
+        } else if two_manifests || rng.below(3) == 0 {
+            ["manifest", "rc-before", "rc-after"][rng.below(3) as usize]
+        } else {
+            "none"
+        };
+        println!("{i} {delay} {writer_seed} {kind} {command} {arm_at} {damage}");
     }
     Ok(format!("{iterations} iterations"))
 }
@@ -260,6 +321,12 @@ fn store_write(opts: &HashMap<&str, &str>) -> Result<String, String> {
         .get("arm-at-compaction")
         .map_or(Ok(0), |_| num(opts, "arm-at-compaction"))?;
     let arm_at_train = opts.contains_key("arm-at-train");
+    let checkpoint_every = opts
+        .get("checkpoint-every")
+        .map_or(Ok(0), |_| num(opts, "checkpoint-every"))?;
+    let arm_at_checkpoint = opts
+        .get("arm-at-checkpoint")
+        .map_or(Ok(0), |_| num(opts, "arm-at-checkpoint"))?;
     let config = store_config(mode, opts)?;
     println!("SEED {seed} END");
     let rt = compio::runtime::Runtime::new().map_err(|e| e.to_string())?;
@@ -267,6 +334,7 @@ fn store_write(opts: &HashMap<&str, &str>) -> Result<String, String> {
         let mut store = Store::open(dir, config).await.unwrap();
         println!("READY END");
         let mut compactions = 0;
+        let mut checkpoints = 0;
         let mut round = 0;
         loop {
             round += 1;
@@ -313,6 +381,16 @@ fn store_write(opts: &HashMap<&str, &str>) -> Result<String, String> {
                 let stats = store.compact().await.unwrap();
                 println!("COMPACTED {} END", stats.segments_rewritten);
             }
+            if checkpoint_every > 0 && round % checkpoint_every == 0 {
+                checkpoints += 1;
+                if checkpoints == arm_at_checkpoint {
+                    arm(opts);
+                    println!("ARMED {round} END");
+                }
+                println!("CKPT-START {round} END");
+                store.checkpoint().await.unwrap();
+                println!("CKPT-DONE {} END", store.checkpoint_number().unwrap_or(0));
+            }
         }
     });
     Ok(String::new())
@@ -333,8 +411,41 @@ fn wal_file_id(name: &str) -> Option<u64> {
     (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok())?
 }
 
+/// The number of a manifest `checkpoint-<16 hex digits>`.
+fn manifest_number(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("checkpoint-")?;
+    (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok())?
+}
+
+/// The number of a quarantine directory `quarantine-<16 hex>[.<k>]`.
+fn quarantine_number(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("quarantine-")?.split('.').next()?;
+    (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok())?
+}
+
+/// The number the store's next checkpoint takes (docs/format.md
+/// "Checkpoint"): above every manifest, tmp manifest, run and quarantine
+/// directory in `dir`.
+fn next_checkpoint(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter_map(|n| {
+            manifest_number(n.strip_suffix(".tmp").unwrap_or(&n))
+                .or_else(|| quarantine_number(&n))
+                .or_else(|| {
+                    let hex = n.strip_prefix("reloc-")?.strip_suffix(".run")?;
+                    u64::from_str_radix(hex, 16).ok()
+                })
+        })
+        .max()
+        .map_or(1, |n| n + 1)
+}
+
 /// Writes `--fault` to the LazyFS fault FIFO `--fifo`; `@WAL@` in it
-/// becomes the WAL file being appended to.
+/// becomes the WAL file being appended to, `@CKPT@` the tmp file of the
+/// next checkpoint's manifest.
 #[expect(
     clippy::unwrap_used,
     reason = "a harness error ends the writer; run.sh reports the iteration"
@@ -342,7 +453,13 @@ fn wal_file_id(name: &str) -> Option<u64> {
 fn arm(opts: &HashMap<&str, &str>) {
     let fifo = opt(opts, "fifo").unwrap();
     let wal = last_wal_file(Path::new(opt(opts, "dir").unwrap())).unwrap();
-    let fault = opt(opts, "fault").unwrap().replace("@WAL@", &wal);
+    let dir = Path::new(opt(opts, "dir").unwrap());
+    let tmp = format!("checkpoint-{:016x}.tmp", next_checkpoint(dir));
+    let fault = opt(opts, "fault")
+        .unwrap()
+        .replace("@WAL@", &wal)
+        .replace("@CKPT@", &tmp);
+    println!("FAULT {fault} END");
     std::fs::OpenOptions::new()
         .write(true)
         .open(fifo)
@@ -434,15 +551,18 @@ fn parse_store_logs(logs: &str) -> Result<StoreLog, String> {
 }
 
 /// Every file under a store directory: relative path → (length, BLAKE3),
-/// plus the WAL files' bytes, to check what recovery cut.
+/// plus the WAL files' bytes, to check what recovery cut, and the
+/// directories (an empty quarantine directory has no file).
 struct Snapshot {
     files: BTreeMap<String, (u64, [u8; 32])>,
     wal: HashMap<String, Vec<u8>>,
+    dirs: HashSet<String>,
 }
 
 fn snapshot(dir: &Path) -> Result<Snapshot, String> {
     let mut files = BTreeMap::new();
     let mut wal = HashMap::new();
+    let mut dirs = HashSet::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let entries = match std::fs::read_dir(&d) {
@@ -452,16 +572,17 @@ fn snapshot(dir: &Path) -> Result<Snapshot, String> {
         };
         for entry in entries {
             let path = entry.map_err(|e| e.to_string())?.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             let rel = path
                 .strip_prefix(dir)
                 .map_err(|e| e.to_string())?
                 .to_string_lossy()
                 .into_owned();
+            if path.is_dir() {
+                dirs.insert(rel);
+                stack.push(path);
+                continue;
+            }
+            let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             files.insert(
                 rel.clone(),
                 (bytes.len() as u64, *blake3::hash(&bytes).as_bytes()),
@@ -471,12 +592,34 @@ fn snapshot(dir: &Path) -> Result<Snapshot, String> {
             }
         }
     }
-    Ok(Snapshot { files, wal })
+    Ok(Snapshot { files, wal, dirs })
 }
 
 /// `name { field: value, ... }` of a recovery action in Debug form.
 fn action_name(a: &str) -> &str {
     a.split([' ', '{']).next().unwrap_or("")
+}
+
+/// The report's action names, a run of one name as `name*count`: a
+/// quarantine moves one file per entry.
+fn action_names(actions: &[String]) -> String {
+    let mut runs: Vec<(&str, usize)> = Vec::new();
+    for a in actions {
+        match runs.last_mut() {
+            Some((name, n)) if *name == action_name(a) => *n += 1,
+            _ => runs.push((action_name(a), 1)),
+        }
+    }
+    runs.iter()
+        .map(|&(name, n)| {
+            if n == 1 {
+                name.to_owned()
+            } else {
+                format!("{name}*{n}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn action_field<'a>(a: &'a str, field: &str) -> Option<&'a str> {
@@ -489,7 +632,7 @@ fn action_field<'a>(a: &'a str, field: &str) -> Option<&'a str> {
 /// The report holds only the changes `docs/guarantees.md` §3 lists, and
 /// `FrameDropped` only in ParallelSync.
 fn check_report(actions: &[String], mode: &str) -> Result<(), String> {
-    const ALLOWED: [&str; 7] = [
+    const ALLOWED: [&str; 11] = [
         "WalTmpRemoved",
         "TornTailTruncated",
         "FrameDropped",
@@ -497,6 +640,10 @@ fn check_report(actions: &[String], mode: &str) -> Result<(), String> {
         "IndexSegmentRemoved",
         "StaleIndexRecordsFenced",
         "TopicIndexRepaired",
+        "CheckpointFileRemoved",
+        "CheckpointManifestDamaged",
+        "CheckpointFileQuarantined",
+        "CheckpointQuarantineResumed",
     ];
     let mut cuts = 0;
     for a in actions {
@@ -531,8 +678,38 @@ fn index_segment_id(name: &str) -> Option<u64> {
 /// changes an existing one, it may only delete it (`IndexSegmentRemoved`);
 /// a new one holds a fence (`StaleIndexRecordsFenced`) or the blocks and
 /// seek pages of `TopicIndexRepaired`, which all go to new segments.
+/// Checkpoint files: a top-level one may be deleted
+/// (`CheckpointFileRemoved`) or moved unchanged into a quarantine directory
+/// (`CheckpointFileQuarantined`); the damage entries themselves are
+/// `check_checkpoints`'.
 fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Result<(), String> {
     let mut explained = vec![false; actions.len()];
+    let mut moved = HashSet::new();
+    for (i, a) in actions.iter().enumerate() {
+        match action_name(a) {
+            "CheckpointFileQuarantined" => {
+                let (Some(file), Some(q)) =
+                    (action_field(a, "file"), action_field(a, "quarantine"))
+                else {
+                    return Err(format!("malformed report entry {a}"));
+                };
+                let dst = format!("{q}/{file}");
+                let src = before.files.get(file);
+                if src.is_none()
+                    || after.files.contains_key(file)
+                    || before.files.contains_key(&dst)
+                    || after.files.get(&dst) != src
+                {
+                    return Err(format!("{a}: not a move of {file}, unchanged, into {q}"));
+                }
+                moved.insert(file.to_owned());
+                moved.insert(dst);
+                explained[i] = true;
+            }
+            "CheckpointManifestDamaged" | "CheckpointQuarantineResumed" => explained[i] = true,
+            _ => {}
+        }
+    }
     let mut explain = |pred: &dyn Fn(&str) -> bool, what: &str| -> Result<(), String> {
         let i = actions
             .iter()
@@ -548,7 +725,7 @@ fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Res
     let mut new_index = Vec::new();
     for rel in keys {
         let (b, a) = (before.files.get(rel), after.files.get(rel));
-        if b == a {
+        if b == a || moved.contains(rel.as_str()) {
             continue;
         }
         let name = rel.rsplit('/').next().unwrap_or(rel);
@@ -577,6 +754,20 @@ fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Res
             }
             (_, Some(_), None) if name.strip_suffix(".tmp").and_then(wal_file_id).is_some() => {
                 explain(&|x| action_name(x) == "WalTmpRemoved", rel)?;
+            }
+            (_, Some(_), None)
+                if !rel.contains('/')
+                    && ["checkpoint-", "objtab-", "reloc-"]
+                        .iter()
+                        .any(|p| name.starts_with(p)) =>
+            {
+                explain(
+                    &|x| {
+                        action_name(x) == "CheckpointFileRemoved"
+                            && action_field(x, "file") == Some(name)
+                    },
+                    rel,
+                )?;
             }
             (_, Some(_), None) if name.starts_with("seg-") => {
                 let id = name
@@ -642,6 +833,122 @@ fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Res
     Ok(())
 }
 
+/// The manifest entries of the report against the quarantine rules
+/// (docs/format.md "Checkpoint"), from the files before recovery:
+/// a manifest whose quarantine was interrupted (its directory without it)
+/// is completed (`CheckpointQuarantineResumed`, `found` the directory's
+/// files); `damaged`, the manifest the harness damaged, is quarantined
+/// (`CheckpointManifestDamaged`) if it is newer than every intact one; no
+/// other manifest is damaged, since every manifest is synced before its
+/// rename and LazyFS cannot damage it. `fallback` in each entry and `used`
+/// (`Store::checkpoint_number`) are the newest other manifest; each
+/// quarantined manifest is in its directory unchanged; `quarantined` is the
+/// number of files in quarantine directories after recovery.
+fn check_checkpoints(
+    before: &Snapshot,
+    after: &Snapshot,
+    actions: &[String],
+    damaged: Option<&str>,
+    used: Option<u64>,
+    quarantined: u64,
+) -> Result<(), String> {
+    let mut manifests: Vec<u64> = before
+        .files
+        .keys()
+        .filter_map(|k| manifest_number(k))
+        .collect();
+    manifests.sort_unstable_by(|a, b| b.cmp(a));
+    let mut fallback = None;
+    // (manifest, quarantine directory, files found there if interrupted)
+    let mut want: Vec<(u64, String, Option<Vec<String>>)> = Vec::new();
+    for &m in &manifests {
+        let name = format!("checkpoint-{m:016x}");
+        let interrupted = before.dirs.iter().find(|d| {
+            quarantine_number(d) == Some(m) && !before.files.contains_key(&format!("{d}/{name}"))
+        });
+        if let Some(q) = interrupted {
+            let prefix = format!("{q}/");
+            let found = before
+                .files
+                .keys()
+                .filter_map(|k| k.strip_prefix(&prefix))
+                .map(str::to_owned)
+                .collect();
+            want.push((m, q.clone(), Some(found)));
+        } else if damaged == Some(name.as_str()) && fallback.is_none() {
+            let base = format!("quarantine-{m:016x}");
+            let q = (0..)
+                .map(|k| {
+                    if k == 0 {
+                        base.clone()
+                    } else {
+                        format!("{base}.{k}")
+                    }
+                })
+                .find(|q| !before.dirs.contains(q))
+                .unwrap_or(base);
+            want.push((m, q, None));
+        } else if fallback.is_none() {
+            fallback = Some(m);
+        }
+    }
+    let mut expected: Vec<String> = want
+        .iter()
+        .map(|(m, q, found)| match found {
+            None => format!(
+                "CheckpointManifestDamaged {{ checkpoint: {m}, fallback: {fallback:?}, quarantine: {q:?} }}"
+            ),
+            Some(f) => format!(
+                "CheckpointQuarantineResumed {{ checkpoint: {m}, fallback: {fallback:?}, quarantine: {q:?}, found: {f:?} }}"
+            ),
+        })
+        .collect();
+    let mut got: Vec<String> = actions
+        .iter()
+        .filter(|a| {
+            matches!(
+                action_name(a),
+                "CheckpointManifestDamaged" | "CheckpointQuarantineResumed"
+            )
+        })
+        .cloned()
+        .collect();
+    expected.sort();
+    got.sort();
+    if got != expected {
+        return Err(format!(
+            "manifest entries {got:?}, the quarantine rules give {expected:?} (damaged by the harness: {damaged:?})"
+        ));
+    }
+    for (m, q, _) in &want {
+        let name = format!("checkpoint-{m:016x}");
+        if after.files.contains_key(&name)
+            || after.files.get(&format!("{q}/{name}")) != before.files.get(&name)
+        {
+            return Err(format!("{name} not moved, unchanged, into {q}"));
+        }
+    }
+    if used != fallback {
+        return Err(format!(
+            "the store uses checkpoint {used:?}, the newest intact manifest is {fallback:?}"
+        ));
+    }
+    let in_quarantine = after
+        .files
+        .keys()
+        .filter(|k| {
+            k.split_once('/')
+                .is_some_and(|(d, _)| quarantine_number(d).is_some())
+        })
+        .count() as u64;
+    if quarantined != in_quarantine {
+        return Err(format!(
+            "quarantined_files() = {quarantined}, {in_quarantine} files in quarantine directories"
+        ));
+    }
+    Ok(())
+}
+
 fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
     let dir = PathBuf::from(opt(opts, "dir")?);
     let mode = opt(opts, "mode")?;
@@ -674,6 +981,7 @@ fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
         let store = Store::open(&dir, config)
             .await
             .map_err(|e| format!("recovery refused to open the store: {e}"))?;
+        let (used, quarantined) = (store.checkpoint_number(), store.quarantined_files());
         let actions: Vec<String> = store
             .recovery_report()
             .actions
@@ -746,6 +1054,14 @@ fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
 
         let after = snapshot(&dir)?;
         check_changes(&before, &after, &actions)?;
+        check_checkpoints(
+            &before,
+            &after,
+            &actions,
+            opts.get("damaged").copied(),
+            used,
+            quarantined,
+        )?;
 
         // Recovery leaves nothing for a second recovery to do.
         let again = Store::open(&dir, config)
@@ -761,9 +1077,49 @@ fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
             "acked={} unacked_present={unacked_present} actions={} [{}]",
             log.acked.len(),
             actions.len(),
-            actions.iter().map(|a| action_name(a)).collect::<Vec<_>>().join(",")
+            action_names(&actions)
         ))
     })
+}
+
+/// Opens the store once and exits: the recovery that run.sh interrupts
+/// with a LazyFS crash.
+fn store_open(opts: &HashMap<&str, &str>) -> Result<String, String> {
+    let dir = opt(opts, "dir")?;
+    let config = store_config(opt(opts, "mode")?, opts)?;
+    let rt = compio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let store = Store::open(dir, config).await.map_err(|e| e.to_string())?;
+        Ok(format!("actions={}", store.recovery_report().actions.len()))
+    })
+}
+
+/// Damages the newest checkpoint manifest in `--dir` (not mounted): cuts it
+/// to a random length or flips one bit, which its CRC detects. Prints the
+/// manifest's name, or `none` without a manifest.
+fn damage(opts: &HashMap<&str, &str>) -> Result<String, String> {
+    let dir = PathBuf::from(opt(opts, "dir")?);
+    let mut rng = Rng::new(num(opts, "seed")?);
+    let newest = std::fs::read_dir(&dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| manifest_number(n).is_some())
+        .max();
+    let Some(name) = newest else {
+        return Ok("none".to_owned());
+    };
+    let path = dir.join(&name);
+    let mut bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let at = rng.below(bytes.len() as u64) as usize;
+    let how = if rng.below(2) == 0 || bytes.is_empty() {
+        bytes.truncate(at);
+        format!("cut to {at} bytes")
+    } else {
+        bytes[at] ^= 1 << rng.below(8);
+        format!("bit flipped in byte {at}")
+    };
+    std::fs::write(&path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(format!("{name} {how}"))
 }
 
 // ---------------------------------------------------------------- broker
@@ -1058,6 +1414,10 @@ mod tests {
                 .filter(|(p, _)| wal_file_id(p).is_some())
                 .map(|(p, b)| ((*p).to_owned(), b.to_vec()))
                 .collect(),
+            dirs: files
+                .iter()
+                .filter_map(|(p, _)| Some(p.rsplit_once('/')?.0.to_owned()))
+                .collect(),
         }
     }
 
@@ -1156,6 +1516,125 @@ mod tests {
         let elsewhere = "StaleIndexRecordsFenced { records: 2, segment: 7 }".to_owned();
         assert!(check_changes(&before, &added, &[elsewhere]).is_err());
         assert!(check_changes(&before, &added, &[fenced, repaired]).is_ok());
+    }
+
+    const C1: &str = "checkpoint-0000000000000001";
+    const C2: &str = "checkpoint-0000000000000002";
+    const Q2: &str = "quarantine-0000000000000002";
+
+    fn moved(file: &str) -> String {
+        format!("CheckpointFileQuarantined {{ file: {file:?}, quarantine: {Q2:?} }}")
+    }
+
+    #[test]
+    fn checkpoint_files_are_removed_or_moved_unchanged() {
+        let before = snap(&[
+            (W0, b"w"),
+            (C2, b"m2"),
+            ("objtab-0000000000000005.tab", b"t"),
+        ]);
+        let after = snap(&[
+            (W0, b"w"),
+            (
+                "quarantine-0000000000000002/checkpoint-0000000000000002",
+                b"m2",
+            ),
+            (
+                "quarantine-0000000000000002/objtab-0000000000000005.tab",
+                b"t",
+            ),
+        ]);
+        let entries = [moved(C2), moved("objtab-0000000000000005.tab")];
+        assert!(check_changes(&before, &after, &entries).is_ok());
+        assert!(check_changes(&before, &after, &entries[..1]).is_err());
+        // Moved but changed.
+        let changed = snap(&[
+            (W0, b"w"),
+            (
+                "quarantine-0000000000000002/checkpoint-0000000000000002",
+                b"m3",
+            ),
+            (
+                "quarantine-0000000000000002/objtab-0000000000000005.tab",
+                b"t",
+            ),
+        ]);
+        assert!(check_changes(&before, &changed, &entries).is_err());
+        let removed = snap(&[(W0, b"w"), (C2, b"m2")]);
+        let entry = r#"CheckpointFileRemoved { file: "objtab-0000000000000005.tab" }"#.to_owned();
+        assert!(check_changes(&before, &removed, std::slice::from_ref(&entry)).is_ok());
+        assert!(check_changes(&before, &removed, &[]).is_err());
+    }
+
+    #[test]
+    fn manifest_entries_follow_the_quarantine_rules() {
+        let damaged = |fallback: &str| {
+            format!(
+                "CheckpointManifestDamaged {{ checkpoint: 2, fallback: {fallback}, quarantine: {Q2:?} }}"
+            )
+        };
+        let before = snap(&[(C1, b"m1"), (C2, b"bad")]);
+        let after = snap(&[
+            (C1, b"m1"),
+            (
+                "quarantine-0000000000000002/checkpoint-0000000000000002",
+                b"bad",
+            ),
+        ]);
+        let ok = [damaged("Some(1)"), moved(C2)];
+        assert!(check_checkpoints(&before, &after, &ok, Some(C2), Some(1), 1).is_ok());
+        // Not the previous manifest, or none, as the fallback.
+        assert!(
+            check_checkpoints(
+                &before,
+                &after,
+                &[damaged("None"), moved(C2)],
+                Some(C2),
+                Some(1),
+                1
+            )
+            .is_err()
+        );
+        assert!(check_checkpoints(&before, &after, &ok, Some(C2), None, 1).is_err());
+        // A manifest damaged although the harness damaged none.
+        assert!(check_checkpoints(&before, &after, &ok, None, Some(1), 1).is_err());
+        // The harness damaged one and nothing was reported.
+        assert!(check_checkpoints(&before, &before, &[], Some(C2), Some(2), 0).is_err());
+        // An interrupted quarantine: completed, with the files found there.
+        let interrupted = snap(&[
+            (C1, b"m1"),
+            (C2, b"bad"),
+            (
+                "quarantine-0000000000000002/objtab-0000000000000005.tab",
+                b"t",
+            ),
+        ]);
+        let done = snap(&[
+            (C1, b"m1"),
+            (
+                "quarantine-0000000000000002/checkpoint-0000000000000002",
+                b"bad",
+            ),
+            (
+                "quarantine-0000000000000002/objtab-0000000000000005.tab",
+                b"t",
+            ),
+        ]);
+        let resumed = format!(
+            "CheckpointQuarantineResumed {{ checkpoint: 2, fallback: Some(1), quarantine: {Q2:?}, found: [\"objtab-0000000000000005.tab\"] }}"
+        );
+        assert!(
+            check_checkpoints(
+                &interrupted,
+                &done,
+                &[resumed, moved(C2)],
+                Some(C2),
+                Some(1),
+                2
+            )
+            .is_ok()
+        );
+        assert!(check_checkpoints(&interrupted, &done, &ok, Some(C2), Some(1), 2).is_err());
     }
 
     #[test]
