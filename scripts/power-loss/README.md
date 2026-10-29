@@ -27,7 +27,7 @@ git -C ~/lazyfs checkout 045a0b3a1126725e693934e29d3ba15e08cc39ec   # tag 0.3.1
 
 LazyFS is mounted by the user running the script, without `allow_other`,
 so `/etc/fuse.conf` needs no change. The script raises its own soft limit
-on open files to the hard limit (the store keeps every segment open).
+on open files to the hard limit.
 
 ## Running
 

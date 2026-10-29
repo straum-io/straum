@@ -43,6 +43,12 @@ macOS (development only). No tokio, including transitively.
 - `Store::topic_stats` (first and next seq, index bytes) and
   `Store::batch_frame_bytes` (the frame bound `put_batch` checks before any
   I/O, additive over messages) let a caller size its batches.
+- Open files are bounded whatever the data size: reads open data segments
+  and earlier WAL files on demand, at most `Config::data_open_files`
+  (default 256) at a time, and index segments at most
+  `Config::index_open_files` (default 64), least recently used closed
+  first; plus the data segment, WAL file and index segment being written,
+  and one more per read in progress (D-227 A).
 - Group commit: one segment `fdatasync` and one WAL `fdatasync` per batch;
   a batch is acknowledged only after both.
 - The WAL is a sequence of files, `wal-<first frame seq>.log`: a file that
@@ -129,6 +135,7 @@ Test variables: `STRAUM_STORE_CRASH_ITERATIONS` (default 200),
 | `tests/store.rs` | deduplication; one fsync per file per batch; restart; rotation; compaction; orphans; a corrupted block fails the read; an intact index block disagreeing with the WAL (`TopicMismatch`) or beyond it (`IndexSegmentCorrupt`) with no file changed; a lost or cut index segment rebuilt byte for byte; a damaged record ends the scan of its segment; WAL truncation at every byte of the last record (Publish, Release, Compact) |
 | `tests/model.rs` | proptest: random publish (with no key, an empty key, or a key and headers), release, compact and restart against an in-memory model, 128 cases per write mode, with dictionary training, a small block cache, seek pages of 2 locations, index segments rotating every 256 bytes, two open index files and WAL files of 512 bytes |
 | `tests/crash.rs` | a writer in a child process killed with SIGKILL at a random moment, checked after each restart; one test per write mode; the dictionary is trained during the run; index segments rotate, seek pages (2 locations) fill and WAL files (16 KiB) rotate during it |
+| `tests/open_files.rs` | reads across more data segments, and inline blocks across more WAL files, than `data_open_files`, before and after reopen, keep at most the bound plus the files being written open; compaction with one open file |
 | `tests/wal_files.rs` | WAL files: one frame per file at a limit of 1 byte and frames up to the limit otherwise, in every write mode, with keys, headers and inline blocks read from earlier files after reopen; only the last file's tail is cut, and writing continues; damage at the end of an earlier file is `WalCorrupted`, a missing, renamed or damaged-header file and an old `wal.log` an error, no file changed; an empty last file and a leftover tmp file; a ParallelSync frame with a missing block is dropped only when no WAL file follows it |
 | `tests/publication.rs` | keys and headers through restart, release and compaction in every write mode; one object for the same payload under different keys; the frame bound counts them and is additive; `topic_stats` |
 | `tests/wal_corruption.rs` | any flipped bit in a middle frame gives `WalCorrupted` and leaves the file unchanged; in the last frame, truncation; a lost first half of the last frame is a torn tail; truncation at every byte; a `seq` gap; an old format gives `UnsupportedFormat`; `max_frame_bytes` |

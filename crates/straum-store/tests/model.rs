@@ -162,6 +162,8 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
             // A new WAL file every frame or two: inline blocks, keys and
             // headers are read from earlier files.
             wal_file_max_bytes: 512,
+            // Two open data files: reads and compaction reopen them.
+            data_open_files: 2,
             ..Config::default()
         };
         let payloads = payloads();

@@ -54,6 +54,8 @@ fn config(mode_name: &str) -> Config {
         // WAL files rotate every few frames, so kills also land around a
         // file's creation and recovery spans many files.
         wal_file_max_bytes: 16 << 10,
+        // Reads and compaction reopen segments and WAL files often.
+        data_open_files: 2,
         ..Config::default()
     }
 }

@@ -86,8 +86,8 @@ fi
 mkdir -p "$OUT" || exit 2
 OUT="$(cd "$OUT" && pwd)"
 LAZYFS_BIN="$LAZYFS/lazyfs/build/lazyfs"
-# The store keeps every segment file open: raise the soft limit to the hard
-# one for this process only.
+# Raise the soft limit on open files to the hard one for this process only
+# (the store bounds its own, but the broker adds connections).
 ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 echo "building straum-power-loss and straum-broker (release)"

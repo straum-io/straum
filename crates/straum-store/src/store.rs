@@ -84,6 +84,10 @@ pub struct Config {
     /// Index segments kept open for reads, least recently used closed
     /// first; the segment being written is open as well. 0 is taken as 1.
     pub index_open_files: usize,
+    /// Data segments and earlier WAL files kept open for reads (blocks,
+    /// keys and headers), least recently used closed first; the segment
+    /// and the WAL file being written are open as well. 0 is taken as 1.
+    pub data_open_files: usize,
     /// Locations per seek page (default 256): a topic's index block is
     /// found through at most one seek page read up to this number squared
     /// blocks, two up to its cube, and so on. Clamped to 2..=4096. Changing
@@ -121,6 +125,7 @@ impl Default for Config {
             block_cache_bytes: 64 << 20,
             index_segment_max_bytes: 64 << 20,
             index_open_files: 64,
+            data_open_files: 256,
             seek_page_entries: 256,
             dict_train_bytes: 1 << 20,
             max_block_raw_bytes: 16 << 10,
@@ -523,9 +528,8 @@ pub struct Store {
     wal: File,
     wal_id: u64,
     wal_len: u64,
-    /// The earlier WAL files, open for reads of inline blocks and of keys
-    /// and headers.
-    wal_files: HashMap<u64, File>,
+    /// Data segments and earlier WAL files open for reads.
+    files: OpenFiles,
     /// Sequence number of the next WAL frame.
     next_frame: u64,
     /// A WAL frame is being written. Frames are written one at a time and
@@ -550,8 +554,8 @@ pub struct Store {
     /// none. Training runs once.
     dictionary: Option<usize>,
     next_topic: u64,
-    /// Open handles of every segment the WAL references.
-    segments: HashMap<u64, File>,
+    /// Every segment the WAL references (and that exists).
+    segments: HashSet<u64>,
     active: Option<Active>,
     next_segment: u64,
     topics: HashMap<Vec<u8>, Topic>,
@@ -752,10 +756,6 @@ impl Store {
             wal.set_len(wal_len).await?;
             wal.sync_all().await?;
         }
-        let mut wal_files = HashMap::with_capacity(last);
-        for (id, _) in &files[..last] {
-            wal_files.insert(*id, File::open(wal_path(&dir, *id)).await?);
-        }
 
         let mut replay = Replay::default();
         let next_frame = frames.len() as u64;
@@ -785,13 +785,14 @@ impl Store {
             }),
         )?;
 
+        let files = OpenFiles::new(&dir, config.data_open_files);
         Ok(Self {
             dir,
             config,
             wal,
             wal_id: last_id,
             wal_len,
-            wal_files,
+            files,
             next_frame,
             in_flight: false,
             next_segment: replay.max_segment.map_or(0, |m| m + 1),
@@ -1259,13 +1260,12 @@ impl Store {
                 .or_default()
                 .push((o.index, number, o.refs > 0));
         }
-        let mut ids: Vec<u64> = self.segments.keys().copied().collect();
+        let mut ids: Vec<u64> = self.segments.iter().copied().collect();
         ids.sort_unstable();
         for old in ids {
-            let Some(old_file) = self.segments.get(&old) else {
-                continue;
-            };
-            let file_len = old_file.metadata().await?.len();
+            let file_len = compio::fs::metadata(segment_path(&self.dir, old))
+                .await?
+                .len();
             let mut blocks = by_segment.remove(&old).unwrap_or_default();
             blocks.sort_unstable();
             let (mut kept, mut partial, mut dead) = (Vec::new(), Vec::new(), Vec::new());
@@ -1361,7 +1361,7 @@ impl Store {
                 sync_dir(&self.dir).await?;
                 self.stats.fsyncs += 2;
                 self.stats.segment_bytes += new_len;
-                self.segments.insert(new, file);
+                self.segments.insert(new);
                 new
             };
 
@@ -1415,6 +1415,7 @@ impl Store {
                 self.blocks.insert(r.block, b);
             }
             self.segments.remove(&old);
+            self.files.forget(FileKey::Data(old));
             // Not followed by a directory fsync: if the unlink is lost, the
             // WAL no longer references the file and recovery deletes it.
             compio::fs::remove_file(segment_path(&self.dir, old)).await?;
@@ -1594,7 +1595,8 @@ impl Store {
                 };
                 let file = self
                     .wal_file(at.file)
-                    .ok_or(corrupt("WAL file of a key or headers is not open"))?;
+                    .await?
+                    .ok_or(corrupt("WAL file of a key or headers is missing"))?;
                 let len = len as usize;
                 let BufResult(res, buf) = file
                     .read_exact_at(Vec::with_capacity(len).slice(..len), at.offset)
@@ -1688,7 +1690,14 @@ impl Store {
     /// Index segment files the store holds open: at most
     /// `Config::index_open_files` for reads, plus the one being written.
     pub fn open_index_files(&self) -> usize {
-        self.index.files.borrow().len() + usize::from(self.index.active.is_some())
+        self.index.files.len() + usize::from(self.index.active.is_some())
+    }
+
+    /// Data segments and earlier WAL files the store holds open: at most
+    /// `Config::data_open_files` for reads, plus the segment and the WAL
+    /// file being written.
+    pub fn open_data_files(&self) -> usize {
+        self.files.len() + usize::from(self.active.is_some()) + 1
     }
 
     pub fn segment_count(&self) -> usize {
@@ -1712,14 +1721,13 @@ impl Store {
         self.dictionary
     }
 
-    /// The handle of WAL file `id`: the one being appended to or an earlier
-    /// one.
-    fn wal_file(&self, id: u64) -> Option<&File> {
+    /// A handle of WAL file `id`: the one being appended to, or an earlier
+    /// one from the open files. `None` if the file does not exist.
+    async fn wal_file(&self, id: u64) -> Result<Option<File>, StoreError> {
         if id == self.wal_id {
-            Some(&self.wal)
-        } else {
-            self.wal_files.get(&id)
+            return Ok(Some(self.wal.clone()));
         }
+        self.files.get(FileKey::Wal(id)).await
     }
 
     /// Before a frame is built: once the WAL file holds a frame and at
@@ -1734,8 +1742,7 @@ impl Store {
         let id = self.next_frame;
         let file = create_wal_file(&self.dir, id, self.config.dict_train_bytes).await?;
         self.stats.fsyncs += 2;
-        let old = std::mem::replace(&mut self.wal, file);
-        self.wal_files.insert(self.wal_id, old);
+        self.wal = file;
         self.wal_id = id;
         self.wal_len = WAL_FILE_HEADER as u64;
         Ok(())
@@ -1856,14 +1863,14 @@ impl Store {
             reason: "stored bytes missing or truncated",
         };
         let (file, offset) = match b.loc {
-            Location::Segment { id, offset } => match self.segments.get(&id) {
-                Some(file) => (file, offset),
-                None => return Err(missing),
-            },
-            Location::Wal(at) => match self.wal_file(at.file) {
-                Some(file) => (file, at.offset),
-                None => return Err(missing),
-            },
+            Location::Segment { id, offset } if self.segments.contains(&id) => {
+                (self.files.get(FileKey::Data(id)).await?, offset)
+            }
+            Location::Segment { .. } => (None, 0),
+            Location::Wal(at) => (self.wal_file(at.file).await?, at.offset),
+        };
+        let Some(file) = file else {
+            return Err(missing);
         };
         let len = usize::try_from(b.len).map_err(|_| StoreError::CorruptBlock {
             block: number,
@@ -1913,7 +1920,7 @@ impl Store {
             // durable before the WAL record is.
             sync_dir(&self.dir).await?;
             self.stats.fsyncs += 1;
-            self.segments.insert(id, file.clone());
+            self.segments.insert(id);
             self.active = Some(Active {
                 id,
                 file,
@@ -2132,6 +2139,79 @@ impl Store {
     }
 }
 
+/// A file the store opens on demand for reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileKey {
+    Data(u64),
+    Wal(u64),
+    Index(u64),
+}
+
+impl FileKey {
+    fn path(self, dir: &Path) -> PathBuf {
+        match self {
+            Self::Data(id) => segment_path(dir, id),
+            Self::Wal(first) => wal_path(dir, first),
+            Self::Index(id) => index_path(dir, id),
+        }
+    }
+}
+
+/// Files open for reads, at most `max` at a time, least recently used
+/// closed first (D-227 A). A linear scan: the bounds are a few hundred. A
+/// read in progress holds its handle until it completes, so concurrent
+/// reads can each keep one more open.
+struct OpenFiles {
+    dir: PathBuf,
+    files: RefCell<VecDeque<(FileKey, File)>>,
+    max: usize,
+}
+
+impl OpenFiles {
+    fn new(dir: &Path, max: usize) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            files: RefCell::new(VecDeque::new()),
+            max: max.max(1),
+        }
+    }
+
+    /// A handle of `key`, opening it (and closing the least recently used)
+    /// if needed; `None` if the file does not exist.
+    async fn get(&self, key: FileKey) -> Result<Option<File>, StoreError> {
+        {
+            let mut files = self.files.borrow_mut();
+            if let Some(at) = files.iter().position(|(k, _)| *k == key)
+                && let Some(entry) = files.remove(at)
+            {
+                let file = entry.1.clone();
+                files.push_back(entry);
+                return Ok(Some(file));
+            }
+        }
+        let file = match File::open(key.path(&self.dir)).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut files = self.files.borrow_mut();
+        while files.len() >= self.max {
+            files.pop_front();
+        }
+        files.push_back((key, file.clone()));
+        Ok(Some(file))
+    }
+
+    /// Closes `key`'s handle, if open: before its file is deleted.
+    fn forget(&self, key: FileKey) {
+        self.files.borrow_mut().retain(|(k, _)| *k != key);
+    }
+
+    fn len(&self) -> usize {
+        self.files.borrow().len()
+    }
+}
+
 /// The shared index segments `idx-<id>.dat`: full topic index blocks and
 /// seek pages of every topic, appended to one segment at a time.
 struct IndexSegments {
@@ -2142,9 +2222,8 @@ struct IndexSegments {
     next_id: u64,
     /// Records not yet written to `active`: written after the WAL fsync.
     buf: Vec<u8>,
-    /// Segments open for reads, least recently used first.
-    files: RefCell<VecDeque<(u64, File)>>,
-    max_open: usize,
+    /// Segments open for reads.
+    files: OpenFiles,
     max_bytes: u64,
     /// `Config::seek_page_entries`, clamped.
     fanout: usize,
@@ -2159,8 +2238,7 @@ impl IndexSegments {
             active: None,
             next_id: 0,
             buf: Vec::new(),
-            files: RefCell::new(VecDeque::new()),
-            max_open: config.index_open_files.max(1),
+            files: OpenFiles::new(dir, config.index_open_files),
             max_bytes: config.index_segment_max_bytes,
             fanout: config.seek_page_entries.clamp(SEEK_PAGE_MIN, SEEK_PAGE_MAX),
             fsyncs: 0,
@@ -2255,34 +2333,13 @@ impl IndexSegments {
         Ok(n)
     }
 
-    /// A handle of segment `id`: the active one, or from the open files,
-    /// opening it (and closing the least recently used) if needed. `None`
-    /// if the file does not exist.
+    /// A handle of segment `id`: the active one, or from the open files.
+    /// `None` if the file does not exist.
     async fn file(&self, id: u64) -> Result<Option<File>, StoreError> {
         if let Some(a) = self.active.as_ref().filter(|a| a.id == id) {
             return Ok(Some(a.file.clone()));
         }
-        {
-            let mut files = self.files.borrow_mut();
-            if let Some(at) = files.iter().position(|(n, _)| *n == id)
-                && let Some(entry) = files.remove(at)
-            {
-                let file = entry.1.clone();
-                files.push_back(entry);
-                return Ok(Some(file));
-            }
-        }
-        let file = match File::open(index_path(&self.dir, id)).await {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let mut files = self.files.borrow_mut();
-        while files.len() >= self.max_open {
-            files.pop_front();
-        }
-        files.push_back((id, file.clone()));
-        Ok(Some(file))
+        self.files.get(FileKey::Index(id)).await
     }
 
     /// The body of the record at `loc` if it is intact (CRC) and is the
@@ -2679,7 +2736,7 @@ async fn open_segments(
     dir: &Path,
     replay: &mut Replay<'_>,
     report: &mut RecoveryReport,
-) -> Result<HashMap<u64, File>, StoreError> {
+) -> Result<HashSet<u64>, StoreError> {
     // Blocking directory listing: only at open, and compio 0.19 has no
     // async read_dir without the extra fs-dir feature.
     let mut on_disk = Vec::new();
@@ -2707,18 +2764,14 @@ async fn open_segments(
         sync_dir(dir).await?;
     }
 
-    let mut segments = HashMap::new();
+    // Lengths only: segments are opened for reads on demand (D-227 A).
+    let mut segments = HashSet::new();
     let mut lens = HashMap::new();
     for &id in &replay.segments {
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(segment_path(dir, id))
-            .await
-        {
-            Ok(file) => {
-                lens.insert(id, file.metadata().await?.len());
-                segments.insert(id, file);
+        match compio::fs::metadata(segment_path(dir, id)).await {
+            Ok(meta) => {
+                lens.insert(id, meta.len());
+                segments.insert(id);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
