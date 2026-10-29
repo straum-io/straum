@@ -440,7 +440,8 @@ report means recovery changed nothing. No change is made without an entry.
 | `StaleIndexRecordsFenced { records, segment }` | index records of cut WAL frames were found; index segment `segment` was created to keep them stale |
 | `IndexSegmentDropped { segment, bytes }` | an index segment was deleted because `Config::rebuild_index` was set (the index is rebuilt from the WAL) |
 | `TopicIndexRepaired { topic, blocks_rewritten, pages_rewritten }` | a topic's index blocks or seek pages were re-encoded from the WAL and appended |
-| `CheckpointFileRemoved { file }` | a checkpoint file the newest manifest does not list was deleted: an earlier manifest, a `checkpoint-<n>.tmp`, or a table or run of a checkpoint that did not complete |
+| `CheckpointFileRemoved { file }` | a checkpoint file the checkpoint used does not list was deleted: an earlier or damaged manifest, a `checkpoint-<n>.tmp`, or a table or run of a checkpoint that did not complete |
+| `CheckpointManifestDamaged { checkpoint, fallback }` | manifest `checkpoint-<checkpoint>` failed its CRC or did not decode; open used manifest `fallback` instead, or none (`None`: the state is rebuilt from the WAL, which holds every frame); the damaged manifest is deleted (`CheckpointFileRemoved`) |
 
 `config_overrides` lists `Config` values the WAL replaced, which change no
 file: `DictTrainBytes { configured, stored }` when `Config::dict_train_bytes`
@@ -658,30 +659,41 @@ frames below it are covered; the tables, in order, cover object numbers
 **Writing.** New table and run files are created (`create_new`), written
 and `fdatasync`ed, then the directory is synced; the manifest is written to
 `checkpoint-<n>.tmp`, `fdatasync`ed, renamed to `checkpoint-<n>` and the
-directory synced; then `checkpoint-<n − 1>` is deleted and the directory
-synced. A crash before the rename leaves the previous checkpoint valid and
-the new files unlisted; after it, the previous manifest is unlisted. A
-checkpoint that fails makes the store refuse further use.
+directory synced; then `checkpoint-<n>` and the new table and run are read back and
+must decode to what was written; only then is `checkpoint-<n − 1>` deleted
+and the directory synced, so a damaged newest manifest has an older one to
+fall back to. A crash before the rename leaves the previous checkpoint
+valid and the new files unlisted; after it, the previous manifest is
+unlisted. A checkpoint that fails (the read-back included) makes the store
+refuse further use, with the previous manifest still in place.
 
-**Recovery.** Before replay, the newest `checkpoint-<n>` is read; it must be
-intact (CRC, version, `n` as named) and every table and run it lists must
-be present, with an intact header naming it, intact pages and exactly the
-listed count, the tables contiguous from 0 to `next_object`, the runs
-ordered and their numbers increasing and below `next_object`; otherwise
-`CorruptCheckpoint` and no file is changed (an older manifest is never
-used instead). `covered` above the WAL's frame count is `CorruptCheckpoint`.
-When replay reaches frame `covered`, the checkpoint must match the state
-the WAL gives there: the next object, block and topic numbers
-(`CorruptCheckpoint`) and every object number's place, reclaimed or
-`(id, block, index)` (`CheckpointMismatch { number }`). Covered numbers
+**Recovery.** Before replay, the manifests are read newest first. A
+manifest that fails its CRC, is of another version or does not name
+itself `n` is damaged (`CheckpointManifestDamaged`): open passes over it
+to the next older one, and uses the newest intact manifest. With none
+intact, the checkpoint is ignored while the WAL holds every frame (its
+files are then orphans, and replay rebuilds everything from the WAL);
+once WAL files can be deleted (ADR-0014 step 6b), that state is
+`CorruptCheckpoint`, and so is a manifest whose `covered` is below the
+first frame the WAL files hold. Every table and run the manifest in use
+lists must be present, with an intact header naming it, intact pages and
+exactly the listed count, the tables contiguous from 0 to `next_object`,
+the runs ordered and their numbers increasing and below `next_object`;
+otherwise `CorruptCheckpoint` and no file is changed: the fallback is for
+a damaged manifest only. `covered` above the WAL's frame count is
+`CorruptCheckpoint`. When replay reaches frame `covered`, the checkpoint
+must match the state the WAL gives there: the next object, block and topic
+numbers (`CorruptCheckpoint`) and every object number's place, reclaimed
+or `(id, block, index)` (`CheckpointMismatch { number }`). Covered numbers
 whose place differs at the end of the WAL go to the next checkpoint's run.
-After every check, the checkpoint files the manifest does not list are
-deleted (`CheckpointFileRemoved`). With no manifest at all, every table and run
-is such a file (a first checkpoint that did not complete); while no WAL
-file is deleted the WAL still holds everything they described (from
-step 6b, tables without a manifest must be refused when WAL files they
-would cover are gone). Checkpoint files without any WAL file
-are `CorruptWal`, as segments are.
+After every check, the checkpoint files the manifest in use does not list
+are deleted (`CheckpointFileRemoved`): earlier and damaged manifests, tmp
+manifests, tables and runs of an interrupted checkpoint. With no manifest
+at all, every table and run is such a file (a first checkpoint that did
+not complete); while no WAL file is deleted the WAL still holds everything
+they described (from step 6b they must be refused when WAL files they
+would cover are gone, as above). Checkpoint files without any WAL file are
+`CorruptWal`, as segments are.
 
 ## Write order (one batch)
 

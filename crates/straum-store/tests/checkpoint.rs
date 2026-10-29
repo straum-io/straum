@@ -2,7 +2,8 @@
 //! tables, relocation runs and manifest written by `Store::checkpoint`,
 //! checked at open against the replay of the frames they cover; damage is
 //! an error with no file changed, files of an interrupted checkpoint are
-//! removed and reported. Interim rule: no WAL file is deleted.
+//! removed and reported, a damaged manifest falls back to the older one or,
+//! with none, to the WAL. Interim rule: no WAL file is deleted.
 
 #![allow(clippy::unwrap_used)] // test crate: helpers outside #[test] fns panic on failure by design
 
@@ -160,17 +161,7 @@ async fn damaged_checkpoint_files_fail_open_and_change_nothing() {
     let mismatch =
         |e: &StoreError| matches!(e, StoreError::CheckpointMismatch { checkpoint: 2, .. });
     type Expect = fn(&StoreError) -> bool;
-    let cases: [(&str, Change, Expect); 12] = [
-        (
-            "manifest CRC",
-            |d| edit(&path_of(d, "checkpoint-", 0), |b| b[13] ^= 1),
-            corrupt,
-        ),
-        (
-            "manifest cut",
-            |d| edit(&path_of(d, "checkpoint-", 0), |b| b.truncate(b.len() - 1)),
-            corrupt,
-        ),
+    let cases: [(&str, Change, Expect); 10] = [
         (
             "table missing",
             |d| std::fs::remove_file(path_of(d, "objtab-", 1)).unwrap(),
@@ -359,4 +350,192 @@ async fn another_version_with_a_manifest_is_unsupported() {
         "{:?}",
         res.err()
     );
+}
+
+fn actions(store: &Store) -> Vec<RecoveryAction> {
+    store.recovery_report().actions.clone()
+}
+
+fn removed(actions: &[RecoveryAction]) -> Vec<String> {
+    let mut files: Vec<String> = actions
+        .iter()
+        .filter_map(|a| match a {
+            RecoveryAction::CheckpointFileRemoved { file } => Some(file.clone()),
+            _ => None,
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+const MANIFEST_DAMAGE: [(&str, Change); 3] = [
+    ("CRC", |p| edit(p, |b| b[13] ^= 1)),
+    ("cut", |p| edit(p, |b| b.truncate(b.len() - 1))),
+    ("empty", |p| std::fs::write(p, b"").unwrap()),
+];
+
+/// `build` with checkpoint 1's manifest left in place, as a crash between
+/// checkpoint 2's rename and the deletion of manifest 1 leaves it.
+async fn build_with_both_manifests(dir: &Path, mode: WriteMode) -> std::ops::Range<u64> {
+    let mut store = Store::open(dir, config(mode)).await.unwrap();
+    for b in 0..4 {
+        put(&mut store, b * 30, (b + 1) * 30).await;
+    }
+    store.checkpoint().await.unwrap();
+    let first = std::fs::read(path_of(dir, "checkpoint-", 0)).unwrap();
+    assert_eq!(store.release_before(b"t", 45).await.unwrap(), 60);
+    store.compact().await.unwrap();
+    put(&mut store, 120, 150).await;
+    store.checkpoint().await.unwrap();
+    put(&mut store, 150, 160).await;
+    drop(store);
+    std::fs::write(dir.join("checkpoint-0000000000000001"), first).unwrap();
+    60..160
+}
+
+/// A damaged newest manifest with an intact older one: open uses the older
+/// checkpoint (checked against the WAL as always), reports the fallback and
+/// deletes the damaged manifest and the files only it listed. The next
+/// checkpoint relocates what moved since the older one.
+#[compio::test]
+async fn a_damaged_newest_manifest_falls_back_to_the_older_one() {
+    for mode in MODES {
+        for (what, damage) in MANIFEST_DAMAGE {
+            let dir = TempDir::new("checkpoint-fallback");
+            let live = build_with_both_manifests(&dir.0, mode).await;
+            damage(&dir.0.join("checkpoint-0000000000000002"));
+            let mut store = Store::open(&dir.0, config(mode)).await.unwrap();
+            let acts = actions(&store);
+            assert_eq!(
+                acts[0],
+                RecoveryAction::CheckpointManifestDamaged {
+                    checkpoint: 2,
+                    fallback: Some(1),
+                },
+                "{mode:?} {what}"
+            );
+            assert_eq!(store.checkpoint_number(), Some(1), "{mode:?} {what}");
+            assert_eq!(
+                names(&dir.0, "checkpoint-"),
+                ["checkpoint-0000000000000001"]
+            );
+            assert_eq!(names(&dir.0, "objtab-"), ["objtab-0000000000000000.tab"]);
+            assert!(names(&dir.0, "reloc-").is_empty(), "{mode:?} {what}");
+            let files = removed(&acts);
+            assert!(
+                files.contains(&"checkpoint-0000000000000002".to_owned()),
+                "{files:?}"
+            );
+            assert_eq!(acts.len(), 1 + files.len(), "{mode:?} {what}: {acts:?}");
+            check(&store, live.clone()).await;
+            store.checkpoint().await.unwrap();
+            drop(store);
+            let store = Store::open(&dir.0, config(mode)).await.unwrap();
+            assert!(store.recovery_report().is_empty(), "{mode:?} {what}");
+            assert_eq!(store.checkpoint_number(), Some(2));
+            check(&store, live.clone()).await;
+        }
+    }
+}
+
+/// The only manifest damaged: while the WAL holds every frame (until
+/// ADR-0014 step 6b), the checkpoint is ignored and the state rebuilt from
+/// the WAL, reported; its files are deleted. (From step 6b the same state
+/// with WAL files deleted is `CorruptCheckpoint`: tested with step 6b.)
+#[compio::test]
+async fn a_damaged_only_manifest_is_ignored_while_the_wal_is_whole() {
+    for (what, damage) in MANIFEST_DAMAGE {
+        let dir = TempDir::new("checkpoint-damaged-only");
+        let live = build(&dir.0, WriteMode::Sequential).await;
+        damage(&path_of(&dir.0, "checkpoint-", 0));
+        let before = names(&dir.0, "");
+        let mut store = Store::open(&dir.0, Config::default()).await.unwrap();
+        let acts = actions(&store);
+        assert_eq!(
+            acts[0],
+            RecoveryAction::CheckpointManifestDamaged {
+                checkpoint: 2,
+                fallback: None,
+            },
+            "{what}"
+        );
+        let expect: Vec<String> = before
+            .into_iter()
+            .filter(|n| {
+                ["checkpoint-", "objtab-", "reloc-"]
+                    .iter()
+                    .any(|p| n.starts_with(p))
+            })
+            .collect();
+        assert_eq!(removed(&acts), expect, "{what}");
+        assert_eq!(acts.len(), 1 + expect.len(), "{what}: {acts:?}");
+        assert_eq!(store.checkpoint_number(), None);
+        check(&store, live.clone()).await;
+        store.checkpoint().await.unwrap();
+        drop(store);
+        let store = Store::open(&dir.0, Config::default()).await.unwrap();
+        assert!(store.recovery_report().is_empty(), "{what}");
+        assert_eq!(store.checkpoint_number(), Some(1));
+    }
+}
+
+/// Both manifests damaged: none is intact, and while the WAL is whole the
+/// checkpoint is ignored, each damaged manifest reported.
+#[compio::test]
+async fn two_damaged_manifests_are_ignored_while_the_wal_is_whole() {
+    let dir = TempDir::new("checkpoint-two-damaged");
+    let live = build_with_both_manifests(&dir.0, WriteMode::Sequential).await;
+    for n in ["checkpoint-0000000000000001", "checkpoint-0000000000000002"] {
+        edit(&dir.0.join(n), |b| b[13] ^= 1);
+    }
+    let store = Store::open(&dir.0, Config::default()).await.unwrap();
+    let acts = actions(&store);
+    let damaged = |checkpoint| RecoveryAction::CheckpointManifestDamaged {
+        checkpoint,
+        fallback: None,
+    };
+    assert_eq!(acts[..2], [damaged(2), damaged(1)]);
+    assert_eq!(store.checkpoint_number(), None);
+    check(&store, live).await;
+}
+
+/// A fallback is refused like any checkpoint when the older checkpoint is
+/// itself damaged or disagrees with the WAL: an error, no file changed
+/// (the damaged newest manifest and the orphans stay as well).
+#[compio::test]
+async fn a_fallback_to_a_damaged_older_checkpoint_fails_open_and_changes_nothing() {
+    let dir = TempDir::new("checkpoint-fallback-refused");
+    build_with_both_manifests(&dir.0, WriteMode::Sequential).await;
+    edit(&dir.0.join("checkpoint-0000000000000002"), |b| b[13] ^= 1);
+    type Expect = fn(&StoreError) -> bool;
+    let cases: [(&str, Change, Expect); 2] = [
+        (
+            "the table both list damaged",
+            |d| edit(&path_of(d, "objtab-", 0), |b| b[40] ^= 1),
+            |e| matches!(e, StoreError::CorruptCheckpoint { checkpoint: 1, .. }),
+        ),
+        (
+            "the older table disagrees with the WAL",
+            |d| {
+                edit(&path_of(d, "objtab-", 0), |b| {
+                    b[24 + 44 * 90 + 32] ^= 1;
+                    reseal_page(b, 0, 44);
+                })
+            },
+            |e| matches!(e, StoreError::CheckpointMismatch { checkpoint: 1, .. }),
+        ),
+    ];
+    for (what, change, expect) in cases {
+        let work = TempDir::new("checkpoint-fallback-refused-work");
+        common::copy_dir(&dir.0, &work.0);
+        change(&work.0);
+        std::fs::write(work.0.join("checkpoint-0000000000000003.tmp"), b"half").unwrap();
+        let before = snapshot(&work.0);
+        let err = match Store::open(&work.0, Config::default()).await {
+            Ok(_) => panic!("{what}: opened"),
+            Err(e) => e,
+        };
+        assert!(expect(&err), "{what}: {err}");
+        assert!(snapshot(&work.0) == before, "{what}: files changed");
+    }
 }

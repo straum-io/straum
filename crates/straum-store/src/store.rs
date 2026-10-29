@@ -448,10 +448,18 @@ pub enum RecoveryAction {
     /// for the index to be rebuilt from the WAL; `bytes` its length. The
     /// rebuilt blocks and pages follow as `TopicIndexRepaired`.
     IndexSegmentDropped { segment: u64, bytes: u64 },
-    /// A checkpoint file the newest checkpoint does not list was deleted:
-    /// an earlier manifest, a `checkpoint-<n>.tmp`, or an object table or
-    /// relocation run of a checkpoint that did not complete.
+    /// A checkpoint file the checkpoint used does not list was deleted: an
+    /// earlier or damaged manifest, a `checkpoint-<n>.tmp`, or an object
+    /// table or relocation run of a checkpoint that did not complete.
     CheckpointFileRemoved { file: String },
+    /// Manifest `checkpoint-<checkpoint>` failed its CRC or did not decode,
+    /// so open used the newest intact older manifest `fallback`, or, with
+    /// `None`, no checkpoint: the WAL holds every frame, and replay rebuilds
+    /// the state from it. The manifest is deleted (`CheckpointFileRemoved`).
+    CheckpointManifestDamaged {
+        checkpoint: u64,
+        fallback: Option<u64>,
+    },
     /// Full index blocks and seek pages of a topic that no index segment
     /// held intact were re-encoded from the WAL and appended.
     TopicIndexRepaired {
@@ -647,7 +655,8 @@ impl Store {
         }
         // After the version check: a directory of another format is
         // `UnsupportedFormat`, not a damaged checkpoint.
-        let (checkpoint, checkpoint_orphans) = open_checkpoint(&dir).await?;
+        let (checkpoint, checkpoint_orphans) =
+            open_checkpoint(&dir, files[0].0, &mut report).await?;
 
         // Only the last frame can be torn: a frame is written only after the
         // previous one is durable, and a WAL file is created only after the
@@ -897,7 +906,8 @@ impl Store {
     /// numbers allocated since the last one, a relocation run of the
     /// covered numbers compaction moved or reclaimed since, each synced,
     /// then the manifest `checkpoint-<n>` through a synced tmp file and a
-    /// rename, then the previous manifest is deleted. Interim rule until
+    /// rename; the previous manifest is deleted only once the new one and
+    /// the new files read back intact. Interim rule until
     /// step 6b: no WAL file is deleted, so open still replays the whole WAL
     /// and checks the checkpoint against it. Call between batches.
     pub async fn checkpoint(&mut self) -> Result<(), StoreError> {
@@ -954,12 +964,49 @@ impl Store {
         write_new_synced(&tmp, m.encode()).await?;
         compio::fs::rename(&tmp, &path).await?;
         sync_dir(&self.dir).await?;
+        // The previous manifest stays until the new one and the files this
+        // checkpoint wrote read back intact: open falls back to it if the
+        // new one is damaged.
+        self.verify_checkpoint(&m, &prev).await?;
         if prev.n > 0 {
             compio::fs::remove_file(checkpoint_path(&self.dir, prev.n)).await?;
             sync_dir(&self.dir).await?;
         }
         self.checkpoint = Some(m);
         self.relocated.clear();
+        Ok(())
+    }
+
+    /// Reads back manifest `m` and the table and run it adds to `prev`'s:
+    /// each must decode to what was written (`CorruptCheckpoint`
+    /// otherwise). The OS may answer from its page cache, so this checks
+    /// what was written, not the medium.
+    async fn verify_checkpoint(&self, m: &Manifest, prev: &Manifest) -> Result<(), StoreError> {
+        let corrupt = |reason| StoreError::CorruptCheckpoint {
+            checkpoint: m.n,
+            reason,
+        };
+        if read_manifest(&self.dir, m.n).await?.as_ref() != Some(m) {
+            return Err(corrupt("the manifest written does not read back"));
+        }
+        for &(first, count) in &m.tables[prev.tables.len()..] {
+            let path = objtab_path(&self.dir, first);
+            if read_table(path, OBJTAB_MAGIC, first, count, OBJECT_ENTRY)
+                .await?
+                .is_none()
+            {
+                return Err(corrupt("the object table written does not read back"));
+            }
+        }
+        for &(run, count) in &m.runs[prev.runs.len()..] {
+            let path = reloc_path(&self.dir, run);
+            if read_table(path, RELOC_MAGIC, run, count, RELOC_ENTRY)
+                .await?
+                .is_none()
+            {
+                return Err(corrupt("the relocation run written does not read back"));
+            }
+        }
         Ok(())
     }
 
@@ -3933,57 +3980,62 @@ fn partition(n: usize, below: impl Fn(usize) -> bool) -> usize {
     lo
 }
 
-/// Reads the newest checkpoint manifest and the tables and runs it lists,
-/// each checked (header, page CRCs, counts, order); returns it with the
-/// checkpoint files it does not list (deleted by `Store::open` after every
-/// check). Nothing is changed here.
-async fn open_checkpoint(
-    dir: &Path,
-) -> Result<(Option<LoadedCheckpoint>, Vec<String>), StoreError> {
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let name = entry?.file_name();
-        if let Some(f) = name.to_str().and_then(parse_checkpoint_file) {
-            found.push((f, name.to_string_lossy().into_owned()));
-        }
-    }
-    let newest = found
-        .iter()
-        .filter_map(|(f, _)| match f {
-            CheckpointFile::Manifest(n) => Some(*n),
-            _ => None,
-        })
-        .max();
-    let Some(n) = newest else {
-        // No checkpoint: every table, run and tmp file is an orphan.
-        return Ok((None, found.into_iter().map(|(_, name)| name).collect()));
+/// The entries of table or run file `path`: its header must be intact,
+/// carry `magic` and name `first`, and its pages intact and holding exactly
+/// `count` entries of `width` bytes. `None` if it is missing or not so.
+async fn read_table(
+    path: PathBuf,
+    magic: [u8; 8],
+    first: u64,
+    count: u64,
+    width: usize,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    let bytes = match compio::fs::read(path).await {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        res => res?,
     };
+    Ok((count > 0)
+        .then_some(())
+        .and_then(|()| codec::decode_table_header(magic, &bytes))
+        .filter(|&f| f == first)
+        .and_then(|_| codec::decode_pages(&bytes[codec::TABLE_HEADER..], width))
+        .filter(|e| e.len() as u64 == count * width as u64))
+}
+
+/// Manifest `checkpoint-<n>` if it is intact (CRC, version) and names
+/// itself `n`.
+async fn read_manifest(dir: &Path, n: u64) -> Result<Option<Manifest>, StoreError> {
+    let bytes = compio::fs::read(checkpoint_path(dir, n)).await?;
+    Ok(Manifest::decode(&bytes).filter(|m| m.n == n))
+}
+
+/// The tables and runs `manifest` lists, each checked (header, page CRCs,
+/// counts, order); `CorruptCheckpoint` if any is missing or damaged.
+async fn load_checkpoint(dir: &Path, manifest: Manifest) -> Result<LoadedCheckpoint, StoreError> {
+    let n = manifest.n;
     let corrupt = |reason| StoreError::CorruptCheckpoint {
         checkpoint: n,
         reason,
     };
-    let manifest = Manifest::decode(&compio::fs::read(checkpoint_path(dir, n)).await?)
-        .filter(|m| m.n == n)
-        .ok_or(corrupt("manifest fails its CRC or does not decode"))?;
-    let read = |path: PathBuf| async move {
-        match compio::fs::read(path).await {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Err(corrupt("a listed table or run is missing"))
-            }
-            res => Ok(res?),
-        }
-    };
     let mut tables = Vec::with_capacity(manifest.tables.len());
     let mut next = 0u64;
     for &(first, count) in &manifest.tables {
-        let bytes = read(objtab_path(dir, first)).await?;
-        let entries = (first == next && count > 0)
-            .then_some(())
-            .and_then(|()| codec::decode_table_header(OBJTAB_MAGIC, &bytes))
-            .filter(|&f| f == first)
-            .and_then(|_| codec::decode_pages(&bytes[codec::TABLE_HEADER..], OBJECT_ENTRY))
-            .filter(|e| e.len() as u64 == count * OBJECT_ENTRY as u64)
-            .ok_or(corrupt("an object table is damaged, short or out of order"))?;
+        let entries = match first == next {
+            true => {
+                read_table(
+                    objtab_path(dir, first),
+                    OBJTAB_MAGIC,
+                    first,
+                    count,
+                    OBJECT_ENTRY,
+                )
+                .await?
+            }
+            false => None,
+        }
+        .ok_or(corrupt(
+            "an object table is missing, damaged, short or out of order",
+        ))?;
         next = first + count;
         tables.push((first, entries));
     }
@@ -3993,45 +4045,116 @@ async fn open_checkpoint(
     let mut runs = Vec::with_capacity(manifest.runs.len());
     let mut last = 0u64;
     for &(run, count) in &manifest.runs {
-        let bytes = read(reloc_path(dir, run)).await?;
-        let entries = (run > last && run <= n && count > 0)
-            .then_some(())
-            .and_then(|()| codec::decode_table_header(RELOC_MAGIC, &bytes))
-            .filter(|&f| f == run)
-            .and_then(|_| codec::decode_pages(&bytes[codec::TABLE_HEADER..], RELOC_ENTRY))
-            .filter(|e| e.len() as u64 == count * RELOC_ENTRY as u64)
-            .filter(|e| {
-                let numbers: Vec<u64> = (0..count as usize)
-                    .filter_map(|i| codec::reloc_entry(e, i).map(|(x, _)| x))
-                    .collect();
-                numbers.windows(2).all(|w| w[0] < w[1])
-                    && numbers.last().is_some_and(|&x| x < manifest.next_object)
-            })
-            .ok_or(corrupt(
-                "a relocation run is damaged, short or out of order",
-            ))?;
+        let entries = match run > last && run <= n {
+            true => read_table(reloc_path(dir, run), RELOC_MAGIC, run, count, RELOC_ENTRY).await?,
+            false => None,
+        }
+        .filter(|e| {
+            let numbers: Vec<u64> = (0..count as usize)
+                .filter_map(|i| codec::reloc_entry(e, i).map(|(x, _)| x))
+                .collect();
+            numbers.windows(2).all(|w| w[0] < w[1])
+                && numbers.last().is_some_and(|&x| x < manifest.next_object)
+        })
+        .ok_or(corrupt(
+            "a relocation run is missing, damaged, short or out of order",
+        ))?;
         last = run;
         runs.push(entries);
     }
     runs.reverse();
+    Ok(LoadedCheckpoint {
+        manifest,
+        tables,
+        runs,
+    })
+}
+
+/// Loads the newest intact checkpoint manifest and the tables and runs it
+/// lists; returns it with the checkpoint files it does not list (deleted by
+/// `Store::open` after every check). Nothing is changed here.
+///
+/// A manifest that fails its CRC or does not decode is passed over for the
+/// next older one (`CheckpointManifestDamaged`, with the manifest used); a
+/// checkpoint keeps the previous manifest until the new one is verified,
+/// so one exists unless the damaged one was the first. Damage in a file
+/// an intact manifest lists is `CorruptCheckpoint`: the fallback is for a
+/// damaged manifest only (an older one lists most of the same files).
+///
+/// `wal_first`: the first frame the WAL files hold. The checkpoint used must
+/// cover every frame before it. With no intact manifest, the checkpoint is
+/// ignored (its files are orphans) only while the WAL holds every frame
+/// (`wal_first == 0`, always so until ADR-0014 step 6b deletes WAL files);
+/// otherwise the state the deleted frames described is lost: an error.
+async fn open_checkpoint(
+    dir: &Path,
+    wal_first: u64,
+    report: &mut RecoveryReport,
+) -> Result<(Option<LoadedCheckpoint>, Vec<String>), StoreError> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        if let Some(f) = name.to_str().and_then(parse_checkpoint_file) {
+            found.push((f, name.to_string_lossy().into_owned()));
+        }
+    }
+    let mut manifests: Vec<u64> = found
+        .iter()
+        .filter_map(|(f, _)| match f {
+            CheckpointFile::Manifest(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    manifests.sort_unstable_by(|a, b| b.cmp(a));
+    let mut damaged = Vec::new();
+    let mut used = None;
+    for &n in &manifests {
+        match read_manifest(dir, n).await? {
+            Some(m) => {
+                used = Some(m);
+                break;
+            }
+            None => damaged.push(n),
+        }
+    }
+    let fallback = used.as_ref().map(|m| m.n);
+    for &checkpoint in &damaged {
+        report
+            .actions
+            .push(RecoveryAction::CheckpointManifestDamaged {
+                checkpoint,
+                fallback,
+            });
+    }
+    let Some(manifest) = used else {
+        if wal_first > 0 && !found.is_empty() {
+            return Err(StoreError::CorruptCheckpoint {
+                checkpoint: damaged.first().copied().unwrap_or(0),
+                reason: "no intact manifest, and the WAL no longer holds every frame",
+            });
+        }
+        // The WAL holds every frame: every checkpoint file is an orphan.
+        return Ok((None, found.into_iter().map(|(_, name)| name).collect()));
+    };
+    if manifest.covered < wal_first {
+        return Err(StoreError::CorruptCheckpoint {
+            checkpoint: manifest.n,
+            reason: "the WAL no longer holds the frames after the checkpoint",
+        });
+    }
+    let loaded = load_checkpoint(dir, manifest).await?;
+    let m = &loaded.manifest;
     let orphans = found
         .into_iter()
         .filter(|(f, _)| match f {
-            CheckpointFile::Manifest(k) => *k != n,
+            CheckpointFile::Manifest(k) => *k != m.n,
             CheckpointFile::Tmp(_) => true,
-            CheckpointFile::Table(first) => !manifest.tables.iter().any(|t| t.0 == *first),
-            CheckpointFile::Run(k) => !manifest.runs.iter().any(|r| r.0 == *k),
+            CheckpointFile::Table(first) => !m.tables.iter().any(|t| t.0 == *first),
+            CheckpointFile::Run(k) => !m.runs.iter().any(|r| r.0 == *k),
         })
         .map(|(_, name)| name)
         .collect();
-    Ok((
-        Some(LoadedCheckpoint {
-            manifest,
-            tables,
-            runs,
-        }),
-        orphans,
-    ))
+    Ok((Some(loaded), orphans))
 }
 
 #[cfg(test)]

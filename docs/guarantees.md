@@ -115,8 +115,11 @@ At startup the store replays the WAL from the beginning
   | `StaleIndexRecordsFenced` | index records of WAL frames that recovery cut were found; a new, empty index segment is created so they stay ignored once new frames reuse those frame numbers |
   | `TopicIndexRepaired` | full index blocks and seek pages of a topic that no index segment holds intact (the index is derived from the WAL and not synced) are re-encoded from the WAL and appended to a new index segment |
   | `WalTmpRemoved` | a `wal-<seq>.log.tmp` of an interrupted WAL file creation is deleted |
+  | `CheckpointFileRemoved` | a checkpoint file the checkpoint in use does not list (an earlier or damaged manifest, a tmp manifest, a table or run of an interrupted checkpoint) is deleted |
+  | `CheckpointManifestDamaged` | the newest checkpoint manifest fails its CRC or does not decode: the newest intact older manifest is used instead; with none, the checkpoint is ignored and the state rebuilt from the WAL, which still holds every frame (no WAL file is deleted yet). The damaged manifest is deleted (`CheckpointFileRemoved`) |
 
-  An empty report means nothing was changed.
+  The last two concern the store's checkpoints (ADR-0014), which the broker
+  does not write yet. An empty report means nothing was changed.
 - **What it refuses.** Damage anywhere else stops the store from opening,
   and no file is changed: a damaged frame followed by a valid one
   or in a WAL file that another follows (`WalCorrupted`), a valid frame
@@ -129,7 +132,11 @@ At startup the store replays the WAL from the beginning
   block of the last frame that does not decompress or fails its checks
   (`CorruptBlock`), an intact index block that disagrees with the WAL
   (`TopicMismatch`) or that the WAL cannot have (`IndexSegmentCorrupt`), a
-  WAL of another format version (`UnsupportedFormat`). The broker then
+  WAL of another format version (`UnsupportedFormat`), a table or run
+  that the checkpoint in use lists missing or damaged
+  (`CorruptCheckpoint`; the fallback is for a damaged manifest only), a
+  checkpoint that disagrees with the WAL
+  (`CheckpointMismatch`). The broker then
   does not start. A damaged header of an index segment that fences stale
   records also fails open with `TopicMismatch`; the operator then starts the
   broker once with the flag `--store-rebuild-index`, which rebuilds the index
