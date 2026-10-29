@@ -387,8 +387,8 @@ fn read_dir_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
 
 /// `base` overlaid with the archive in `data`, opened twice. Invariants:
 /// no panic; an open that fails changes no file; an open that succeeds
-/// changes only what its `RecoveryReport` lists; the reopen after it
-/// reports and changes nothing.
+/// changes only what its `RecoveryReport` lists, the way each action
+/// says; the reopen after it succeeds, reports nothing and changes nothing.
 pub fn store_open(base: &[(String, Vec<u8>)], data: &[u8]) {
     let archive = Archive::parse(data);
     let dir = scratch();
@@ -427,24 +427,30 @@ pub fn check_dir(dir: &Path) {
     if first.is_ok() {
         let second = block_on(open_report(dir));
         let again = snapshot(dir);
+        // F1 (README, "Findings"): dropping the last ParallelSync frame
+        // leaves the frame before it last, with its blocks checked for
+        // presence and bounds only; the reopen checks them in full and drops
+        // that frame too, or fails.
+        let f1 = known("F1")
+            && first.as_ref().is_ok_and(|r| {
+                r.actions
+                    .iter()
+                    .any(|a| matches!(a, RecoveryAction::FrameDropped { .. }))
+            });
         match second {
-            Err(e) => assert_unchanged(
-                &after,
-                &again,
-                &format!("reopen failed ({e}) and changed files"),
-            ),
+            Err(e) => {
+                assert_unchanged(
+                    &after,
+                    &again,
+                    &format!("reopen failed ({e}) and changed files"),
+                );
+                assert!(
+                    f1,
+                    "reopen after a successful open failed: {e}\nfirst open: {first:?}"
+                );
+            }
+            Ok(report) if f1 => check_explained(&after, &again, &report),
             Ok(report) => {
-                // F1 (open, lane A): dropping the last ParallelSync frame
-                // leaves the frame before it last, unchecked until the next
-                // open drops it too.
-                let dropped = |r: &RecoveryReport| {
-                    r.actions
-                        .iter()
-                        .any(|a| matches!(a, RecoveryAction::FrameDropped { .. }))
-                };
-                if known("F1") && first.as_ref().is_ok_and(dropped) && dropped(&report) {
-                    return;
-                }
                 assert!(
                     report.is_empty(),
                     "reopen after a successful open repaired again: {:?}\nfirst open: {:?}",
@@ -486,17 +492,15 @@ fn assert_unchanged(before: &Snapshot, after: &Snapshot, what: &str) {
 /// Every changed path must be one an action of `report` names, changed the
 /// way that action says.
 fn check_explained(before: &Snapshot, after: &Snapshot, report: &RecoveryReport) {
-    let had_wal = before
-        .keys()
-        .any(|k| k.starts_with("wal-") && k.ends_with(".log"));
-    let index_repaired = report.actions.iter().any(|a| {
-        matches!(
-            a,
-            RecoveryAction::TopicIndexRepaired { .. }
-                | RecoveryAction::StaleIndexRecordsFenced { .. }
-                | RecoveryAction::IndexSegmentDropped { .. }
-        )
+    // A new store: no WAL file and none of the files that make a missing WAL
+    // `CorruptWal`.
+    let fresh_dir = !before.keys().any(|k| {
+        ["wal-", "seg-", "idx-"].iter().any(|p| k.starts_with(p)) || is_checkpoint_file(k)
     });
+    let index_repaired = report
+        .actions
+        .iter()
+        .any(|a| matches!(a, RecoveryAction::TopicIndexRepaired { .. }));
     for path in diff(before, after) {
         let (old, new) = (before.get(&path), after.get(&path));
         let ok = report.actions.iter().any(|a| match a {
@@ -524,6 +528,11 @@ fn check_explained(before: &Snapshot, after: &Snapshot, report: &RecoveryReport)
             RecoveryAction::OrphanSegmentRemoved { segment } => {
                 new.is_none() && path == format!("seg-{segment:016x}.dat")
             }
+            RecoveryAction::StaleIndexRecordsFenced { segment, .. } => {
+                old.is_none()
+                    && matches!(new, Some(Some(_)))
+                    && path == format!("idx-{segment:016x}.dat")
+            }
             RecoveryAction::IndexSegmentRemoved { segment, .. }
             | RecoveryAction::IndexSegmentDropped { segment, .. } => {
                 new.is_none() && path == format!("idx-{segment:016x}.dat")
@@ -533,16 +542,17 @@ fn check_explained(before: &Snapshot, after: &Snapshot, report: &RecoveryReport)
                 old.is_none() && new == Some(&None) && path == *quarantine
             }
             RecoveryAction::CheckpointFileQuarantined { file, quarantine } => {
-                (path == *file && new.is_none())
-                    || (path == format!("{quarantine}/{file}")
-                        && old.is_none()
-                        && new.is_some()
-                        && new == before.get(file))
+                let moved = format!("{quarantine}/{file}");
+                let arrived = before.get(&moved).is_none()
+                    && matches!(before.get(file), Some(Some(_)))
+                    && after.get(&moved) == before.get(file);
+                arrived && ((path == *file && new.is_none()) || path == moved)
             }
             _ => false,
         });
         // The index is derived: repairs append to index segments or add new
-        // ones, never rewrite what is there.
+        // ones, never rewrite what is there. Not tied to the reported topic:
+        // the harness does not decode index records.
         let index_ok = index_repaired
             && path.starts_with("idx-")
             && match (old, new) {
@@ -550,8 +560,7 @@ fn check_explained(before: &Snapshot, after: &Snapshot, report: &RecoveryReport)
                 (Some(Some(o)), Some(Some(n))) => n.starts_with(o),
                 _ => false,
             };
-        // A new store: the directory held no WAL file, open created the first.
-        let fresh = !had_wal && path == "wal-0000000000000000.log" && old.is_none();
+        let fresh = fresh_dir && path == "wal-0000000000000000.log" && old.is_none();
         assert!(
             ok || index_ok || fresh,
             "open changed {path} (before: {:?} bytes, after: {:?} bytes) without reporting it: {:?}",

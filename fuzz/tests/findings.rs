@@ -1,4 +1,4 @@
-//! Findings handed to the store's owners, each built through the store's
+//! Open findings (README, "Findings"), each built through the store's
 //! API. Ignored while open; the reproducers under `regressions/open/` are
 //! the fuzzer's own inputs for the same findings.
 
@@ -10,7 +10,7 @@ use straum_store::{Message, Store, WriteMode};
 /// checks frame 1's block for presence and bounds only; the reopen then
 /// drops frame 1 as never acknowledged, though frame 2 followed it.
 #[test]
-#[ignore = "open finding F1, handed to lane A"]
+#[ignore = "open finding F1 (fuzz/README.md, Findings)"]
 fn f1_an_acknowledged_parallel_sync_frame_is_dropped_on_the_second_open() {
     let dir = scratch().with_extension("f1");
     let _ = std::fs::remove_dir_all(&dir);

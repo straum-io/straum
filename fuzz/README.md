@@ -50,3 +50,27 @@ Protocol findings are regression tests in `crates/straum-proto/tests`.
 
 To save a crash: `xxd -p -c 64 artifacts/<target>/crash-<hash> >
 regressions/open/<target>/<name>.hex`.
+
+## Findings
+
+Open, reported to the store's owners:
+
+- **F1** (`store_wal`): an acknowledged ParallelSync frame is dropped on
+  the second open. The first open drops the last frame, whose block is
+  damaged (`FrameDropped`); the frame before it was followed by that frame,
+  so it was acknowledged, but its blocks are checked for presence and
+  bounds only. It is now last, and the reopen checks it in full and drops
+  it as never acknowledged. `tests/findings.rs` builds it through the API;
+  `regressions/open/store_wal/` holds the fuzzer's input.
+- **F2** (seen in `store_checkpoint`): the store's file name parsers use
+  `u64::from_str_radix`, which takes a `+` sign and upper-case hex, so
+  `checkpoint-+000000000000002` is read as manifest 2 and the path rebuilt
+  from the number (`checkpoint-0000000000000002`) names another file: open
+  fails with an I/O `NotFound`, no file changed. On a case-insensitive file
+  system, an upper-case manifest name is moved under that name while the
+  report gives the lower-case one. Archives therefore hold lower-case names
+  only.
+
+Fixed: `straum_proto::json::unhex` took a leading `+`
+(`regressions/proto_json/`, and `unhex_takes_hex_digits_only` in
+`crates/straum-proto/tests/codec.rs`).

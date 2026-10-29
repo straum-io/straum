@@ -63,7 +63,7 @@ fn regressions_hold_the_invariants() {
 /// Findings handed over and not yet fixed; move a file up to
 /// `regressions/<target>/` once its fix lands.
 #[test]
-#[ignore = "open findings, handed to lane A"]
+#[ignore = "open findings (fuzz/README.md, Findings)"]
 fn open_findings_hold_the_invariants() {
     replay_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("regressions/open"));
 }
