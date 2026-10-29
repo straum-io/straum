@@ -1533,7 +1533,8 @@ impl Store {
     ///
     /// The mark phase marks one topic per step: every object number its
     /// live entries point at, read from its index (`TopicIndexCorrupt` for
-    /// a damaged full block, `UnknownObjectNumber` for a number the object
+    /// a damaged full block or a live entry its index cannot return,
+    /// `UnknownObjectNumber` for a number the object
     /// index does not hold; either ends the compaction, nothing written,
     /// and the store stays usable). Numbers at or above the next object
     /// number when the mark phase began are live, and so is every number a
