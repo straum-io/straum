@@ -787,8 +787,7 @@ impl Store {
         let codecs = codecs_for(&replay.dicts)?;
         let dictionary = replay.dicts.last().map(|d| d.len());
 
-        let segments = open_segments(&dir, &mut replay, &mut report).await?;
-        let (index, topics) = open_index(&dir, &replay, next_frame, &config, &mut report).await?;
+        // Before any file is changed: a mismatch is corruption.
         check_refcounts(
             &replay.objects,
             replay.topics.values().flat_map(|t| {
@@ -796,6 +795,8 @@ impl Store {
                 t.entries.iter().skip(first_live).map(|(number, _)| number)
             }),
         )?;
+        let segments = open_segments(&dir, &mut replay, &mut report).await?;
+        let (index, topics) = open_index(&dir, &replay, next_frame, &config, &mut report).await?;
 
         let files = OpenFiles::new(&dir, config.data_open_files);
         Ok(Self {

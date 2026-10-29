@@ -565,7 +565,9 @@ one start). Open then deletes every index segment before reading any
 topic's blocks and seek pages from the WAL into a new segment
 (`TopicIndexRepaired`). The WAL, data segments and every other file are
 unchanged; the rebuild is safe whenever the WAL itself opens, since the
-index holds nothing the WAL does not. Without the setting, open never
+index holds nothing the WAL does not, and every WAL and refcount check
+runs before the first deletion. If the rebuilding open is interrupted
+(some segments deleted, others not), open again with the setting. Without the setting, open never
 deletes an intact index segment.
 
 ## Write order (one batch)
