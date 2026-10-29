@@ -59,7 +59,9 @@ highest in the WAL plus one.
 One dictionary per store, trained once. When the raw bytes of new objects
 stored in blocks without a dictionary reach the threshold in the WAL file
 header (`Config::dict_train_bytes` when the WAL was created; default 1 MiB;
-0 disables training), the next non-empty batch trains a
+0 disables training), the next non-empty batch whose frame still fits
+`Config::max_frame_bytes` with the PutDict record (its upper bound,
+64 KiB + 21 bytes) added trains a
 dictionary of at most 64 KiB on the objects of those blocks, in block order,
 at most 10 MiB of samples. The batch's frame carries it in a PutDict record
 before its block, and every later block, compaction's included, uses it.
@@ -367,7 +369,9 @@ only the last frame of the last file can be unacknowledged.
 read in sequence-number order; the first must be named 0, and each later
 one must be named by the frame after the previous file's last; otherwise
 `CorruptWal { file, offset: 0, .. }` (a missing, extra or renamed file),
-and no file is changed. In each file reading starts at byte 24. A frame
+and no file is changed. A directory with no WAL file but data or index
+segments is `CorruptWal` as well (a new WAL would make the segments
+orphans); with neither, open creates `wal-0000000000000000.log`. In each file reading starts at byte 24. A frame
 is bad if its header or body is short or its CRC does not match.
 
 1. A bad frame in the last WAL file with no frame with a valid CRC readable
@@ -462,7 +466,7 @@ pages. A 24-byte header, then records.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 49 44 58 00` (`"STRMIDX\0"`) |
-| 8 | 4 | `version` u32 = 12 (the WAL version) |
+| 8 | 4 | `version` u32 = 13 (the WAL version) |
 | 12 | 8 | `created_at` u64: the store's next WAL frame number when the segment was created |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 

@@ -854,9 +854,15 @@ impl Store {
             }
             u32::try_from(m.payload.len()).map_err(|_| StoreError::ObjectTooLarge)?;
         }
-        let train = !batch.is_empty() && self.should_train();
         let frame = self.batch_frame_bytes(batch);
         self.check_frame(frame)?;
+        // The dictionary record goes into the batch's frame only if it fits
+        // there: training waits for a batch small enough, so the frame
+        // limit never refuses a batch because training is due.
+        let dict = RECORD_PUT_DICT_BASE + block::DICT_SIZE;
+        let train = !batch.is_empty()
+            && self.should_train()
+            && frame + dict <= self.config.max_frame_bytes as usize;
         let res = self.put_batch_inner(batch, now_ms, train).await;
         self.poison_on_err(res)
     }
@@ -1106,9 +1112,10 @@ impl Store {
         Ok(seqs)
     }
 
-    /// Whether the next non-empty `put_batch` trains the dictionary (the
-    /// raw bytes stored without one reached `Config::dict_train_bytes` and
-    /// training has not run). For tests and fault injection.
+    /// Whether training is due: the raw bytes stored without a dictionary
+    /// reached `Config::dict_train_bytes` and training has not run. The
+    /// next non-empty `put_batch` whose frame leaves room for the
+    /// dictionary record trains. For tests and fault injection.
     pub fn trains_next_batch(&self) -> bool {
         self.should_train()
     }
@@ -1637,20 +1644,15 @@ impl Store {
     /// The upper bound of the WAL frame `put_batch` checks against
     /// `Config::max_frame_bytes` before any I/O: every object counted as
     /// new and as a block of its own (inline up to the threshold and zstd's
-    /// bound for its raw bytes), plus the dictionary if the batch trains
-    /// it. Additive over messages: the bound of two batches together is the
+    /// bound for its raw bytes). A due dictionary is added only to a batch
+    /// whose frame then still fits the limit, so it is not counted here.
+    /// Additive over messages: the bound of two batches together is the
     /// sum of their bounds minus the bound of an empty batch, so a caller
     /// can grow a batch message by message. A batch over the limit fails
     /// with `FrameTooLarge`.
     pub fn batch_frame_bytes(&self, batch: &[Message<'_>]) -> usize {
         let inline = self.config.write_mode.inline_threshold();
-        let dict = if self.should_train() {
-            RECORD_PUT_DICT_BASE + block::DICT_SIZE
-        } else {
-            0
-        };
         FRAME_HEADER
-            + dict
             + batch
                 .iter()
                 .map(|m| {
@@ -3136,6 +3138,7 @@ async fn read_wal_files(
         return Err(StoreError::UnsupportedFormat);
     }
     let (mut ids, mut tmps) = (Vec::new(), Vec::new());
+    let mut segments = false;
     for entry in std::fs::read_dir(dir)? {
         let name = entry?.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -3143,7 +3146,17 @@ async fn read_wal_files(
             ids.push(id);
         } else if name.strip_suffix(".tmp").and_then(parse_wal_name).is_some() {
             tmps.push(name.to_owned());
+        } else if parse_segment_name(name).is_some() || parse_index_name(name).is_some() {
+            segments = true;
         }
+    }
+    if ids.is_empty() && segments {
+        // A new store would delete the segments as orphans: refuse.
+        return Err(StoreError::CorruptWal {
+            file: 0,
+            offset: 0,
+            reason: "no WAL file, but data or index segments exist",
+        });
     }
     for tmp in &tmps {
         compio::fs::remove_file(dir.join(tmp)).await?;

@@ -420,3 +420,38 @@ async fn reads_work_without_a_block_cache() {
         );
     }
 }
+
+/// A frame limit below the dictionary record never refuses a batch because
+/// training is due: training waits for a batch that leaves room for it.
+#[compio::test]
+async fn training_waits_for_a_batch_with_room_for_the_dictionary() {
+    let dir = TempDir::new("blocks-train-room");
+    let mut rng = Rng(11);
+    let mut payload = || -> Vec<u8> { (0..1000).map(|_| (rng.next() % 16) as u8).collect() };
+    let small = Config {
+        dict_train_bytes: 4096,
+        max_frame_bytes: 32 << 10,
+        ..Config::default()
+    };
+    let mut store = Store::open(&dir.0, small).await.unwrap();
+    for i in 0..20u64 {
+        let p = payload();
+        let m = msg(b"t", &p);
+        store.put_batch(&[m], i).await.unwrap();
+    }
+    assert!(store.trains_next_batch());
+    assert_eq!(store.dictionary_bytes(), None, "no room in a 32 KiB frame");
+    drop(store);
+    // With room, the next batch trains; everything reads back.
+    let roomy = Config {
+        max_frame_bytes: 1 << 20,
+        ..small
+    };
+    let mut store = Store::open(&dir.0, roomy).await.unwrap();
+    let p = payload();
+    store.put_batch(&[msg(b"t", &p)], 20).await.unwrap();
+    assert!(store.dictionary_bytes().is_some());
+    assert!(!store.trains_next_batch());
+    assert_eq!(store.read(b"t", 20).await.unwrap(), Some(p));
+    assert!(store.read(b"t", 0).await.unwrap().is_some());
+}

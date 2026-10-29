@@ -229,9 +229,14 @@ async fn a_missing_or_foreign_file_is_an_error_and_changes_nothing() {
     let files = wal_files(&dir.0);
     let name = |k: usize| files[k].1.file_name().unwrap().to_owned();
     type Damage<'a> = &'a dyn Fn(&Path);
-    let cases: [(&str, Damage); 5] = [
+    let cases: [(&str, Damage); 6] = [
         ("middle file missing", &|d| {
             std::fs::remove_file(d.join(name(1))).unwrap()
+        }),
+        ("every WAL file missing, segments present", &|d| {
+            for (_, path) in wal_files(d) {
+                std::fs::remove_file(path).unwrap();
+            }
         }),
         ("first file missing", &|d| {
             std::fs::remove_file(d.join(name(0))).unwrap()

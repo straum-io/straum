@@ -103,7 +103,7 @@ At startup the store replays the WAL from the beginning
 
   | Report entry | Change |
   |---|---|
-  | `TornTailTruncated` | a last WAL frame that is short or fails its CRC, with no valid frame after it, is cut |
+  | `TornTailTruncated` | the last frame of the last WAL file, short or failing its CRC with no valid frame after it, is cut |
   | `FrameDropped` | a complete last ParallelSync frame whose bodies are missing or wrong is cut |
   | `OrphanSegmentRemoved` | a data segment the WAL does not refer to is deleted |
   | `IndexSegmentRemoved` | an index segment without an intact header is deleted; the index records it held are rewritten from the WAL (`TopicIndexRepaired`) |
@@ -191,7 +191,7 @@ At startup the store replays the WAL from the beginning
 - **Memory grows with stored data.** The store keeps, per stored body,
   entries in memory (the object index), and nothing bounds them: the
   broker does not refuse writes as memory grows. Topic entries are read
-  from disk; a live message with a key or headers keeps 24 bytes in
+  from disk; a live message with a key or headers keeps 32 bytes in
   memory. Measured with 100-byte bodies (store alone, batches of 512,
   10 million unique messages, macOS) before topic entries moved to disk:
   the object index took about 178 bytes allocated per stored body with
