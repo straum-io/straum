@@ -998,7 +998,8 @@ holder of an id.
 | `producer_window` | `u32` | the broker's `producer_window`: the most requests a client may keep in flight per partition and still get each original `ProduceOk` back |
 
 - `producer_id` 0: a new id with epoch 0, bound to the requesting
-  principal (with `auth = none`, to no principal).
+  principal. With `auth = none` ids are bound to no principal, and
+  `max_producers_per_principal` caps all of them together.
 - An id this principal holds, with its current epoch: the epoch becomes
   epoch + 1 and the id's sequence state on every partition is dropped;
   requests with the old epoch get `ProducerFenced` from then on. At epoch
@@ -1098,7 +1099,7 @@ timestamps until `range_complete` is 1.
 | `start_seq` | `u64` | |
 | `next_seq` | `u64` | |
 | `messages` | `array<FetchedMessage>` | `FetchedMessage` is an item |
-| `range_complete` | `u8` | 1: the message after the last one returned (after the seek point, if none is returned) exists and has a timestamp ≥ `to_timestamp_ms`, so no later message is in the range. 0 otherwise, and always with `to_timestamp_ms` = 0 |
+| `range_complete` | `u8` | 1: the message after the last one returned (the message at the seek point, if none is returned) exists and has a timestamp ≥ `to_timestamp_ms`, so no later message is in the range. 0 otherwise, and always with `to_timestamp_ms` = 0 |
 
 - The broker waits up to `max_wait_ms` as in version 0 when the response
   would hold no message and `range_complete` would be 0; with
@@ -1183,7 +1184,8 @@ after `UnknownProducer`, a retry may store its messages twice.
 
 ### 10.19 Consumer groups (not yet specified)
 
-Placeholder. Committed offsets (`OffsetCommit`, `OffsetFetch`) and the
-listing and description of groups are to be specified here, with their
-message types, before version 1 is frozen; the decision is pending.
-Until then version 1 defines no consumer-group request.
+Placeholder. Whether version 1 includes consumer groups (committed
+offsets with `OffsetCommit` and `OffsetFetch`, listing and describing
+groups) is pending a decision. If it does, they are specified here before
+version 1 is frozen. Until then version 1 defines no consumer-group
+request, and section 8 holds: the broker stores no offsets.
