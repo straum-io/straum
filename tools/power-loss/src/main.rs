@@ -10,6 +10,7 @@
 //! store-verify  --dir D --mode M --logs DIR
 //! broker-produce --addr A --base N --seed N
 //! broker-verify --broker BIN --data-dir D --mode M --logs DIR --stderr FILE
+//! free-addr     (prints `RESULT ok 127.0.0.1:<free port>`)
 //! ```
 //!
 //! Writers print one line per event to stdout, which the driver keeps
@@ -21,7 +22,7 @@
 //! `RESULT` line.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
@@ -71,7 +72,7 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(cmd) = args.next() else {
         eprintln!(
-            "usage: straum-power-loss <plan|store-write|store-verify|broker-produce|broker-verify> --key value ..."
+            "usage: straum-power-loss <plan|store-write|store-verify|broker-produce|broker-verify|free-addr> --key value ..."
         );
         return ExitCode::from(2);
     };
@@ -86,6 +87,7 @@ fn main() -> ExitCode {
         "store-verify" => store_verify(&opts),
         "broker-produce" => broker_produce(&opts),
         "broker-verify" => broker_verify(&opts),
+        "free-addr" => straum_conformance::broker::free_addr(),
         _ => Err(format!("unknown command {cmd}")),
     };
     match res {
@@ -696,6 +698,8 @@ fn broker_produce(opts: &HashMap<&str, &str>) -> Result<String, String> {
     // A retried Produce may be stored twice (guarantees.md §1): no retries.
     config.max_attempts = 1;
     config.request_timeout = Some(Duration::from_secs(30));
+    straum_client::wait_ready(addr, Duration::from_secs(120), || true)
+        .map_err(|e| format!("broker at {addr} not ready: {e}"))?;
     let mut c = Client::connect(config.clone()).map_err(|e| e.to_string())?;
     match c.create_topic(BROKER_TOPIC, 1, 0) {
         Ok(()) => println!("TOPIC END"),
@@ -806,11 +810,14 @@ fn broker_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
         };
     }
     let before = snapshot(&store_dir)?;
+    let stderr_path = opt(opts, "stderr")?;
+    let stderr = std::fs::File::create(stderr_path).map_err(|e| format!("{stderr_path}: {e}"))?;
+    let addr = straum_conformance::broker::free_addr()?;
     let mut child = Command::new(opt(opts, "broker")?)
         .args(["--data-dir", &data.to_string_lossy()])
         .args([
             "--listen",
-            "127.0.0.1:0",
+            &addr,
             "--cluster-id",
             "powerloss",
             "--node-id",
@@ -823,46 +830,49 @@ fn broker_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
             "65536",
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(stderr)
         .spawn()
         .map_err(|e| format!("start broker: {e}"))?;
-    let res = broker_check(&mut child, opt(opts, "stderr")?, &log);
+    let res = straum_client::wait_ready(&addr, Duration::from_secs(120), || {
+        matches!(child.try_wait(), Ok(None))
+    })
+    .map_err(|e| format!("broker not ready (recovery refused?): {e}"))
+    .and_then(|ok| match ok.cluster_id.as_str() {
+        "powerloss" => broker_check(&addr, &log),
+        other => Err(format!(
+            "{addr} answered for cluster {other:?}, not this broker"
+        )),
+    });
     let _ = child.kill();
     let _ = child.wait();
-    let (actions, summary) = res?;
+    let summary = res?;
+    // The store's recovery report, printed by the broker before it listens.
+    let actions: Vec<String> = std::fs::read_to_string(stderr_path)
+        .map_err(|e| format!("{stderr_path}: {e}"))?
+        .lines()
+        .filter_map(|l| l.strip_prefix("straum-server: recovery: "))
+        .map(str::to_owned)
+        .collect();
+    for a in &actions {
+        println!("RECOVERY {a}");
+    }
     check_report(&actions, mode)?;
     let after = snapshot(&store_dir)?;
     check_changes(&before, &after, &actions)?;
-    Ok(summary)
+    Ok(format!(
+        "{summary} actions={} [{}]",
+        actions.len(),
+        actions
+            .iter()
+            .map(|a| action_name(a))
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
 }
 
-fn broker_check(
-    child: &mut std::process::Child,
-    stderr_path: &str,
-    log: &BrokerLog,
-) -> Result<(Vec<String>, String), String> {
-    let mut out = std::fs::File::create(stderr_path).map_err(|e| format!("{stderr_path}: {e}"))?;
-    let mut lines = BufReader::new(child.stderr.take().ok_or("no stderr")?).lines();
-    let mut actions = Vec::new();
-    let addr = loop {
-        let line = lines
-            .next()
-            .ok_or("broker exited before listening (recovery refused?)")?
-            .map_err(|e| e.to_string())?;
-        let _ = writeln!(out, "{line}");
-        if let Some(a) = line.strip_prefix("straum-server: recovery: ") {
-            println!("RECOVERY {a}");
-            actions.push(a.to_owned());
-        }
-        if let Some(a) = line.strip_prefix("straum-server: listening on ") {
-            break a.to_owned();
-        }
-    };
-    std::thread::spawn(move || {
-        for line in lines.map_while(Result::ok) {
-            let _ = writeln!(out, "{line}");
-        }
-    });
+/// Fetches the topic from the broker at `addr` and checks every
+/// acknowledged message.
+fn broker_check(addr: &str, log: &BrokerLog) -> Result<String, String> {
     let mut config = ClientConfig::new(addr);
     config.max_attempts = 1;
     let mut c = Client::connect(config).map_err(|e| format!("connect: {e}"))?;
@@ -874,7 +884,7 @@ fn broker_check(
         let f = match c.fetch(BROKER_TOPIC, 0, seq, 4 << 20, 0) {
             Ok(f) => f,
             Err(e) if !log.topic_acked && log.acked.is_empty() => {
-                return Ok((actions, format!("acked=0 (topic never acknowledged: {e})")));
+                return Ok(format!("acked=0 (topic never acknowledged: {e})"));
             }
             Err(e) => return Err(format!("fetch from seq {seq}: {e}")),
         };
@@ -925,17 +935,10 @@ fn broker_check(
             log.acked.len() - seen
         ));
     }
-    let summary = format!(
-        "acked={} unacked_present={unacked_present} actions={} [{}]",
-        log.acked.len(),
-        actions.len(),
-        actions
-            .iter()
-            .map(|a| action_name(a))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    Ok((actions, summary))
+    Ok(format!(
+        "acked={} unacked_present={unacked_present}",
+        log.acked.len()
+    ))
 }
 
 fn hex(b: &[u8]) -> String {

@@ -52,10 +52,12 @@ authentication exists.
   stored, and recorded through the store.
 - **Startup**: identity check, store open, the store's recovery report on
   stderr once, `straum-server: compio driver <driver>`, then
-  `straum-server: listening on <address>`. **SIGTERM or SIGINT**: no new
-  connections or requests, queued groups committed, waiting fetches
-  answered, answers written (up to `shutdown_timeout_ms`), store closed.
-  Nothing is logged per message.
+  `straum-server: listening on <address>`. The broker is ready when it
+  answers Hello; clients and runners detect that through the protocol, not
+  from these lines (conformance/README.md, Readiness). **SIGTERM or
+  SIGINT**: no new connections or requests, queued groups committed,
+  waiting fetches answered, answers written (up to `shutdown_timeout_ms`),
+  store closed. Nothing is logged per message.
 - A failed store write makes every later write answer `StorageError` until
   the broker is restarted (the store refuses writes after an I/O error).
 
