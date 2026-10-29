@@ -32,6 +32,7 @@ enum Op {
         age: u64,
     },
     Compact,
+    Checkpoint,
     Restart,
 }
 
@@ -42,6 +43,7 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(Op::Put),
         2 => (0..TOPICS.len(), 0..6u64).prop_map(|(topic, age)| Op::Release { topic, age }),
         1 => Just(Op::Compact),
+        1 => Just(Op::Checkpoint),
         1 => Just(Op::Restart),
     ]
 }
@@ -215,6 +217,7 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
                         .indexed
                         .retain(|p, inline| *inline || live.contains_key(p));
                 }
+                Op::Checkpoint => store.checkpoint().await.unwrap(),
                 Op::Restart => {
                     drop(store);
                     store = Store::open(&dir.0, config).await.unwrap();

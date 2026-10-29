@@ -18,7 +18,7 @@ impl ObjectId {
 /// start of every WAL file.
 pub const WAL_FILE_HEADER: usize = 24;
 pub const WAL_MAGIC: [u8; 8] = *b"STRMWAL\0";
-pub const WAL_VERSION: u32 = 14;
+pub const WAL_VERSION: u32 = 15;
 /// Header bytes covered by the header CRC (everything before it).
 const WAL_HEADER_CRC_AT: usize = 20;
 /// `len u32 | seq u64 | count u32 | mode u8 | crc32c u32`.
@@ -1189,6 +1189,196 @@ pub fn seek_page_shape(body: &[u8]) -> Option<(u8, usize)> {
 pub fn seek_page_loc(body: &[u8], i: usize) -> Option<IndexLoc> {
     let at = 1 + i.checked_mul(INDEX_LOC)?;
     body.get(at..at + INDEX_LOC).map(IndexLoc::at)
+}
+
+/// `magic [8] | version u32 | first u64 | crc32c u32` at the start of an
+/// object table (`first`: its first object number) or a relocation run
+/// (`first`: the number of the checkpoint that wrote it).
+pub const TABLE_HEADER: usize = 24;
+pub const OBJTAB_MAGIC: [u8; 8] = *b"STRMOBJ\0";
+pub const RELOC_MAGIC: [u8; 8] = *b"STRMREL\0";
+pub const CHECKPOINT_MAGIC: [u8; 8] = *b"STRMCKP\0";
+
+/// Pages of a table or run: each at most 4 KiB, the entries it holds and a
+/// CRC32C of its page number (u64) and those entries.
+pub const PAGE: usize = 4096;
+
+/// An object table entry: `id [32] | block u64 | index u32`; a reclaimed
+/// number has a zero id and `block` and `index` all ones.
+pub const OBJECT_ENTRY: usize = 44;
+/// A relocation run entry: `number u64 | block u64 | index u32`, with
+/// `block` and `index` all ones for a number reclaimed.
+pub const RELOC_ENTRY: usize = 20;
+
+/// Where an object number's object lies, or `None` if it was reclaimed.
+pub type Placement = Option<(ObjectId, u64, u32)>;
+
+pub fn table_header(magic: [u8; 8], first: u64) -> [u8; TABLE_HEADER] {
+    let mut h = [0; TABLE_HEADER];
+    h[..8].copy_from_slice(&magic);
+    h[8..12].copy_from_slice(&WAL_VERSION.to_le_bytes());
+    h[12..20].copy_from_slice(&first.to_le_bytes());
+    let crc = crc32c::crc32c(&h[..20]);
+    h[20..].copy_from_slice(&crc.to_le_bytes());
+    h
+}
+
+/// `first` of an intact header of this version with `magic`.
+pub fn decode_table_header(magic: [u8; 8], buf: &[u8]) -> Option<u64> {
+    let h: &[u8; TABLE_HEADER] = buf.get(..TABLE_HEADER)?.try_into().ok()?;
+    let first = u64_at(h, 12);
+    (*h == table_header(magic, first)).then_some(first)
+}
+
+fn page_crc(page: u64, entries: &[u8]) -> u32 {
+    crc32c::crc32c_append(crc32c::crc32c(&page.to_le_bytes()), entries)
+}
+
+/// Appends `entries` (concatenated, `width` bytes each) as pages.
+pub fn put_pages(out: &mut Vec<u8>, entries: &[u8], width: usize) {
+    let per_page = (PAGE - 4) / width * width;
+    for (page, chunk) in (0u64..).zip(entries.chunks(per_page)) {
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(&page_crc(page, chunk).to_le_bytes());
+    }
+}
+
+/// The entries of `put_pages`'s output; `None` if a page is short, holds
+/// a partial entry or fails its CRC.
+pub fn decode_pages(buf: &[u8], width: usize) -> Option<Vec<u8>> {
+    let page_len = (PAGE - 4) / width * width + 4;
+    let mut out = Vec::with_capacity(buf.len());
+    for (page, chunk) in (0u64..).zip(buf.chunks(page_len)) {
+        let (entries, crc) = chunk.split_at_checked(chunk.len().checked_sub(4)?)?;
+        if entries.is_empty()
+            || entries.len() % width != 0
+            || page_crc(page, entries) != u32_at(crc, 0)
+        {
+            return None;
+        }
+        out.extend_from_slice(entries);
+    }
+    Some(out)
+}
+
+pub fn put_object_entry(out: &mut Vec<u8>, placement: Placement) {
+    let (id, block, index) = placement.unwrap_or((ObjectId([0; 32]), u64::MAX, u32::MAX));
+    out.extend_from_slice(&id.0);
+    out.extend_from_slice(&block.to_le_bytes());
+    out.extend_from_slice(&index.to_le_bytes());
+}
+
+/// Entry `i` of an object table's entries.
+pub fn object_entry(entries: &[u8], i: usize) -> Option<Placement> {
+    let e = entries
+        .get(i.checked_mul(OBJECT_ENTRY)?..)?
+        .get(..OBJECT_ENTRY)?;
+    Some(placement(id_at(e, 0), u64_at(e, 32), u32_at(e, 40)))
+}
+
+fn placement(id: ObjectId, block: u64, index: u32) -> Placement {
+    (block != u64::MAX || index != u32::MAX).then_some((id, block, index))
+}
+
+pub fn put_reloc_entry(out: &mut Vec<u8>, number: u64, at: Option<(u64, u32)>) {
+    let (block, index) = at.unwrap_or((u64::MAX, u32::MAX));
+    out.extend_from_slice(&number.to_le_bytes());
+    out.extend_from_slice(&block.to_le_bytes());
+    out.extend_from_slice(&index.to_le_bytes());
+}
+
+/// Entry `i` of a relocation run: its number and new `(block, index)`,
+/// `None` if reclaimed.
+pub fn reloc_entry(entries: &[u8], i: usize) -> Option<(u64, Option<(u64, u32)>)> {
+    let e = entries
+        .get(i.checked_mul(RELOC_ENTRY)?..)?
+        .get(..RELOC_ENTRY)?;
+    let (block, index) = (u64_at(e, 8), u32_at(e, 16));
+    Some((
+        u64_at(e, 0),
+        (block != u64::MAX || index != u32::MAX).then_some((block, index)),
+    ))
+}
+
+/// A checkpoint manifest `checkpoint-<n>`: `magic [8] | version u32 | n u64
+/// | covered u64 | next_object u64 | next_block u64 | next_topic u64 |
+/// tables u32 | (first u64, count u64) per table | runs u32 | (checkpoint
+/// u64, count u64) per run | crc32c u32` over everything before it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Manifest {
+    /// The checkpoint's number, from 1.
+    pub n: u64,
+    /// The WAL frames it covers: every frame below this number.
+    pub covered: u64,
+    pub next_object: u64,
+    pub next_block: u64,
+    pub next_topic: u64,
+    /// Object tables `(first number, count)`, together covering numbers
+    /// `0..next_object` in order.
+    pub tables: Vec<(u64, u64)>,
+    /// Relocation runs `(checkpoint that wrote it, entries)`, oldest first.
+    pub runs: Vec<(u64, u64)>,
+}
+
+impl Manifest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&CHECKPOINT_MAGIC);
+        out.extend_from_slice(&WAL_VERSION.to_le_bytes());
+        for v in [
+            self.n,
+            self.covered,
+            self.next_object,
+            self.next_block,
+            self.next_topic,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for list in [&self.tables, &self.runs] {
+            out.extend_from_slice(&(list.len() as u32).to_le_bytes());
+            for (a, b) in list {
+                out.extend_from_slice(&a.to_le_bytes());
+                out.extend_from_slice(&b.to_le_bytes());
+            }
+        }
+        let crc = crc32c::crc32c(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// `None` unless `buf` is exactly an intact manifest of this version.
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        let (body, crc) = buf.split_at_checked(buf.len().checked_sub(4)?)?;
+        if crc32c::crc32c(body) != u32_at(crc, 0) {
+            return None;
+        }
+        let mut r = Reader(body);
+        if r.take(8).ok()? != CHECKPOINT_MAGIC || r.u32().ok()? != WAL_VERSION {
+            return None;
+        }
+        let mut u64s = [0u64; 5];
+        for v in &mut u64s {
+            *v = u64_at(r.take(8).ok()?, 0);
+        }
+        let mut lists = [Vec::new(), Vec::new()];
+        for list in &mut lists {
+            for _ in 0..r.u32().ok()? {
+                let pair = r.take(16).ok()?;
+                list.push((u64_at(pair, 0), u64_at(pair, 8)));
+            }
+        }
+        let [tables, runs] = lists;
+        let [n, covered, next_object, next_block, next_topic] = u64s;
+        r.0.is_empty().then_some(Self {
+            n,
+            covered,
+            next_object,
+            next_block,
+            next_topic,
+            tables,
+            runs,
+        })
+    }
 }
 
 // Callers pass slices whose length was checked; out-of-range reads cannot occur.

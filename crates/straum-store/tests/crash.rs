@@ -157,6 +157,9 @@ fn crash_child() {
             if round % 2 == 1 {
                 store.release_before(SCRATCH, now).await.unwrap();
             }
+            if round % 5 == 4 {
+                store.checkpoint().await.unwrap();
+            }
             if round % 3 == 2 {
                 let stats = store.compact().await.unwrap();
                 writeln!(out, "COMPACTED {} END", stats.segments_rewritten).unwrap();

@@ -89,6 +89,19 @@ pub enum StoreError {
         offset: u64,
         reason: &'static str,
     },
+    /// The newest checkpoint manifest, or a table or run it lists, is
+    /// missing, short, fails a CRC or is inconsistent (docs/format.md,
+    /// "Checkpoint"). No file is changed.
+    #[error("checkpoint {checkpoint}: {reason}")]
+    CorruptCheckpoint {
+        checkpoint: u64,
+        reason: &'static str,
+    },
+    /// A checkpoint's object table or relocation run gives object `number`
+    /// another place (or none) than the WAL has at the frames the
+    /// checkpoint covers. No file is changed.
+    #[error("checkpoint {checkpoint} disagrees with the WAL on object number {number}")]
+    CheckpointMismatch { checkpoint: u64, number: u64 },
     #[error("refcount of {id:?}: WAL replay says {wal}, topic indexes say {topics}")]
     RefcountMismatch { id: ObjectId, wal: u64, topics: u64 },
 }

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,7 @@ use crate::codec::{
     RECORD_PUT_INLINE_BLOCK_BASE, RECORD_PUT_OBJECT, RECORD_PUT_TOPIC_BASE, RECORD_RELEASE, Record,
     Rewritten, WAL_FILE_HEADER,
 };
+use crate::codec::{Manifest, OBJECT_ENTRY, OBJTAB_MAGIC, Placement, RELOC_ENTRY, RELOC_MAGIC};
 
 /// The single WAL file of formats before 13: refused, never read.
 const LEGACY_WAL_FILE: &str = "wal.log";
@@ -447,6 +448,10 @@ pub enum RecoveryAction {
     /// for the index to be rebuilt from the WAL; `bytes` its length. The
     /// rebuilt blocks and pages follow as `TopicIndexRepaired`.
     IndexSegmentDropped { segment: u64, bytes: u64 },
+    /// A checkpoint file the newest checkpoint does not list was deleted:
+    /// an earlier manifest, a `checkpoint-<n>.tmp`, or an object table or
+    /// relocation run of a checkpoint that did not complete.
+    CheckpointFileRemoved { file: String },
     /// Full index blocks and seek pages of a topic that no index segment
     /// held intact were re-encoded from the WAL and appended.
     TopicIndexRepaired {
@@ -585,6 +590,11 @@ pub struct Store {
     timing: CommitTiming,
     recovery: RecoveryReport,
     poisoned: bool,
+    /// The last checkpoint (ADR-0014 step 4); `None` before the first.
+    checkpoint: Option<Manifest>,
+    /// Object numbers the last checkpoint covers whose place compaction
+    /// changed since: the next checkpoint's relocation run.
+    relocated: BTreeSet<u64>,
 }
 
 impl Store {
@@ -609,6 +619,7 @@ impl Store {
         let mut report = RecoveryReport::default();
         compio::fs::create_dir_all(&dir).await?;
         let (files, tmps) = read_wal_files(&dir, &mut report, config.dict_train_bytes).await?;
+        let (checkpoint, checkpoint_orphans) = open_checkpoint(&dir).await?;
         let stored = files
             .first()
             .and_then(|(_, bytes)| codec::decode_wal_header(bytes))
@@ -771,7 +782,15 @@ impl Store {
 
         let mut replay = Replay::default();
         let next_frame = frames.len() as u64;
-        for (at, _, records) in frames {
+        if let Some(c) = &checkpoint
+            && c.manifest.covered > next_frame
+        {
+            return Err(c.corrupt("covers WAL frames the WAL does not hold"));
+        }
+        for (seq, (at, _, records)) in (0u64..).zip(frames) {
+            if let Some(c) = checkpoint.as_ref().filter(|c| c.manifest.covered == seq) {
+                c.check(&replay)?;
+            }
             let body_at = at.offset + FRAME_HEADER as u64;
             let corrupt = |reason| StoreError::CorruptWal {
                 file: at.file,
@@ -784,6 +803,19 @@ impl Store {
             }
             replay.finish_frame().map_err(corrupt)?;
         }
+        if let Some(c) = checkpoint
+            .as_ref()
+            .filter(|c| c.manifest.covered == next_frame)
+        {
+            c.check(&replay)?;
+        }
+        // Covered numbers compaction moved or reclaimed after the
+        // checkpoint: the next checkpoint's relocation run.
+        let relocated = checkpoint.as_ref().map_or_else(BTreeSet::new, |c| {
+            (0..c.manifest.next_object)
+                .filter(|x| c.placement(*x) != Some(placement_of(replay.objects.get(x))))
+                .collect()
+        });
         let codecs = codecs_for(&replay.dicts)?;
         let dictionary = replay.dicts.last().map(|d| d.len());
 
@@ -807,7 +839,13 @@ impl Store {
         for tmp in &tmps {
             compio::fs::remove_file(dir.join(tmp)).await?;
         }
-        if !orphans.is_empty() || !tmps.is_empty() {
+        for file in &checkpoint_orphans {
+            compio::fs::remove_file(dir.join(file)).await?;
+            report
+                .actions
+                .push(RecoveryAction::CheckpointFileRemoved { file: file.clone() });
+        }
+        if !orphans.is_empty() || !tmps.is_empty() || !checkpoint_orphans.is_empty() {
             sync_dir(&dir).await?;
         }
         if pos < last_len {
@@ -848,7 +886,96 @@ impl Store {
             timing: CommitTiming::default(),
             recovery: report,
             poisoned: false,
+            checkpoint: checkpoint.map(|c| c.manifest),
+            relocated,
         })
+    }
+
+    /// Writes a checkpoint (ADR-0014 §3, step 4): the object table of the
+    /// numbers allocated since the last one, a relocation run of the
+    /// covered numbers compaction moved or reclaimed since, each synced,
+    /// then the manifest `checkpoint-<n>` through a synced tmp file and a
+    /// rename, then the previous manifest is deleted. Interim rule until
+    /// step 6b: no WAL file is deleted, so open still replays the whole WAL
+    /// and checks the checkpoint against it. Call between batches.
+    pub async fn checkpoint(&mut self) -> Result<(), StoreError> {
+        self.usable()?;
+        self.begin_write();
+        let res = self.checkpoint_inner().await;
+        self.in_flight = false;
+        self.poison_on_err(res)
+    }
+
+    async fn checkpoint_inner(&mut self) -> Result<(), StoreError> {
+        let prev = self.checkpoint.clone().unwrap_or_default();
+        let n = prev.n + 1;
+        let mut m = Manifest {
+            n,
+            covered: self.next_frame,
+            next_object: self.next_object,
+            next_block: self.next_block,
+            next_topic: self.next_topic,
+            tables: prev.tables.clone(),
+            runs: prev.runs.clone(),
+        };
+        let mut wrote = false;
+        if self.next_object > prev.next_object {
+            let first = prev.next_object;
+            let mut entries =
+                Vec::with_capacity((self.next_object - first) as usize * OBJECT_ENTRY);
+            for x in first..self.next_object {
+                codec::put_object_entry(&mut entries, placement_of(self.objects.get(&x)));
+            }
+            let mut out = codec::table_header(OBJTAB_MAGIC, first).to_vec();
+            codec::put_pages(&mut out, &entries, OBJECT_ENTRY);
+            write_new_synced(&objtab_path(&self.dir, first), out).await?;
+            m.tables.push((first, self.next_object - first));
+            wrote = true;
+        }
+        if !self.relocated.is_empty() {
+            let mut entries = Vec::with_capacity(self.relocated.len() * RELOC_ENTRY);
+            for &x in &self.relocated {
+                let at = placement_of(self.objects.get(&x)).map(|(_, b, i)| (b, i));
+                codec::put_reloc_entry(&mut entries, x, at);
+            }
+            let mut out = codec::table_header(RELOC_MAGIC, n).to_vec();
+            codec::put_pages(&mut out, &entries, RELOC_ENTRY);
+            write_new_synced(&reloc_path(&self.dir, n), out).await?;
+            m.runs.push((n, self.relocated.len() as u64));
+            wrote = true;
+        }
+        if wrote {
+            sync_dir(&self.dir).await?;
+        }
+        let path = checkpoint_path(&self.dir, n);
+        let tmp = path.with_extension("tmp");
+        write_new_synced(&tmp, m.encode()).await?;
+        compio::fs::rename(&tmp, &path).await?;
+        sync_dir(&self.dir).await?;
+        if prev.n > 0 {
+            compio::fs::remove_file(checkpoint_path(&self.dir, prev.n)).await?;
+            sync_dir(&self.dir).await?;
+        }
+        self.checkpoint = Some(m);
+        self.relocated.clear();
+        Ok(())
+    }
+
+    /// Number of the last checkpoint written or loaded; `None` before the
+    /// first.
+    pub fn checkpoint_number(&self) -> Option<u64> {
+        self.checkpoint.as_ref().map(|m| m.n)
+    }
+
+    /// Records that compaction changed object `number`'s place.
+    fn relocate(&mut self, number: u64) {
+        if self
+            .checkpoint
+            .as_ref()
+            .is_some_and(|m| number < m.next_object)
+        {
+            self.relocated.insert(number);
+        }
     }
 
     /// Durably appends a batch and returns the topic sequence number of each
@@ -1420,6 +1547,7 @@ impl Store {
                     if !live && let Some(o) = self.objects.remove(&number) {
                         self.ids.remove(&o.id);
                         stats.objects_dropped += 1;
+                        self.relocate(number);
                     }
                 }
                 self.blocks.remove(n);
@@ -1435,6 +1563,7 @@ impl Store {
                     if let Some(o) = self.objects.get_mut(number) {
                         o.block = r.block;
                         o.index = index;
+                        self.relocate(*number);
                     }
                 }
                 let b = Block {
@@ -3369,7 +3498,10 @@ async fn read_wal_files(
             ids.push(id);
         } else if name.strip_suffix(".tmp").and_then(parse_wal_name).is_some() {
             tmps.push(name.to_owned());
-        } else if parse_segment_name(name).is_some() || parse_index_name(name).is_some() {
+        } else if parse_segment_name(name).is_some()
+            || parse_index_name(name).is_some()
+            || parse_checkpoint_file(name).is_some()
+        {
             segments = true;
         }
     }
@@ -3378,7 +3510,7 @@ async fn read_wal_files(
         return Err(StoreError::CorruptWal {
             file: 0,
             offset: 0,
-            reason: "no WAL file, but data or index segments exist",
+            reason: "no WAL file, but data or index segments or checkpoint files exist",
         });
     }
     // Deleted by `Store::open` after every check.
@@ -3656,6 +3788,248 @@ fn parse_index_name(name: &str) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(hex, 16).ok()
+}
+
+fn objtab_path(dir: &Path, first: u64) -> PathBuf {
+    dir.join(format!("objtab-{first:016x}.tab"))
+}
+
+fn reloc_path(dir: &Path, n: u64) -> PathBuf {
+    dir.join(format!("reloc-{n:016x}.run"))
+}
+
+fn checkpoint_path(dir: &Path, n: u64) -> PathBuf {
+    dir.join(format!("checkpoint-{n:016x}"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointFile {
+    Manifest(u64),
+    Tmp(u64),
+    Table(u64),
+    Run(u64),
+}
+
+fn parse_checkpoint_file(name: &str) -> Option<CheckpointFile> {
+    let hex16 = |hex: &str| {
+        (hex.len() == 16)
+            .then(|| u64::from_str_radix(hex, 16).ok())
+            .flatten()
+    };
+    if let Some(rest) = name.strip_prefix("checkpoint-") {
+        return match rest.strip_suffix(".tmp") {
+            Some(hex) => hex16(hex).map(CheckpointFile::Tmp),
+            None => hex16(rest).map(CheckpointFile::Manifest),
+        };
+    }
+    if let Some(hex) = name
+        .strip_prefix("objtab-")
+        .and_then(|r| r.strip_suffix(".tab"))
+    {
+        return hex16(hex).map(CheckpointFile::Table);
+    }
+    let hex = name.strip_prefix("reloc-")?.strip_suffix(".run")?;
+    hex16(hex).map(CheckpointFile::Run)
+}
+
+/// Creates `path` (never an existing file) holding `bytes`, synced.
+async fn write_new_synced(path: &Path, bytes: Vec<u8>) -> Result<(), StoreError> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await?;
+    write_all(&file, bytes, 0).await.0?;
+    file.sync_data().await?;
+    Ok(())
+}
+
+fn placement_of(o: Option<&Object>) -> Placement {
+    // Object indexes are block positions, below 2^32.
+    o.map(|o| (o.id, o.block, o.index as u32))
+}
+
+/// The newest checkpoint with its object tables and relocation runs, read
+/// at open.
+struct LoadedCheckpoint {
+    manifest: Manifest,
+    /// `(first number, entries)`, in number order.
+    tables: Vec<(u64, Vec<u8>)>,
+    /// Entries of each relocation run, newest first.
+    runs: Vec<Vec<u8>>,
+}
+
+impl LoadedCheckpoint {
+    fn corrupt(&self, reason: &'static str) -> StoreError {
+        StoreError::CorruptCheckpoint {
+            checkpoint: self.manifest.n,
+            reason,
+        }
+    }
+
+    /// Object `x`'s place as the checkpoint records it: the newest run
+    /// that lists it, else its table; `None` if no table covers it.
+    fn placement(&self, x: u64) -> Option<Placement> {
+        let t = self
+            .tables
+            .partition_point(|(first, _)| *first <= x)
+            .checked_sub(1)?;
+        let (first, entries) = &self.tables[t];
+        let base = codec::object_entry(entries, usize::try_from(x - first).ok()?)?;
+        for run in &self.runs {
+            let count = run.len() / RELOC_ENTRY;
+            let i = partition(count, |i| {
+                codec::reloc_entry(run, i).is_some_and(|(number, _)| number < x)
+            });
+            if let Some((number, at)) = codec::reloc_entry(run, i)
+                && number == x
+            {
+                let id = base.map_or(ObjectId([0; 32]), |(id, _, _)| id);
+                return Some(at.map(|(block, index)| (id, block, index)));
+            }
+        }
+        Some(base)
+    }
+
+    /// The checkpoint against the replay of exactly the frames it covers:
+    /// the next numbers, and every covered object's place.
+    fn check(&self, replay: &Replay<'_>) -> Result<(), StoreError> {
+        let m = &self.manifest;
+        if (m.next_object, m.next_block, m.next_topic)
+            != (
+                replay.next_object,
+                replay.next_block,
+                replay.topic_names.len() as u64,
+            )
+        {
+            return Err(self.corrupt("next numbers differ from the WAL at the covered frame"));
+        }
+        for x in 0..m.next_object {
+            if self.placement(x) != Some(placement_of(replay.objects.get(&x))) {
+                return Err(StoreError::CheckpointMismatch {
+                    checkpoint: m.n,
+                    number: x,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The first `i` in `0..n` for which `below(i)` is false (`below` true
+/// then false).
+fn partition(n: usize, below: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut hi) = (0, n);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if below(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Reads the newest checkpoint manifest and the tables and runs it lists,
+/// each checked (header, page CRCs, counts, order); returns it with the
+/// checkpoint files it does not list (deleted by `Store::open` after every
+/// check). Nothing is changed here.
+async fn open_checkpoint(
+    dir: &Path,
+) -> Result<(Option<LoadedCheckpoint>, Vec<String>), StoreError> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        if let Some(f) = name.to_str().and_then(parse_checkpoint_file) {
+            found.push((f, name.to_string_lossy().into_owned()));
+        }
+    }
+    let newest = found
+        .iter()
+        .filter_map(|(f, _)| match f {
+            CheckpointFile::Manifest(n) => Some(*n),
+            _ => None,
+        })
+        .max();
+    let Some(n) = newest else {
+        // No checkpoint: every table, run and tmp file is an orphan.
+        return Ok((None, found.into_iter().map(|(_, name)| name).collect()));
+    };
+    let corrupt = |reason| StoreError::CorruptCheckpoint {
+        checkpoint: n,
+        reason,
+    };
+    let manifest = Manifest::decode(&compio::fs::read(checkpoint_path(dir, n)).await?)
+        .filter(|m| m.n == n)
+        .ok_or(corrupt("manifest fails its CRC or does not decode"))?;
+    let read = |path: PathBuf| async move {
+        match compio::fs::read(path).await {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(corrupt("a listed table or run is missing"))
+            }
+            res => Ok(res?),
+        }
+    };
+    let mut tables = Vec::with_capacity(manifest.tables.len());
+    let mut next = 0u64;
+    for &(first, count) in &manifest.tables {
+        let bytes = read(objtab_path(dir, first)).await?;
+        let entries = (first == next && count > 0)
+            .then_some(())
+            .and_then(|()| codec::decode_table_header(OBJTAB_MAGIC, &bytes))
+            .filter(|&f| f == first)
+            .and_then(|_| codec::decode_pages(&bytes[codec::TABLE_HEADER..], OBJECT_ENTRY))
+            .filter(|e| e.len() as u64 == count * OBJECT_ENTRY as u64)
+            .ok_or(corrupt("an object table is damaged, short or out of order"))?;
+        next = first + count;
+        tables.push((first, entries));
+    }
+    if next != manifest.next_object {
+        return Err(corrupt("object tables do not cover every object number"));
+    }
+    let mut runs = Vec::with_capacity(manifest.runs.len());
+    let mut last = 0u64;
+    for &(run, count) in &manifest.runs {
+        let bytes = read(reloc_path(dir, run)).await?;
+        let entries = (run > last && run <= n && count > 0)
+            .then_some(())
+            .and_then(|()| codec::decode_table_header(RELOC_MAGIC, &bytes))
+            .filter(|&f| f == run)
+            .and_then(|_| codec::decode_pages(&bytes[codec::TABLE_HEADER..], RELOC_ENTRY))
+            .filter(|e| e.len() as u64 == count * RELOC_ENTRY as u64)
+            .filter(|e| {
+                let numbers: Vec<u64> = (0..count as usize)
+                    .filter_map(|i| codec::reloc_entry(e, i).map(|(x, _)| x))
+                    .collect();
+                numbers.windows(2).all(|w| w[0] < w[1])
+                    && numbers.last().is_some_and(|&x| x < manifest.next_object)
+            })
+            .ok_or(corrupt(
+                "a relocation run is damaged, short or out of order",
+            ))?;
+        last = run;
+        runs.push(entries);
+    }
+    runs.reverse();
+    let orphans = found
+        .into_iter()
+        .filter(|(f, _)| match f {
+            CheckpointFile::Manifest(k) => *k != n,
+            CheckpointFile::Tmp(_) => true,
+            CheckpointFile::Table(first) => !manifest.tables.iter().any(|t| t.0 == *first),
+            CheckpointFile::Run(k) => !manifest.runs.iter().any(|r| r.0 == *k),
+        })
+        .map(|(_, name)| name)
+        .collect();
+    Ok((
+        Some(LoadedCheckpoint {
+            manifest,
+            tables,
+            runs,
+        }),
+        orphans,
+    ))
 }
 
 #[cfg(test)]

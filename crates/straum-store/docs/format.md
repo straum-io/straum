@@ -13,7 +13,11 @@ names, segments).
 ├── wal-<seq:016x>.log           the log, in files named by their first frame's sequence number
 ├── wal-<seq:016x>.log.tmp       only while a WAL file is being created; deleted at open
 ├── seg-<id:016x>.dat            data segments; id is a u64 in hex, 16 digits
-└── idx-<id:016x>.dat            index segments: topic index blocks and seek pages of every topic
+├── idx-<id:016x>.dat            index segments: topic index blocks, attribute records and seek pages of every topic
+├── objtab-<first:016x>.tab      object tables written by checkpoints, by their first object number
+├── reloc-<n:016x>.run           relocation runs, by the checkpoint that wrote them
+├── checkpoint-<n:016x>          the checkpoint manifest (one; n from 1)
+└── checkpoint-<n:016x>.tmp      only while a manifest is being written; deleted at open
 ```
 
 A topic name is 1 to 100 bytes (`MAX_TOPIC`). Segment ids are never reused:
@@ -109,7 +113,7 @@ checkpoint will delete the files wholly before the frame it covers
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 14 |
+| 8 | 4 | `version` u32 = 15 |
 | 12 | 8 | `dict_train_bytes` u64: the dictionary training threshold |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -136,7 +140,7 @@ the block branch a 16-byte header without `dict_train_bytes`; 9 at most one
 rewritten block per Compact record, 10 one index file per topic
 (`topics/<hex>.idx`), 11 Publish without the publication's key and
 headers, 12 one WAL file, `wal.log`, 13 keys and headers of full index
-blocks only in the WAL (no attribute records). The number keeps increasing
+blocks only in the WAL (no attribute records), 14 no checkpoint files. The number keeps increasing
 with each format change on this line; none is reused (D-251 A).
 
 ### Frame
@@ -436,6 +440,7 @@ report means recovery changed nothing. No change is made without an entry.
 | `StaleIndexRecordsFenced { records, segment }` | index records of cut WAL frames were found; index segment `segment` was created to keep them stale |
 | `IndexSegmentDropped { segment, bytes }` | an index segment was deleted because `Config::rebuild_index` was set (the index is rebuilt from the WAL) |
 | `TopicIndexRepaired { topic, blocks_rewritten, pages_rewritten }` | a topic's index blocks or seek pages were re-encoded from the WAL and appended |
+| `CheckpointFileRemoved { file }` | a checkpoint file the newest manifest does not list was deleted: an earlier manifest, a `checkpoint-<n>.tmp`, or a table or run of a checkpoint that did not complete |
 
 `config_overrides` lists `Config` values the WAL replaced, which change no
 file: `DictTrainBytes { configured, stored }` when `Config::dict_train_bytes`
@@ -473,7 +478,7 @@ attribute records and seek pages. A 24-byte header, then records.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 49 44 58 00` (`"STRMIDX\0"`) |
-| 8 | 4 | `version` u32 = 14 (the WAL version) |
+| 8 | 4 | `version` u32 = 15 (the WAL version) |
 | 12 | 8 | `created_at` u64: the number of the first WAL frame its records may describe (the batch's frame for a segment started while writing a batch's records, the frame count for one started at open) |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -606,6 +611,70 @@ every WAL, refcount and segment check runs before the first deletion. If
 the rebuilding open is interrupted (some segments deleted, others not),
 open again with the setting. Without the setting, open never deletes an
 intact index segment.
+
+## Checkpoint (ADR-0014 step 4)
+
+`Store::checkpoint`, between batches, writes the object table of the object
+numbers allocated since the last checkpoint and the relocation run of the
+numbers that checkpoint already covered whose place compaction changed
+since, then the manifest. Interim rule until ADR-0014 step 6b: no WAL file
+is deleted and open still replays the whole WAL, so the checkpoint is
+checked against it at every open; the in-memory object maps stay. The
+broker does not checkpoint yet (step 7 adds the triggers).
+
+Object tables and relocation runs share a 24-byte header and a page layout:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | `magic` = `"STRMOBJ\0"` (table) or `"STRMREL\0"` (run) |
+| 8 | 4 | `version` u32 = 15 (the WAL version) |
+| 12 | 8 | `first` u64: the table's first object number, or the number of the checkpoint that wrote the run (also in the file name) |
+| 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
+
+Then pages of at most 4 KiB: as many whole entries as fit in 4092 bytes,
+then a CRC32C u32 of the page number (u64, from 0) followed by the page's
+entries; the last page holds the rest (at least one entry).
+
+| File | Entry | Bytes |
+|---|---|---|
+| object table | `id [32] \| block u64 \| index u32`, one per number from `first`, in order; a number compaction had reclaimed by then: a zero id and `block`, `index` all ones | 44 (93 per page) |
+| relocation run | `number u64 \| block u64 \| index u32`: the number's place at the checkpoint, `block` and `index` all ones if reclaimed; numbers strictly increasing | 20 (204 per page) |
+
+A number's place is the newest run that lists it, else its table's entry
+(the id comes from the table: ids never change). How a block is located
+(segment, offset, lengths, dictionary, CRC) is still only in the WAL
+(D-254).
+
+Manifest `checkpoint-<n>`: `magic "STRMCKP\0" | version u32 | n u64 |
+covered u64 | next_object u64 | next_block u64 | next_topic u64 | tables
+u32 | (first u64, count u64) per table | runs u32 | (checkpoint u64, count
+u64) per run | crc u32` (CRC32C of every byte before it). `covered`: the
+frames below it are covered; the tables, in order, cover object numbers
+`0..next_object` without gaps; the runs are listed oldest first.
+
+**Writing.** New table and run files are created (`create_new`), written
+and `fdatasync`ed, then the directory is synced; the manifest is written to
+`checkpoint-<n>.tmp`, `fdatasync`ed, renamed to `checkpoint-<n>` and the
+directory synced; then `checkpoint-<n − 1>` is deleted and the directory
+synced. A crash before the rename leaves the previous checkpoint valid and
+the new files unlisted; after it, the previous manifest is unlisted. A
+checkpoint that fails makes the store refuse further use.
+
+**Recovery.** Before replay, the newest `checkpoint-<n>` is read; it must be
+intact (CRC, version, `n` as named) and every table and run it lists must
+be present, with an intact header naming it, intact pages and exactly the
+listed count, the tables contiguous from 0 to `next_object`, the runs
+ordered and their numbers increasing and below `next_object`; otherwise
+`CorruptCheckpoint` and no file is changed (an older manifest is never
+used instead). `covered` above the WAL's frame count is `CorruptCheckpoint`.
+When replay reaches frame `covered`, the checkpoint must match the state
+the WAL gives there: the next object, block and topic numbers
+(`CorruptCheckpoint`) and every object number's place, reclaimed or
+`(id, block, index)` (`CheckpointMismatch { number }`). Covered numbers
+whose place differs at the end of the WAL go to the next checkpoint's run.
+After every check, the checkpoint files the manifest does not list are
+deleted (`CheckpointFileRemoved`). Checkpoint files without any WAL file
+are `CorruptWal`, as segments are.
 
 ## Write order (one batch)
 
