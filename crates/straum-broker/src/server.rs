@@ -157,8 +157,8 @@ pub async fn serve(
     );
     if config.store_rebuild_index {
         eprintln!(
-            "straum-broker: recovery: topic index rebuilt from the WAL (--store-rebuild-index, \
-             this start only)"
+            "straum-broker: store topic index rebuilt from the WAL on request \
+             (--store-rebuild-index, this start only)"
         );
     }
     for action in &report.actions {
