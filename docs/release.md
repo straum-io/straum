@@ -90,7 +90,8 @@ The push starts `release`:
 
 1. `tag` runs `check-tag.sh`: the tag names a version, is on `main` and
    matches the crate, and `DOCKERHUB_NAMESPACE` is set.
-2. `image` builds each platform on its own runner and pushes it by digest;
+2. `image` builds each platform on its own runner and pushes it by digest
+   (on a dry run `image-dry` builds both and holds no write permission);
    `image-merge` tags one manifest list `X.Y.Z`, `X.Y` and, without a `-`
    suffix, `latest` in both registries and attests the GHCR one.
 3. `deb` and `macos` build the packages and archives; `checksums` writes
@@ -108,18 +109,27 @@ scripts/release/verify.sh vX.Y.Z
 ```
 
 It downloads the draft's assets, runs `sha256sum -c SHA256SUMS`, and
-`gh attestation verify` on each package, each archive and
-`oci://ghcr.io/straum-io/straum:X.Y.Z`. By hand, also:
+`gh attestation verify` on each package, each archive and the GHCR
+manifest list by the digest in the release notes, accepting only
+attestations made by `release.yml` for `refs/tags/vX.Y.Z`. By hand, also:
 
 ```bash
 docker buildx imagetools inspect ghcr.io/straum-io/straum:X.Y.Z
 ```
 
-shows `linux/amd64` and `linux/arm64`, and
+shows the manifest list digest of the release notes and `linux/amd64` and
+`linux/arm64`, and
 `docker buildx imagetools inspect ghcr.io/straum-io/straum:X.Y.Z --format '{{json .Image}}'`
 shows the `org.opencontainers.image.revision` label of the tagged commit.
 A user verifies a downloaded file the same way:
-`gh attestation verify <file> -R straum-io/straum`.
+
+```bash
+gh attestation verify <file> -R straum-io/straum \
+    --signer-workflow straum-io/straum/.github/workflows/release.yml \
+    --source-ref refs/tags/vX.Y.Z
+```
+
+`-R` alone accepts an attestation from any workflow of the repository.
 
 ## Publishing
 
