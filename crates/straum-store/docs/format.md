@@ -566,7 +566,7 @@ look current at the next open, disagree with the WAL, and open fails with
 `Config::rebuild_index` set (the broker: `--store-rebuild-index true` for
 one start). Open then deletes every index segment before reading any
 (`IndexSegmentDropped { segment, bytes }` each) and re-derives every
-topic's blocks and seek pages from the WAL into a new segment
+topic's blocks and seek pages from the WAL into new index segments
 (`TopicIndexRepaired`). The rebuild changes no other file; the repairs
 of every open (a torn tail, orphans) apply as usual. It is safe whenever
 the WAL itself opens, since the index holds nothing the WAL does not, and

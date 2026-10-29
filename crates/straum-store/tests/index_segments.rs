@@ -116,6 +116,14 @@ async fn a_damaged_fence_header_fails_open() {
         put(&mut store, 1, 0, 10).await;
     }
     edit(&index_segments(&dir.0)[1], |b| b[13] ^= 1);
+    let clean = snapshot(&dir.0);
+    // Repairs due as well (a torn tail, a tmp file, an orphan segment):
+    // the index check fails before any of them is made.
+    edit(&wal, |b| b.extend_from_slice(&[0xa5; 10]));
+    let orphan = dir.0.join("seg-00000000000000ff.dat");
+    let tmp = dir.0.join(format!("{}.tmp", common::WAL0));
+    std::fs::write(&orphan, b"orphan").unwrap();
+    std::fs::write(&tmp, b"half-created").unwrap();
     let before = snapshot(&dir.0);
     let err = Store::open(&dir.0, config).await.err().unwrap();
     assert!(
@@ -123,6 +131,10 @@ async fn a_damaged_fence_header_fails_open() {
         "{err}"
     );
     assert!(snapshot(&dir.0) == before, "files changed");
+    edit(&wal, |b| b.truncate(b.len() - 10));
+    std::fs::remove_file(&orphan).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+    let before = clean;
 
     // The operator's way out (D-229 A): rebuild the index from the WAL.
     let segments = index_segments(&dir.0);
