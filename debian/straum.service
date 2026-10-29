@@ -12,7 +12,7 @@ DynamicUser=yes
 StateDirectory=straum
 Restart=on-failure
 RestartSec=5
-# Exit status 2: a configuration error; restarting does not fix it.
+# Exit status 2: invalid flags or settings; restarting does not fix it.
 RestartPreventExitStatus=2
 NoNewPrivileges=yes
 ProtectSystem=strict

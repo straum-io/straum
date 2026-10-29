@@ -62,7 +62,8 @@ authentication exists.
 ## Configuration
 
 `--config <file>` reads `key = value` lines (`#` comments); every key is
-also a flag, `--key value`, with `-` or `_`; flags win.
+also a flag, `--key value`, with `-` or `_`; flags win. Invalid flags or
+settings exit with status 2; any other startup or runtime error, 1.
 
 | Key | Default | |
 |---|---|---|

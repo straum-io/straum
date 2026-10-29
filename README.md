@@ -96,7 +96,8 @@ scripts/validate.sh push    # adds the long tests, and the io_uring container (s
 - `scripts/`: validation, the Linux container, benchmarks, the power-loss
   harness.
 - `docs/`: guarantees and protocol.
-- `.github/`: CI, the release pipeline (runs only on version tags), the
+- `.github/`: CI, the release pipeline (builds on pull requests that
+  touch the build, publishes only on version tags), the
   PR body check, the Issue and PR templates.
 - `Dockerfile`, `debian/`: the image and the Debian package of
   `straum-server` (loopback only, so the image runs with `--network host`;
