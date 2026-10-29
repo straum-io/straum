@@ -115,8 +115,8 @@ At startup the store replays the WAL from the beginning
   | `StaleIndexRecordsFenced` | index records of WAL frames that recovery cut were found; a new, empty index segment is created so they stay ignored once new frames reuse those frame numbers |
   | `TopicIndexRepaired` | full index blocks and seek pages of a topic that no index segment holds intact (the index is derived from the WAL and not synced) are re-encoded from the WAL and appended to a new index segment |
   | `WalTmpRemoved` | a `wal-<seq>.log.tmp` of an interrupted WAL file creation is deleted |
-  | `CheckpointFileRemoved` | a checkpoint file the checkpoint in use does not list (an earlier or damaged manifest, a tmp manifest, a table or run of an interrupted checkpoint) is deleted |
-  | `CheckpointManifestDamaged` | a checkpoint manifest, read newest first, fails its CRC, version or name check, or does not decode (one entry per such manifest): the newest intact older manifest is used instead; with none, the checkpoint is ignored and the state rebuilt from the WAL, which still holds every frame (no WAL file is deleted yet). The damaged manifest is deleted (`CheckpointFileRemoved`) |
+  | `CheckpointFileRemoved` | a checkpoint file the checkpoint in use does not list (an earlier manifest, a tmp manifest, a table or run of an interrupted checkpoint or of a damaged manifest) is deleted |
+  | `CheckpointManifestDamaged` | a checkpoint manifest, read newest first, fails its CRC, version or name check, or does not decode (one entry per such manifest): the newest intact older manifest is used instead; with none, the checkpoint is ignored and the state rebuilt from the WAL, which still holds every frame (no WAL file is deleted yet). The damaged manifest is renamed, unchanged, to `checkpoint-<n>.damaged` and kept for diagnosis; it is never read again and reported only this once |
 
   The last two concern the store's checkpoints (ADR-0014), which the broker
   does not write yet. An empty report means nothing was changed.

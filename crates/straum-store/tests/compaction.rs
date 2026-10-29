@@ -179,3 +179,74 @@ async fn a_damaged_index_block_fails_the_mark_phase_and_changes_nothing() {
     assert_eq!(store.object_count(), 70);
     put(&mut store, b"b", &[body(1)]).await;
 }
+
+/// A checkpoint after every step of one compaction, marks and sweeps alike
+/// (owner's condition: the Compact record is the swap point, so no
+/// checkpoint captures a half-swapped segment). A copy of the directory is
+/// opened after each: the checkpoint matches the WAL at its covered frame
+/// (`CheckpointMismatch` otherwise), nothing is repaired, and every live
+/// entry reads back, in every write mode.
+#[compio::test]
+async fn checkpoints_inside_one_compaction_match_the_wal() {
+    for mode in MODES {
+        let dir = TempDir::new("compaction-checkpoint-inside");
+        let segmented = Config {
+            write_mode: mode,
+            segment_max_bytes: 12_000,
+            ..Config::default()
+        };
+        let mut store = Store::open(&dir.0, segmented).await.unwrap();
+        let mut live = Vec::new();
+        for (i, topic) in [&b"a"[..], b"b"].into_iter().enumerate() {
+            let bodies: Vec<Vec<u8>> = (0..6).map(|k| body(50 * i as u64 + k)).collect();
+            put(&mut store, topic, &bodies).await;
+            assert_eq!(store.release_before(topic, 2).await.unwrap(), 6);
+            let seqs = put(&mut store, topic, &bodies[..2]).await;
+            live.extend(seqs.into_iter().zip(bodies).map(|(q, b)| (topic, q, b)));
+        }
+        let mut swept = 0;
+        loop {
+            let s = step(&mut store).await;
+            store.checkpoint().await.unwrap();
+            let copy = TempDir::new("compaction-checkpoint-inside-copy");
+            common::copy_dir(&dir.0, &copy.0);
+            let reopened = Store::open(&copy.0, segmented).await.unwrap();
+            assert!(reopened.recovery_report().is_empty(), "{mode:?} {s:?}");
+            for (topic, seq, b) in &live {
+                assert_eq!(reopened.read(topic, *seq).await.unwrap().as_ref(), Some(b));
+            }
+            match s {
+                CompactStep::Swept => swept += 1,
+                CompactStep::Done(_) => break,
+                CompactStep::Marked => {}
+            }
+        }
+        assert!(swept >= 2, "{mode:?}: {swept} sweep steps");
+    }
+}
+
+/// A sweep step that fails part way leaves the store refusing every call,
+/// a checkpoint included, so no checkpoint records a half-swapped segment.
+#[compio::test]
+async fn a_failed_sweep_step_refuses_a_checkpoint() {
+    let dir = TempDir::new("compaction-failed-sweep");
+    let mut store = Store::open(&dir.0, Config::default()).await.unwrap();
+    put(&mut store, b"a", &[body(1), body(2)]).await;
+    assert_eq!(store.release_before(b"a", 2).await.unwrap(), 2);
+    put(&mut store, b"a", &[body(3)]).await;
+    assert_eq!(step(&mut store).await, CompactStep::Marked);
+    // The segment vanishes under the store: its sweep fails.
+    let seg = dir.0.join("seg-0000000000000000.dat");
+    let saved = std::fs::read(&seg).unwrap();
+    std::fs::remove_file(&seg).unwrap();
+    assert!(store.compact_step().await.is_err());
+    assert!(matches!(
+        store.checkpoint().await,
+        Err(StoreError::Poisoned)
+    ));
+    drop(store);
+    std::fs::write(&seg, saved).unwrap();
+    let store = Store::open(&dir.0, Config::default()).await.unwrap();
+    assert_eq!(store.checkpoint_number(), None);
+    assert_eq!(store.read(b"a", 2).await.unwrap(), Some(body(3)));
+}

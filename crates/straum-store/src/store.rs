@@ -449,16 +449,20 @@ pub enum RecoveryAction {
     /// rebuilt blocks and pages follow as `TopicIndexRepaired`.
     IndexSegmentDropped { segment: u64, bytes: u64 },
     /// A checkpoint file the checkpoint used does not list was deleted: an
-    /// earlier or damaged manifest, a `checkpoint-<n>.tmp`, or an object
-    /// table or relocation run of a checkpoint that did not complete.
+    /// earlier manifest, a `checkpoint-<n>.tmp`, or an object table or
+    /// relocation run of a checkpoint that did not complete or whose
+    /// manifest is damaged.
     CheckpointFileRemoved { file: String },
-    /// Manifest `checkpoint-<checkpoint>` failed its CRC or did not decode,
-    /// so open used the newest intact older manifest `fallback`, or, with
-    /// `None`, no checkpoint: the WAL holds every frame, and replay rebuilds
-    /// the state from it. The manifest is deleted (`CheckpointFileRemoved`).
+    /// Manifest `checkpoint-<checkpoint>` failed its CRC, version or name
+    /// check, or did not decode, so open used the newest intact older
+    /// manifest `fallback`, or, with `None`, no checkpoint: the WAL holds
+    /// every frame, and replay rebuilds the state from it. The manifest was
+    /// renamed to `quarantined` (`checkpoint-<n>.damaged`) and kept for
+    /// diagnosis; it is never read again.
     CheckpointManifestDamaged {
         checkpoint: u64,
         fallback: Option<u64>,
+        quarantined: String,
     },
     /// Full index blocks and seek pages of a topic that no index segment
     /// held intact were re-encoded from the WAL and appended.
@@ -603,6 +607,10 @@ pub struct Store {
     relocated: BTreeSet<u64>,
     /// A compaction in progress (`compact_step`).
     compaction: Option<Compaction>,
+    /// The next checkpoint's number: above every manifest, quarantined
+    /// manifest, tmp manifest and run on disk at open, so a number never
+    /// repeats and a quarantine name never collides.
+    next_checkpoint: u64,
 }
 
 /// What a `Store::compact_step` did.
@@ -727,8 +735,12 @@ impl Store {
         }
         // After the version check: a directory of another format is
         // `UnsupportedFormat`, not a damaged checkpoint.
-        let (checkpoint, checkpoint_orphans) =
-            open_checkpoint(&dir, files[0].0, &mut report).await?;
+        let OpenedCheckpoint {
+            loaded: checkpoint,
+            orphans: checkpoint_orphans,
+            quarantine,
+            next_checkpoint,
+        } = open_checkpoint(&dir, files[0].0, &mut report).await?;
 
         // Only the last frame can be torn: a frame is written only after the
         // previous one is durable, and a WAL file is created only after the
@@ -928,7 +940,15 @@ impl Store {
                 .actions
                 .push(RecoveryAction::CheckpointFileRemoved { file: file.clone() });
         }
-        if !orphans.is_empty() || !tmps.is_empty() || !checkpoint_orphans.is_empty() {
+        for &n in &quarantine {
+            let path = checkpoint_path(&dir, n);
+            compio::fs::rename(&path, quarantine_path(&dir, n)).await?;
+        }
+        if !orphans.is_empty()
+            || !tmps.is_empty()
+            || !checkpoint_orphans.is_empty()
+            || !quarantine.is_empty()
+        {
             sync_dir(&dir).await?;
         }
         if pos < last_len {
@@ -970,6 +990,7 @@ impl Store {
             recovery: report,
             poisoned: false,
             checkpoint: checkpoint.map(|c| c.manifest),
+            next_checkpoint,
             relocated,
             compaction: None,
         })
@@ -994,7 +1015,9 @@ impl Store {
 
     async fn checkpoint_inner(&mut self) -> Result<(), StoreError> {
         let prev = self.checkpoint.clone().unwrap_or_default();
-        let n = prev.n + 1;
+        let n = self.next_checkpoint;
+        // Not reused even if this checkpoint fails.
+        self.next_checkpoint += 1;
         let mut m = Manifest {
             n,
             covered: self.next_frame,
@@ -1051,7 +1074,8 @@ impl Store {
         // failed read-back removes the new manifest, so the previous one
         // stays the one in use.
         if read_manifest(&self.dir, n).await?.as_ref() != Some(&m) {
-            compio::fs::remove_file(&path).await?;
+            // Quarantined, not deleted, like a damaged manifest at open.
+            compio::fs::rename(&path, quarantine_path(&self.dir, n)).await?;
             sync_dir(&self.dir).await?;
             return Err(StoreError::CorruptCheckpoint {
                 checkpoint: n,
@@ -3990,10 +4014,17 @@ fn checkpoint_path(dir: &Path, n: u64) -> PathBuf {
     dir.join(format!("checkpoint-{n:016x}"))
 }
 
+/// A damaged manifest's quarantine name: kept for diagnosis, never read.
+fn quarantine_path(dir: &Path, n: u64) -> PathBuf {
+    dir.join(format!("checkpoint-{n:016x}.damaged"))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheckpointFile {
     Manifest(u64),
     Tmp(u64),
+    /// `checkpoint-<n>.damaged`.
+    Quarantined(u64),
     Table(u64),
     Run(u64),
 }
@@ -4005,10 +4036,13 @@ fn parse_checkpoint_file(name: &str) -> Option<CheckpointFile> {
             .flatten()
     };
     if let Some(rest) = name.strip_prefix("checkpoint-") {
-        return match rest.strip_suffix(".tmp") {
-            Some(hex) => hex16(hex).map(CheckpointFile::Tmp),
-            None => hex16(rest).map(CheckpointFile::Manifest),
-        };
+        if let Some(hex) = rest.strip_suffix(".tmp") {
+            return hex16(hex).map(CheckpointFile::Tmp);
+        }
+        if let Some(hex) = rest.strip_suffix(".damaged") {
+            return hex16(hex).map(CheckpointFile::Quarantined);
+        }
+        return hex16(rest).map(CheckpointFile::Manifest);
     }
     if let Some(hex) = name
         .strip_prefix("objtab-")
@@ -4213,9 +4247,20 @@ async fn load_checkpoint(dir: &Path, manifest: Manifest) -> Result<LoadedCheckpo
     })
 }
 
+/// What `open_checkpoint` found; `Store::open` makes the changes after
+/// every check.
+struct OpenedCheckpoint {
+    loaded: Option<LoadedCheckpoint>,
+    /// Checkpoint files to delete (reported then).
+    orphans: Vec<String>,
+    /// Damaged manifests to rename to their quarantine name (reported).
+    quarantine: Vec<u64>,
+    next_checkpoint: u64,
+}
+
 /// Loads the newest intact checkpoint manifest and the tables and runs it
-/// lists; returns it with the checkpoint files it does not list (deleted by
-/// `Store::open` after every check). Nothing is changed here.
+/// lists; returns it with the checkpoint files it does not list and the
+/// damaged manifests to quarantine. Nothing is changed here.
 ///
 /// A manifest that fails its CRC or does not decode is passed over for the
 /// next older one (`CheckpointManifestDamaged`, with the manifest used); a
@@ -4229,11 +4274,13 @@ async fn load_checkpoint(dir: &Path, manifest: Manifest) -> Result<LoadedCheckpo
 /// ignored (its files are orphans) only while the WAL holds every frame
 /// (`wal_first == 0`, always so until ADR-0014 step 6b deletes WAL files);
 /// otherwise the state the deleted frames described is lost: an error.
+/// Quarantined manifests (`checkpoint-<n>.damaged`) are kept and never read;
+/// a damaged manifest whose quarantine name is taken is refused.
 async fn open_checkpoint(
     dir: &Path,
     wal_first: u64,
     report: &mut RecoveryReport,
-) -> Result<(Option<LoadedCheckpoint>, Vec<String>), StoreError> {
+) -> Result<OpenedCheckpoint, StoreError> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let name = entry?.file_name();
@@ -4260,6 +4307,28 @@ async fn open_checkpoint(
             None => damaged.push(n),
         }
     }
+    let next_checkpoint = found
+        .iter()
+        .filter_map(|(f, _)| match *f {
+            CheckpointFile::Manifest(n)
+            | CheckpointFile::Tmp(n)
+            | CheckpointFile::Quarantined(n)
+            | CheckpointFile::Run(n) => Some(n),
+            CheckpointFile::Table(_) => None,
+        })
+        .max()
+        .map_or(1, |n| n.saturating_add(1));
+    for &n in &damaged {
+        if found.contains(&(
+            CheckpointFile::Quarantined(n),
+            format!("checkpoint-{n:016x}.damaged"),
+        )) {
+            return Err(StoreError::CorruptCheckpoint {
+                checkpoint: n,
+                reason: "a damaged manifest's quarantine name is already taken",
+            });
+        }
+    }
     let fallback = used.as_ref().map(|m| m.n);
     for &checkpoint in &damaged {
         report
@@ -4267,8 +4336,15 @@ async fn open_checkpoint(
             .push(RecoveryAction::CheckpointManifestDamaged {
                 checkpoint,
                 fallback,
+                quarantined: format!("checkpoint-{checkpoint:016x}.damaged"),
             });
     }
+    // Damaged manifests are quarantined, quarantined ones kept.
+    let kept = |f: &CheckpointFile| match *f {
+        CheckpointFile::Manifest(k) => damaged.contains(&k),
+        CheckpointFile::Quarantined(_) => true,
+        _ => false,
+    };
     let Some(manifest) = used else {
         if wal_first > 0 {
             return Err(StoreError::CorruptCheckpoint {
@@ -4276,8 +4352,19 @@ async fn open_checkpoint(
                 reason: "no intact manifest, and the WAL no longer holds every frame",
             });
         }
-        // The WAL holds every frame: every checkpoint file is an orphan.
-        return Ok((None, found.into_iter().map(|(_, name)| name).collect()));
+        // The WAL holds every frame: every other checkpoint file is an
+        // orphan.
+        let orphans = found
+            .into_iter()
+            .filter(|(f, _)| !kept(f))
+            .map(|(_, name)| name)
+            .collect();
+        return Ok(OpenedCheckpoint {
+            loaded: None,
+            orphans,
+            quarantine: damaged,
+            next_checkpoint,
+        });
     };
     if manifest.covered < wal_first {
         return Err(StoreError::CorruptCheckpoint {
@@ -4289,15 +4376,22 @@ async fn open_checkpoint(
     let m = &loaded.manifest;
     let orphans = found
         .into_iter()
+        .filter(|(f, _)| !kept(f))
         .filter(|(f, _)| match f {
             CheckpointFile::Manifest(k) => *k != m.n,
             CheckpointFile::Tmp(_) => true,
+            CheckpointFile::Quarantined(_) => false,
             CheckpointFile::Table(first) => !m.tables.iter().any(|t| t.0 == *first),
             CheckpointFile::Run(k) => !m.runs.iter().any(|r| r.0 == *k),
         })
         .map(|(_, name)| name)
         .collect();
-    Ok((Some(loaded), orphans))
+    Ok(OpenedCheckpoint {
+        loaded: Some(loaded),
+        orphans,
+        quarantine: damaged,
+        next_checkpoint,
+    })
 }
 
 #[cfg(test)]

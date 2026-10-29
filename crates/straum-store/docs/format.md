@@ -16,8 +16,9 @@ names, segments).
 ├── idx-<id:016x>.dat            index segments: topic index blocks, attribute records and seek pages of every topic
 ├── objtab-<first:016x>.tab      object tables written by checkpoints, by their first object number
 ├── reloc-<n:016x>.run           relocation runs, by the checkpoint that wrote them
-├── checkpoint-<n:016x>          the checkpoint manifest (one; n from 1)
-└── checkpoint-<n:016x>.tmp      only while a manifest is being written; deleted at open
+├── checkpoint-<n:016x>          the checkpoint manifest (one; n from 1, never repeated)
+├── checkpoint-<n:016x>.tmp      only while a manifest is being written; deleted at open
+└── checkpoint-<n:016x>.damaged  a damaged manifest in quarantine: kept for diagnosis, never read
 ```
 
 A topic name is 1 to 100 bytes (`MAX_TOPIC`). Segment ids are never reused:
@@ -448,8 +449,8 @@ report means recovery changed nothing. No change is made without an entry.
 | `StaleIndexRecordsFenced { records, segment }` | index records of cut WAL frames were found; index segment `segment` was created to keep them stale |
 | `IndexSegmentDropped { segment, bytes }` | an index segment was deleted because `Config::rebuild_index` was set (the index is rebuilt from the WAL) |
 | `TopicIndexRepaired { topic, blocks_rewritten, pages_rewritten }` | a topic's index blocks or seek pages were re-encoded from the WAL and appended |
-| `CheckpointFileRemoved { file }` | a checkpoint file the checkpoint used does not list was deleted: an earlier or damaged manifest, a `checkpoint-<n>.tmp`, or a table or run of a checkpoint that did not complete |
-| `CheckpointManifestDamaged { checkpoint, fallback }` | manifest `checkpoint-<checkpoint>` failed its CRC or did not decode; open used manifest `fallback` instead, or none (`None`: the state is rebuilt from the WAL, which holds every frame); the damaged manifest is deleted (`CheckpointFileRemoved`) |
+| `CheckpointFileRemoved { file }` | a checkpoint file the checkpoint used does not list was deleted: an earlier manifest, a `checkpoint-<n>.tmp`, or a table or run of a checkpoint that did not complete or whose manifest is damaged |
+| `CheckpointManifestDamaged { checkpoint, fallback, quarantined }` | manifest `checkpoint-<checkpoint>` failed its CRC, version or name check, or did not decode; open used manifest `fallback` instead, or none (`None`: the state is rebuilt from the WAL, which holds every frame); the damaged manifest was renamed, unchanged, to `quarantined` (`checkpoint-<n>.damaged`), reported this once |
 
 `config_overrides` lists `Config` values the WAL replaced, which change no
 file: `DictTrainBytes { configured, stored }` when `Config::dict_train_bytes`
@@ -668,8 +669,8 @@ frames below it are covered; the tables, in order, cover object numbers
 and `fdatasync`ed, then the directory is synced; the manifest is written to
 `checkpoint-<n>.tmp`, `fdatasync`ed, renamed to `checkpoint-<n>` and the
 directory synced; then `checkpoint-<n>` is read back and must decode to what was
-written (a manifest that does not is deleted again and the directory
-synced); only then is `checkpoint-<n − 1>` deleted and the directory
+written (a manifest that does not is renamed to its quarantine name and
+the directory synced); only then is `checkpoint-<n − 1>` deleted and the directory
 synced, so a damaged newest manifest has an older one to fall back to. The
 new table and run are read back, and must hold the entries written, before
 the manifest tmp file is written, so a failure there leaves them unlisted.
@@ -700,8 +701,16 @@ numbers (`CorruptCheckpoint`) and every object number's place, reclaimed
 or `(id, block, index)` (`CheckpointMismatch { number }`). Covered numbers
 whose place differs at the end of the WAL go to the next checkpoint's run.
 After every check, the checkpoint files the manifest in use does not list
-are deleted (`CheckpointFileRemoved`): earlier and damaged manifests, tmp
-manifests, tables and runs of an interrupted checkpoint. With no manifest
+are deleted (`CheckpointFileRemoved`): earlier manifests, tmp manifests,
+tables and runs of an interrupted checkpoint or of a damaged manifest
+(derived from the WAL, and the next checkpoint reuses an object table's
+name). Each damaged manifest is renamed, unchanged, to
+`checkpoint-<n>.damaged` (quarantine, D-257 A as amended by the owner):
+kept for diagnosis, never read as a manifest again and not reported again.
+A damaged manifest whose quarantine name already exists is
+`CorruptCheckpoint`, no file changed. Checkpoint numbers never repeat: the
+next is above every manifest, quarantined or tmp manifest and run on disk,
+so a quarantine name cannot collide. With no manifest
 at all, every table and run is such a file (a first checkpoint that did
 not complete); while no WAL file is deleted the WAL still holds everything
 they described (from step 6b they must be refused when WAL files they
