@@ -3,8 +3,8 @@ name: release
 # A pushed version tag builds the straum-server image for linux/amd64 and
 # linux/arm64 and publishes it to Docker Hub, builds the Debian packages for
 # both, and creates the GitHub release with the packages, their checksums and
-# provenance, and uploads Ubuntu source packages to the Launchpad PPA (Constitution
-# §12.3: only release versions are published). A pull request that touches
+# provenance (Constitution §12.3: only release versions are published). The
+# Launchpad PPA upload is off until D-251 (job ppa). A pull request that touches
 # the build builds the amd64 image, both packages and the noble source package,
 # without publishing anything.
 #
@@ -165,9 +165,12 @@ jobs:
 
   # Ubuntu source packages for the Launchpad PPA, which builds them per series
   # and architecture (scripts/ppa.sh, debian/). A pull request builds the noble
-  # source package and then builds it with the network cut off, as Launchpad
-  # does.
+  # source package; the binary build with the network cut off, as Launchpad
+  # does, and the upload are off: the workspace needs Rust 1.95 and the
+  # newest versioned Rust in Ubuntu is 1.93, so Launchpad cannot build the
+  # package until the owner decides D-251 (straum-dev-plan).
   ppa:
+    if: github.event_name == 'pull_request'
     needs: [image, deb]
     runs-on: ubuntu-24.04
     steps:
@@ -193,7 +196,7 @@ jobs:
               PPA_UNSIGNED=1 scripts/ppa.sh "0.0.0~pr${PR}" noble
           fi
       - name: Build offline, as Launchpad does
-        if: github.event_name == 'pull_request'
+        if: false
         run: |
           set -eu
           cd target/ppa

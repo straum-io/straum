@@ -17,7 +17,9 @@
 # setting of crates/straum-broker/README.md can follow as a flag, or come
 # from a file mounted into the container and passed with --config.
 
-FROM rust:1.88-bookworm AS build
+# Rust 1.95 or later: compio-executor 0.1.4 uses cfg_select! (stable in 1.95),
+# above the workspace's rust-version.
+FROM rust:1.95-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
