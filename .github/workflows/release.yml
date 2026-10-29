@@ -64,7 +64,7 @@ jobs:
             org.opencontainers.image.description=Durable event log for one server (experimental, not production-ready)
             org.opencontainers.image.licenses=Apache-2.0
 
-      # ponytail: arm64 builds under QEMU, slow for a Rust workspace; move to
+      # arm64 builds under QEMU, slow for a Rust workspace; move to
       # native arm64 runners with a manifest merge if release builds get too long.
       - uses: docker/setup-qemu-action@v3
         if: env.PUBLISH == 'true'
