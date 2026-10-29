@@ -35,7 +35,7 @@ impl Rng {
 }
 
 fn start(data: &std::path::Path) -> (Child, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_straum-broker"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_straum-server"))
         .args([
             "--data-dir",
             &data.to_string_lossy(),
@@ -54,7 +54,7 @@ fn start(data: &std::path::Path) -> (Child, String) {
             panic!("broker exited before listening")
         };
         let line = line.unwrap();
-        if let Some(a) = line.strip_prefix("straum-broker: listening on ") {
+        if let Some(a) = line.strip_prefix("straum-server: listening on ") {
             break a.to_owned();
         }
     };

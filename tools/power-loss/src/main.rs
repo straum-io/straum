@@ -850,11 +850,11 @@ fn broker_check(
             .ok_or("broker exited before listening (recovery refused?)")?
             .map_err(|e| e.to_string())?;
         let _ = writeln!(out, "{line}");
-        if let Some(a) = line.strip_prefix("straum-broker: recovery: ") {
+        if let Some(a) = line.strip_prefix("straum-server: recovery: ") {
             println!("RECOVERY {a}");
             actions.push(a.to_owned());
         }
-        if let Some(a) = line.strip_prefix("straum-broker: listening on ") {
+        if let Some(a) = line.strip_prefix("straum-server: listening on ") {
             break a.to_owned();
         }
     };

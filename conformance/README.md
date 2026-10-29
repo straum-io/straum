@@ -75,7 +75,7 @@ Each `scenarios/<name>.json` is one scenario, run against a fresh broker:
 `broker` holds settings for the broker (keys of
 `crates/straum-broker/README.md`); the runner adds a new data directory,
 `--listen 127.0.0.1:0`, `--cluster-id conformance` and `--node-id 1`, and
-reads the address from the broker's `straum-broker: listening on <address>`
+reads the address from the broker's `straum-server: listening on <address>`
 line on stderr. Steps run in order:
 
 | Step | Meaning |
@@ -135,7 +135,7 @@ The Rust runner uses straum-client:
 
 ```bash
 cargo build --release -p straum-broker -p straum-conformance
-target/release/straum-conformance broker target/release/straum-broker   # scenarios/
+target/release/straum-conformance broker target/release/straum-server   # scenarios/
 target/release/straum-conformance client                                # client-scenarios/
 ```
 
@@ -147,9 +147,10 @@ A runner in another language:
 1. Frames: decode every `frames/*.bin` and compare with its `.json`; encode
    the `.json` message and compare with the `.bin`.
 2. Partitioner: compare the SDK's partitioner with `partitioner/vectors.json`.
-3. Broker scenarios: build `straum-broker`, start it per scenario as above,
-   play the steps with the SDK's connection layer (raw requests, pipelining,
-   correlation ids), and match responses with the rules above.
+3. Broker scenarios: build `straum-server` (crate `straum-broker`), start
+   it per scenario as above, play the steps with the SDK's connection layer
+   (raw requests, pipelining, correlation ids), and match responses with the
+   rules above.
 4. Client scenarios: start `straum-fake-server <scenario.json>`, read its
    address, run the `client` operation with the SDK pointed at it, compare
    the outcome with `result`, and require the fake server to exit 0.
