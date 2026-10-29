@@ -563,8 +563,8 @@ look current at the next open, disagree with the WAL, and open fails with
 (`tests/index_segments.rs`, `a_damaged_fence_header_fails_open`).
 
 **Rebuild (D-229 A).** The operator's way out: open with
-`Config::rebuild_index` set (the broker: `--store-rebuild-index true` for
-one start). Open then deletes every index segment before reading any
+`Config::rebuild_index` set (the broker: the flag `--store-rebuild-index`,
+one start only; refused in its configuration file). Open then deletes every index segment before reading any
 (`IndexSegmentDropped { segment, bytes }` each) and re-derives every
 topic's blocks and seek pages from the WAL into new index segments
 (`TopicIndexRepaired`). The rebuild changes no other file; the repairs

@@ -89,7 +89,18 @@ also a flag, `--key value`, with `-` or `_`; flags win.
 | `store_write_mode` | `sequential` | `sequential`, `parallel` (ParallelSync; not recommended on disks without power-loss protection, see the store's README), `inline` (InlineSmall, experimental) |
 | `store_segment_max_bytes` | 64 MiB | |
 | `store_max_frame_bytes` | 64 MiB | the store's WAL frame limit; at least `max_frame_bytes`. The store trains its compression dictionary only in a group whose frame leaves 64 KiB + 21 bytes free, so keep it well above `max_group_bytes` |
-| `store_rebuild_index` | `false` | `true`: rebuild the store's topic index from its WAL at this start, the way out of a `TopicMismatch` at startup (D-229 A). The index segments are deleted and re-derived; the WAL and data are not touched. The startup line counts the recovery actions, one per deleted segment and per rebuilt topic. Meant for one start (`--store-rebuild-index true`); in the configuration file it rebuilds at every start (safe, but open takes longer); if that start is interrupted, start again with it |
+
+**Rebuilding the index.** `--store-rebuild-index` (a flag without a
+value, on the command line only) rebuilds the store's topic index from its
+WAL at this one start: the way out of a `TopicMismatch` at startup
+(D-229 A). The index segments are deleted and re-derived; the WAL and data
+are not touched. The startup output says so and lists the recovery
+actions: one `IndexSegmentDropped` per deleted segment and one
+`TopicIndexRepaired` per rebuilt topic. The next start without the flag
+opens normally. If the rebuilding start is interrupted, start again with
+the flag. A `store_rebuild_index` line in the configuration file, or the
+flag with a value, is refused at startup (exit status 2), so a rebuild
+never repeats at every start unnoticed.
 
 ## Tests
 

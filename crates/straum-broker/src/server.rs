@@ -155,6 +155,12 @@ pub async fn serve(
         if created { " (new data directory)" } else { "" },
         report.actions.len()
     );
+    if config.store_rebuild_index {
+        eprintln!(
+            "straum-broker: recovery: topic index rebuilt from the WAL (--store-rebuild-index, \
+             this start only)"
+        );
+    }
     for action in &report.actions {
         eprintln!("straum-broker: recovery: {action:?}");
     }
