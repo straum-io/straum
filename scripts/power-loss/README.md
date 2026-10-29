@@ -187,13 +187,17 @@ acknowledged, `after-training` or `before-training` otherwise.
 
 ### Checkpoint
 
-A checkpoint writes an object table (`objtab-*.tab`), a relocation run
-(`reloc-*.run`) when compaction moved covered objects, the manifest
-through `checkpoint-<n>.tmp` and a rename, and deletes the previous
-manifest (`crates/straum-store/docs/format.md` "Checkpoint"). The `crash`
-points are `create`, `write` and `fsync` of the table, the run and the tmp
-manifest, its `rename`, and the `unlink` of the previous manifest, each
-`before` or `after`. `torn` splits the write of the tmp manifest (the
+A checkpoint writes an object table (`objtab-*.tab`) and a block table
+(`blktab-*.tab`), relocation runs (`reloc-*.run`, `blkrel-*.run`) when
+compaction moved covered objects or blocks, the dictionary file once after
+training, the manifest through `checkpoint-<n>.tmp` and a rename, and
+deletes the previous manifest (`crates/straum-store/docs/format.md`
+"Checkpoint"). The `crash` points are `create`, `write` and `fsync` of
+both tables, the object run and the tmp manifest, `write` and `fsync` of
+the block run, the tmp manifest's `rename`, and the `unlink` of the
+previous manifest, each `before` or `after`; the dictionary file has none
+(it is written once per store). Checkpoint files a recovery deletes or
+quarantines are checked whatever their kind. `torn` splits the write of the tmp manifest (the
 writer names `checkpoint-<n>.tmp`, `n` the next checkpoint number on
 disk).
 

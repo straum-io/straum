@@ -134,15 +134,30 @@ const CRASH_POINTS: [(&str, &str); 8] = [
     ("create", "wal-"),
 ];
 
+/// Files a checkpoint writes, by name prefix (docs/format.md "Files").
+const CHECKPOINT_FILES: [&str; 6] = [
+    "checkpoint-",
+    "objtab-",
+    "blktab-",
+    "blkrel-",
+    "dict-",
+    "reloc-",
+];
+
 /// The manifest's tmp file, written, synced and renamed by a checkpoint.
 const CKPT_TMP: &str = r"checkpoint-[0-9a-f]{16}\.tmp$";
 
-/// Crash points of a checkpoint: its object table, relocation run and
-/// manifest, and the deletion of the previous manifest.
-const CHECKPOINT_POINTS: [(&str, &str); 11] = [
+/// Crash points of a checkpoint: its object and block tables, relocation
+/// runs and manifest, and the deletion of the previous manifest.
+const CHECKPOINT_POINTS: [(&str, &str); 16] = [
     ("create", "objtab-"),
     ("write", "objtab-"),
     ("fsync", "objtab-"),
+    ("create", "blktab-"),
+    ("write", "blktab-"),
+    ("fsync", "blktab-"),
+    ("write", "blkrel-"),
+    ("fsync", "blkrel-"),
     ("create", "reloc-"),
     ("write", "reloc-"),
     ("fsync", "reloc-"),
@@ -435,8 +450,10 @@ fn next_checkpoint(dir: &Path) -> u64 {
             manifest_number(n.strip_suffix(".tmp").unwrap_or(&n))
                 .or_else(|| quarantine_number(&n))
                 .or_else(|| {
-                    let hex = n.strip_prefix("reloc-")?.strip_suffix(".run")?;
-                    u64::from_str_radix(hex, 16).ok()
+                    let run = n
+                        .strip_prefix("reloc-")
+                        .or_else(|| n.strip_prefix("blkrel-"))?;
+                    u64::from_str_radix(run.strip_suffix(".run")?, 16).ok()
                 })
         })
         .max()
@@ -756,10 +773,7 @@ fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Res
                 explain(&|x| action_name(x) == "WalTmpRemoved", rel)?;
             }
             (_, Some(_), None)
-                if !rel.contains('/')
-                    && ["checkpoint-", "objtab-", "reloc-"]
-                        .iter()
-                        .any(|p| name.starts_with(p)) =>
+                if !rel.contains('/') && CHECKPOINT_FILES.iter().any(|p| name.starts_with(p)) =>
             {
                 explain(
                     &|x| {
