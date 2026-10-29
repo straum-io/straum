@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -71,12 +71,11 @@ pub struct Config {
     /// `StoreError::FrameTooLarge`.
     pub max_frame_bytes: u32,
     pub write_mode: WriteMode,
-    /// Decompressed blocks kept for reads, most recently used; 0 keeps none.
-    pub block_cache_blocks: usize,
     /// Upper bound on the memory of the decompressed blocks kept for reads
-    /// (raw bytes and object offsets). A block larger than this is not
-    /// kept; the least recently used blocks are evicted once either this or
-    /// `block_cache_blocks` would be exceeded.
+    /// (raw bytes, object offsets and a fixed 160 bytes per block for the
+    /// cache's own entries). The least recently used blocks are evicted
+    /// once it would be exceeded; a block larger than this is not kept, so
+    /// 0 keeps none. The only limit: the number of blocks follows from it.
     pub block_cache_bytes: usize,
     /// An index segment holding at least this many bytes is sealed before
     /// the next batch, and the next index record starts a new one; a
@@ -110,7 +109,6 @@ impl Default for Config {
             segment_max_bytes: 64 << 20,
             max_frame_bytes: 64 << 20,
             write_mode: WriteMode::Sequential,
-            block_cache_blocks: 16,
             block_cache_bytes: 64 << 20,
             index_segment_max_bytes: 64 << 20,
             index_open_files: 64,
@@ -274,59 +272,78 @@ struct Decoded {
 }
 
 impl Decoded {
-    /// Heap bytes held, as counted against `Config::block_cache_bytes`.
+    /// Memory held, as counted against `Config::block_cache_bytes`: the
+    /// heap bytes plus `CACHE_ENTRY_OVERHEAD`.
     fn bytes(&self) -> usize {
-        self.raw.capacity() + self.spans.capacity() * size_of::<Range<usize>>()
+        self.raw.capacity()
+            + self.spans.capacity() * size_of::<Range<usize>>()
+            + CACHE_ENTRY_OVERHEAD
     }
 }
 
-/// Decompressed blocks kept for reads, least recently used first. A linear
-/// scan: the count limit is small (`Config::block_cache_blocks`, default 16).
+/// Bytes counted per cached block beyond its heap buffers: the `Decoded`
+/// and its `Rc` header, the map entries and their share of the tables,
+/// rounded up. Counting them keeps the cache within its byte limit even
+/// when blocks are tiny.
+const CACHE_ENTRY_OVERHEAD: usize = 160;
+
+/// Decompressed blocks kept for reads within `Config::block_cache_bytes`,
+/// least recently used evicted first. A map by block number and an ordered
+/// map by last use: a byte limit of 64 MiB holds about 4 000 blocks of
+/// 16 KiB, too many for a linear scan per read.
 struct BlockCache {
-    entries: VecDeque<(u64, Rc<Decoded>)>,
+    /// Block number → (block, last use).
+    entries: HashMap<u64, (Rc<Decoded>, u64)>,
+    /// Last use → block number; the first entry is the least recently used.
+    order: BTreeMap<u64, u64>,
+    tick: u64,
     bytes: usize,
-    max_blocks: usize,
     max_bytes: usize,
 }
 
 impl BlockCache {
-    fn new(max_blocks: usize, max_bytes: usize) -> Self {
+    fn new(max_bytes: usize) -> Self {
         Self {
-            entries: VecDeque::new(),
+            entries: HashMap::new(),
+            order: BTreeMap::new(),
+            tick: 0,
             bytes: 0,
-            max_blocks,
             max_bytes,
         }
     }
 
     fn get(&mut self, number: u64) -> Option<Rc<Decoded>> {
-        let at = self.entries.iter().position(|(n, _)| *n == number)?;
-        let entry = self.entries.remove(at)?;
-        let d = Rc::clone(&entry.1);
-        self.entries.push_back(entry);
-        Some(d)
+        let (d, used) = self.entries.get_mut(&number)?;
+        self.order.remove(used);
+        self.tick += 1;
+        *used = self.tick;
+        self.order.insert(self.tick, number);
+        Some(Rc::clone(d))
     }
 
     fn insert(&mut self, number: u64, d: Rc<Decoded>) {
         self.remove(number);
         let size = d.bytes();
-        if self.max_blocks == 0 || size > self.max_bytes {
+        if size > self.max_bytes {
             return;
         }
-        while self.entries.len() >= self.max_blocks || self.bytes + size > self.max_bytes {
-            let Some((_, old)) = self.entries.pop_front() else {
+        while self.bytes + size > self.max_bytes {
+            let Some((_, old)) = self.order.pop_first() else {
                 break;
             };
-            self.bytes -= old.bytes();
+            if let Some((old, _)) = self.entries.remove(&old) {
+                self.bytes -= old.bytes();
+            }
         }
         self.bytes += size;
-        self.entries.push_back((number, d));
+        self.tick += 1;
+        self.order.insert(self.tick, number);
+        self.entries.insert(number, (d, self.tick));
     }
 
     fn remove(&mut self, number: u64) {
-        if let Some(at) = self.entries.iter().position(|(n, _)| *n == number)
-            && let Some((_, old)) = self.entries.remove(at)
-        {
+        if let Some((old, used)) = self.entries.remove(&number) {
+            self.order.remove(&used);
             self.bytes -= old.bytes();
         }
     }
@@ -688,10 +705,7 @@ impl Store {
             blocks: replay.blocks,
             next_block: replay.next_block,
             codecs: RefCell::new(codecs),
-            cache: RefCell::new(BlockCache::new(
-                config.block_cache_blocks,
-                config.block_cache_bytes,
-            )),
+            cache: RefCell::new(BlockCache::new(config.block_cache_bytes)),
             dictless_raw: replay.dictless_raw,
             dictionary,
             next_topic: replay.topic_names.len() as u64,
@@ -3427,13 +3441,19 @@ mod tests {
         })
     }
 
+    /// A block of `raw_len` heap bytes as the cache counts it.
+    fn counted(raw_len: usize) -> usize {
+        raw_len + CACHE_ENTRY_OVERHEAD
+    }
+
     fn cached_numbers(c: &BlockCache) -> Vec<u64> {
-        c.entries.iter().map(|(n, _)| *n).collect()
+        c.order.values().copied().collect()
     }
 
     #[test]
     fn block_cache_does_not_keep_a_block_larger_than_its_byte_limit() {
-        let mut c = BlockCache::new(16, 1000);
+        let limit = counted(1000);
+        let mut c = BlockCache::new(limit);
         c.insert(1, decoded(400));
         c.insert(2, decoded(1001));
         assert!(c.get(2).is_none());
@@ -3442,43 +3462,57 @@ mod tests {
             [1],
             "the oversized block evicts nothing"
         );
-        assert_eq!(c.bytes, 400);
+        assert_eq!(c.bytes, counted(400));
         c.insert(3, decoded(1000));
         assert_eq!(
             cached_numbers(&c),
             [3],
             "a block of exactly the limit is kept"
         );
-        assert_eq!(c.bytes, 1000);
+        assert_eq!(c.bytes, limit);
     }
 
     #[test]
     fn block_cache_evicts_least_recently_used_by_bytes() {
-        let mut c = BlockCache::new(16, 1000);
+        let mut c = BlockCache::new(counted(300) * 3 + 100);
         for n in 1..=3 {
             c.insert(n, decoded(300));
         }
         assert!(c.get(1).is_some(), "1 becomes the most recently used");
         c.insert(4, decoded(300));
-        assert_eq!(cached_numbers(&c), [3, 1, 4], "2 evicted: 1200 > 1000");
-        c.insert(5, decoded(700));
+        assert_eq!(cached_numbers(&c), [3, 1, 4], "2 evicted");
+        c.insert(5, decoded(600));
         assert_eq!(cached_numbers(&c), [4, 5]);
-        assert_eq!(c.bytes, 1000);
         c.remove(4);
-        assert_eq!((cached_numbers(&c), c.bytes), (vec![5], 700));
+        assert_eq!(cached_numbers(&c), [5]);
+        assert_eq!(c.bytes, counted(600));
     }
 
     #[test]
-    fn block_cache_evicts_by_count_and_keeps_nothing_at_zero() {
-        let mut c = BlockCache::new(2, 1 << 20);
-        for n in 1..=3 {
-            c.insert(n, decoded(10));
+    fn block_cache_holds_many_small_blocks_up_to_its_bytes_and_none_at_zero() {
+        // 16 KiB blocks in a 1 MiB cache: the bytes govern, not a count.
+        let limit = 1 << 20;
+        let mut c = BlockCache::new(limit);
+        for n in 0..200 {
+            c.insert(n, decoded(16 << 10));
         }
-        assert_eq!(cached_numbers(&c), [2, 3]);
-        assert_eq!(c.bytes, 20);
-        c.insert(3, decoded(30));
-        assert_eq!((cached_numbers(&c), c.bytes), (vec![2, 3], 40), "replaced");
-        let mut none = BlockCache::new(0, 1 << 20);
+        let fit = limit / counted(16 << 10);
+        assert_eq!(c.entries.len(), fit);
+        assert_eq!(c.order.len(), fit);
+        assert!(c.bytes <= limit);
+        assert_eq!(
+            cached_numbers(&c),
+            (200 - fit as u64..200).collect::<Vec<_>>()
+        );
+        c.insert(199, decoded(30));
+        assert_eq!(c.entries.len(), fit, "replaced, not added");
+        // Tiny blocks: the per-entry overhead keeps the count bounded.
+        let mut tiny = BlockCache::new(1 << 16);
+        for n in 0..10_000 {
+            tiny.insert(n, decoded(1));
+        }
+        assert_eq!(tiny.entries.len(), (1 << 16) / counted(1));
+        let mut none = BlockCache::new(0);
         none.insert(1, decoded(10));
         assert!(none.get(1).is_none());
         assert_eq!(none.bytes, 0);

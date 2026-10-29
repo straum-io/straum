@@ -46,9 +46,10 @@ the raw block. Reading an object decompresses its block, checks the raw
 length, the CRC and that the block splits into exactly the recorded number
 of objects (any failure is `CorruptBlock`, never data), then checks the
 object's BLAKE3 (`HashMismatch`). The last decompressed blocks are cached,
-least recently used first out, within two limits: `Config::block_cache_blocks`
-(default 16) blocks and `Config::block_cache_bytes` (default 64 MiB) of raw
-bytes and object offsets. A block larger than the byte limit is not cached.
+least recently used first out, within `Config::block_cache_bytes` (default
+64 MiB) of raw bytes, object offsets and 160 bytes per block for the
+cache's entries; no count limit. A block larger than the byte limit is not
+cached.
 
 Block numbers start at 0 and are never reused: the next number is the
 highest in the WAL plus one.

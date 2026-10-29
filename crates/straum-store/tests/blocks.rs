@@ -401,7 +401,7 @@ async fn failed_training_is_recorded_once() {
 async fn reads_work_without_a_block_cache() {
     let dir = TempDir::new("blocks-nocache");
     let config = Config {
-        block_cache_blocks: 0,
+        block_cache_bytes: 0,
         ..Config::default()
     };
     let mut rng = Rng(5);

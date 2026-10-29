@@ -40,7 +40,7 @@
 //! reads of random `topic_seq`s (xorshift64* from `--seed`). Each workload
 //! stops after N reads or `--read-seconds`, whichever comes first, and is
 //! repeated for every `--read-cache` setting: `default` (the configuration
-//! default) or, with the `blocks` feature, `off` (`block_cache_blocks = 0`).
+//! default) or, with the `blocks` feature, `off` (`block_cache_bytes = 0`).
 //! Built without `blocks` (an engine without a block cache) the setting is
 //! reported as `none`. Reads come from the page cache as written: dropping
 //! it needs root.
@@ -102,7 +102,7 @@ impl ReadCache {
         let mut config = store_config(write_mode, args);
         #[cfg(feature = "blocks")]
         if self == Self::Off {
-            config.block_cache_blocks = 0;
+            config.block_cache_bytes = 0;
         }
         config
     }

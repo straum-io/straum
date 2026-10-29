@@ -13,9 +13,9 @@ macOS (development only). No tokio, including transitively.
   trained, a 64 KiB dictionary (`Config::dict_train_bytes`). Reading one
   object decompresses one block, so the limit bounds the cost of a read
   whatever the batch size. Reads decompress the block and check its CRC and
-  the object's BLAKE3; the last blocks read are cached
-  (`Config::block_cache_blocks`, default 16, and `Config::block_cache_bytes`,
-  default 64 MiB; a larger block is not cached). The training threshold is
+  the object's BLAKE3; the last blocks read are cached within
+  `Config::block_cache_bytes` (default 64 MiB, counting 160 bytes per block
+  for the cache's entries; a larger block is not cached, 0 caches none). The training threshold is
   fixed in the WAL file header when the WAL is created.
 - Topic entries are read from shared index segments (`idx-<id>.dat`), not
   held in memory, and there is no file per topic: full 64-entry index
@@ -183,7 +183,7 @@ start one byte further in, so payloads repeat only where the file does).
 which each message repeats, with probability one half, the body of a random
 earlier message of the measured topic; then it reopens the store and runs
 four read workloads, up to N reads or `--read-seconds` each, once per
-`--read-cache` setting (`default`, or `off`: `block_cache_blocks = 0`):
+`--read-cache` setting (`default`, or `off`: `block_cache_bytes = 0`):
 `scan` (the measured topic in `topic_seq` order), `random` (random
 `topic_seq`s), `dedup_scan` (the second topic in order, so the repeated
 bodies come from old blocks) and `multi` (4 cursors starting at even

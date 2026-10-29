@@ -150,7 +150,7 @@ fn store_matches_model(ops: Vec<Op>, mode: WriteMode) {
             // it may build no dictionary, which is a path too.
             dict_train_bytes: 256,
             // Small, so reads also go through eviction.
-            block_cache_blocks: 2,
+            block_cache_bytes: 2048,
             // Seek pages of two locations: lookups read several pages.
             seek_page_entries: 2,
             // Index segments rotate between batches.
