@@ -73,3 +73,40 @@ jobs:
             cargo llvm-cov --workspace --tests --summary-only -- --include-ignored --skip linux_runtime_uses_io_uring | tail -1
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # The power-loss harness (scripts/power-loss/run.sh) in its --quick mode on
+  # every PR (D-242 A). LazyFS runs as the runner's user through fusermount3;
+  # nothing is installed beyond the packages below and the pinned LazyFS.
+  power-loss:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev g++ cmake git pkg-config
+      - id: pin
+        run: echo "lazyfs=$(sed -n 's/^LAZYFS_PIN=\([0-9a-f]*\).*/\1/p' scripts/power-loss/run.sh)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: lazyfs
+        with:
+          path: ~/lazyfs
+          key: lazyfs-${{ steps.pin.outputs.lazyfs }}-${{ runner.os }}-${{ runner.arch }}
+      # LazyFS 0.3.1 fetches dependencies whose CMakeLists ask for a CMake
+      # policy version below 3.5, which the runner's CMake 4 refuses.
+      - if: steps.lazyfs.outputs.cache-hit != 'true'
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: |
+          git clone https://github.com/dsrhaslab/lazyfs.git ~/lazyfs
+          git -C ~/lazyfs checkout ${{ steps.pin.outputs.lazyfs }}
+          (cd ~/lazyfs/libs/libpcache && ./build.sh)
+          (cd ~/lazyfs/lazyfs && ./build.sh)
+      - run: scripts/power-loss/run.sh --quick --out "$RUNNER_TEMP/power-loss"
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: power-loss
+          path: |
+            ${{ runner.temp }}/power-loss/*.txt
+            ${{ runner.temp }}/power-loss/*.log
+            ${{ runner.temp }}/power-loss/*/pre-recovery
