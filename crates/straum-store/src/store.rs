@@ -466,8 +466,20 @@ pub enum RecoveryAction {
     },
     /// Checkpoint file `file` was moved, unchanged, into the quarantine
     /// directory `quarantine` (`quarantine-<n>`, with `.1`, `.2`, … if that
-    /// name is taken).
+    /// name is taken by a completed quarantine).
     CheckpointFileQuarantined { file: String, quarantine: String },
+    /// An interrupted quarantine of manifest `checkpoint` (its directory
+    /// exists without the manifest, which is still in the store directory)
+    /// was completed in that directory: `found` lists the files an earlier,
+    /// interrupted open had moved there (in no report then), and the moves
+    /// made now follow as `CheckpointFileQuarantined`. Open used manifest
+    /// `fallback`, or none.
+    CheckpointQuarantineResumed {
+        checkpoint: u64,
+        fallback: Option<u64>,
+        quarantine: String,
+        found: Vec<String>,
+    },
     /// Full index blocks and seek pages of a topic that no index segment
     /// held intact were re-encoded from the WAL and appended.
     TopicIndexRepaired {
@@ -947,7 +959,7 @@ impl Store {
                 .push(RecoveryAction::CheckpointFileRemoved { file: file.clone() });
         }
         for q in &quarantine {
-            move_to_quarantine(&dir, &q.dir, &q.files).await?;
+            move_to_quarantine(&dir, &q.dir, &q.files, q.resumed.is_none()).await?;
         }
         let quarantined_files = count_quarantined(&dir)?;
         if !orphans.is_empty()
@@ -1088,7 +1100,7 @@ impl Store {
             // manifest at open.
             names.push(file_name(&path));
             let q = free_quarantine_name(&self.dir, n)?;
-            move_to_quarantine(&self.dir, &q, &names).await?;
+            move_to_quarantine(&self.dir, &q, &names, true).await?;
             sync_dir(&self.dir).await?;
             self.quarantined_files += names.len() as u64;
             return Err(StoreError::CorruptCheckpoint {
@@ -4076,10 +4088,17 @@ fn free_quarantine_name(dir: &Path, n: u64) -> io::Result<String> {
 /// directory, an interrupted move is finished by the next open, which finds
 /// the manifest again and quarantines it with the files still in place (in
 /// the next free name); so a table or run it may list is never deleted.
-async fn move_to_quarantine(dir: &Path, quarantine: &str, files: &[String]) -> io::Result<()> {
+async fn move_to_quarantine(
+    dir: &Path,
+    quarantine: &str,
+    files: &[String],
+    create: bool,
+) -> io::Result<()> {
     let q = dir.join(quarantine);
-    std::fs::create_dir(&q)?;
-    sync_dir(dir).await?;
+    if create {
+        std::fs::create_dir(&q)?;
+        sync_dir(dir).await?;
+    }
     let (manifests, others): (Vec<&String>, Vec<&String>) =
         files.iter().partition(|f| f.starts_with("checkpoint-"));
     for group in [others, manifests] {
@@ -4350,8 +4369,12 @@ struct OpenedCheckpoint {
 }
 
 struct Quarantine {
+    checkpoint: u64,
     dir: String,
     files: Vec<String>,
+    /// An interrupted quarantine completed in its existing directory: the
+    /// files found there.
+    resumed: Option<Vec<String>>,
 }
 
 /// Loads the newest intact checkpoint manifest and the tables and runs it
@@ -4394,15 +4417,76 @@ async fn open_checkpoint(
         })
         .collect();
     manifests.sort_unstable_by(|a, b| b.cmp(a));
+    // Quarantine directories and their files. One that lacks its manifest
+    // while the manifest is still in the store directory is an interrupted
+    // quarantine (the manifest moves last): it is completed in place.
+    let mut dirs: Vec<(u64, String, Vec<String>)> = Vec::new();
+    for (f, name) in &found {
+        if let CheckpointFile::Quarantined(n) = *f {
+            let path = dir.join(name);
+            let files = if path.is_dir() {
+                let mut v = Vec::new();
+                for e in std::fs::read_dir(&path)? {
+                    v.push(e?.file_name().to_string_lossy().into_owned());
+                }
+                v.sort();
+                v
+            } else {
+                Vec::new()
+            };
+            dirs.push((n, name.clone(), files));
+        }
+    }
+    let manifest_name = |n: u64| format!("checkpoint-{n:016x}");
+    let mut resumed: Vec<(u64, String, Vec<String>)> = Vec::new();
+    for &n in &manifests {
+        let open: Vec<&(u64, String, Vec<String>)> = dirs
+            .iter()
+            .filter(|d| d.0 == n && !d.2.contains(&manifest_name(n)))
+            .collect();
+        match open[..] {
+            [] => {}
+            [d] => resumed.push(d.clone()),
+            _ => {
+                return Err(StoreError::CorruptCheckpoint {
+                    checkpoint: n,
+                    reason: "two interrupted quarantines of one manifest",
+                });
+            }
+        }
+    }
+    let is_resumed = |n: u64| resumed.iter().any(|r| r.0 == n);
     let mut damaged = Vec::new();
     let mut used = None;
-    for &n in &manifests {
+    for &n in manifests.iter().filter(|&&n| !is_resumed(n)) {
         match read_manifest(dir, n).await? {
             Some(m) => {
                 used = Some(m);
                 break;
             }
             None => damaged.push(n),
+        }
+    }
+    // An interrupted quarantine of an intact manifest (a read-back failure
+    // at write time): every table and run it lists must be in place or in
+    // that quarantine; otherwise the state is not explained, an error that
+    // changes no file.
+    let present = |name: &str| found.iter().any(|(_, f)| f == name);
+    for (n, _, inside) in &resumed {
+        if let Some(m) = read_manifest(dir, *n).await? {
+            let listed = m
+                .tables
+                .iter()
+                .map(|&(first, _)| file_name(&objtab_path(dir, first)))
+                .chain(m.runs.iter().map(|&(k, _)| file_name(&reloc_path(dir, k))));
+            for f in listed {
+                if !present(&f) && !inside.contains(&f) {
+                    return Err(StoreError::CorruptCheckpoint {
+                        checkpoint: *n,
+                        reason: "a file the manifest lists is neither in place nor in its interrupted quarantine",
+                    });
+                }
+            }
         }
     }
     let next_checkpoint = found
@@ -4439,12 +4523,11 @@ async fn open_checkpoint(
         Some(m) => (m.n, m.next_object, m.tables.clone(), m.runs.clone()),
         None => (0, 0, Vec::new(), Vec::new()),
     };
-    // Tables and runs are cumulative: the newest damaged manifest lists
-    // every table and run newer than the manifest used, so those it may
-    // list go with it (a later interrupted checkpoint's table cannot be
-    // told apart and is kept too); runs newer than it are orphans.
-    let newest = damaged.first().copied();
-    let mut quarantine: Vec<Quarantine> = Vec::with_capacity(damaged.len());
+    // Tables and runs are cumulative: the newest manifest quarantined now
+    // may list every table and run newer than the manifest used, so those
+    // go with it (a later interrupted checkpoint's table cannot be told
+    // apart and is kept too); runs newer than it are orphans.
+    let mut quarantine: Vec<Quarantine> = Vec::new();
     let mut taken: Vec<String> = Vec::new();
     for &n in &damaged {
         let base = format!("quarantine-{n:016x}");
@@ -4456,14 +4539,29 @@ async fn open_checkpoint(
         }
         taken.push(name.clone());
         quarantine.push(Quarantine {
+            checkpoint: n,
             dir: name,
-            files: vec![format!("checkpoint-{n:016x}")],
+            files: vec![manifest_name(n)],
+            resumed: None,
         });
     }
+    for (n, name, inside) in &resumed {
+        quarantine.push(Quarantine {
+            checkpoint: *n,
+            dir: name.clone(),
+            files: vec![manifest_name(*n)],
+            resumed: Some(inside.clone()),
+        });
+    }
+    quarantine.sort_unstable_by(|a, b| b.checkpoint.cmp(&a.checkpoint));
+    let newest = quarantine
+        .first()
+        .map(|q| q.checkpoint)
+        .filter(|&d| d > used_n);
     let mut orphans = Vec::new();
     for (f, name) in found {
         let to_newest = match f {
-            CheckpointFile::Manifest(k) if damaged.contains(&k) => {
+            CheckpointFile::Manifest(k) if quarantine.iter().any(|q| q.checkpoint == k) => {
                 continue;
             }
             CheckpointFile::Manifest(k) if k == used_n => continue,
@@ -4479,20 +4577,28 @@ async fn open_checkpoint(
             None => orphans.push(name),
         }
     }
-    for (q, &checkpoint) in quarantine.iter().zip(&damaged) {
-        report
-            .actions
-            .push(RecoveryAction::CheckpointManifestDamaged {
+    for q in &quarantine {
+        let quarantine = q.dir.clone();
+        let checkpoint = q.checkpoint;
+        report.actions.push(match &q.resumed {
+            None => RecoveryAction::CheckpointManifestDamaged {
                 checkpoint,
                 fallback,
-                quarantine: q.dir.clone(),
-            });
+                quarantine: quarantine.clone(),
+            },
+            Some(found) => RecoveryAction::CheckpointQuarantineResumed {
+                checkpoint,
+                fallback,
+                quarantine: quarantine.clone(),
+                found: found.clone(),
+            },
+        });
         for file in &q.files {
             report
                 .actions
                 .push(RecoveryAction::CheckpointFileQuarantined {
                     file: file.clone(),
-                    quarantine: q.dir.clone(),
+                    quarantine: quarantine.clone(),
                 });
         }
     }

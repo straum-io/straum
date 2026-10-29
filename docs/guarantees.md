@@ -118,11 +118,12 @@ At startup the store replays the WAL from the beginning
   | `CheckpointFileRemoved` | a checkpoint file the checkpoint in use does not list (an earlier manifest, a tmp manifest, a table or run of an interrupted checkpoint) is deleted |
   | `CheckpointManifestDamaged` | a checkpoint manifest, read newest first, fails its CRC, version or name check, or does not decode (one entry per such manifest): the newest intact older manifest is used instead; with none, the checkpoint is ignored and the state rebuilt from the WAL, which still holds every frame (no WAL file is deleted yet). The manifest is not deleted: it moves, unchanged, into a quarantine directory `quarantine-<n>` (an existing one is never overwritten; the next free suffix `.1`, `.2`, … is used) |
   | `CheckpointFileQuarantined` | each file moved into that quarantine: the damaged manifest and the tables and runs it may list, kept for diagnosis |
+  | `CheckpointQuarantineResumed` | a quarantine an earlier open or checkpoint began and did not finish (its directory exists, the manifest still in place) is completed in the same directory; the files found there are listed, so every change is reported at least once |
 
-  The last three concern the store's checkpoints (ADR-0014), which the
+  The last four concern the store's checkpoints (ADR-0014), which the
   broker does not write yet. A quarantine is reported once, by the open
-  that made it (files moved by an open that was interrupted are in no
-  report, since its report was lost, but are counted); while quarantined
+  that made it, or, if that open was interrupted, by the open that
+  completes it; while quarantined
   files exist, the broker prints one
   startup warning (`straum-server: warning: …`, not a recovery line) until
   an operator removes them. An empty report means nothing was changed.

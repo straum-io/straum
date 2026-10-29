@@ -456,6 +456,7 @@ report means recovery changed nothing. No change is made without an entry.
 | `CheckpointFileRemoved { file }` | a checkpoint file the checkpoint used does not list was deleted: an earlier manifest, a `checkpoint-<n>.tmp`, or a table or run of a checkpoint that did not complete |
 | `CheckpointManifestDamaged { checkpoint, fallback, quarantine }` | manifest `checkpoint-<checkpoint>` failed its CRC, version or name check, or did not decode; open used manifest `fallback` instead, or none (`None`: the state is rebuilt from the WAL, which holds every frame); the manifest and the files it may list moved, unchanged, into the directory `quarantine` |
 | `CheckpointFileQuarantined { file, quarantine }` | checkpoint file `file` was moved, unchanged, into the quarantine directory `quarantine` (one entry per file) |
+| `CheckpointQuarantineResumed { checkpoint, fallback, quarantine, found }` | an interrupted quarantine of manifest `checkpoint` was completed in its directory `quarantine`; `found`: the files an interrupted open had moved there; open used manifest `fallback` instead, or none |
 
 `config_overrides` lists `Config` values the WAL replaced, which change no
 file: `DictTrainBytes { configured, stored }` when `Config::dict_train_bytes`
@@ -675,9 +676,9 @@ and `fdatasync`ed, then the directory is synced; the manifest is written to
 `checkpoint-<n>.tmp`, `fdatasync`ed, renamed to `checkpoint-<n>` and the
 directory synced; then `checkpoint-<n>` is read back and must decode to what was
 written (a manifest that does not moves into a quarantine directory with
-this checkpoint's new table and run, the directories synced; the
-checkpoint's `CorruptCheckpoint` error is its only report, later opens
-keep it silently); only then is `checkpoint-<n − 1>` deleted and the directory
+this checkpoint's new table and run, as below; the previous manifest stays
+in force and the checkpoint returns `CorruptCheckpoint`, its report; an
+interruption is completed by the next open); only then is `checkpoint-<n − 1>` deleted and the directory
 synced, so a damaged newest manifest has an older one to fall back to. The
 new table and run are read back, and must hold the entries written, before
 the manifest tmp file is written, so a failure there leaves them unlisted.
@@ -709,25 +710,43 @@ or `(id, block, index)` (`CheckpointMismatch { number }`). Covered numbers
 whose place differs at the end of the WAL go to the next checkpoint's run.
 After every check, the checkpoint files the manifest in use does not list
 are deleted (`CheckpointFileRemoved`): earlier manifests, tmp manifests,
-tables and runs of an interrupted checkpoint. Each damaged manifest moves,
-unchanged, into a quarantine directory `quarantine-<n>` (D-257 A as
-amended by the owner), created and synced before the moves; the tables and
-runs move first and are synced, then the manifest, so an open interrupted
-during the move leaves the manifest in place and the next open quarantines
-it again with the files not yet moved (in the next free name), deleting
-none (the files the interrupted open moved are in no recovery report,
-since that open's report was lost; `quarantined_files` and the broker's
-warning count them); a name that
-is taken gets the next free suffix (`quarantine-<n>.1`, `.2`, …), so an
-existing quarantine is never overwritten. Tables and runs are cumulative,
-so the tables at or above the used manifest's `next_object` and the runs
-numbered above the used manifest and up to the newest damaged one may be
-parts of that newest damaged checkpoint: they move into its quarantine too
-(a later interrupted checkpoint's table cannot be told apart and is kept as
-well); runs above it are orphans. Each moved file is reported once
-(`CheckpointFileQuarantined`); a quarantine directory is never read and not
-reported again, and `Store::quarantined_files` counts the files in all of
-them at open. Checkpoint numbers do not repeat (the next is above every
+tables and runs of an interrupted checkpoint.
+
+**Quarantine** (D-257 A as amended by the owner). A damaged manifest is
+never deleted: it moves, unchanged, into a quarantine directory
+`quarantine-<n>` with the tables and runs it may list. Tables and runs are
+cumulative, so the newest manifest quarantined may list every table at or
+above the used manifest's `next_object` and every run numbered above the
+used manifest up to its own: they move with it (a table that cannot be
+attributed with certainty, such as a later interrupted checkpoint's, is
+kept there too); runs above it are orphans. The move: create the directory
+and sync the store directory; move the tables and runs, sync both
+directories; move the manifest last, sync both.
+
+- *Completed* quarantine: the directory holds `checkpoint-<n>`. It is never
+  read, never changed and not reported again; a new quarantine of the same
+  number uses the next free name, `quarantine-<n>.1`, `.2`, ….
+- *Interrupted* quarantine: the directory exists without `checkpoint-<n>`,
+  and `checkpoint-<n>` is still in the store directory (a crash after the
+  directory's creation and before the manifest's move, at open, at write
+  time, or while completing an earlier one). Open completes it in that
+  same directory: it moves the files the quarantine takes that are still in
+  place, then the manifest, and reports the files it found there
+  (`CheckpointQuarantineResumed`, `found`: the interrupted open's report was
+  lost) and each move (`CheckpointFileQuarantined`). It then uses the
+  newest manifest not quarantined, as for a damaged one. A crash during
+  the completion leaves an interrupted quarantine again, completed by the
+  next open. If the manifest is intact (a read-back failure at write time),
+  every table and run it lists must be in place or in that directory;
+  otherwise the state is unexplained, `CorruptCheckpoint`, no file
+  changed. Two interrupted quarantines of one manifest are
+  `CorruptCheckpoint` too. A quarantine directory without its manifest
+  while no `checkpoint-<n>` is in the store directory is kept, unread.
+
+Every change is reported at least once: by the open that made it, or, when
+that open crashed, as `found` by the open that completes the quarantine.
+`Store::quarantined_files` counts the files in all quarantine directories
+at open. Checkpoint numbers do not repeat (the next is above every
 manifest, tmp manifest, run and quarantine directory on disk). With no manifest
 at all, every table and run is such a file (a first checkpoint that did
 not complete); while no WAL file is deleted the WAL still holds everything
