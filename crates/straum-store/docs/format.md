@@ -119,7 +119,7 @@ checkpoint will delete the files wholly before the frame it covers
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `magic` = `53 54 52 4d 57 41 4c 00` (`"STRMWAL\0"`) |
-| 8 | 4 | `version` u32 = 20 |
+| 8 | 4 | `version` u32 = 21 |
 | 12 | 8 | `dict_train_bytes` u64: the dictionary training threshold |
 | 20 | 4 | `crc` u32: CRC32C of bytes `[0..20)` |
 
@@ -153,7 +153,9 @@ write a directory that holds quarantined manifests), 17 a damaged manifest
 quarantined alone as `checkpoint-<n>.damaged` (its tables and runs deleted), 18 no block
 tables, block relocation runs or dictionary file, and a manifest without the next
 segment number, the training state, the dictionary and the live segments, 19 no id
-runs (every id in memory). The number keeps increasing
+runs (every id in memory), 20 each id under at most one live number (no
+degraded deduplication: replay refused a new object whose id was already
+indexed, and an id run held an id once). The number keeps increasing
 with each format change on this line; none is reused (D-251 A).
 
 ### Frame
@@ -644,8 +646,29 @@ since; the same for blocks (block table, block relocation run, D-255 A);
 the dictionary file once, at the first checkpoint after training; then the
 manifest. Interim rule until ADR-0014 step 6b: no WAL file
 is deleted and open still replays the whole WAL, so the checkpoint is
-checked against it at every open; the in-memory object maps stay. The
-broker does not checkpoint yet (step 7 adds the triggers).
+checked against it at every open; the in-memory object maps stay.
+
+Triggers (ADR-0014 step 7, D-209 A): before a batch, a release or a
+compaction step, a checkpoint runs if a frame was written since the last
+one and either the WAL bytes since it reached
+`Config::checkpoint_wal_bytes` (default 256 MiB, counted at open from the
+frames past the covered one) or the memtable reached its share of
+`Config::memory_budget_bytes` (a quarter: 112 bytes per new id with its
+dense-table entry, 16 per relocated number); its error is the call's, with
+nothing of the call written. `Store::close` checkpoints if a frame was
+written since the last one.
+
+Memory budget (ADR-0014 §4, D-207 B): the id runs' fences and, newest
+first, their filters stay within seven sixteenths of the budget; the
+filters of the oldest runs that do not fit are dropped at open and after
+each checkpoint, and the write path no longer searches those runs
+(`Store::unsearched_id_runs`). A repeat of content whose id lives only in
+them is stored again under a new number; reads go by number, so they are
+unaffected, and the runs keep every pair, so a merge or an open with a
+larger budget searches them again. Replay therefore accepts an id under a
+new number in a later frame; within one frame an id repeats never (a
+batch deduplicates against its own new objects), and a repeat there is
+`CorruptWal`.
 
 Object and block tables and their relocation runs share a 24-byte header
 and a page layout:
@@ -683,7 +706,9 @@ then), and listed by every later manifest.
 
 Id run `idrun-<n>.run` (ADR-0014 step 6): the 24-byte header (`magic`
 `"STRMIDR\0"`, `first` = `n`), then pages of `id [32] | number u64`
-entries (40 bytes, 102 per page) sorted by id, then a footer: `pages u64 |
+entries (40 bytes, 102 per page) sorted strictly by id, then number (an
+id repeats under several numbers after degraded deduplication, ADR-0014
+§4), then a footer: `pages u64 |
 fence u64 per page | filter | len u32 | crc u32` (`len` the footer's
 bytes before it; the CRC32C over the footer and `len`). A fence is the
 first 8 bytes of a page's first id, big-endian. The filter is a binary
@@ -903,21 +928,31 @@ compaction is done. Batches, releases and checkpoints may run between
 steps; the compaction's state is in memory only, so a restart ends it
 (what it completed is in the WAL).
 
+Numbers below `threshold`, the next object number when the compaction
+began, are compacted in ranges of at most eight per byte of the bitmap's
+share of `Config::memory_budget_bytes` (a sixteenth: 16 MiB, about 134 M
+numbers, by default; ADR-0014 §1), in order; each range runs a mark phase
+over every topic and then a sweep of every segment. Numbers outside the
+range count as live in it: those below were swept by earlier ranges, those
+above wait for later ones, whose mark phase sees every entry written
+meanwhile.
+
 1. **Mark**, one topic per step, in name order (topics that existed when
-   the mark phase began): the object number of every live entry, read
-   from the topic index, gets a bit in a bitmap over the numbers below
-   `threshold`, the next object number when the mark phase began. A full
+   the range's mark phase began): the object number of every live entry,
+   read from the topic index, gets a bit in the range's bitmap if the
+   range holds it. A full
    index block that fails its check is `TopicIndexCorrupt`, a number the
    object index lacks `UnknownObjectNumber`; either ends the compaction
    with nothing written and the store usable.
-2. **Live** during the compaction: a marked number, every number at or
-   above `threshold`, and every number a Publish of a batch references
-   while the compaction is in progress (marked as the batch is built), so
+2. **Live** during the compaction: a marked number, every number outside
+   the range (at or above `threshold` included), and every number of the
+   range a Publish of a batch references while the compaction is in
+   progress (marked as the batch is built), so
    a batch written between the mark and the sweep never loses an object,
    new or old (D-206 A with the owner's requirement).
 3. **Sweep**, one data segment per step, in id order: the segments that
-   exist once the mark phase is complete (the active segment is sealed
-   then). Each is rewritten as below if one of its blocks holds an object
+   exist once the range's mark phase is complete (the active segment is
+   sealed then); one more step then starts the next range. Each is rewritten as below if one of its blocks holds an object
    that is not live, or the file holds bytes no block covers.
 
 A segment is rewritten as follows.

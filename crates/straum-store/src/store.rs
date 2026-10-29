@@ -43,6 +43,15 @@ pub const RECENT_ID_CACHE_ENTRIES: usize = 1 << 18;
 /// id is rewritten once per tier it climbs.
 const TIER_RUNS: usize = 4;
 
+/// Memory counted per memtable entry against the memtable's share: the
+/// id map's entry (40 bytes plus the hash map's overhead, about 64) and
+/// the object's dense-table entry held until the checkpoint (48), ADR-0014
+/// §4: about 600 000 entries in the default 64 MiB share.
+const MEMTABLE_ENTRY_BYTES: u64 = 112;
+/// Memory counted per relocated object or block number held for the next
+/// checkpoint's relocation runs (a `BTreeSet<u64>` entry).
+const RELOCATED_BYTES: u64 = 16;
+
 fn id_run_tier(count: u64) -> u32 {
     count.max(1).ilog(4)
 }
@@ -151,6 +160,39 @@ pub struct Config {
     /// share of the memory budget (step 7): about 20.5 MiB at capacity,
     /// computed from the maps' capacity (`RecentIds::bytes`). 0 keeps none.
     pub recent_id_cache_entries: usize,
+    /// The memory budget (ADR-0014 §4, D-207 B as varied by the owner),
+    /// split into shares: the memtable a quarter (at it the next write
+    /// runs a checkpoint), the id runs' fences and filters seven sixteenths
+    /// (beyond it the oldest runs' filters are dropped and those runs are
+    /// no longer searched, so a repeat of content whose id lives only in
+    /// them is stored again under a new number), the compaction bitmap a
+    /// sixteenth (compaction marks and sweeps number ranges of at most
+    /// eight numbers per byte of it). The block cache's quarter is
+    /// `block_cache_bytes` (its default is D-205's open question) and the
+    /// recent-id cache's share is `recent_id_cache_entries` (pending the
+    /// owner); both are still set on their own. Default 256 MiB.
+    pub memory_budget_bytes: u64,
+    /// WAL bytes written since the last checkpoint at which the next
+    /// batch, release or compaction step first runs a checkpoint (D-209 A).
+    /// 0: no WAL trigger (the memtable's share still triggers one).
+    /// Default 256 MiB.
+    pub checkpoint_wal_bytes: u64,
+}
+
+impl Config {
+    fn memtable_share(&self) -> u64 {
+        self.memory_budget_bytes / 4
+    }
+
+    fn filter_share(&self) -> u64 {
+        self.memory_budget_bytes / 16 * 7
+    }
+
+    /// Numbers one compaction range covers: eight per byte of the
+    /// bitmap's share, at least one.
+    fn compaction_range(&self) -> u64 {
+        (self.memory_budget_bytes / 16 * 8).max(1)
+    }
 }
 
 impl Default for Config {
@@ -169,6 +211,8 @@ impl Default for Config {
             wal_file_max_bytes: 64 << 20,
             rebuild_index: false,
             recent_id_cache_entries: RECENT_ID_CACHE_ENTRIES,
+            memory_budget_bytes: 256 << 20,
+            checkpoint_wal_bytes: 256 << 20,
         }
     }
 }
@@ -672,6 +716,9 @@ pub struct Store {
     next_checkpoint: u64,
     /// Files in quarantine directories (`quarantined_files`).
     quarantined_files: u64,
+    /// WAL bytes of the frames the last checkpoint does not cover: the
+    /// WAL trigger (`Config::checkpoint_wal_bytes`).
+    wal_since_checkpoint: u64,
 }
 
 /// What a `Store::compact_step` did.
@@ -679,23 +726,28 @@ pub struct Store {
 pub enum CompactStep {
     /// Marked one topic's live entries (the mark phase).
     Marked,
-    /// Swept one segment: rewritten, dropped or left as it was.
+    /// Swept one segment (rewritten, dropped or left as it was), or
+    /// finished one number range's sweep and began the next range.
     Swept,
     /// The compaction is complete; its totals.
     Done(CompactStats),
 }
 
-/// A compaction in progress: the mark phase, then the sweep.
+/// A compaction in progress: per number range (ADR-0014 §1), a mark
+/// phase over every topic, then a sweep of every segment.
 struct Compaction {
-    /// The next object number when the mark phase began: every number at
+    /// The next object number when the compaction began: every number at
     /// or above it is live.
     threshold: u64,
-    /// One bit per number below `threshold`: marked live.
-    // ponytail: one bitmap over every number below the threshold; ADR-0014
-    // §1's number ranges within the bitmap's budget share come with the
-    // memory budget (step 7).
+    /// The range being compacted, `lo..hi`, at most
+    /// `Config::compaction_range` numbers, so the bitmap stays within its
+    /// share of the memory budget. Numbers below it were swept by earlier
+    /// ranges and those above wait for later ones: both count as live.
+    lo: u64,
+    hi: u64,
+    /// One bit per number of the range: marked live.
     marks: Vec<u64>,
-    /// Topics still to mark, popped from the end.
+    /// Topics still to mark in this range, popped from the end.
     topics: Vec<Vec<u8>>,
     /// Taken once every topic is marked.
     sweep: Option<SweepPlan>,
@@ -703,10 +755,13 @@ struct Compaction {
 }
 
 impl Compaction {
-    fn new(threshold: u64, topics: Vec<Vec<u8>>) -> Self {
+    fn new(threshold: u64, lo: u64, span: u64, topics: Vec<Vec<u8>>) -> Self {
+        let hi = threshold.min(lo.saturating_add(span));
         Self {
             threshold,
-            marks: vec![0; threshold.div_ceil(64) as usize],
+            lo,
+            hi,
+            marks: vec![0; (hi - lo).div_ceil(64) as usize],
             topics,
             sweep: None,
             stats: CompactStats::default(),
@@ -714,13 +769,18 @@ impl Compaction {
     }
 
     fn mark(&mut self, number: u64) {
-        if number < self.threshold {
-            self.marks[(number / 64) as usize] |= 1 << (number % 64);
+        if (self.lo..self.hi).contains(&number) {
+            let x = number - self.lo;
+            self.marks[(x / 64) as usize] |= 1 << (x % 64);
         }
     }
 
     fn live(&self, number: u64) -> bool {
-        number >= self.threshold || self.marks[(number / 64) as usize] >> (number % 64) & 1 == 1
+        if !(self.lo..self.hi).contains(&number) {
+            return true;
+        }
+        let x = number - self.lo;
+        self.marks[(x / 64) as usize] >> (x % 64) & 1 == 1
     }
 }
 
@@ -809,6 +869,8 @@ impl Store {
         // after it, or in a file that another file follows, is mid-log
         // damage; the files are then left untouched.
         let mut frames = Vec::new();
+        // Each frame's size, for the WAL trigger.
+        let mut sizes: Vec<u64> = Vec::new();
         let last = files.len() - 1;
         let (last_id, last_len) = (files[last].0, files[last].1.len());
         let mut pos = WAL_FILE_HEADER;
@@ -879,6 +941,7 @@ impl Store {
                     }
                 }
                 pos += frame.size();
+                sizes.push(frame.size() as u64);
                 frames.push((WalPos { file: id, offset }, mode, records));
             }
         }
@@ -918,6 +981,7 @@ impl Store {
             });
             pos = at.offset as usize;
             frames.pop();
+            sizes.pop();
         }
         match dropped {
             Some(action) => report.actions.push(action),
@@ -1039,7 +1103,9 @@ impl Store {
 
         fault::check(FaultPoint::OpenBeforeReport)?;
         let files = OpenFiles::new(&dir, config.data_open_files);
-        Ok(Self {
+        let covered = checkpoint.as_ref().map_or(0, |c| c.manifest.covered) as usize;
+        let wal_since_checkpoint = sizes[covered..].iter().sum();
+        let mut store = Self {
             dir,
             config,
             wal,
@@ -1081,7 +1147,10 @@ impl Store {
             relocated,
             relocated_blocks,
             compaction: None,
-        })
+            wal_since_checkpoint,
+        };
+        store.fit_filters();
+        Ok(store)
     }
 
     /// Writes a checkpoint (ADR-0014 §3, step 4): the object table of the
@@ -1308,6 +1377,75 @@ impl Store {
         self.checkpoint = Some(m);
         self.relocated.clear();
         self.relocated_blocks.clear();
+        self.wal_since_checkpoint = 0;
+        self.fit_filters();
+        Ok(())
+    }
+
+    /// Whether a frame was written since the last checkpoint (or ever,
+    /// before the first).
+    fn changed(&self) -> bool {
+        self.checkpoint.as_ref().map_or(0, |c| c.covered) != self.next_frame
+    }
+
+    /// Memory the memtable's share counts: its entries with their
+    /// dense-table entries, and the relocations held for the next
+    /// checkpoint (ADR-0014 §4).
+    fn memtable_bytes(&self) -> u64 {
+        self.memtable.len() as u64 * MEMTABLE_ENTRY_BYTES
+            + (self.relocated.len() + self.relocated_blocks.len()) as u64 * RELOCATED_BYTES
+    }
+
+    /// Runs a checkpoint before a write when one is due (D-209 A): the WAL
+    /// since the last one reached `checkpoint_wal_bytes`, or the memtable
+    /// its share of the memory budget. Its error is the write's, before
+    /// the write changed anything.
+    async fn checkpoint_if_due(&mut self) -> Result<(), StoreError> {
+        let wal = self.config.checkpoint_wal_bytes;
+        let due = (wal > 0 && self.wal_since_checkpoint >= wal)
+            || self.memtable_bytes() >= self.config.memtable_share();
+        if due && self.changed() {
+            self.checkpoint().await?;
+        }
+        Ok(())
+    }
+
+    /// Keeps the id runs' fences and, newest first, their filters within
+    /// the filters' share of the memory budget (ADR-0014 §4, D-207 B): the
+    /// filters of the oldest runs that do not fit are dropped, so the write
+    /// path no longer searches those runs and a repeat of content whose id
+    /// lives only there is stored again under a new number. A dropped
+    /// filter comes back only with a merge or an open with a larger budget.
+    fn fit_filters(&mut self) {
+        let share = self.config.filter_share();
+        let mut used: u64 = self.id_runs.iter().map(|r| r.fences.len() as u64 * 8).sum();
+        let mut full = false;
+        for run in &mut self.id_runs {
+            let bytes = run.filter.bytes() as u64;
+            full = full || used + bytes > share;
+            if full {
+                run.filter = Fuse8::empty();
+            } else {
+                used += bytes;
+            }
+        }
+    }
+
+    /// Id runs whose filter the memory budget dropped: the write path no
+    /// longer searches them, so deduplication against their ids is off.
+    pub fn unsearched_id_runs(&self) -> usize {
+        self.id_runs
+            .iter()
+            .filter(|r| r.count > 0 && r.filter.bytes() == 0)
+            .count()
+    }
+
+    /// Closes the store, first writing a checkpoint if anything changed
+    /// since the last one (D-209 A).
+    pub async fn close(mut self) -> Result<(), StoreError> {
+        if self.changed() {
+            self.checkpoint().await?;
+        }
         Ok(())
     }
 
@@ -1373,14 +1511,18 @@ impl Store {
                 let i = partition(count, |i| {
                     codec::id_entry(&page, i).is_some_and(|(x, _)| x < *id)
                 });
-                if let Some((x, n)) = codec::id_entry(&page, i)
-                    && x == *id
-                {
-                    if self.objects.contains_key(&n) {
-                        self.recent.borrow_mut().insert(*id, n);
-                        return Ok(Some(n));
+                // An id may repeat under several numbers (degraded
+                // deduplication, ADR-0014 §4): any live one.
+                for i in i..count {
+                    match codec::id_entry(&page, i) {
+                        Some((x, n)) if x == *id => {
+                            if self.objects.contains_key(&n) {
+                                self.recent.borrow_mut().insert(*id, n);
+                                return Ok(Some(n));
+                            }
+                        }
+                        _ => break,
                     }
-                    break;
                 }
                 if run.fences[p] < fence {
                     break;
@@ -1456,7 +1598,7 @@ impl Store {
             }
             let Some(k) = (0..sources.len())
                 .filter(|&k| sources[k].1 < sources[k].0.len())
-                .min_by_key(|&k| sources[k].0[sources[k].1].0)
+                .min_by_key(|&k| sources[k].0[sources[k].1])
             else {
                 break;
             };
@@ -1514,6 +1656,7 @@ impl Store {
         }
         let frame = self.batch_frame_bytes(batch);
         self.check_frame(frame)?;
+        self.checkpoint_if_due().await?;
         // The dictionary record goes into the batch's frame only if it fits
         // there: training waits for a batch small enough, so the frame
         // limit never refuses a batch because training is due.
@@ -1559,15 +1702,19 @@ impl Store {
                 continue;
             }
             // An id the memtable or a run's filter covers never gets a
-            // second number (ADR-0014 §5): `lookup` searched both, so no
-            // live object may have this id.
+            // second number (ADR-0014 §5): `lookup` searched both, so a
+            // live object with this id lives only in a run the memory
+            // budget no longer searches (§4).
             #[cfg(debug_assertions)]
             {
                 let live = self
                     .debug_ids
                     .get(&id)
                     .is_some_and(|n| self.objects.contains_key(n));
-                debug_assert!(!live, "a live id got a second number");
+                debug_assert!(
+                    !live || (self.unsearched_id_runs() > 0 && !self.memtable.contains_key(&id)),
+                    "a live id got a second number"
+                );
                 self.debug_ids.insert(id, self.next_object);
             }
             let number = self.next_object;
@@ -1854,6 +2001,7 @@ impl Store {
         cutoff_ms: u64,
     ) -> Result<u64, StoreError> {
         self.usable()?;
+        self.checkpoint_if_due().await?;
         // The entries to release, oldest first, read before anything is
         // written: a damaged index block fails the call here, not midway.
         // Collection stops as soon as one more release would not fit a
@@ -1949,14 +2097,11 @@ impl Store {
     /// describes.
     pub async fn compact_step(&mut self) -> Result<CompactStep, StoreError> {
         self.usable()?;
+        self.checkpoint_if_due().await?;
+        let span = self.config.compaction_range();
         let mut c = match self.compaction.take() {
             Some(c) => c,
-            None => {
-                let mut topics: Vec<Vec<u8>> = self.topics.keys().cloned().collect();
-                // Popped from the end: marked in name order.
-                topics.sort_unstable_by(|a, b| b.cmp(a));
-                Compaction::new(self.next_object, topics)
-            }
+            None => Compaction::new(self.next_object, 0, span, self.topic_names()),
         };
         if let Some(name) = c.topics.pop() {
             // A read only: on error nothing changed, so the store stays
@@ -1969,12 +2114,29 @@ impl Store {
             c.sweep = Some(self.sweep_plan());
         }
         let Some(old) = c.sweep.as_mut().and_then(|p| p.segments.pop()) else {
-            return Ok(CompactStep::Done(c.stats));
+            if c.hi == c.threshold {
+                return Ok(CompactStep::Done(c.stats));
+            }
+            // The next range: mark every topic again, then sweep again.
+            // ponytail: every segment is visited once per range; one with
+            // no object in the range is left as it was.
+            let mut next = Compaction::new(c.threshold, c.hi, span, self.topic_names());
+            next.stats = c.stats;
+            self.compaction = Some(next);
+            return Ok(CompactStep::Swept);
         };
         let res = self.sweep_segment(old, &mut c).await;
         self.compaction = Some(c);
         self.poison_on_err(res)?;
         Ok(CompactStep::Swept)
+    }
+
+    /// Every topic's name, in reverse name order (popped from the end:
+    /// marked in name order).
+    fn topic_names(&self) -> Vec<Vec<u8>> {
+        let mut topics: Vec<Vec<u8>> = self.topics.keys().cloned().collect();
+        topics.sort_unstable_by(|a, b| b.cmp(a));
+        topics
     }
 
     /// Whether a compaction is in progress (between its first and its last
@@ -2865,6 +3027,7 @@ impl Store {
             Instant::now(),
         );
         self.wal_len += n;
+        self.wal_since_checkpoint += n;
         self.next_frame += 1;
         self.stats.fsyncs += 1;
         self.stats.wal_bytes += n;
@@ -2923,6 +3086,7 @@ impl Store {
         seg_buf.clear();
         self.seg_buf = seg_buf;
         self.wal_len += wal_n;
+        self.wal_since_checkpoint += wal_n;
         self.next_frame += 1;
         self.stats.fsyncs += 1;
         self.stats.wal_bytes += wal_n;
@@ -3295,7 +3459,13 @@ impl IndexSegments {
 #[derive(Default)]
 struct Replay<'a> {
     objects: HashMap<u64, Object>,
-    ids: HashMap<ObjectId, u64>,
+    /// Ids of the objects the frame being replayed introduced. A batch
+    /// never stores one id twice (it deduplicates against its own new
+    /// objects), but across frames an id may repeat under a new number:
+    /// after its object was reclaimed, or when the memory budget dropped
+    /// the filter of the run holding it (degraded deduplication, ADR-0014
+    /// §4), which the WAL does not record.
+    frame_ids: HashSet<ObjectId>,
     /// One above the highest object number in the WAL: numbers of objects
     /// compaction dropped are not reused either.
     next_object: u64,
@@ -3348,8 +3518,8 @@ impl<'a> Replay<'a> {
         if number < self.next_object {
             return Err("object number not above every earlier one");
         }
-        if self.ids.insert(object.id, number).is_some() {
-            return Err("new object already in the index");
+        if !self.frame_ids.insert(object.id) {
+            return Err("new object's id repeats in its frame");
         }
         self.next_object = number + 1;
         self.objects.insert(number, object);
@@ -3386,6 +3556,7 @@ impl<'a> Replay<'a> {
     /// Checks at the end of each frame: every block it introduced holds at
     /// least one object.
     fn finish_frame(&mut self) -> Result<(), &'static str> {
+        self.frame_ids.clear();
         for n in self.frame_blocks.drain(..) {
             if self.blocks.get(&n).is_none_or(|b| b.objects == 0) {
                 return Err("block without objects");
@@ -3583,7 +3754,6 @@ impl<'a> Replay<'a> {
             return Err("Compact rewrites a block with no or repeated objects");
         }
         let mut relocated = 0;
-        let ids = &mut self.ids;
         self.objects.retain(|number, o| {
             if !old_blocks.contains(&o.block) || kept_set.contains_key(&o.block) {
                 return true;
@@ -3595,10 +3765,7 @@ impl<'a> Replay<'a> {
                     relocated += 1;
                     true
                 }
-                None => {
-                    ids.remove(&o.id);
-                    false
-                }
+                None => false,
             }
         });
         if relocated != moved.len() {
@@ -5153,7 +5320,7 @@ async fn load_checkpoint(dir: &Path, manifest: Manifest) -> Result<LoadedCheckpo
 }
 
 /// Id run `n` from its file: the header names it, the pages are intact and
-/// hold exactly `count` entries sorted strictly by id, the footer is
+/// hold exactly `count` entries sorted strictly by (id, number), the footer is
 /// intact, its fences are the pages' first ids and its filter finds every
 /// id. `None` otherwise.
 fn decode_id_run(bytes: &[u8], n: u64, count: u64) -> Option<(IdRun, Vec<(ObjectId, u64)>)> {
@@ -5172,7 +5339,7 @@ fn decode_id_run(bytes: &[u8], n: u64, count: u64) -> Option<(IdRun, Vec<(Object
         .filter_map(|i| codec::id_entry(&body, i))
         .collect();
     let per_page = (codec::page_len(ID_ENTRY) - 4) / ID_ENTRY;
-    let ok = entries.windows(2).all(|w| w[0].0 < w[1].0)
+    let ok = entries.windows(2).all(|w| w[0] < w[1])
         && fences
             == entries
                 .chunks(per_page)
@@ -5638,8 +5805,8 @@ mod tests {
         r.apply(put(id, 0, 0, 0), 0).unwrap();
         assert_eq!(
             r.apply(put(id, 1, 0, 1), 0),
-            Err("new object already in the index"),
-            "same id twice"
+            Err("new object's id repeats in its frame"),
+            "same id twice in a frame"
         );
         assert_eq!(
             r.apply(put(ObjectId::of(b"y"), 0, 0, 2), 0),
@@ -5745,7 +5912,6 @@ mod tests {
         .unwrap();
         assert!(!r.objects.contains_key(&1), "dead object dropped");
         assert!(!r.objects.contains_key(&3), "dead block's object dropped");
-        assert!(!r.ids.contains_key(&ids[1]), "and its id");
         let a = &r.objects[&0];
         assert_eq!((a.id, a.block, a.index), (ids[0], 3, 0));
         let c = &r.objects[&2];

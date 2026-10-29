@@ -250,3 +250,65 @@ async fn a_failed_sweep_step_refuses_a_checkpoint() {
     assert_eq!(store.checkpoint_number(), None);
     assert_eq!(store.read(b"a", 2).await.unwrap(), Some(body(3)));
 }
+
+/// A bitmap share of one byte (a 16-byte budget): compaction marks and
+/// sweeps number ranges of eight (ADR-0014 §1), marking every topic again
+/// per range. During it, a batch deduplicates onto a released object of a
+/// later range (it survives: its range's mark phase sees the new entry) and
+/// repeats one an earlier range already reclaimed (stored again under a new
+/// number). The tiny budget also checkpoints before every step and write.
+#[compio::test]
+async fn compaction_in_number_ranges_keeps_what_one_range_keeps() {
+    for mode in MODES {
+        let dir = TempDir::new("compaction-ranges");
+        let tiny = Config {
+            write_mode: mode,
+            memory_budget_bytes: 16,
+            ..Config::default()
+        };
+        let mut store = Store::open(&dir.0, tiny).await.unwrap();
+        let old: Vec<Vec<u8>> = (0..20).map(body).collect();
+        for chunk in old.chunks(5) {
+            put(&mut store, b"a", chunk).await;
+        }
+        let kept: Vec<Vec<u8>> = (100..105).map(body).collect();
+        let kept_seqs = put(&mut store, b"b", &kept).await;
+        assert_eq!(store.release_before(b"a", 2).await.unwrap(), 20);
+
+        let mut marked = 0;
+        while marked < 4 {
+            if step(&mut store).await == CompactStep::Marked {
+                marked += 1;
+            }
+        }
+        // In the second range's sweep or later: number 17 (third range)
+        // not yet considered, number 2 (first range) reclaimed.
+        assert!(!store.contains(&ObjectId::of(&old[2])), "{mode:?}");
+        let again = vec![old[17].clone(), old[2].clone()];
+        let again_seqs = put(&mut store, b"a", &again).await;
+        assert_eq!(store.stats().messages_deduplicated, 1, "{mode:?}");
+        loop {
+            match step(&mut store).await {
+                CompactStep::Marked => marked += 1,
+                CompactStep::Done(stats) => {
+                    assert_eq!(stats.objects_dropped, 19, "{mode:?}");
+                    break;
+                }
+                CompactStep::Swept => {}
+            }
+        }
+        // Numbers 0..25 at the start: four ranges, two topics each.
+        assert_eq!(marked, 8, "{mode:?}");
+        reads(&store, b"a", &again_seqs, &again).await;
+        reads(&store, b"b", &kept_seqs, &kept).await;
+        for (i, b) in old.iter().enumerate() {
+            let live = i == 2 || i == 17;
+            assert_eq!(store.contains(&ObjectId::of(b)), live, "{mode:?} {i}");
+        }
+        drop(store);
+        let store = Store::open(&dir.0, tiny).await.unwrap();
+        assert!(store.recovery_report().is_empty(), "{mode:?}");
+        reads(&store, b"a", &again_seqs, &again).await;
+        reads(&store, b"b", &kept_seqs, &kept).await;
+    }
+}

@@ -54,8 +54,17 @@ impl Fuse8 {
             == 0
     }
 
+    /// The filter of no keys: holds nothing, contains nothing.
+    pub fn empty() -> Self {
+        Self {
+            seed: 0,
+            segment_length: 1,
+            segment_count_length: 0,
+            fingerprints: Vec::new(),
+        }
+    }
+
     /// Bytes of fingerprints held.
-    #[cfg(test)]
     pub fn bytes(&self) -> usize {
         self.fingerprints.len()
     }
@@ -69,12 +78,7 @@ impl Fuse8 {
         keys.dedup();
         let size = keys.len();
         if size == 0 {
-            return Some(Self {
-                seed: 0,
-                segment_length: 1,
-                segment_count_length: 0,
-                fingerprints: Vec::new(),
-            });
+            return Some(Self::empty());
         }
         let sized = size.max(2) as f64;
         let segment_length: u32 =
