@@ -39,11 +39,13 @@
 //!   padded to `size` bytes: repeated lines repeat, so writes deduplicate
 //!   as the log does.
 //!
-//! With the `checkpoint` feature (ADR-0014; the engine checkpoints on its
-//! own triggers during the writes), a store run also records the last
-//! checkpoint's number after the writes and times one more
-//! `Store::checkpoint` covering the rest; every store run times reopening
-//! the store (`open_ns`) after the writes.
+//! Every store run then times reopening the store (`open_ns`), as after a
+//! crash at the end of the writes. With the `checkpoint` feature (ADR-0014;
+//! the engine checkpoints on its own triggers during the writes) it also
+//! records the last checkpoint's number after the writes, and times one
+//! more `Store::checkpoint` after the reopen, covering the WAL since that
+//! checkpoint (`final_checkpoint_ns`); `disk_bytes_per_msg` and the reads
+//! come after it.
 //!
 //! With `--reads N` (store modes only) the store is reopened after the
 //! writes and read twice: a sequential scan from the first `topic_seq`, and
@@ -181,7 +183,7 @@ enum Payload {
     },
     Lines {
         path: PathBuf,
-        lines: Vec<Vec<u8>>,
+        format: strip::Format,
     },
 }
 
@@ -212,6 +214,10 @@ struct Source<'a> {
     /// `file:`: next window offset, and how many times the file wrapped.
     offset: u64,
     pass: u64,
+    /// `lines:`: the log, read a line at a time (so its size does not count
+    /// in the run's peak RSS), and restarted at its end.
+    reader: Option<std::io::BufReader<std::fs::File>>,
+    line: Vec<u8>,
 }
 
 impl<'a> Source<'a> {
@@ -223,6 +229,42 @@ impl<'a> Source<'a> {
             rng: XorShift::new(seed),
             offset: 0,
             pass: 0,
+            reader: None,
+            line: Vec::new(),
+        }
+    }
+
+    /// The next non-empty line of the log at `path`, without its
+    /// timestamp, into `self.line`.
+    fn next_line(&mut self, path: &Path, format: strip::Format) -> std::io::Result<()> {
+        use std::io::BufRead;
+        let mut restarted = false;
+        loop {
+            let reader = match self.reader.as_mut() {
+                Some(r) => r,
+                None => self
+                    .reader
+                    .insert(std::io::BufReader::new(std::fs::File::open(path)?)),
+            };
+            self.line.clear();
+            if reader.read_until(b'\n', &mut self.line)? == 0 {
+                if restarted {
+                    return Err(std::io::Error::other("payload log has no lines"));
+                }
+                self.reader = None;
+                restarted = true;
+                continue;
+            }
+            while self.line.last().is_some_and(|&b| b == b'\n' || b == b'\r') {
+                self.line.pop();
+            }
+            if self.line.is_empty() {
+                continue;
+            }
+            if let Some(body) = strip::strip_timestamp(format, &self.line) {
+                self.line = body;
+            }
+            return Ok(());
         }
     }
 
@@ -256,10 +298,10 @@ impl<'a> Source<'a> {
                     file.read_exact_at(buf, self.offset)?;
                     self.offset += size;
                 }
-                Payload::Lines { lines, .. } => {
-                    let line = &lines[(self.next % lines.len() as u64) as usize];
-                    let n = line.len().min(self.size);
-                    buf[..n].copy_from_slice(&line[..n]);
+                Payload::Lines { path, format } => {
+                    self.next_line(path, *format)?;
+                    let n = self.line.len().min(self.size);
+                    buf[..n].copy_from_slice(&self.line[..n]);
                 }
             }
             self.next += 1;
@@ -677,20 +719,26 @@ async fn run_store(
     let rss = peak_rss();
     let s = store.stats();
     #[cfg(feature = "checkpoint")]
-    let (checkpoints, checkpoint_ns) = {
-        let n = store.checkpoint_number().unwrap_or(0);
-        let start = Instant::now();
-        store.checkpoint().await.map_err(std::io::Error::other)?;
-        (Some(n), Some(start.elapsed().as_nanos() as u64))
-    };
+    let checkpoints = Some(store.checkpoint_number().unwrap_or(0));
     #[cfg(not(feature = "checkpoint"))]
-    let (checkpoints, checkpoint_ns) = (None, None);
+    let checkpoints = None;
+    // Reopened as after a crash at the end of the writes: from the last
+    // checkpoint the triggers wrote and the WAL after it.
     drop(store);
     let start = Instant::now();
-    let reopened = Store::open(dir, store_config(write_mode, args))
+    #[cfg_attr(not(feature = "checkpoint"), allow(unused_mut))]
+    let mut reopened = Store::open(dir, store_config(write_mode, args))
         .await
         .map_err(std::io::Error::other)?;
     let open_ns = start.elapsed().as_nanos() as u64;
+    #[cfg(feature = "checkpoint")]
+    let checkpoint_ns = {
+        let start = Instant::now();
+        reopened.checkpoint().await.map_err(std::io::Error::other)?;
+        Some(start.elapsed().as_nanos() as u64)
+    };
+    #[cfg(not(feature = "checkpoint"))]
+    let checkpoint_ns = None;
     drop(reopened);
     let mut run = finish(
         lat,
@@ -1081,19 +1129,8 @@ fn parse_args() -> Result<Args, String> {
                             f => return Err(format!("unknown log format {f}")),
                         };
                         let path = PathBuf::from(path);
-                        let data =
-                            std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-                        let lines: Vec<Vec<u8>> = data
-                            .split(|&b| b == b'\n')
-                            .filter(|l| !l.is_empty())
-                            .map(|l| {
-                                strip::strip_timestamp(format, l).unwrap_or_else(|| l.to_vec())
-                            })
-                            .collect();
-                        if lines.is_empty() {
-                            return Err(format!("{}: no lines", path.display()));
-                        }
-                        Payload::Lines { path, lines }
+                        std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                        Payload::Lines { path, format }
                     }
                     v => {
                         let path = PathBuf::from(

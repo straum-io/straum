@@ -366,8 +366,10 @@ been measured.
 `scripts/bench/checkpoint.sh` is ADR-0014's milestone benchmark (step 9,
 D-239): the checked-out commit (`head`) against `540c887` (`base`, the
 block branch with the 16 KiB cap before the checkpoint work), both with
-`max_block_raw_bytes` 16 KiB and InlineSmall's threshold at it. It is
-`block-cap.sh` with these differences:
+`max_block_raw_bytes` 16 KiB and InlineSmall's threshold at it. Until
+steps 6b and 8 land a run is interim, not the core's result: `head` still
+replays the whole WAL at open, deletes no WAL file and keeps inline blocks
+in the WAL. It is `block-cap.sh` with these differences:
 
 - Two worktrees and builds: the checked-out commit's bench (its main
   binary) built against `540c887` with `cap` only, and against the
@@ -380,18 +382,28 @@ block branch with the 16 KiB cap before the checkpoint work), both with
   bodies and at least 300 batches; the four read workloads with the block
   cache on and off. No raw or hashcopy baselines, no ParallelSync.
 - `head` checkpoints on its own triggers during the writes, so the batch
-  latency includes them; its rows add the last checkpoint's number, one
-  more checkpoint's duration (`final_checkpoint_ns`), and, in both
-  variants, the time to reopen the store (`open_ns`).
+  latency includes them. After the writes each run reopens the store as
+  after a crash (`open_ns`, both variants); `head` then writes one more
+  checkpoint, covering the WAL since the last triggered one
+  (`final_checkpoint_ns`, with the last checkpoint's number in
+  `checkpoints`), so its `disk_bytes_per_msg` and reads come after it.
+  `peak_rss_bytes` covers the write loop; the `lines:` payload reads its log
+  a line at a time, so the log's size is not in it.
+- Duplicate-heavy cells read every id run whose filter answers a repeat
+  (step 7's newest-number rule), so they measure that cost too.
 
 ```bash
 scripts/bench/checkpoint.sh --out ~/checkpoint
 ```
 
 `--quick`, `--keep`, the preconditions, the outputs and the cleanup are
-those of `block-cap.sh`. Not covered: duplicate lookups with the page
-cache dropped (needs root) or a working set larger than RAM (beyond the
-budget's 256 MiB per run). Its duration has not been measured.
+those of `block-cap.sh`. The full matrix plans 180 runs and about 48 GB of
+bodies (WAL and metadata come on top); its duration has not been measured,
+and a `--quick` run in the straum-test container (16 runs) passed as a
+smoke test only. Not covered: duplicate lookups with a cold page cache.
+Dropping the whole cache needs root; dropping the store's own pages
+(`posix_fadvise(DONTNEED)`) or a memory-limited user scope (`systemd-run
+--user --scope -p MemoryMax=`) would not, and are open for the owner.
 
 ### The recent-id cache (ADR-0014 step 6a)
 

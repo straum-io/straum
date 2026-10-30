@@ -17,7 +17,9 @@
 # script runs from (ADR-0014 steps 1 to 7: id runs with filters, the
 # recent-id cache, the byte-bounded block cache, checkpoints on the
 # engine's own triggers). Both run with max_block_raw_bytes 16 KiB and
-# InlineSmall's threshold at it. The benchmark binary is the one of the
+# InlineSmall's threshold at it. Until steps 6b and 8 land, a run is an
+# interim result, not the core's: head still replays the whole WAL at open,
+# deletes no WAL file and keeps inline blocks in the WAL. The benchmark binary is the one of the
 # commit this script runs from, built against base with `cap` only and
 # against head with its defaults, in git worktrees under <dir>/work with
 # the release profile of their own Cargo.toml, which must be identical.
@@ -359,7 +361,8 @@ payload_flag() {
     echo "- Write modes: $MODES; repetitions: $REPS"
     echo "- Per run: up to $MAX_BATCHES batches or $MAX_BYTES payload bytes, at least $MIN_BATCHES batches"
     echo "- Variants: base and head, max_block_raw_bytes $CAP, InlineSmall threshold $CAP"
-    echo "- Columns of head only: checkpoints (the last checkpoint's number after the writes), final_checkpoint_ns (one more checkpoint after them); both: open_ns (reopening after the writes), peak_rss_bytes, disk_bytes_per_msg, batch_p99_ns (which includes the checkpoints the triggers ran)"
+    echo "- Columns of head only: checkpoints (the last checkpoint's number after the writes), final_checkpoint_ns (one more checkpoint after the reopen, covering the WAL since that one); both: open_ns (reopening right after the writes, as after a crash), peak_rss_bytes (the write loop), disk_bytes_per_msg (after head's final checkpoint), batch_p99_ns (which includes the checkpoints the triggers ran)"
+    echo "- Interim: ADR-0014 steps 6b and 8 not landed (head replays the whole WAL at open and deletes no WAL file)"
     echo "- Read workloads: scan, random, dedup_scan (half of the messages repeat random earlier bodies), multi (4 interleaved cursors); up to $READS reads or $READ_SECONDS s each; with the default block cache and with it off"
     echo "- Noisy: 1-minute load average above $LOAD_THRESHOLD at a run start, or above $LOAD_START_THRESHOLD before the first"
 } >>"$ENV_MD"
