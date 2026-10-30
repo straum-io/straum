@@ -7,7 +7,7 @@
 # script.
 #
 #   scripts/power-loss/run.sh --out DIR [--quick] [--iterations N] [--seed N]
-#       [--scenarios store,broker,compaction,dictionary]
+#       [--scenarios store,broker,compaction,dictionary,checkpoint]
 #       [--modes sequential,parallel,inline] [--lazyfs DIR] [--keep]
 #
 # Exit status: 0 only if every iteration of every scenario passed; 1 if any
@@ -22,7 +22,7 @@ OUT=""
 ITERATIONS=200
 QUICK=0
 SEED=24301
-SCENARIOS=store,broker,compaction,dictionary
+SCENARIOS=store,broker,compaction,dictionary,checkpoint
 MODES=sequential,parallel,inline
 LAZYFS="${LAZYFS_DIR:-$HOME/lazyfs}"
 KEEP=0
@@ -103,12 +103,15 @@ BROKER="$ROOT/target/release/straum-server"
 {
     echo "date_utc: $(date -u +%FT%TZ)"
     echo "command: $0 --out $OUT --iterations $ITERATIONS --seed $SEED --scenarios $SCENARIOS --modes $MODES"
-    # STRAUM_COMMIT: for a tree whose git metadata is not reachable (a
-    # worktree mounted into a container).
+    # STRAUM_COMMIT and STRAUM_UNCOMMITTED (the number of changed files),
+    # set on the host, for when git cannot read the tree's metadata: a
+    # worktree mounted into a container (README.md "In a container").
     if commit="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"; then
         echo "straum_commit: $commit ($(git -C "$ROOT" status --porcelain | wc -l | tr -d ' ') uncommitted changes)"
+    elif [ -n "${STRAUM_COMMIT:-}" ]; then
+        echo "straum_commit: $STRAUM_COMMIT (${STRAUM_UNCOMMITTED:-unknown} uncommitted changes, from the host)"
     else
-        echo "straum_commit: ${STRAUM_COMMIT:-unknown} (uncommitted changes: unknown)"
+        echo "straum_commit: unknown (uncommitted changes: unknown)"
     fi
     echo "binaries_sha256: $(sha256sum "$BIN" "$BROKER" 2>/dev/null | awk '{printf "%s %s; ", $1, $2}')"
     echo "lazyfs: $LAZYFS_TAG, commit $(git -C "$LAZYFS" rev-parse HEAD), $LAZYFS_BIN"
@@ -242,6 +245,7 @@ inject() {
 # ---------------------------------------------------------------- scenarios
 
 FAILED=0
+DAMAGED=""
 : >"$OUT/iterations.log"
 : >"$OUT/summary.rows"
 
@@ -259,8 +263,9 @@ verify() {
         timeout 3600 "$BIN" broker-verify --broker "$BROKER" --data-dir "$run/mnt/data" \
             --mode "$mode" --logs "$run" --stderr "$dir/verify-broker.log" >"$dir/verify.log" 2>&1
     else
+        # shellcheck disable=SC2086 # empty, or the option and a file name
         timeout 3600 "$BIN" store-verify --dir "$run/mnt/store" --mode "$mode" \
-            --logs "$run" >"$dir/verify.log" 2>&1
+            --logs "$run" ${DAMAGED:+--damaged $DAMAGED} >"$dir/verify.log" 2>&1
     fi
     local s=$?
     grep '^RESULT' "$dir/verify.log" || echo "RESULT FAIL verifier exited $s without a result"
@@ -293,6 +298,16 @@ write_phase() {
         compaction)
             "$BIN" store-write --dir "$run/mnt/store" --mode "$mode" --seed "$wseed" \
                 --compact-every 1 --arm-at-compaction "$arm" --fifo "$run/faults.fifo" \
+                --fault "$cmd" >"$it/writer.log" 2>"$it/writer.err" &
+            WRITERS="$!"; ready="$it/writer.log"
+            ;;
+        checkpoint)
+            # A checkpoint every 4th round; the writer arms crash and torn
+            # faults just before its arm-th checkpoint, run.sh sends clear.
+            local at="$arm"
+            [ "$kind" = clear ] && at=0
+            "$BIN" store-write --dir "$run/mnt/store" --mode "$mode" --seed "$wseed" \
+                --checkpoint-every 4 --arm-at-checkpoint "$at" --fifo "$run/faults.fifo" \
                 --fault "$cmd" >"$it/writer.log" 2>"$it/writer.err" &
             WRITERS="$!"; ready="$it/writer.log"
             ;;
@@ -332,9 +347,10 @@ write_phase() {
     for pid in $WRITERS; do
         kill -0 "$pid" 2>/dev/null || { ERR="a writer exited before the fault (see $it)"; return 1; }
     done
-    if [ "$scenario" = compaction ] || [ "$scenario" = dictionary ]; then
-        # The writer arms the fault itself, just before a compaction or the
-        # batch that trains the dictionary.
+    if [ "$scenario" = compaction ] || [ "$scenario" = dictionary ] ||
+        { [ "$scenario" = checkpoint ] && [ "$kind" != clear ]; }; then
+        # The writer arms the fault itself, just before a compaction, a
+        # checkpoint or the batch that trains the dictionary.
         inject "$run" "$kind" "" 600
     else
         sleep "$(awk -v d="$delay" 'BEGIN {printf "%.3f", d / 1000}')"
@@ -347,6 +363,48 @@ write_phase() {
         fi
         inject "$run" "$kind" "$cmd" 100
     fi
+}
+
+# damage_phase <run> <iter dir> <damage> <seed> <mode>: after the power
+# loss, with LazyFS unmounted, damages the newest checkpoint manifest under
+# root/ (sets DAMAGED to its name, empty without one); with rc-<timing>,
+# a first recovery then runs on LazyFS and is killed before or after its
+# first rename into a quarantine directory, with rcm-<timing> at the
+# manifest's rename (the tables and runs move first). Sets DAMAGE_OUT.
+damage_phase() {
+    local run="$1" it="$2" damage="$3" wseed="$4" mode="$5" res
+    res="$("$BIN" damage --dir "$run/root/store" --seed "$wseed")"
+    echo "$res" >"$it/damage.log"
+    DAMAGED="$(sed -n 's/^RESULT ok \(checkpoint-[0-9a-f]\{16\}\) .*/\1/p' <<<"$res")"
+    DAMAGE_OUT="${res#RESULT ok }"
+    DAMAGE_OUT="${DAMAGE_OUT// /_}"
+    local to=/quarantine-
+    case "$damage" in
+        rc-*) ;;
+        rcm-*) to='/quarantine-[^/]*/checkpoint-' ;;
+        *) return 0 ;;
+    esac
+    [ -n "$DAMAGED" ] || return 0
+    mount_lazyfs "$run" "$it/lazyfs-rc.log" || { ERR="remount for the interrupted recovery"; return 1; }
+    # LazyFS 0.3.1 matches a rename by to_rgx only, and only when from_rgx
+    # is given and does not match the word "none".
+    printf 'lazyfs::crash::timing=%s::op=rename::from_rgx=/store/::to_rgx=%s\n' \
+        "${damage#*-}" "$to" >"$run/faults.fifo"
+    # LazyFS reads the FIFO on its own thread.
+    sleep 0.2
+    "$BIN" store-open --dir "$run/mnt/store" --mode "$mode" >"$it/store-open.log" 2>&1 &
+    WRITERS="$!"
+    local rc=no-crash
+    for _ in $(seq 600); do
+        kill -0 "$LAZYFS_PID" 2>/dev/null || { rc=triggered; break; }
+        kill -0 "$WRITERS" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -KILL "$WRITERS" 2>/dev/null
+    wait "$WRITERS" 2>/dev/null
+    WRITERS=""
+    unmount_lazyfs
+    DAMAGE_OUT="$DAMAGE_OUT rc=$damage:$rc"
 }
 
 run_scenario() {
@@ -375,7 +433,7 @@ run_scenario() {
         echo "$name initial verify: $result"
         status=failed
     fi
-    while [ "$status" = ok ] && read -r -u 3 i delay wseed kind cmd arm; do
+    while [ "$status" = ok ] && read -r -u 3 i delay wseed kind cmd arm damage; do
         local it
         it="$run/iter-$(printf '%06d' "$i")"
         mkdir -p "$it"
@@ -385,6 +443,8 @@ run_scenario() {
         fi
         local where="" logs="$run"
         ERR=""
+        DAMAGED=""
+        DAMAGE_OUT=""
         CMD="$cmd"
         if ! write_phase "$scenario" "$mode" "$run" "$it" "$delay" "$wseed" "$kind" "$cmd" "$arm" "$i"; then
             # shellcheck disable=SC2086
@@ -395,7 +455,15 @@ run_scenario() {
         fi
         case "$kind" in clear) clear=$((clear + 1)) ;; crash) crash=$((crash + 1)) ;; torn) torn=$((torn + 1)) ;; esac
         [ "$OUTCOME" = fallback ] && fallback=$((fallback + 1))
-        if [ "$scenario" = compaction ]; then
+        if [ "$scenario" = checkpoint ]; then
+            where="outside-checkpoint"
+            grep ' END$' "$it/writer.log" | tail -1 | grep -q '^CKPT-START' && where="in-checkpoint"
+            [ "$where" = in-checkpoint ] && incompaction=$((incompaction + 1))
+            if [ -z "$ERR" ] && [ "$damage" != none ]; then
+                damage_phase "$run" "$it" "$damage" "$wseed" "$mode"
+            fi
+            [ -n "$DAMAGE_OUT" ] && where="$where damaged=$DAMAGE_OUT"
+        elif [ "$scenario" = compaction ]; then
             where="outside-compaction"
             grep ' END$' "$it/writer.log" | tail -1 | grep -q '^COMPACT-START' && where="in-compaction"
             [ "$where" = in-compaction ] && incompaction=$((incompaction + 1))
@@ -413,11 +481,17 @@ run_scenario() {
                 incompaction=$((incompaction + 1))
             fi
         fi
+        # A fault the writer armed, with the file names it filled in.
+        if [[ "$CMD" == *@* ]] && [ -f "$it/writer.log" ]; then
+            CMD="$(sed -n 's/^FAULT \(.*\) END$/\1/p' "$it/writer.log" | tail -1)"
+        fi
         if [ -n "$ERR" ]; then
             result="RESULT FAIL $ERR"
         else
-            # The files as the power loss left them, before recovery changes
-            # them: the reproduction if this iteration fails.
+            # The files as the power loss left them (and the harness damaged
+            # them), before recovery changes them; after an interrupted
+            # recovery, as that recovery left them: the reproduction if this
+            # iteration fails.
             rm -rf -- "${run:?}/pre-recovery"
             cp -a "$run/root" "$run/pre-recovery"
             mount_lazyfs "$run" "$it/lazyfs.log" || { result="RESULT FAIL remount"; }
@@ -449,7 +523,7 @@ run_scenario() {
 START=$(date +%s)
 for scenario in ${SCENARIOS//,/ }; do
     case "$scenario" in
-        store | broker | compaction | dictionary) ;;
+        store | broker | compaction | dictionary | checkpoint) ;;
         *) echo "unknown scenario $scenario" >&2; exit 2 ;;
     esac
     for mode in ${MODES//,/ }; do
