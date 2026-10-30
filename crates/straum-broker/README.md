@@ -51,7 +51,10 @@ authentication exists.
 - **Timestamps** are assigned at group commit, never below the last one
   stored, and recorded through the store.
 - **Startup**: identity check, store open, the store's recovery report on
-  stderr once, `straum-server: compio driver <driver>`, then
+  stderr once, a `straum-server: warning: <n> quarantined checkpoint
+  file(s) …` line at every start while the store holds quarantined
+  files (damaged checkpoint manifests kept for diagnosis; remove
+  them once examined), `straum-server: compio driver <driver>`, then
   `straum-server: listening on <address>`. The broker is ready when it
   answers Hello; clients and runners detect that through the protocol, not
   from these lines (conformance/README.md, Readiness). **SIGTERM or
@@ -92,7 +95,19 @@ settings exit with status 2; any other startup or runtime error, 1.
 | `shutdown_timeout_ms` | 5000 | |
 | `store_write_mode` | `sequential` | `sequential`, `parallel` (ParallelSync; not recommended on disks without power-loss protection, see the store's README), `inline` (InlineSmall, experimental) |
 | `store_segment_max_bytes` | 64 MiB | |
-| `store_max_frame_bytes` | 64 MiB | the store's WAL frame limit; at least `max_frame_bytes` |
+| `store_max_frame_bytes` | 64 MiB | the store's WAL frame limit; at least `max_frame_bytes`. The store trains its compression dictionary only in a group whose frame leaves 64 KiB + 21 bytes free, so keep it well above `max_group_bytes` |
+
+**Rebuilding the index.** `--store-rebuild-index` (a flag without a
+value, on the command line only) rebuilds the store's topic index from its
+WAL at this one start: the way out of a `TopicMismatch` at startup
+(D-229 A). The index segments are deleted and re-derived; the WAL and data
+are not touched. The startup output says so and lists the recovery
+actions: one `IndexSegmentDropped` per deleted segment and one
+`TopicIndexRepaired` per rebuilt topic. The next start without the flag
+opens normally. If the rebuilding start is interrupted, start again with
+the flag. A `store_rebuild_index` line in the configuration file, or the
+flag with a value, is refused at startup (exit status 2), so a rebuild
+never repeats at every start unnoticed.
 
 ## Tests
 
@@ -100,6 +115,7 @@ settings exit with status 2; any other startup or runtime error, 1.
 |---|---|
 | unit tests | configuration, identity file, topic records and placement, the single-threaded mutex, event and one-shot |
 | `tests/broker.rs` | produce and fetch with keys and headers; concurrent producers get distinct contiguous seqs; fetch waiting and timeout; admin requests agree; a restart keeps topics, messages and timestamps; another identity refuses to start |
+| `tests/quarantine.rs` | the quarantine warning at every start while a quarantine directory exists, never as a `recovery:` line |
 | `tests/errors.rs` | every error code version 0 sends, each from a request; `StorageError` from damaged object bytes |
 | `tests/backpressure.rs` | a client that never reads: pending bytes within the bound (from BrokerStats), reading stops, other connections served |
 | `tests/durability.rs` (long) | the binary as a child process, killed with SIGKILL at random moments while producing, restarted: every acknowledged message is fetched with its seq, timestamp, key, headers and body; `STRAUM_BROKER_CRASH_ITERATIONS` (200), `STRAUM_BROKER_CRASH_SEED` (24301) |

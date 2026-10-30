@@ -1,10 +1,10 @@
 //! Directory states a SIGKILL cannot produce, built directly: the last WAL
-//! frame is durable but the segment bytes it introduces are missing or
-//! wrong, or an object of an earlier, acknowledged frame is gone. Run for
-//! every write mode. Only a ParallelSync last frame may be durable before
-//! its objects: it is dropped and reported. In Sequential and InlineSmall
-//! (segment objects synced first) the same state is corruption: an error,
-//! and no file changes.
+//! frame is durable but the block it introduces is missing or wrong, or a
+//! block of an earlier, acknowledged frame is gone. Run for every write
+//! mode. Only a ParallelSync last frame may be durable before its block: it
+//! is dropped and reported. In Sequential and InlineSmall (segment blocks
+//! synced first) the same state is corruption: an error, and no file
+//! changes.
 
 #![allow(clippy::unwrap_used)] // test crate: helpers outside #[test] fns panic on failure by design
 
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use std::collections::BTreeMap;
 
-use common::{TempDir, copy_dir, snapshot, wal_frame_starts};
+use common::{Rng, TempDir, copy_dir, snapshot, wal_frame_starts};
 use straum_store::{
     Config, DropReason, FrameMode, Message, ObjectId, RecoveryAction, Store, StoreError, WriteMode,
 };
@@ -22,9 +22,10 @@ use straum_store::{
 const BATCHES: u8 = 4;
 /// Changes a store directory in place.
 type Damage = fn(&Path);
-/// Segment of the object the last frame introduces.
+/// Segment of the block the last frame introduces.
 const LAST: u64 = BATCHES as u64 - 1;
-/// Above the InlineSmall threshold used below: these objects go to segments.
+/// Incompressible, so a one-object block stays above the InlineSmall
+/// threshold used below and goes to a segment.
 const PAYLOAD: usize = 5000;
 
 fn modes() -> [WriteMode; 3] {
@@ -37,7 +38,7 @@ fn modes() -> [WriteMode; 3] {
 
 fn config(mode: WriteMode) -> Config {
     Config {
-        // Every object gets a segment of its own: object i is in segment i.
+        // Every block gets a segment of its own: batch i is in segment i.
         segment_max_bytes: 1,
         write_mode: mode,
         ..Config::default()
@@ -45,14 +46,15 @@ fn config(mode: WriteMode) -> Config {
 }
 
 fn payload(i: u8) -> Vec<u8> {
-    vec![i; PAYLOAD]
+    let mut rng = Rng(u64::from(i) + 1);
+    (0..PAYLOAD).map(|_| rng.next() as u8).collect()
 }
 
 fn segment(dir: &Path, id: u64) -> PathBuf {
     dir.join(format!("seg-{id:016x}.dat"))
 }
 
-/// One batch per frame, one new object per batch.
+/// One batch per frame, one new object (one block) per batch.
 async fn build(dir: &Path, mode: WriteMode) {
     let mut store = Store::open(dir, config(mode)).await.unwrap();
     for i in 0..BATCHES {
@@ -86,10 +88,10 @@ async fn open_damaged(mode: WriteMode, damage: impl FnOnce(&Path)) -> Opened {
     copy_dir(&src.0, &work.0);
     damage(&work.0);
     let files_before = snapshot(&work.0);
-    let wal_before = std::fs::read(work.0.join("wal.log")).unwrap();
+    let wal_before = std::fs::read(work.0.join(common::WAL0)).unwrap();
     let res = Store::open(&work.0, config(mode)).await;
     let files_after = snapshot(&work.0);
-    let wal_after = std::fs::read(work.0.join("wal.log")).unwrap();
+    let wal_after = std::fs::read(work.0.join(common::WAL0)).unwrap();
     Opened {
         res,
         files_before,
@@ -127,6 +129,7 @@ async fn assert_last_frame_outcome(mode: WriteMode, o: Opened, reason: DropReaso
             actions.first(),
             Some(&RecoveryAction::FrameDropped {
                 frame_seq: u64::from(BATCHES) - 1,
+                file: 0,
                 offset: last as u64,
                 mode: FrameMode::ParallelSync,
                 object,
@@ -144,6 +147,9 @@ async fn assert_last_frame_outcome(mode: WriteMode, o: Opened, reason: DropReaso
             (Err(StoreError::MissingObject(id)), DropReason::ObjectMissing)
             | (Err(StoreError::HashMismatch(id)), DropReason::ObjectHashMismatch) => {
                 assert_eq!(id, object, "{what}");
+            }
+            (Err(StoreError::CorruptBlock { block, .. }), DropReason::BlockCorrupted) => {
+                assert_eq!(block, LAST, "{what}");
             }
             (res, _) => panic!("{what}: expected corruption error, got {:?}", res.err()),
         }
@@ -182,10 +188,22 @@ async fn last_frame_with_wrong_segment_bytes() {
     for mode in modes() {
         let what = format!("{mode:?}: wrong bytes");
         let o = open_damaged(mode, |d| {
-            std::fs::write(segment(d, LAST), vec![0xee; PAYLOAD]).unwrap();
+            let len = std::fs::metadata(segment(d, LAST)).unwrap().len();
+            std::fs::write(segment(d, LAST), vec![0xee; len as usize]).unwrap();
         })
         .await;
-        assert_last_frame_outcome(mode, o, DropReason::ObjectHashMismatch, &what).await;
+        assert_last_frame_outcome(mode, o, DropReason::BlockCorrupted, &what).await;
+        // One flipped bit inside the compressed block: zstd or the CRC
+        // catches it.
+        let what = format!("{mode:?}: one bit");
+        let o = open_damaged(mode, |d| {
+            let mut b = std::fs::read(segment(d, LAST)).unwrap();
+            let mid = b.len() / 2;
+            b[mid] ^= 0x10;
+            std::fs::write(segment(d, LAST), b).unwrap();
+        })
+        .await;
+        assert_last_frame_outcome(mode, o, DropReason::BlockCorrupted, &what).await;
     }
 }
 
@@ -196,9 +214,9 @@ async fn last_frame_with_wrong_segment_bytes() {
 async fn parallel_sync_frame_followed_by_torn_tail_is_not_dropped() {
     let o = open_damaged(WriteMode::ParallelSync, |d| {
         std::fs::remove_file(segment(d, LAST)).unwrap();
-        let mut wal = std::fs::read(d.join("wal.log")).unwrap();
+        let mut wal = std::fs::read(d.join(common::WAL0)).unwrap();
         wal.extend_from_slice(&[0x5a; 30]);
-        std::fs::write(d.join("wal.log"), wal).unwrap();
+        std::fs::write(d.join(common::WAL0), wal).unwrap();
     })
     .await;
     assert!(
@@ -233,13 +251,17 @@ async fn earlier_frame_object_missing_is_an_error() {
     }
 }
 
-/// Content of an earlier object is not hashed at open (that would read
-/// every object); a mismatch is reported when the object is read.
+/// Content of an earlier block is not decoded at open (that would read
+/// every block); damage is reported when an object of it is read, never
+/// returned as data.
 #[compio::test]
-async fn earlier_frame_object_with_wrong_bytes_fails_on_read() {
+async fn earlier_frame_block_with_wrong_bytes_fails_on_read() {
     for mode in modes() {
         let o = open_damaged(mode, |d| {
-            std::fs::write(segment(d, 1), vec![0xee; PAYLOAD]).unwrap();
+            let mut b = std::fs::read(segment(d, 1)).unwrap();
+            let mid = b.len() / 2;
+            b[mid] ^= 0x01;
+            std::fs::write(segment(d, 1), b).unwrap();
         })
         .await;
         let store = o.res.unwrap();
@@ -249,14 +271,16 @@ async fn earlier_frame_object_with_wrong_bytes_fails_on_read() {
         );
         let err = store.read(b"t", 1).await.unwrap_err();
         assert!(
-            matches!(err, StoreError::HashMismatch(_)),
+            matches!(err, StoreError::CorruptBlock { block: 1, .. }),
             "{mode:?}: {err}"
         );
+        // Other blocks stay readable.
+        assert_eq!(store.read(b"t", 0).await.unwrap(), Some(payload(0)));
     }
 }
 
-/// InlineSmall: the last frame's inline bytes are covered by the frame CRC.
-/// Damaging them is a torn last frame; earlier inline objects stay readable.
+/// InlineSmall: the last frame's inline block is covered by the frame CRC.
+/// Damaging it is a torn last frame; earlier inline blocks stay readable.
 #[compio::test]
 async fn inline_small_damaged_last_frame_is_dropped() {
     let dir = TempDir::new("fault-inline");
@@ -275,18 +299,19 @@ async fn inline_small_damaged_last_frame_is_dropped() {
             }];
             store.put_batch(&batch, u64::from(i)).await.unwrap();
         }
-        assert_eq!(store.segment_count(), 0, "all objects inline");
+        assert_eq!(store.segment_count(), 0, "all blocks inline");
         assert_eq!(
             store.stats().fsyncs,
             u64::from(BATCHES),
             "one fdatasync per batch"
         );
     }
-    let path = dir.0.join("wal.log");
+    let path = dir.0.join(common::WAL0);
     let mut wal = std::fs::read(&path).unwrap();
     let last = *wal_frame_starts(&wal).last().unwrap();
     let len = wal.len();
-    wal[len - 10] ^= 0xff; // inside the last inline object's bytes
+    // Inside the last frame (its inline block or the records after it).
+    wal[len - 10] ^= 0xff;
     std::fs::write(&path, &wal).unwrap();
     let store = Store::open(&dir.0, config).await.unwrap();
     assert_eq!(std::fs::metadata(&path).unwrap().len(), last as u64);
@@ -294,6 +319,7 @@ async fn inline_small_damaged_last_frame_is_dropped() {
         store.recovery_report().actions.first(),
         Some(&RecoveryAction::TornTailTruncated {
             frame_seq: u64::from(BATCHES) - 1,
+            file: 0,
             offset: last as u64,
             bytes_removed: (len - last) as u64,
         })
@@ -305,4 +331,51 @@ async fn inline_small_damaged_last_frame_is_dropped() {
             Some(vec![i; 100])
         );
     }
+}
+
+/// straum#135 (fuzzing finding F1): the blocks of the last two ParallelSync
+/// frames are damaged. The last frame may be dropped as never acknowledged,
+/// but the frame before it was acknowledged (a frame followed it), so its
+/// damaged block is corruption: open fails and no file changes. Before the
+/// fix the first open dropped the last frame and the second open, finding
+/// the other frame last, dropped that acknowledged frame too.
+#[compio::test]
+async fn a_damaged_block_before_a_dropped_last_frame_fails_open() {
+    let dir = TempDir::new("fault-before-dropped");
+    let seg = dir.0.join("seg-0000000000000000.dat");
+    let config = Config {
+        write_mode: WriteMode::ParallelSync,
+        ..Config::default()
+    };
+    let mut ends = Vec::new();
+    let mut store = Store::open(&dir.0, config).await.unwrap();
+    for b in 0..3u64 {
+        let body = format!("batch {b} {}", "x".repeat(100)).into_bytes();
+        let msg = Message {
+            topic: b"t",
+            payload: &body,
+            ..Default::default()
+        };
+        store.put_batch(&[msg], b).await.unwrap();
+        ends.push(std::fs::metadata(&seg).unwrap().len() as usize);
+    }
+    drop(store);
+    let mut bytes = std::fs::read(&seg).unwrap();
+    for b in 1..3 {
+        bytes[(ends[b - 1] + ends[b]) / 2] ^= 0xff;
+    }
+    std::fs::write(&seg, bytes).unwrap();
+    let before = snapshot(&dir.0);
+    let err = match Store::open(&dir.0, config).await {
+        Ok(store) => panic!("opened: {:?}", store.recovery_report()),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            StoreError::CorruptBlock { .. } | StoreError::HashMismatch(_)
+        ),
+        "{err}"
+    );
+    assert!(snapshot(&dir.0) == before, "files changed");
 }

@@ -45,7 +45,7 @@ async fn clean_open_reports_nothing_and_changes_nothing() {
 async fn torn_tail_is_truncated_and_reported() {
     let dir = TempDir::new("report-torn");
     build(&dir.0).await;
-    let path = dir.0.join("wal.log");
+    let path = dir.0.join(common::WAL0);
     let wal = std::fs::read(&path).unwrap();
     let last = *wal_frame_starts(&wal).last().unwrap();
     let cut = last + 10;
@@ -56,24 +56,14 @@ async fn torn_tail_is_truncated_and_reported() {
         actions.first(),
         Some(&RecoveryAction::TornTailTruncated {
             frame_seq: 2,
+            file: 0,
             offset: last as u64,
             bytes_removed: 10,
         }),
         "{actions:?}"
     );
-    // The topic index still had the dropped entry: repaired and reported.
-    assert!(
-        actions.iter().any(|a| matches!(
-            a,
-            RecoveryAction::TopicIndexRepaired {
-                entries_kept: 2,
-                bytes_truncated,
-                entries_rewritten: 0,
-                ..
-            } if *bytes_truncated > 0
-        )),
-        "{actions:?}"
-    );
+    // The dropped entry was in the tail, which is in memory only.
+    assert_eq!(actions.len(), 1, "{actions:?}");
     drop(store);
     let store = Store::open(&dir.0, Config::default()).await.unwrap();
     assert!(store.recovery_report().is_empty(), "second open is clean");
@@ -84,9 +74,9 @@ async fn orphans_and_lost_files_are_reported() {
     let dir = TempDir::new("report-orphans");
     build(&dir.0).await;
     std::fs::write(dir.0.join("seg-00000000000000ff.dat"), b"orphan").unwrap();
-    std::fs::write(dir.0.join("topics/7a7a.idx"), b"unknown topic").unwrap();
-    std::fs::write(dir.0.join("wal.log.tmp"), b"half-created").unwrap();
-    std::fs::remove_file(dir.0.join("topics/74.idx")).unwrap();
+    // An index segment whose header never became durable.
+    std::fs::write(dir.0.join("idx-0000000000000007.dat"), b"STRMIDX").unwrap();
+    std::fs::write(dir.0.join(format!("{}.tmp", common::WAL0)), b"half-created").unwrap();
     let store = Store::open(&dir.0, Config::default()).await.unwrap();
     let actions = &store.recovery_report().actions;
     assert!(
@@ -98,33 +88,61 @@ async fn orphans_and_lost_files_are_reported() {
         "{actions:?}"
     );
     assert!(
-        actions.contains(&RecoveryAction::UnknownTopicIndexRemoved {
-            path: dir.0.join("topics/7a7a.idx")
+        actions.contains(&RecoveryAction::IndexSegmentRemoved {
+            segment: 7,
+            bytes: 7
         }),
         "{actions:?}"
     );
-    assert!(
-        actions.contains(&RecoveryAction::TopicIndexRepaired {
-            path: dir.0.join("topics/74.idx"),
-            entries_kept: 0,
-            bytes_truncated: 0,
-            entries_rewritten: 3,
-        }),
-        "{actions:?}"
-    );
-    assert_eq!(actions.len(), 4, "{actions:?}");
+    assert_eq!(actions.len(), 3, "{actions:?}");
+    assert!(!dir.0.join("idx-0000000000000007.dat").exists());
     assert_eq!(store.read(b"t", 2).await.unwrap(), Some(vec![2; 32]));
+}
+
+/// An error found after a repair was due (here a torn tail, a leftover
+/// tmp file and an orphan segment, then a missing earlier segment) leaves
+/// every file as it was: every check runs before the first change.
+#[compio::test]
+async fn an_error_after_due_repairs_changes_nothing() {
+    let dir = TempDir::new("report-check-first");
+    let config = Config {
+        segment_max_bytes: 1,
+        ..Config::default()
+    };
+    let mut store = Store::open(&dir.0, config).await.unwrap();
+    for i in 0..3u8 {
+        let p = [i; 32];
+        let batch = [Message {
+            topic: b"t",
+            payload: &p,
+            ..Default::default()
+        }];
+        store.put_batch(&batch, u64::from(i)).await.unwrap();
+    }
+    drop(store);
+    let path = dir.0.join(common::WAL0);
+    let wal = std::fs::read(&path).unwrap();
+    let last = *wal_frame_starts(&wal).last().unwrap();
+    std::fs::write(&path, &wal[..last + 10]).unwrap();
+    std::fs::write(dir.0.join("seg-00000000000000ff.dat"), b"orphan").unwrap();
+    std::fs::write(dir.0.join(format!("{}.tmp", common::WAL0)), b"half-created").unwrap();
+    // The first batch's segment; the last complete frame's is intact.
+    std::fs::remove_file(dir.0.join("seg-0000000000000000.dat")).unwrap();
+    let before = snapshot(&dir.0);
+    let err = Store::open(&dir.0, config).await.err().unwrap();
+    assert!(matches!(err, StoreError::MissingObject(_)), "{err}");
+    assert!(snapshot(&dir.0) == before, "files changed");
 }
 
 #[compio::test]
 async fn old_format_version_is_unsupported() {
     let dir = TempDir::new("report-old");
     build(&dir.0).await;
-    let path = dir.0.join("wal.log");
+    let path = dir.0.join(common::WAL0);
     let mut wal = std::fs::read(&path).unwrap();
     wal[8..12].copy_from_slice(&1u32.to_le_bytes());
-    let crc = crc32c::crc32c(&wal[..12]);
-    wal[12..16].copy_from_slice(&crc.to_le_bytes());
+    let crc = crc32c::crc32c(&wal[..20]);
+    wal[20..24].copy_from_slice(&crc.to_le_bytes());
     std::fs::write(&path, &wal).unwrap();
     let before = snapshot(&dir.0);
     let err = Store::open(&dir.0, Config::default()).await.err().unwrap();

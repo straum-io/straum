@@ -143,6 +143,8 @@ pub async fn serve(
         segment_max_bytes: config.store_segment_max_bytes,
         max_frame_bytes: config.store_max_frame_bytes,
         write_mode: config.store_write_mode,
+        rebuild_index: config.store_rebuild_index,
+        ..straum_store::Config::default()
     };
     let store = Store::open(config.data_dir.join("store"), store_config).await?;
     let report = store.recovery_report();
@@ -153,8 +155,23 @@ pub async fn serve(
         if created { " (new data directory)" } else { "" },
         report.actions.len()
     );
+    if config.store_rebuild_index {
+        eprintln!(
+            "straum-server: store topic index rebuilt from the WAL on request \
+             (--store-rebuild-index, this start only)"
+        );
+    }
     for action in &report.actions {
         eprintln!("straum-server: recovery: {action:?}");
+    }
+    // Not a recovery line: a quarantine is reported once, by the open that
+    // made it; this repeats at every start while quarantined files exist.
+    let quarantined = store.quarantined_files();
+    if quarantined > 0 {
+        eprintln!(
+            "straum-server: warning: {quarantined} quarantined checkpoint file(s) under {}, kept for diagnosis; remove them once examined",
+            config.data_dir.join("store").display()
+        );
     }
     let (catalog, clock_floor) = load_catalog(&store, config.node_id).await?;
 

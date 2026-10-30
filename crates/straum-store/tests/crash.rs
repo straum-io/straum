@@ -5,7 +5,7 @@
 //! * every acknowledged publish is readable with the right bytes
 //! * no WAL reference points to a missing object (recovery and reads verify)
 //! * no topic_seq is assigned twice
-//! * refcounts equal the live topic entries pointing at each object
+//! * every live topic entry's object is in the object index
 //!
 //! One test per write mode, each with its own directory and the same seed.
 //! Iterations: `STRAUM_STORE_CRASH_ITERATIONS` (default 200). Seed:
@@ -20,7 +20,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::{Rng, TempDir};
-use straum_store::{Config, Message, ObjectId, Store, WriteMode};
+use straum_store::{CompactStep, Config, Message, ObjectId, Store, WriteMode};
 
 const CHILD_DIR: &str = "STRAUM_STORE_CRASH_CHILD_DIR";
 const CHILD_SEED: &str = "STRAUM_STORE_CRASH_CHILD_SEED";
@@ -30,8 +30,8 @@ fn mode(name: &str) -> WriteMode {
     match name {
         "sequential" => WriteMode::Sequential,
         "parallel" => WriteMode::ParallelSync,
-        // Below most payloads of the writer (up to ~3 KiB): a mix of inline
-        // and segment objects.
+        // Applies to a batch's compressed block (payloads up to ~3 KiB, up
+        // to 16 a batch): a mix of inline and segment blocks.
         "inline" => WriteMode::InlineSmall { threshold: 1024 },
         other => panic!("unknown write mode {other}"),
     }
@@ -41,6 +41,21 @@ fn config(mode_name: &str) -> Config {
     Config {
         segment_max_bytes: 4096,
         write_mode: mode(mode_name),
+        // Index segments rotate and seek pages fill often, so kills also
+        // land around both.
+        index_segment_max_bytes: 4096,
+        seek_page_entries: 2,
+        // The dictionary is trained early in the run, so kills also land
+        // before, during and after training.
+        dict_train_bytes: 32 << 10,
+        // Batches of up to 16 payloads of up to ~3 KiB: several blocks per
+        // frame, so kills also land between them.
+        max_block_raw_bytes: 4096,
+        // WAL files rotate every few frames, so kills also land around a
+        // file's creation and recovery spans many files.
+        wal_file_max_bytes: 16 << 10,
+        // Reads and compaction reopen segments and WAL files often.
+        data_open_files: 2,
         ..Config::default()
     }
 }
@@ -64,6 +79,16 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
         .collect()
+}
+
+/// The key of a published payload: one for payloads of even length, so a
+/// key needs no line of its own in the ACK protocol; its one header holds
+/// the same bytes.
+fn key_of(payload: &[u8]) -> Option<Vec<u8>> {
+    payload
+        .len()
+        .is_multiple_of(2)
+        .then(|| format!("k{}", payload.len()).into_bytes())
 }
 
 /// The writer. A no-op unless started by `sigkill_at_random_points`.
@@ -99,13 +124,20 @@ fn crash_child() {
                 topics.push(topic);
                 payloads.push(payload);
             }
+            let keys: Vec<Option<Vec<u8>>> = payloads.iter().map(|p| key_of(p)).collect();
+            let headers: Vec<[(&[u8], &[u8]); 1]> = keys
+                .iter()
+                .map(|k| [(&b"h"[..], k.as_deref().unwrap_or_default())])
+                .collect();
             let batch: Vec<Message> = topics
                 .iter()
                 .zip(&payloads)
-                .map(|(&topic, payload)| Message {
+                .zip(keys.iter().zip(&headers))
+                .map(|((&topic, payload), (key, headers))| Message {
                     topic,
                     payload,
-                    ..Default::default()
+                    key: key.as_deref(),
+                    headers: if key.is_some() { headers } else { &[] },
                 })
                 .collect();
             let now = std::time::SystemTime::now()
@@ -125,8 +157,21 @@ fn crash_child() {
             if round % 2 == 1 {
                 store.release_before(SCRATCH, now).await.unwrap();
             }
-            if round % 3 == 2 {
-                let stats = store.compact().await.unwrap();
+            if round % 5 == 4 {
+                store.checkpoint().await.unwrap();
+            }
+            // A whole compaction every seventh round; otherwise one step,
+            // so batches, releases, checkpoints and kills land between the
+            // steps of the mark phase (three topics) and of the sweep.
+            let done = if round % 7 == 6 {
+                Some(store.compact().await.unwrap())
+            } else {
+                match store.compact_step().await.unwrap() {
+                    CompactStep::Done(stats) => Some(stats),
+                    _ => None,
+                }
+            };
+            if let Some(stats) = done {
                 writeln!(out, "COMPACTED {} END", stats.segments_rewritten).unwrap();
                 out.flush().unwrap();
             }
@@ -165,6 +210,7 @@ fn sigkill_at_random_points(mode_name: &str) {
     let mut acked: HashMap<(String, u64), Vec<u8>> = HashMap::new();
     let mut killed_mid_run = 0;
     let mut compactions = 0;
+    let mut dictionary = None;
 
     for i in 0..iterations {
         let mut child = Command::new(&exe)
@@ -219,45 +265,59 @@ fn sigkill_at_random_points(mode_name: &str) {
             }
         }
 
-        verify(&dir.0, &acked, i, mode_name);
+        dictionary = verify(&dir.0, &acked, i, mode_name);
     }
     println!(
-        "crash test {mode_name}: {killed_mid_run} kills, {} acknowledged publishes verified, {compactions} completed compactions",
+        "crash test {mode_name}: {killed_mid_run} kills, {} acknowledged publishes verified, {compactions} completed compactions, dictionary {dictionary:?}",
         acked.len()
     );
     assert_eq!(killed_mid_run, iterations);
 }
 
-fn verify(dir: &std::path::Path, acked: &HashMap<(String, u64), Vec<u8>>, i: u64, mode_name: &str) {
+/// Returns the store's dictionary length (`Store::dictionary_bytes`).
+fn verify(
+    dir: &std::path::Path,
+    acked: &HashMap<(String, u64), Vec<u8>>,
+    i: u64,
+    mode_name: &str,
+) -> Option<usize> {
     let rt = compio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let store = match Store::open(dir, config(mode_name)).await {
             Ok(store) => store,
             Err(e) => panic!("iteration {i}: recovery failed: {e}"),
         };
-        for ((topic, seq), payload) in acked {
-            let got = store.read(topic.as_bytes(), *seq).await.unwrap();
+        // In topic order, so consecutive reads share decompressed blocks.
+        let mut sorted: Vec<_> = acked.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for ((topic, seq), payload) in sorted {
+            let got = store.read_entry(topic.as_bytes(), *seq).await.unwrap();
+            let key = key_of(payload);
+            let headers = match &key {
+                Some(k) => vec![(b"h".to_vec(), k.clone())],
+                None => vec![],
+            };
             assert_eq!(
-                got.as_ref(),
-                Some(payload),
+                got.map(|e| (e.payload, e.key, e.headers)),
+                Some((payload.clone(), key, headers)),
                 "iteration {i}: acked {topic}/{seq}"
             );
         }
         // Every live entry resolves to an existing object with matching
-        // bytes, and refcounts equal the live entries per object.
-        let mut counts: HashMap<ObjectId, u64> = HashMap::new();
+        // bytes, held by the object index.
         let topics: Vec<Vec<u8>> = store.topics().map(<[u8]>::to_vec).collect();
         for topic in &topics {
             let (first, next) = store.topic_range(topic).unwrap();
             for seq in first..next {
-                let id = store.entry(topic, seq).unwrap();
+                let id = store.entry(topic, seq).await.unwrap().unwrap();
                 let bytes = store.read(topic, seq).await.unwrap().unwrap();
                 assert_eq!(ObjectId::of(&bytes), id);
-                *counts.entry(id).or_default() += 1;
+                assert!(
+                    store.contains(&id),
+                    "iteration {i}: {topic:?}/{seq} indexed"
+                );
             }
         }
-        for (id, n) in &counts {
-            assert_eq!(store.refcount(id), Some(*n), "iteration {i}: refcount");
-        }
-    });
+        store.dictionary_bytes()
+    })
 }

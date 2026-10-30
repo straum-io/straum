@@ -7,7 +7,11 @@
 //! plan          --scenario S --seed N --iterations K --store-root P
 //! store-write   --dir D --mode M --seed N [--compact-every C]
 //!               [--arm-at-compaction K --fifo F --fault CMD]
-//! store-verify  --dir D --mode M --logs DIR
+//!               [--dict-train-bytes B [--arm-at-train --fifo F --fault CMD]]
+//!               [--checkpoint-every C [--arm-at-checkpoint K --fifo F --fault CMD]]
+//! store-verify  --dir D --mode M --logs DIR [--dict-train-bytes B] [--damaged NAME]
+//! store-open    --dir D --mode M   (opens the store once: a recovery to interrupt)
+//! damage        --dir D --seed N   (damages the newest checkpoint manifest)
 //! broker-produce --addr A --base N --seed N
 //! broker-verify --broker BIN --data-dir D --mode M --logs DIR --stderr FILE
 //! free-addr     (prints `RESULT ok 127.0.0.1:<free port>`)
@@ -72,7 +76,7 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(cmd) = args.next() else {
         eprintln!(
-            "usage: straum-power-loss <plan|store-write|store-verify|broker-produce|broker-verify|free-addr> --key value ..."
+            "usage: straum-power-loss <plan|store-write|store-verify|store-open|damage|broker-produce|broker-verify|free-addr> --key value ..."
         );
         return ExitCode::from(2);
     };
@@ -85,6 +89,8 @@ fn main() -> ExitCode {
         "plan" => plan(&opts),
         "store-write" => store_write(&opts),
         "store-verify" => store_verify(&opts),
+        "store-open" => store_open(&opts),
+        "damage" => damage(&opts),
         "broker-produce" => broker_produce(&opts),
         "broker-verify" => broker_verify(&opts),
         "free-addr" => straum_conformance::broker::free_addr(),
@@ -116,44 +122,109 @@ fn num(opts: &HashMap<&str, &str>, key: &str) -> Result<u64, String> {
 
 /// LazyFS crash points: `lazyfs::crash` kills LazyFS at the first matching
 /// operation after the command arrives, dropping its cache.
-const CRASH_POINTS: [(&str, &str); 7] = [
-    ("write", r"wal\.log"),
-    ("fsync", r"wal\.log"),
+const CRASH_POINTS: [(&str, &str); 8] = [
+    ("write", r"wal-.*\.log$"),
+    ("fsync", r"wal-.*\.log$"),
     ("write", "seg-"),
     ("fsync", "seg-"),
-    ("write", r"\.idx"),
+    ("write", "idx-"),
     ("create", "seg-"),
     ("unlink", "seg-"),
+    // A new WAL file, created when the previous one is full.
+    ("create", "wal-"),
 ];
 
+/// Files a checkpoint writes, by name prefix (docs/format.md "Files").
+const CHECKPOINT_FILES: [&str; 7] = [
+    "checkpoint-",
+    "objtab-",
+    "blktab-",
+    "blkrel-",
+    "dict-",
+    "idrun-",
+    "reloc-",
+];
+
+/// The manifest's tmp file, written, synced and renamed by a checkpoint.
+const CKPT_TMP: &str = r"checkpoint-[0-9a-f]{16}\.tmp$";
+
+/// Crash points of a checkpoint: its object and block tables, relocation
+/// and id runs and manifest, the deletion of the previous manifest and of
+/// the id runs a merge replaced.
+const CHECKPOINT_POINTS: [(&str, &str); 20] = [
+    ("create", "objtab-"),
+    ("write", "objtab-"),
+    ("fsync", "objtab-"),
+    ("create", "blktab-"),
+    ("write", "blktab-"),
+    ("fsync", "blktab-"),
+    ("write", "blkrel-"),
+    ("fsync", "blkrel-"),
+    ("create", "idrun-"),
+    ("write", "idrun-"),
+    ("fsync", "idrun-"),
+    ("unlink", "idrun-"),
+    ("create", "reloc-"),
+    ("write", "reloc-"),
+    ("fsync", "reloc-"),
+    ("create", CKPT_TMP),
+    ("write", CKPT_TMP),
+    ("fsync", CKPT_TMP),
+    // LazyFS 0.3.1 matches a rename by `to_rgx` alone once `from_rgx`
+    // does not match the word "none" (and never without `from_rgx`): the
+    // tmp manifest renamed to `checkpoint-<n>`.
+    (
+        "rename",
+        r"checkpoint-[0-9a-f]{16}\.tmp$::to_rgx=checkpoint-[0-9a-f]{16}$",
+    ),
+    ("unlink", PREV_MANIFEST),
+];
+
+/// The previous manifest, deleted once the new one reads back.
+const PREV_MANIFEST: &str = r"checkpoint-[0-9a-f]{16}$";
+
 /// One line per iteration: `<i> <delay_ms> <writer_seed> <kind> <command>
-/// <arm_at_compaction>`. Each iteration draws from its own generator, so an
-/// iteration is reproduced from the seed and its number alone.
+/// <arm_at> <damage>`. Each iteration draws from its own generator, so an
+/// iteration is reproduced from the seed and its number alone. `damage`
+/// (checkpoint scenario, else `none`): after the power loss the newest
+/// manifest is damaged (`manifest`); with `rc-<timing>` the first
+/// recovery is then killed before or after its first move into the
+/// quarantine, with `rcm-<timing>` before or after the manifest's move.
 fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
     let scenario = opt(opts, "scenario")?;
     let seed = num(opts, "seed")?;
     let iterations = num(opts, "iterations")?;
     let root = opt(opts, "store-root")?;
-    let index = match scenario {
-        "broker" => hex(format!("t/{BROKER_TOPIC}/0").as_bytes()),
-        _ => hex(ORDERS),
-    };
     for i in 0..iterations {
         let mut rng = Rng::new(mix(seed, i));
         let writer_seed = rng.next();
         let delay = rng.below(300);
-        let compaction = scenario == "compaction";
+        // The writer arms these faults itself, at a compaction or at the
+        // batch that trains the dictionary.
+        let compaction = matches!(scenario, "compaction" | "dictionary");
         let kind = match rng.below(3) {
             0 if !compaction => "clear",
             0 | 1 => "crash",
             _ => "torn",
         };
+        // The checkpoint scenario cycles its cases, so that a few
+        // iterations cover each: clear, crash, torn, and a crash before the
+        // previous manifest's deletion.
+        let two_manifests = scenario == "checkpoint" && i % 4 == 3;
+        let kind = match scenario {
+            "checkpoint" => ["clear", "crash", "torn", "crash"][(i % 4) as usize],
+            _ => kind,
+        };
         let command = match kind {
+            _ if two_manifests => {
+                format!("lazyfs::crash::timing=before::op=unlink::from_rgx={PREV_MANIFEST}")
+            }
             "clear" => "lazyfs::clear-cache".to_owned(),
             "crash" => {
                 let points = match scenario {
-                    // Operations a compaction issues.
-                    "compaction" => &CRASH_POINTS[..4],
+                    "checkpoint" => &CHECKPOINT_POINTS[..],
+                    // Operations a compaction or a training batch issues.
+                    "compaction" | "dictionary" => &CRASH_POINTS[..4],
                     // The broker never compacts: no segment is unlinked.
                     "broker" => &CRASH_POINTS[..6],
                     _ => &CRASH_POINTS[..],
@@ -164,11 +235,17 @@ fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
             }
             _ => {
                 // Torn WAL writes twice as often as torn index writes; a
-                // compaction writes no index.
-                let file = if compaction || rng.below(3) > 0 {
-                    "wal.log".to_owned()
+                // compaction writes no index. `@WAL@` is the WAL file being
+                // appended to when the fault is armed; `@IDX@` the index
+                // segment the writer will append to, named by run.sh
+                // before the writer starts.
+                let file = if scenario == "checkpoint" {
+                    // The manifest's tmp file, named by the writer.
+                    "@CKPT@"
+                } else if compaction || rng.below(3) > 0 {
+                    "@WAL@"
                 } else {
-                    format!("topics/{index}.idx")
+                    "@IDX@"
                 };
                 let parts = 2 + rng.below(3);
                 let persist: Vec<String> = (1..=parts)
@@ -184,14 +261,29 @@ fn plan(opts: &HashMap<&str, &str>) -> Result<String, String> {
             }
         };
         let arm_at = 1 + rng.below(4);
-        println!("{i} {delay} {writer_seed} {kind} {command} {arm_at}");
+        // A crash before the previous manifest's deletion leaves two
+        // manifests: damaging the newest then must fall back to the other.
+        let damage = if scenario != "checkpoint" {
+            "none"
+        } else if two_manifests || rng.below(3) == 0 {
+            [
+                "manifest",
+                "rc-before",
+                "rc-after",
+                "rcm-before",
+                "rcm-after",
+            ][rng.below(5) as usize]
+        } else {
+            "none"
+        };
+        println!("{i} {delay} {writer_seed} {kind} {command} {arm_at} {damage}");
     }
     Ok(format!("{iterations} iterations"))
 }
 
 // ---------------------------------------------------------------- store
 
-fn store_config(mode: &str) -> Result<Config, String> {
+fn store_config(mode: &str, opts: &HashMap<&str, &str>) -> Result<Config, String> {
     let write_mode = match mode {
         "sequential" => WriteMode::Sequential,
         "parallel" => WriteMode::ParallelSync,
@@ -199,11 +291,17 @@ fn store_config(mode: &str) -> Result<Config, String> {
         "inline" => WriteMode::InlineSmall { threshold: 1024 },
         _ => return Err(format!("unknown write mode {mode}")),
     };
+    let dict_train_bytes = match opts.get("dict-train-bytes") {
+        Some(_) => num(opts, "dict-train-bytes")?,
+        None => Config::default().dict_train_bytes,
+    };
     Ok(Config {
-        // Small segments: rotation, sealing mid-batch and compaction happen
-        // within one iteration.
+        // Small segments and WAL files: rotation, sealing mid-batch and
+        // compaction happen within one iteration.
         segment_max_bytes: 64 << 10,
+        wal_file_max_bytes: 64 << 10,
         write_mode,
+        dict_train_bytes,
         ..Config::default()
     })
 }
@@ -249,13 +347,21 @@ fn store_write(opts: &HashMap<&str, &str>) -> Result<String, String> {
     let arm_at = opts
         .get("arm-at-compaction")
         .map_or(Ok(0), |_| num(opts, "arm-at-compaction"))?;
-    let config = store_config(mode)?;
+    let arm_at_train = opts.contains_key("arm-at-train");
+    let checkpoint_every = opts
+        .get("checkpoint-every")
+        .map_or(Ok(0), |_| num(opts, "checkpoint-every"))?;
+    let arm_at_checkpoint = opts
+        .get("arm-at-checkpoint")
+        .map_or(Ok(0), |_| num(opts, "arm-at-checkpoint"))?;
+    let config = store_config(mode, opts)?;
     println!("SEED {seed} END");
     let rt = compio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     rt.block_on(async {
         let mut store = Store::open(dir, config).await.unwrap();
         println!("READY END");
         let mut compactions = 0;
+        let mut checkpoints = 0;
         let mut round = 0;
         loop {
             round += 1;
@@ -271,6 +377,14 @@ fn store_write(opts: &HashMap<&str, &str>) -> Result<String, String> {
                 })
                 .collect();
             let now = now_ms();
+            if store.trains_next_batch() {
+                // The fault, if armed here, hits the batch that trains.
+                if arm_at_train {
+                    arm(opts);
+                    println!("ARMED {round} END");
+                }
+                println!("TRAIN {round} END");
+            }
             println!("TRY {round} END");
             let seqs = store.put_batch(&batch, now).await.unwrap();
             // An ACK line is a durability promise: printed only after
@@ -287,24 +401,101 @@ fn store_write(opts: &HashMap<&str, &str>) -> Result<String, String> {
             if round % compact_every == 0 {
                 compactions += 1;
                 if compactions == arm_at {
-                    let fifo = opt(opts, "fifo").unwrap();
-                    let fault = opt(opts, "fault").unwrap();
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(fifo)
-                        .and_then(|mut f| writeln!(f, "{fault}"))
-                        .unwrap();
+                    arm(opts);
                     println!("ARMED {round} END");
-                    // LazyFS reads the FIFO on its own thread.
-                    std::thread::sleep(Duration::from_millis(200));
                 }
                 println!("COMPACT-START {round} END");
                 let stats = store.compact().await.unwrap();
                 println!("COMPACTED {} END", stats.segments_rewritten);
             }
+            if checkpoint_every > 0 && round % checkpoint_every == 0 {
+                checkpoints += 1;
+                if checkpoints == arm_at_checkpoint {
+                    arm(opts);
+                    println!("ARMED {round} END");
+                }
+                println!("CKPT-START {round} END");
+                store.checkpoint().await.unwrap();
+                println!("CKPT-DONE {} END", store.checkpoint_number().unwrap_or(0));
+            }
         }
     });
     Ok(String::new())
+}
+
+/// The newest WAL file of the store in `dir`: the one being appended to.
+fn last_wal_file(dir: &Path) -> Option<String> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| wal_file_id(n).is_some())
+        .max()
+}
+
+/// The first frame seq of a WAL file `wal-<16 hex digits>.log`.
+fn wal_file_id(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("wal-")?.strip_suffix(".log")?;
+    (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok())?
+}
+
+/// The number of a manifest `checkpoint-<16 hex digits>`.
+fn manifest_number(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("checkpoint-")?;
+    (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok())?
+}
+
+/// The number of a quarantine directory `quarantine-<16 hex>[.<k>]`.
+fn quarantine_number(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("quarantine-")?.split('.').next()?;
+    (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok())?
+}
+
+/// The number the store's next checkpoint takes (docs/format.md
+/// "Checkpoint"): above every manifest, tmp manifest, run and quarantine
+/// directory in `dir`.
+fn next_checkpoint(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter_map(|n| {
+            manifest_number(n.strip_suffix(".tmp").unwrap_or(&n))
+                .or_else(|| quarantine_number(&n))
+                .or_else(|| {
+                    let run = ["reloc-", "blkrel-", "idrun-"]
+                        .iter()
+                        .find_map(|p| n.strip_prefix(p))?;
+                    u64::from_str_radix(run.strip_suffix(".run")?, 16).ok()
+                })
+        })
+        .max()
+        .map_or(1, |n| n + 1)
+}
+
+/// Writes `--fault` to the LazyFS fault FIFO `--fifo`; `@WAL@` in it
+/// becomes the WAL file being appended to, `@CKPT@` the tmp file of the
+/// next checkpoint's manifest.
+#[expect(
+    clippy::unwrap_used,
+    reason = "a harness error ends the writer; run.sh reports the iteration"
+)]
+fn arm(opts: &HashMap<&str, &str>) {
+    let fifo = opt(opts, "fifo").unwrap();
+    let wal = last_wal_file(Path::new(opt(opts, "dir").unwrap())).unwrap();
+    let dir = Path::new(opt(opts, "dir").unwrap());
+    let tmp = format!("checkpoint-{:016x}.tmp", next_checkpoint(dir));
+    let fault = opt(opts, "fault")
+        .unwrap()
+        .replace("@WAL@", &wal)
+        .replace("@CKPT@", &tmp);
+    println!("FAULT {fault} END");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(fifo)
+        .and_then(|mut f| writeln!(f, "{fault}"))
+        .unwrap();
+    // LazyFS reads the FIFO on its own thread.
+    std::thread::sleep(Duration::from_millis(200));
 }
 
 /// What the writer logs of one scenario say: every acknowledged message and
@@ -316,6 +507,9 @@ struct StoreLog {
     /// The last round each writer handed to the store: at most one batch
     /// per writer can be durable without its ACK lines.
     unacked: Vec<(u64, u64)>,
+    /// The round whose batch trained the dictionary, and the last round
+    /// acknowledged, of the last writer log that has a `TRAIN` line.
+    train: Option<(u64, u64)>,
 }
 
 /// `iter-*/<name>` under `logs`, in iteration order.
@@ -345,6 +539,7 @@ fn parse_store_logs(logs: &str) -> Result<StoreLog, String> {
     for path in log_files(logs, "writer.log")? {
         let mut seed = None;
         let mut last_try = None;
+        let (mut trained, mut last_ack) = (None, 0);
         for f in log_lines(&path)? {
             let n = |i: usize| -> Result<u64, String> {
                 f.get(i)
@@ -354,9 +549,11 @@ fn parse_store_logs(logs: &str) -> Result<StoreLog, String> {
             match f[0].as_str() {
                 "SEED" => seed = Some(n(1)?),
                 "TRY" => last_try = Some(n(1)?),
+                "TRAIN" => trained = Some(n(1)?),
                 "ACK" => {
                     let seed = seed.ok_or("ACK before SEED")?;
                     let (round, j, seq) = (n(1)?, n(2)?, n(4)?);
+                    last_ack = last_ack.max(round);
                     let key = (f[3].clone().into_bytes(), seq);
                     if let Some(prev) = log.acked.insert(key, (seed, round, j))
                         && store_message(prev.0, prev.1, prev.2).1
@@ -375,20 +572,26 @@ fn parse_store_logs(logs: &str) -> Result<StoreLog, String> {
         if let (Some(seed), Some(round)) = (seed, last_try) {
             log.unacked.push((seed, round));
         }
+        if let Some(round) = trained {
+            log.train = Some((round, last_ack));
+        }
     }
     Ok(log)
 }
 
 /// Every file under a store directory: relative path → (length, BLAKE3),
-/// plus the WAL's bytes, to check what recovery cut.
+/// plus the WAL files' bytes, to check what recovery cut, and the
+/// directories (an empty quarantine directory has no file).
 struct Snapshot {
     files: BTreeMap<String, (u64, [u8; 32])>,
-    wal: Vec<u8>,
+    wal: HashMap<String, Vec<u8>>,
+    dirs: HashSet<String>,
 }
 
 fn snapshot(dir: &Path) -> Result<Snapshot, String> {
     let mut files = BTreeMap::new();
-    let mut wal = Vec::new();
+    let mut wal = HashMap::new();
+    let mut dirs = HashSet::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let entries = match std::fs::read_dir(&d) {
@@ -398,31 +601,54 @@ fn snapshot(dir: &Path) -> Result<Snapshot, String> {
         };
         for entry in entries {
             let path = entry.map_err(|e| e.to_string())?.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             let rel = path
                 .strip_prefix(dir)
                 .map_err(|e| e.to_string())?
                 .to_string_lossy()
                 .into_owned();
+            if path.is_dir() {
+                dirs.insert(rel);
+                stack.push(path);
+                continue;
+            }
+            let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             files.insert(
                 rel.clone(),
                 (bytes.len() as u64, *blake3::hash(&bytes).as_bytes()),
             );
-            if rel == "wal.log" {
-                wal = bytes;
+            if wal_file_id(&rel).is_some() {
+                wal.insert(rel, bytes);
             }
         }
     }
-    Ok(Snapshot { files, wal })
+    Ok(Snapshot { files, wal, dirs })
 }
 
 /// `name { field: value, ... }` of a recovery action in Debug form.
 fn action_name(a: &str) -> &str {
     a.split([' ', '{']).next().unwrap_or("")
+}
+
+/// The report's action names, a run of one name as `name*count`: a
+/// quarantine moves one file per entry.
+fn action_names(actions: &[String]) -> String {
+    let mut runs: Vec<(&str, usize)> = Vec::new();
+    for a in actions {
+        match runs.last_mut() {
+            Some((name, n)) if *name == action_name(a) => *n += 1,
+            _ => runs.push((action_name(a), 1)),
+        }
+    }
+    runs.iter()
+        .map(|&(name, n)| {
+            if n == 1 {
+                name.to_owned()
+            } else {
+                format!("{name}*{n}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn action_field<'a>(a: &'a str, field: &str) -> Option<&'a str> {
@@ -435,13 +661,18 @@ fn action_field<'a>(a: &'a str, field: &str) -> Option<&'a str> {
 /// The report holds only the changes `docs/guarantees.md` §3 lists, and
 /// `FrameDropped` only in ParallelSync.
 fn check_report(actions: &[String], mode: &str) -> Result<(), String> {
-    const ALLOWED: [&str; 6] = [
+    const ALLOWED: [&str; 11] = [
         "WalTmpRemoved",
         "TornTailTruncated",
         "FrameDropped",
         "OrphanSegmentRemoved",
-        "UnknownTopicIndexRemoved",
+        "IndexSegmentRemoved",
+        "StaleIndexRecordsFenced",
         "TopicIndexRepaired",
+        "CheckpointFileRemoved",
+        "CheckpointManifestDamaged",
+        "CheckpointFileQuarantined",
+        "CheckpointQuarantineResumed",
     ];
     let mut cuts = 0;
     for a in actions {
@@ -464,11 +695,50 @@ fn check_report(actions: &[String], mode: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The id of an index segment file `idx-<16 hex digits>.dat`.
+fn index_segment_id(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("idx-")?.strip_suffix(".dat")?;
+    (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok())?
+}
+
 /// Every difference between the snapshots before and after recovery is
 /// listed in the report, and every report entry is a difference on disk.
-/// Anything else is a silent repair.
+/// Anything else is a silent repair. Index segments: recovery never
+/// changes an existing one, it may only delete it (`IndexSegmentRemoved`);
+/// a new one holds a fence (`StaleIndexRecordsFenced`) or the blocks and
+/// seek pages of `TopicIndexRepaired`, which all go to new segments.
+/// Checkpoint files: a top-level one may be deleted
+/// (`CheckpointFileRemoved`) or moved unchanged into a quarantine directory
+/// (`CheckpointFileQuarantined`); the damage entries themselves are
+/// `check_checkpoints`'.
 fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Result<(), String> {
     let mut explained = vec![false; actions.len()];
+    let mut moved = HashSet::new();
+    for (i, a) in actions.iter().enumerate() {
+        match action_name(a) {
+            "CheckpointFileQuarantined" => {
+                let (Some(file), Some(q)) =
+                    (action_field(a, "file"), action_field(a, "quarantine"))
+                else {
+                    return Err(format!("malformed report entry {a}"));
+                };
+                let dst = format!("{q}/{file}");
+                let src = before.files.get(file);
+                if src.is_none()
+                    || after.files.contains_key(file)
+                    || before.files.contains_key(&dst)
+                    || after.files.get(&dst) != src
+                {
+                    return Err(format!("{a}: not a move of {file}, unchanged, into {q}"));
+                }
+                moved.insert(file.to_owned());
+                moved.insert(dst);
+                explained[i] = true;
+            }
+            "CheckpointManifestDamaged" | "CheckpointQuarantineResumed" => explained[i] = true,
+            _ => {}
+        }
+    }
     let mut explain = |pred: &dyn Fn(&str) -> bool, what: &str| -> Result<(), String> {
         let i = actions
             .iter()
@@ -481,34 +751,49 @@ fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Res
         Ok(())
     };
     let keys: HashSet<&String> = before.files.keys().chain(after.files.keys()).collect();
+    let mut new_index = Vec::new();
     for rel in keys {
         let (b, a) = (before.files.get(rel), after.files.get(rel));
-        if b == a {
+        if b == a || moved.contains(rel.as_str()) {
             continue;
         }
         let name = rel.rsplit('/').next().unwrap_or(rel);
         match (rel.as_str(), b, a) {
-            ("wal.log", Some(b), Some(a)) => {
+            (_, Some(b), Some(a)) if wal_file_id(rel).is_some() => {
                 let cut = a.0 as usize;
-                if a.0 >= b.0 || *blake3::hash(&before.wal[..cut]).as_bytes() != a.1 {
+                let bytes = before.wal.get(rel).map_or(&[][..], Vec::as_slice);
+                if a.0 >= b.0 || *blake3::hash(&bytes[..cut]).as_bytes() != a.1 {
                     return Err(format!(
-                        "silent repair: wal.log changed other than by a cut ({} → {} bytes)",
+                        "silent repair: {rel} changed other than by a cut ({} → {} bytes)",
                         b.0, a.0
                     ));
                 }
+                let file = wal_file_id(rel).unwrap_or_default().to_string();
                 let removed = (b.0 - a.0).to_string();
                 let offset = a.0.to_string();
                 explain(
                     &|x| {
                         matches!(action_name(x), "TornTailTruncated" | "FrameDropped")
+                            && action_field(x, "file") == Some(file.as_str())
                             && action_field(x, "offset") == Some(offset.as_str())
                             && action_field(x, "bytes_removed") == Some(removed.as_str())
                     },
-                    "wal.log (cut)",
+                    &format!("{rel} (cut)"),
                 )?;
             }
-            ("wal.log.tmp", Some(_), None) => {
+            (_, Some(_), None) if name.strip_suffix(".tmp").and_then(wal_file_id).is_some() => {
                 explain(&|x| action_name(x) == "WalTmpRemoved", rel)?;
+            }
+            (_, Some(_), None)
+                if !rel.contains('/') && CHECKPOINT_FILES.iter().any(|p| name.starts_with(p)) =>
+            {
+                explain(
+                    &|x| {
+                        action_name(x) == "CheckpointFileRemoved"
+                            && action_field(x, "file") == Some(name)
+                    },
+                    rel,
+                )?;
             }
             (_, Some(_), None) if name.starts_with("seg-") => {
                 let id = name
@@ -525,25 +810,44 @@ fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Res
                     rel,
                 )?;
             }
-            (_, Some(_), None) if rel.starts_with("topics/") => {
+            (_, Some(b), None) if index_segment_id(name).is_some() => {
+                let id = index_segment_id(name).unwrap_or_default().to_string();
+                let bytes = b.0.to_string();
                 explain(
                     &|x| {
-                        action_name(x) == "UnknownTopicIndexRemoved"
-                            && action_field(x, "path").is_some_and(|p| p.ends_with(rel.as_str()))
+                        action_name(x) == "IndexSegmentRemoved"
+                            && action_field(x, "segment") == Some(id.as_str())
+                            && action_field(x, "bytes") == Some(bytes.as_str())
                     },
                     rel,
                 )?;
             }
-            (_, _, Some(_)) if rel.starts_with("topics/") => {
-                explain(
-                    &|x| {
-                        action_name(x) == "TopicIndexRepaired"
-                            && action_field(x, "path").is_some_and(|p| p.ends_with(rel.as_str()))
-                    },
-                    rel,
-                )?;
+            (_, None, Some(_)) if index_segment_id(name).is_some() => {
+                new_index.push((rel.clone(), index_segment_id(name).unwrap_or_default()));
             }
             _ => return Err(format!("silent repair: {rel} changed ({b:?} → {a:?})")),
+        }
+    }
+    // A new index segment is a fence or holds repaired records; repaired
+    // records need a new segment.
+    let repaired: Vec<usize> = (0..actions.len())
+        .filter(|&i| action_name(&actions[i]) == "TopicIndexRepaired")
+        .collect();
+    for (rel, id) in &new_index {
+        let id = id.to_string();
+        let fence = actions.iter().position(|x| {
+            action_name(x) == "StaleIndexRecordsFenced"
+                && action_field(x, "segment") == Some(id.as_str())
+        });
+        match fence {
+            Some(i) => explained[i] = true,
+            None if !repaired.is_empty() => {}
+            None => return Err(format!("silent repair: {rel} created with no report entry")),
+        }
+    }
+    if !new_index.is_empty() {
+        for i in repaired {
+            explained[i] = true;
         }
     }
     if let Some(i) = explained.iter().position(|e| !e) {
@@ -555,17 +859,133 @@ fn check_changes(before: &Snapshot, after: &Snapshot, actions: &[String]) -> Res
     Ok(())
 }
 
+/// The manifest entries of the report against the quarantine rules
+/// (docs/format.md "Checkpoint"), from the files before recovery:
+/// a manifest whose quarantine was interrupted (its directory without it)
+/// is completed (`CheckpointQuarantineResumed`, `found` the directory's
+/// files); `damaged`, the manifest the harness damaged, is quarantined
+/// (`CheckpointManifestDamaged`) if it is newer than every intact one; no
+/// other manifest is damaged, since every manifest is synced before its
+/// rename and LazyFS cannot damage it. `fallback` in each entry and `used`
+/// (`Store::checkpoint_number`) are the newest other manifest; each
+/// quarantined manifest is in its directory unchanged; `quarantined` is the
+/// number of files in quarantine directories after recovery.
+fn check_checkpoints(
+    before: &Snapshot,
+    after: &Snapshot,
+    actions: &[String],
+    damaged: Option<&str>,
+    used: Option<u64>,
+    quarantined: u64,
+) -> Result<(), String> {
+    let mut manifests: Vec<u64> = before
+        .files
+        .keys()
+        .filter_map(|k| manifest_number(k))
+        .collect();
+    manifests.sort_unstable_by(|a, b| b.cmp(a));
+    let mut fallback = None;
+    // (manifest, quarantine directory, files found there if interrupted)
+    let mut want: Vec<(u64, String, Option<Vec<String>>)> = Vec::new();
+    for &m in &manifests {
+        let name = format!("checkpoint-{m:016x}");
+        let interrupted = before.dirs.iter().find(|d| {
+            quarantine_number(d) == Some(m) && !before.files.contains_key(&format!("{d}/{name}"))
+        });
+        if let Some(q) = interrupted {
+            let prefix = format!("{q}/");
+            let found = before
+                .files
+                .keys()
+                .filter_map(|k| k.strip_prefix(&prefix))
+                .map(str::to_owned)
+                .collect();
+            want.push((m, q.clone(), Some(found)));
+        } else if damaged == Some(name.as_str()) && fallback.is_none() {
+            let base = format!("quarantine-{m:016x}");
+            let q = (0..)
+                .map(|k| {
+                    if k == 0 {
+                        base.clone()
+                    } else {
+                        format!("{base}.{k}")
+                    }
+                })
+                .find(|q| !before.dirs.contains(q))
+                .unwrap_or(base);
+            want.push((m, q, None));
+        } else if fallback.is_none() {
+            fallback = Some(m);
+        }
+    }
+    let mut expected: Vec<String> = want
+        .iter()
+        .map(|(m, q, found)| match found {
+            None => format!(
+                "CheckpointManifestDamaged {{ checkpoint: {m}, fallback: {fallback:?}, quarantine: {q:?} }}"
+            ),
+            Some(f) => format!(
+                "CheckpointQuarantineResumed {{ checkpoint: {m}, fallback: {fallback:?}, quarantine: {q:?}, found: {f:?} }}"
+            ),
+        })
+        .collect();
+    let mut got: Vec<String> = actions
+        .iter()
+        .filter(|a| {
+            matches!(
+                action_name(a),
+                "CheckpointManifestDamaged" | "CheckpointQuarantineResumed"
+            )
+        })
+        .cloned()
+        .collect();
+    expected.sort();
+    got.sort();
+    if got != expected {
+        return Err(format!(
+            "manifest entries {got:?}, the quarantine rules give {expected:?} (damaged by the harness: {damaged:?})"
+        ));
+    }
+    for (m, q, _) in &want {
+        let name = format!("checkpoint-{m:016x}");
+        if after.files.contains_key(&name)
+            || after.files.get(&format!("{q}/{name}")) != before.files.get(&name)
+        {
+            return Err(format!("{name} not moved, unchanged, into {q}"));
+        }
+    }
+    if used != fallback {
+        return Err(format!(
+            "the store uses checkpoint {used:?}, the newest intact manifest is {fallback:?}"
+        ));
+    }
+    let in_quarantine = after
+        .files
+        .keys()
+        .filter(|k| {
+            k.split_once('/')
+                .is_some_and(|(d, _)| quarantine_number(d).is_some())
+        })
+        .count() as u64;
+    if quarantined != in_quarantine {
+        return Err(format!(
+            "quarantined_files() = {quarantined}, {in_quarantine} files in quarantine directories"
+        ));
+    }
+    Ok(())
+}
+
 fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
     let dir = PathBuf::from(opt(opts, "dir")?);
     let mode = opt(opts, "mode")?;
-    let config = store_config(mode)?;
+    let config = store_config(mode, opts)?;
     let log = parse_store_logs(opt(opts, "logs")?)?;
-    if !dir.join("wal.log").exists() {
+    if last_wal_file(&dir).is_none() {
         return if log.acked.is_empty() {
             Ok("acked=0 (no store yet)".to_owned())
         } else {
             Err(format!(
-                "wal.log missing with {} acknowledged messages",
+                "no WAL file with {} acknowledged messages",
                 log.acked.len()
             ))
         };
@@ -587,6 +1007,7 @@ fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
         let store = Store::open(&dir, config)
             .await
             .map_err(|e| format!("recovery refused to open the store: {e}"))?;
+        let (used, quarantined) = (store.checkpoint_number(), store.quarantined_files());
         let actions: Vec<String> = store
             .recovery_report()
             .actions
@@ -611,16 +1032,19 @@ fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
         }
 
         // Every live entry resolves to its object with matching bytes,
-        // refcounts equal the live entries per object, and a tracked entry
+        // the object index holds it, and a tracked entry
         // that was never acknowledged holds a body that writer did send.
-        let mut counts: HashMap<ObjectId, u64> = HashMap::new();
         let mut unacked_present = 0;
         let topics: Vec<Vec<u8>> = store.topics().map(<[u8]>::to_vec).collect();
         for topic in &topics {
             let t = String::from_utf8_lossy(topic);
             let (first, next) = store.topic_range(topic).ok_or("topic without a range")?;
             for seq in first..next {
-                let id = store.entry(topic, seq).ok_or(format!("{t}/{seq}: no entry"))?;
+                let id = store
+                    .entry(topic, seq)
+                    .await
+                    .map_err(|e| format!("{t}/{seq}: {e}"))?
+                    .ok_or(format!("{t}/{seq}: no entry"))?;
                 let bytes = store
                     .read(topic, seq)
                     .await
@@ -629,7 +1053,9 @@ fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
                 if ObjectId::of(&bytes) != id {
                     return Err(format!("{t}/{seq}: bytes do not match the entry's id"));
                 }
-                *counts.entry(id).or_default() += 1;
+                if !store.contains(&id) {
+                    return Err(format!("{t}/{seq}: object not in the object index"));
+                }
                 if topic != SCRATCH && !log.acked.contains_key(&(topic.clone(), seq)) {
                     if !candidates.get(&id).is_some_and(|ts| ts.contains(topic.as_slice())) {
                         return Err(format!(
@@ -640,15 +1066,28 @@ fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
                 }
             }
         }
-        for (id, n) in &counts {
-            if store.refcount(id) != Some(*n) {
-                return Err(format!("refcount of {id:?}: {:?}, live entries {n}", store.refcount(id)));
-            }
+        // An acknowledged training batch, or one after it, makes the
+        // dictionary durable: recovery must find it in the WAL.
+        if let Some((train, last_ack)) = log.train
+            && last_ack >= train
+            && store.dictionary_bytes().is_none()
+        {
+            return Err(format!(
+                "round {last_ack} acknowledged after the training round {train}, but no dictionary after recovery"
+            ));
         }
         drop(store);
 
         let after = snapshot(&dir)?;
         check_changes(&before, &after, &actions)?;
+        check_checkpoints(
+            &before,
+            &after,
+            &actions,
+            opts.get("damaged").copied(),
+            used,
+            quarantined,
+        )?;
 
         // Recovery leaves nothing for a second recovery to do.
         let again = Store::open(&dir, config)
@@ -664,9 +1103,49 @@ fn store_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
             "acked={} unacked_present={unacked_present} actions={} [{}]",
             log.acked.len(),
             actions.len(),
-            actions.iter().map(|a| action_name(a)).collect::<Vec<_>>().join(",")
+            action_names(&actions)
         ))
     })
+}
+
+/// Opens the store once and exits: the recovery that run.sh interrupts
+/// with a LazyFS crash.
+fn store_open(opts: &HashMap<&str, &str>) -> Result<String, String> {
+    let dir = opt(opts, "dir")?;
+    let config = store_config(opt(opts, "mode")?, opts)?;
+    let rt = compio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let store = Store::open(dir, config).await.map_err(|e| e.to_string())?;
+        Ok(format!("actions={}", store.recovery_report().actions.len()))
+    })
+}
+
+/// Damages the newest checkpoint manifest in `--dir` (not mounted): cuts it
+/// to a random length or flips one bit, which its CRC detects. Prints the
+/// manifest's name, or `none` without a manifest.
+fn damage(opts: &HashMap<&str, &str>) -> Result<String, String> {
+    let dir = PathBuf::from(opt(opts, "dir")?);
+    let mut rng = Rng::new(num(opts, "seed")?);
+    let newest = std::fs::read_dir(&dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| manifest_number(n).is_some())
+        .max();
+    let Some(name) = newest else {
+        return Ok("none".to_owned());
+    };
+    let path = dir.join(&name);
+    let mut bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let at = rng.below(bytes.len() as u64) as usize;
+    let how = if rng.below(2) == 0 || bytes.is_empty() {
+        bytes.truncate(at);
+        format!("cut to {at} bytes")
+    } else {
+        bytes[at] ^= 1 << rng.below(8);
+        format!("bit flipped in byte {at}")
+    };
+    std::fs::write(&path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(format!("{name} {how}"))
 }
 
 // ---------------------------------------------------------------- broker
@@ -802,11 +1281,11 @@ fn broker_verify(opts: &HashMap<&str, &str>) -> Result<String, String> {
     let mode = opt(opts, "mode")?;
     let log = parse_broker_logs(opt(opts, "logs")?)?;
     let store_dir = data.join("store");
-    if !store_dir.join("wal.log").exists() {
+    if last_wal_file(&store_dir).is_none() {
         return if log.acked.is_empty() && !log.topic_acked {
             Ok("acked=0 (no store yet)".to_owned())
         } else {
-            Err("store/wal.log missing after acknowledgements".to_owned())
+            Err("no WAL file in store/ after acknowledgements".to_owned())
         };
     }
     let before = snapshot(&store_dir)?;
@@ -941,10 +1420,6 @@ fn broker_check(addr: &str, log: &BrokerLog) -> Result<String, String> {
     ))
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,66 +1437,239 @@ mod tests {
                 .collect(),
             wal: files
                 .iter()
-                .find(|(p, _)| *p == "wal.log")
-                .map(|(_, b)| b.to_vec())
-                .unwrap_or_default(),
+                .filter(|(p, _)| wal_file_id(p).is_some())
+                .map(|(p, b)| ((*p).to_owned(), b.to_vec()))
+                .collect(),
+            dirs: files
+                .iter()
+                .filter_map(|(p, _)| Some(p.rsplit_once('/')?.0.to_owned()))
+                .collect(),
         }
     }
+
+    const W0: &str = "wal-0000000000000000.log";
+    const IDX0: &str = "idx-0000000000000000.dat";
+    const IDX1: &str = "idx-0000000000000001.dat";
 
     #[test]
     fn changes_must_match_the_report() {
         let before = snap(&[
-            ("wal.log", b"0123456789"),
+            (W0, b"0123456789"),
             ("seg-000000000000000a.dat", b"x"),
-            ("topics/6f.idx", b"abc"),
+            (IDX0, b"abc"),
         ]);
         let cut = snap(&[
-            ("wal.log", b"012345"),
+            (W0, b"012345"),
             ("seg-000000000000000a.dat", b"x"),
-            ("topics/6f.idx", b"abc"),
+            (IDX0, b"abc"),
         ]);
-        let torn = "TornTailTruncated { frame_seq: 3, offset: 6, bytes_removed: 4 }".to_owned();
+        let torn =
+            "TornTailTruncated { frame_seq: 3, file: 0, offset: 6, bytes_removed: 4 }".to_owned();
         assert!(check_changes(&before, &cut, std::slice::from_ref(&torn)).is_ok());
         // Cut without an entry, entry without a cut, wrong offset.
         assert!(check_changes(&before, &cut, &[]).is_err());
         assert!(check_changes(&before, &before, std::slice::from_ref(&torn)).is_err());
-        let wrong = "TornTailTruncated { frame_seq: 3, offset: 5, bytes_removed: 5 }".to_owned();
+        let wrong =
+            "TornTailTruncated { frame_seq: 3, file: 0, offset: 5, bytes_removed: 5 }".to_owned();
         assert!(check_changes(&before, &cut, &[wrong]).is_err());
         // A WAL rewritten, not cut.
         let rewritten = snap(&[
-            ("wal.log", b"01234X"),
+            (W0, b"01234X"),
             ("seg-000000000000000a.dat", b"x"),
-            ("topics/6f.idx", b"abc"),
+            (IDX0, b"abc"),
         ]);
         assert!(check_changes(&before, &rewritten, &[torn]).is_err());
 
-        let no_seg = snap(&[("wal.log", b"0123456789"), ("topics/6f.idx", b"abc")]);
+        let no_seg = snap(&[(W0, b"0123456789"), (IDX0, b"abc")]);
         let orphan = "OrphanSegmentRemoved { segment: 10 }".to_owned();
         assert!(check_changes(&before, &no_seg, &[orphan]).is_ok());
         assert!(check_changes(&before, &no_seg, &[]).is_err());
         // A segment changed in place is never a documented repair.
         let seg_changed = snap(&[
-            ("wal.log", b"0123456789"),
+            (W0, b"0123456789"),
             ("seg-000000000000000a.dat", b"y"),
-            ("topics/6f.idx", b"abc"),
+            (IDX0, b"abc"),
         ]);
         assert!(check_changes(&before, &seg_changed, &[]).is_err());
+    }
 
-        let idx = snap(&[
-            ("wal.log", b"0123456789"),
-            ("seg-000000000000000a.dat", b"x"),
-            ("topics/6f.idx", b"abd"),
+    #[test]
+    fn a_cut_names_its_wal_file() {
+        const W1: &str = "wal-0000000000000005.log";
+        let before = snap(&[(W0, b"0123456789"), (W1, b"abcdef")]);
+        let cut = snap(&[(W0, b"0123456789"), (W1, b"abc")]);
+        let torn = |file| {
+            format!(
+                "TornTailTruncated {{ frame_seq: 7, file: {file}, offset: 3, bytes_removed: 3 }}"
+            )
+        };
+        assert!(check_changes(&before, &cut, &[torn(5)]).is_ok());
+        assert!(check_changes(&before, &cut, &[torn(0)]).is_err());
+        let tmp = snap(&[
+            (W0, b"0123456789"),
+            (W1, b"abcdef"),
+            ("wal-0000000000000009.log.tmp", b"h"),
         ]);
-        let repaired = r#"TopicIndexRepaired { path: "/m/store/topics/6f.idx", entries_kept: 1, bytes_truncated: 1, entries_rewritten: 1 }"#.to_owned();
-        assert!(check_changes(&before, &idx, &[repaired]).is_ok());
+        let removed = "WalTmpRemoved".to_owned();
+        assert!(check_changes(&tmp, &before, std::slice::from_ref(&removed)).is_ok());
+        assert!(check_changes(&tmp, &before, &[]).is_err());
+    }
+
+    #[test]
+    fn index_segments_may_only_be_deleted_or_added_with_a_report_entry() {
+        let before = snap(&[(W0, b"0123456789"), (IDX0, b"abc")]);
+        let repaired =
+            r#"TopicIndexRepaired { topic: [111], blocks_rewritten: 1, pages_rewritten: 0 }"#
+                .to_owned();
+        // An existing segment changed in place: never a repair.
+        let changed = snap(&[(W0, b"0123456789"), (IDX0, b"abd")]);
+        assert!(check_changes(&before, &changed, std::slice::from_ref(&repaired)).is_err());
+        // Deleted, with its size reported.
+        let gone = snap(&[(W0, b"0123456789"), (IDX1, b"hdr+blocks")]);
+        let removed = "IndexSegmentRemoved { segment: 0, bytes: 3 }".to_owned();
+        let actions = [removed.clone(), repaired.clone()];
+        assert!(check_changes(&before, &gone, &actions).is_ok());
+        let wrong = "IndexSegmentRemoved { segment: 0, bytes: 4 }".to_owned();
+        assert!(check_changes(&before, &gone, &[wrong, repaired.clone()]).is_err());
+        // A new segment needs a fence or repaired records, and repaired
+        // records need a new segment.
+        let added = snap(&[(W0, b"0123456789"), (IDX0, b"abc"), (IDX1, b"h")]);
+        assert!(check_changes(&before, &added, &[]).is_err());
+        assert!(check_changes(&before, &added, std::slice::from_ref(&repaired)).is_ok());
+        assert!(check_changes(&before, &before, std::slice::from_ref(&repaired)).is_err());
+        let fenced = "StaleIndexRecordsFenced { records: 2, segment: 1 }".to_owned();
+        assert!(check_changes(&before, &added, std::slice::from_ref(&fenced)).is_ok());
+        let elsewhere = "StaleIndexRecordsFenced { records: 2, segment: 7 }".to_owned();
+        assert!(check_changes(&before, &added, &[elsewhere]).is_err());
+        assert!(check_changes(&before, &added, &[fenced, repaired]).is_ok());
+    }
+
+    const C1: &str = "checkpoint-0000000000000001";
+    const C2: &str = "checkpoint-0000000000000002";
+    const Q2: &str = "quarantine-0000000000000002";
+
+    fn moved(file: &str) -> String {
+        format!("CheckpointFileQuarantined {{ file: {file:?}, quarantine: {Q2:?} }}")
+    }
+
+    #[test]
+    fn checkpoint_files_are_removed_or_moved_unchanged() {
+        let before = snap(&[
+            (W0, b"w"),
+            (C2, b"m2"),
+            ("objtab-0000000000000005.tab", b"t"),
+        ]);
+        let after = snap(&[
+            (W0, b"w"),
+            (
+                "quarantine-0000000000000002/checkpoint-0000000000000002",
+                b"m2",
+            ),
+            (
+                "quarantine-0000000000000002/objtab-0000000000000005.tab",
+                b"t",
+            ),
+        ]);
+        let entries = [moved(C2), moved("objtab-0000000000000005.tab")];
+        assert!(check_changes(&before, &after, &entries).is_ok());
+        assert!(check_changes(&before, &after, &entries[..1]).is_err());
+        // Moved but changed.
+        let changed = snap(&[
+            (W0, b"w"),
+            (
+                "quarantine-0000000000000002/checkpoint-0000000000000002",
+                b"m3",
+            ),
+            (
+                "quarantine-0000000000000002/objtab-0000000000000005.tab",
+                b"t",
+            ),
+        ]);
+        assert!(check_changes(&before, &changed, &entries).is_err());
+        let removed = snap(&[(W0, b"w"), (C2, b"m2")]);
+        let entry = r#"CheckpointFileRemoved { file: "objtab-0000000000000005.tab" }"#.to_owned();
+        assert!(check_changes(&before, &removed, std::slice::from_ref(&entry)).is_ok());
+        assert!(check_changes(&before, &removed, &[]).is_err());
+    }
+
+    #[test]
+    fn manifest_entries_follow_the_quarantine_rules() {
+        let damaged = |fallback: &str| {
+            format!(
+                "CheckpointManifestDamaged {{ checkpoint: 2, fallback: {fallback}, quarantine: {Q2:?} }}"
+            )
+        };
+        let before = snap(&[(C1, b"m1"), (C2, b"bad")]);
+        let after = snap(&[
+            (C1, b"m1"),
+            (
+                "quarantine-0000000000000002/checkpoint-0000000000000002",
+                b"bad",
+            ),
+        ]);
+        let ok = [damaged("Some(1)"), moved(C2)];
+        assert!(check_checkpoints(&before, &after, &ok, Some(C2), Some(1), 1).is_ok());
+        // Not the previous manifest, or none, as the fallback.
+        assert!(
+            check_checkpoints(
+                &before,
+                &after,
+                &[damaged("None"), moved(C2)],
+                Some(C2),
+                Some(1),
+                1
+            )
+            .is_err()
+        );
+        assert!(check_checkpoints(&before, &after, &ok, Some(C2), None, 1).is_err());
+        // A manifest damaged although the harness damaged none.
+        assert!(check_checkpoints(&before, &after, &ok, None, Some(1), 1).is_err());
+        // The harness damaged one and nothing was reported.
+        assert!(check_checkpoints(&before, &before, &[], Some(C2), Some(2), 0).is_err());
+        // An interrupted quarantine: completed, with the files found there.
+        let interrupted = snap(&[
+            (C1, b"m1"),
+            (C2, b"bad"),
+            (
+                "quarantine-0000000000000002/objtab-0000000000000005.tab",
+                b"t",
+            ),
+        ]);
+        let done = snap(&[
+            (C1, b"m1"),
+            (
+                "quarantine-0000000000000002/checkpoint-0000000000000002",
+                b"bad",
+            ),
+            (
+                "quarantine-0000000000000002/objtab-0000000000000005.tab",
+                b"t",
+            ),
+        ]);
+        let resumed = format!(
+            "CheckpointQuarantineResumed {{ checkpoint: 2, fallback: Some(1), quarantine: {Q2:?}, found: [\"objtab-0000000000000005.tab\"] }}"
+        );
+        assert!(
+            check_checkpoints(
+                &interrupted,
+                &done,
+                &[resumed, moved(C2)],
+                Some(C2),
+                Some(1),
+                2
+            )
+            .is_ok()
+        );
+        assert!(check_checkpoints(&interrupted, &done, &ok, Some(C2), Some(1), 2).is_err());
     }
 
     #[test]
     fn report_rules() {
-        let dropped = "FrameDropped { frame_seq: 1, offset: 2, mode: ParallelSync, object: x, reason: ObjectMissing, bytes_removed: 3 }".to_owned();
+        let dropped = "FrameDropped { frame_seq: 1, file: 0, offset: 2, mode: ParallelSync, object: x, reason: ObjectMissing, bytes_removed: 3 }".to_owned();
         assert!(check_report(std::slice::from_ref(&dropped), "parallel").is_ok());
         assert!(check_report(std::slice::from_ref(&dropped), "sequential").is_err());
-        let torn = "TornTailTruncated { frame_seq: 1, offset: 2, bytes_removed: 3 }".to_owned();
+        let torn =
+            "TornTailTruncated { frame_seq: 1, file: 0, offset: 2, bytes_removed: 3 }".to_owned();
         assert!(check_report(&[torn, dropped], "parallel").is_err());
         assert!(check_report(&["Rewritten".to_owned()], "parallel").is_err());
     }

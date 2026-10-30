@@ -92,7 +92,8 @@ scripts/validate.sh push    # adds the long tests, and the io_uring container (s
 - `crates/`: the broker, the protocol encoding, the reference client, the
   conformance runner, the storage engine, benchmarks.
 - `conformance/`: fixtures and scenarios.
-- `tools/`: the duplicate survey and the power-loss writer and verifier.
+- `tools/`: the duplicate survey, the block compression survey, and the
+  power-loss writer and verifier.
 - `scripts/`: validation, the Linux container, benchmarks, the power-loss
   harness.
 - `docs/`: guarantees and protocol.

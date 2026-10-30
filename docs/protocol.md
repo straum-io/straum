@@ -320,8 +320,10 @@ request each. `DescribeTopicOk`:
 
 `PartitionDescription`: `partition u32`, `start_seq u64`, `next_seq u64`,
 `message_count u64` (live messages: `next_seq − start_seq`), `index_bytes
-u64` (bytes of the partition's own index on disk; bodies are shared across
-partitions through deduplication and are not attributed to one).
+u64` (bytes of the partition's own index: its records in the shared index
+files plus its last, incomplete index block, which is held in memory until
+it is full; message bodies are not included, because deduplication shares
+them across partitions).
 
 ### 4.11 BrokerStats
 

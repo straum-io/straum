@@ -13,7 +13,7 @@ use straum_store::{Config, Message, Store, StoreError};
 
 const BATCHES: u8 = 5;
 
-/// A WAL of 5 frames, one per batch (PutObject + Publish each).
+/// A WAL of 5 frames, one per batch (PutBlock + PutObject + Publish each).
 async fn build(dir: &Path) {
     let mut store = Store::open(dir, Config::default()).await.unwrap();
     for i in 0..BATCHES {
@@ -32,7 +32,7 @@ async fn build(dir: &Path) {
 async fn open_with_wal(src: &Path, wal: &[u8]) -> (Result<Store, StoreError>, Vec<u8>, TempDir) {
     let work = TempDir::new("walframe");
     copy_dir(src, &work.0);
-    let path = work.0.join("wal.log");
+    let path = work.0.join(common::WAL0);
     std::fs::write(&path, wal).unwrap();
     let res = Store::open(&work.0, Config::default()).await;
     let after = std::fs::read(&path).unwrap();
@@ -53,7 +53,7 @@ async fn assert_last_frame_dropped(store: &Store, what: &str) {
 async fn bit_flip_in_middle_frame_fails_and_leaves_wal_unchanged() {
     let src = TempDir::new("walmid");
     build(&src.0).await;
-    let wal = std::fs::read(src.0.join("wal.log")).unwrap();
+    let wal = std::fs::read(src.0.join(common::WAL0)).unwrap();
     let starts = wal_frame_starts(&wal);
     assert_eq!(starts.len(), usize::from(BATCHES));
     let mid = starts.len() / 2;
@@ -65,9 +65,14 @@ async fn bit_flip_in_middle_frame_fails_and_leaves_wal_unchanged() {
             bad[at] ^= 1 << bit;
             let (res, after, _work) = open_with_wal(&src.0, &bad).await;
             match res {
-                Err(StoreError::WalCorrupted { offset, next_frame }) => {
+                Err(StoreError::WalCorrupted {
+                    file: 0,
+                    offset,
+                    next_file: 0,
+                    next_offset,
+                }) => {
                     assert_eq!(offset, start as u64, "byte {at} bit {bit}");
-                    assert_eq!(next_frame, end as u64, "byte {at} bit {bit}");
+                    assert_eq!(next_offset, end as u64, "byte {at} bit {bit}");
                 }
                 Err(e) => panic!("byte {at} bit {bit}: unexpected error {e}"),
                 Ok(_) => panic!("byte {at} bit {bit}: opened a WAL with mid-log damage"),
@@ -83,7 +88,7 @@ async fn bit_flip_in_middle_frame_fails_and_leaves_wal_unchanged() {
 async fn bit_flip_in_last_frame_drops_only_that_frame() {
     let src = TempDir::new("wallast");
     build(&src.0).await;
-    let wal = std::fs::read(src.0.join("wal.log")).unwrap();
+    let wal = std::fs::read(src.0.join(common::WAL0)).unwrap();
     let last = *wal_frame_starts(&wal).last().unwrap();
     let mut checked = 0;
     for at in last..wal.len() {
@@ -110,7 +115,7 @@ async fn bit_flip_in_last_frame_drops_only_that_frame() {
 async fn last_frame_with_lost_first_half_is_a_torn_tail() {
     let src = TempDir::new("walhalf");
     build(&src.0).await;
-    let wal = std::fs::read(src.0.join("wal.log")).unwrap();
+    let wal = std::fs::read(src.0.join(common::WAL0)).unwrap();
     let last = *wal_frame_starts(&wal).last().unwrap();
     let half = last + (wal.len() - last) / 2;
     for fill in [0x00, 0xff, 0x5a] {
@@ -127,7 +132,7 @@ async fn last_frame_with_lost_first_half_is_a_torn_tail() {
 async fn truncation_at_every_offset_of_last_frame() {
     let src = TempDir::new("walcut");
     build(&src.0).await;
-    let wal = std::fs::read(src.0.join("wal.log")).unwrap();
+    let wal = std::fs::read(src.0.join(common::WAL0)).unwrap();
     let last = *wal_frame_starts(&wal).last().unwrap();
     for cut in last..wal.len() {
         let (res, after, _work) = open_with_wal(&src.0, &wal[..cut]).await;
@@ -141,7 +146,7 @@ async fn truncation_at_every_offset_of_last_frame() {
 async fn frame_sequence_gap_is_corruption() {
     let src = TempDir::new("walgap");
     build(&src.0).await;
-    let wal = std::fs::read(src.0.join("wal.log")).unwrap();
+    let wal = std::fs::read(src.0.join(common::WAL0)).unwrap();
     let starts = wal_frame_starts(&wal);
     // Drop frame 2: frames 0, 1, 3, 4 remain, each with a valid CRC.
     let gap = [&wal[..starts[2]], &wal[starts[3]..]].concat();
@@ -173,13 +178,13 @@ async fn old_format_wal_is_unsupported() {
     old.extend_from_slice(&0xdead_beefu32.to_le_bytes());
     old.push(3);
     old.extend_from_slice(&[1, 0, b't', 0, 0, 0, 0, 0, 0, 0]);
-    let wal = std::fs::read(src.0.join("wal.log")).unwrap();
+    let wal = std::fs::read(src.0.join(common::WAL0)).unwrap();
     // The same header with another version and a valid header CRC.
     let with_version = |v: u32| {
         let mut w = wal.clone();
         w[8..12].copy_from_slice(&v.to_le_bytes());
-        let crc = crc32c::crc32c(&w[..12]);
-        w[12..16].copy_from_slice(&crc.to_le_bytes());
+        let crc = crc32c::crc32c(&w[..20]);
+        w[20..24].copy_from_slice(&crc.to_le_bytes());
         w
     };
     let current = u32::from_le_bytes(wal[8..12].try_into().unwrap());
@@ -207,7 +212,9 @@ async fn old_format_wal_is_unsupported() {
 async fn batch_over_max_frame_is_rejected_before_io() {
     let dir = TempDir::new("walmax");
     let config = Config {
-        // 10 messages need 21 + 10 × (65 + 32) = 991 bytes; 2 need 215.
+        // Bound: frame header 21, PutBlock 75, per message PutObject 73,
+        // Publish 51 and PutTopic 22 (new topic, counted per message).
+        // 10 messages: 1556 bytes; 2: 388.
         max_frame_bytes: 512,
         ..Config::default()
     };
@@ -221,11 +228,11 @@ async fn batch_over_max_frame_is_rejected_before_io() {
             ..Default::default()
         })
         .collect();
-    let wal_before = std::fs::read(dir.0.join("wal.log")).unwrap();
+    let wal_before = std::fs::read(dir.0.join(common::WAL0)).unwrap();
     let err = store.put_batch(&batch, 0).await.unwrap_err();
     assert!(matches!(err, StoreError::FrameTooLarge), "{err}");
     assert_eq!(store.stats(), Default::default(), "no I/O");
-    assert_eq!(std::fs::read(dir.0.join("wal.log")).unwrap(), wal_before);
+    assert_eq!(std::fs::read(dir.0.join(common::WAL0)).unwrap(), wal_before);
     // Not poisoned: a batch that fits still works.
     store.put_batch(&batch[..2], 0).await.unwrap();
 }

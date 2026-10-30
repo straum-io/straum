@@ -35,6 +35,10 @@ pub struct Config {
     pub store_write_mode: WriteMode,
     pub store_segment_max_bytes: u64,
     pub store_max_frame_bytes: u32,
+    /// Rebuild the store's derived topic index from its WAL at this start
+    /// (`straum_store::Config::rebuild_index`). Only the bare command-line
+    /// flag `--store-rebuild-index` sets it, so it applies to one start.
+    pub store_rebuild_index: bool,
 }
 
 impl Default for Config {
@@ -65,6 +69,7 @@ impl Default for Config {
             store_write_mode: WriteMode::Sequential,
             store_segment_max_bytes: 64 << 20,
             store_max_frame_bytes: 64 << 20,
+            store_rebuild_index: false,
         }
     }
 }
@@ -119,6 +124,14 @@ impl Config {
             }
             "store_segment_max_bytes" => self.store_segment_max_bytes = num(&key, value)?,
             "store_max_frame_bytes" => self.store_max_frame_bytes = num(&key, value)?,
+            // A one-shot operator action, never a standing setting: a
+            // configuration file line would rebuild at every start.
+            "store_rebuild_index" => {
+                return Err(format!(
+                    "{key} is not a setting: pass the flag --store-rebuild-index \
+                     (no value) on the command line of the one start that rebuilds"
+                ));
+            }
             _ => return Err(format!("unknown setting {key}")),
         }
         Ok(())
@@ -146,6 +159,10 @@ impl Config {
         let mut pairs = Vec::new();
         let mut it = args.iter();
         while let Some(flag) = it.next() {
+            if flag == "--store-rebuild-index" || flag == "--store_rebuild_index" {
+                config.store_rebuild_index = true;
+                continue;
+            }
             let key = flag
                 .strip_prefix("--")
                 .ok_or_else(|| format!("unexpected argument {flag}"))?;
@@ -267,6 +284,41 @@ mod tests {
         );
         assert_eq!(c.cluster_id, "c1");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn store_rebuild_index_is_a_bare_flag_only() {
+        let base = ["--data-dir", "/d", "--cluster-id", "c", "--node-id", "1"];
+        let args = |extra: &[&str]| -> Vec<String> {
+            base.iter().chain(extra).map(|s| s.to_string()).collect()
+        };
+        assert!(!Config::from_args(args(&[])).unwrap().store_rebuild_index);
+        let c = Config::from_args(args(&["--store-rebuild-index"])).unwrap();
+        assert!(c.store_rebuild_index);
+        let c = Config::from_args(args(&["--store-rebuild-index", "--node-id", "2"])).unwrap();
+        assert!(c.store_rebuild_index && c.node_id == 2);
+        assert!(
+            Config::from_args(args(&["--store_rebuild_index"]))
+                .unwrap()
+                .store_rebuild_index
+        );
+        // In a configuration file, or as a `key value` flag, it is refused
+        // and the message names the flag.
+        for (k, v) in [
+            ("store_rebuild_index", "true"),
+            ("store-rebuild-index", "false"),
+        ] {
+            let err = Config::default().set(k, v).unwrap_err();
+            assert!(err.contains("--store-rebuild-index"), "{err}");
+        }
+        let err = Config::default()
+            .apply_file("store_rebuild_index = true\n")
+            .unwrap_err();
+        assert!(
+            err.starts_with("line 1: ") && err.contains("--store-rebuild-index"),
+            "{err}"
+        );
+        assert!(Config::from_args(args(&["--store-rebuild-index", "true"])).is_err());
     }
 
     #[test]
