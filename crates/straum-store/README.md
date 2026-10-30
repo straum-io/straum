@@ -399,8 +399,9 @@ scripts/bench/checkpoint.sh --out ~/checkpoint
 `--quick`, `--keep`, the preconditions, the outputs and the cleanup are
 those of `block-cap.sh`. The full matrix plans 180 runs and about 48 GB of
 bodies (WAL and metadata come on top); its duration has not been measured,
-and a `--quick` run in the straum-test container (16 runs) passed as a
-smoke test only. Not covered: duplicate lookups with a cold page cache.
+so no full run before steps 6b and 8 without the owner's decision; a
+`--quick` run in the straum-test container (16 runs) passed as a smoke test
+only. Not covered: duplicate lookups with a cold page cache.
 Dropping the whole cache needs root; dropping the store's own pages
 (`posix_fadvise(DONTNEED)`) or a memory-limited user scope (`systemd-run
 --user --scope -p MemoryMax=`) would not, and are open for the owner.

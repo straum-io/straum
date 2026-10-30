@@ -255,7 +255,7 @@ impl<'a> Source<'a> {
                 restarted = true;
                 continue;
             }
-            while self.line.last().is_some_and(|&b| b == b'\n' || b == b'\r') {
+            if self.line.last() == Some(&b'\n') {
                 self.line.pop();
             }
             if self.line.is_empty() {

@@ -98,7 +98,9 @@ allowed: compaction removes them.
 
 The WAL is a sequence of files. Each is named by the sequence number of
 its first frame (16 hex digits) and holds a file header (24 bytes), then
-frames. One frame is one batch of messages (`put_batch`), one
+frames. Every number in a store file name is exactly 16 lower-case hex
+digits; a name spelled otherwise (upper case, a sign) is not a store file:
+open leaves it unchanged and unreported. One frame is one batch of messages (`put_batch`), one
 `release_before` call, or one compaction step (one rewritten segment).
 Frame sequence numbers run on across files: a file starts with the frame
 after the previous file's last.
@@ -446,7 +448,7 @@ short or its CRC does not match.
    and a failure is an error, no file changed (straum#135; without the
    check the next open would drop that frame as well).
 5. Blocks of earlier frames are checked at open for presence and bounds
-   only: a segment block must lie in full within its segment file, otherwise
+   only (except the frame before a dropped one, rule 4's last paragraph): a segment block must lie in full within its segment file, otherwise
    `MissingObject` (naming the block's lowest-numbered object; an error, not a
    repair). Their content is not decompressed at open; it is checked on every
    read (`CorruptBlock`, `HashMismatch`).
