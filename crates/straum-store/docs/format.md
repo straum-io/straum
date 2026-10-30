@@ -441,6 +441,10 @@ short or its CRC does not match.
    Residual ParallelSync risk: an acknowledged last frame whose block bytes
    are later corrupted on disk cannot be told from a crash before
    acknowledgement; such a frame is dropped (and reported).
+   Once a frame is dropped, the frame before it was acknowledged (one
+   followed it) and is now the last: its blocks are checked as in rule 4,
+   and a failure is an error, no file changed (straum#135; without the
+   check the next open would drop that frame as well).
 5. Blocks of earlier frames are checked at open for presence and bounds
    only: a segment block must lie in full within its segment file, otherwise
    `MissingObject` (naming the block's lowest-numbered object; an error, not a

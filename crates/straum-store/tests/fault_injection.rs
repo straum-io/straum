@@ -332,3 +332,50 @@ async fn inline_small_damaged_last_frame_is_dropped() {
         );
     }
 }
+
+/// straum#135 (fuzzing finding F1): the blocks of the last two ParallelSync
+/// frames are damaged. The last frame may be dropped as never acknowledged,
+/// but the frame before it was acknowledged (a frame followed it), so its
+/// damaged block is corruption: open fails and no file changes. Before the
+/// fix the first open dropped the last frame and the second open, finding
+/// the other frame last, dropped that acknowledged frame too.
+#[compio::test]
+async fn a_damaged_block_before_a_dropped_last_frame_fails_open() {
+    let dir = TempDir::new("fault-before-dropped");
+    let seg = dir.0.join("seg-0000000000000000.dat");
+    let config = Config {
+        write_mode: WriteMode::ParallelSync,
+        ..Config::default()
+    };
+    let mut ends = Vec::new();
+    let mut store = Store::open(&dir.0, config).await.unwrap();
+    for b in 0..3u64 {
+        let body = format!("batch {b} {}", "x".repeat(100)).into_bytes();
+        let msg = Message {
+            topic: b"t",
+            payload: &body,
+            ..Default::default()
+        };
+        store.put_batch(&[msg], b).await.unwrap();
+        ends.push(std::fs::metadata(&seg).unwrap().len() as usize);
+    }
+    drop(store);
+    let mut bytes = std::fs::read(&seg).unwrap();
+    for b in 1..3 {
+        bytes[(ends[b - 1] + ends[b]) / 2] ^= 0xff;
+    }
+    std::fs::write(&seg, bytes).unwrap();
+    let before = snapshot(&dir.0);
+    let err = match Store::open(&dir.0, config).await {
+        Ok(store) => panic!("opened: {:?}", store.recovery_report()),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            StoreError::CorruptBlock { .. } | StoreError::HashMismatch(_)
+        ),
+        "{err}"
+    );
+    assert!(snapshot(&dir.0) == before, "files changed");
+}

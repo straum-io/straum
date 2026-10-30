@@ -1149,3 +1149,31 @@ async fn a_block_reclaimed_between_checkpoints_is_a_hole_in_the_table() {
         check(&store, 0..40).await;
     }
 }
+
+/// Names the store never writes (a leading `+`, upper-case hex) are not
+/// store files: open leaves them alone and reports nothing (fuzzing
+/// finding F2; before, `checkpoint-+000000000000002` failed open).
+#[compio::test]
+async fn misspelled_store_names_are_not_store_files() {
+    let dir = TempDir::new("checkpoint-misspelled");
+    let mut store = Store::open(&dir.0, config(WriteMode::Sequential))
+        .await
+        .unwrap();
+    put(&mut store, 0, 5).await;
+    store.checkpoint().await.unwrap();
+    drop(store);
+    for name in [
+        "checkpoint-+000000000000002",
+        "checkpoint-000000000000000A.tmp",
+        "seg-00000000000000AB.dat",
+        "wal-+000000000000000.log",
+    ] {
+        std::fs::write(dir.0.join(name), b"x").unwrap();
+    }
+    let before = snapshot(&dir.0);
+    let store = Store::open(&dir.0, config(WriteMode::Sequential))
+        .await
+        .unwrap();
+    assert!(store.recovery_report().is_empty());
+    assert!(snapshot(&dir.0) == before, "files changed");
+}

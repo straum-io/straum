@@ -962,18 +962,19 @@ impl Store {
         // reported with no file changed.
         let mut dropped = None;
         let mut check = codecs_for(&dicts)?;
+        let corruption = |bad: BadObject| match bad.reason {
+            DropReason::ObjectMissing => StoreError::MissingObject(bad.object),
+            DropReason::ObjectHashMismatch => StoreError::HashMismatch(bad.object),
+            DropReason::BlockCorrupted => StoreError::CorruptBlock {
+                block: bad.block,
+                reason: bad.why,
+            },
+        };
         if let Some((at, mode, records)) = frames.last()
             && let Some(bad) = first_bad_object(&dir, records, &mut check).await?
         {
             if *mode != FrameMode::ParallelSync || torn || at.file != last_id {
-                return Err(match bad.reason {
-                    DropReason::ObjectMissing => StoreError::MissingObject(bad.object),
-                    DropReason::ObjectHashMismatch => StoreError::HashMismatch(bad.object),
-                    DropReason::BlockCorrupted => StoreError::CorruptBlock {
-                        block: bad.block,
-                        reason: bad.why,
-                    },
-                });
+                return Err(corruption(bad));
             }
             dropped = Some(RecoveryAction::FrameDropped {
                 frame_seq: frames.len() as u64 - 1,
@@ -987,6 +988,15 @@ impl Store {
             pos = at.offset as usize;
             frames.pop();
             sizes.pop();
+            // The frame now last was followed by the dropped one, so it was
+            // acknowledged: its blocks are checked in full here, as the
+            // next open would check them, and damage is corruption, no file
+            // changed (straum#135; otherwise the next open would drop it).
+            if let Some((_, _, records)) = frames.last()
+                && let Some(bad) = first_bad_object(&dir, records, &mut check).await?
+            {
+                return Err(corruption(bad));
+            }
         }
         match dropped {
             Some(action) => report.actions.push(action),
@@ -4573,11 +4583,17 @@ fn segment_path(dir: &Path, id: u64) -> PathBuf {
 }
 
 fn parse_segment_name(name: &str) -> Option<u64> {
-    let hex = name.strip_prefix("seg-")?.strip_suffix(".dat")?;
-    if hex.len() != 16 {
-        return None;
-    }
-    u64::from_str_radix(hex, 16).ok()
+    hex16(name.strip_prefix("seg-")?.strip_suffix(".dat")?)
+}
+
+/// The number in a file name: exactly 16 lower-case hex digits, as the
+/// store writes them. `from_str_radix` alone also takes a leading `+` and
+/// upper case, names the store never writes (and that a case-insensitive
+/// file system would report under another spelling).
+fn hex16(hex: &str) -> Option<u64> {
+    (hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .then(|| u64::from_str_radix(hex, 16).ok())
+        .flatten()
 }
 
 fn wal_path(dir: &Path, first: u64) -> PathBuf {
@@ -4585,11 +4601,7 @@ fn wal_path(dir: &Path, first: u64) -> PathBuf {
 }
 
 fn parse_wal_name(name: &str) -> Option<u64> {
-    let hex = name.strip_prefix("wal-")?.strip_suffix(".log")?;
-    if hex.len() != 16 {
-        return None;
-    }
-    u64::from_str_radix(hex, 16).ok()
+    hex16(name.strip_prefix("wal-")?.strip_suffix(".log")?)
 }
 
 fn index_path(dir: &Path, id: u64) -> PathBuf {
@@ -4597,11 +4609,7 @@ fn index_path(dir: &Path, id: u64) -> PathBuf {
 }
 
 fn parse_index_name(name: &str) -> Option<u64> {
-    let hex = name.strip_prefix("idx-")?.strip_suffix(".dat")?;
-    if hex.len() != 16 {
-        return None;
-    }
-    u64::from_str_radix(hex, 16).ok()
+    hex16(name.strip_prefix("idx-")?.strip_suffix(".dat")?)
 }
 
 fn objtab_path(dir: &Path, first: u64) -> PathBuf {
@@ -4647,9 +4655,7 @@ fn parse_quarantine_name(name: &str) -> Option<u64> {
         Some(_) => return None,
         None => rest,
     };
-    (hex.len() == 16)
-        .then(|| u64::from_str_radix(hex, 16).ok())
-        .flatten()
+    hex16(hex)
 }
 
 /// The first free quarantine name for checkpoint `n`: `quarantine-<n>`,
@@ -4737,11 +4743,6 @@ fn parse_checkpoint_file(name: &str) -> Option<CheckpointFile> {
     if let Some(n) = parse_quarantine_name(name) {
         return Some(CheckpointFile::Quarantined(n));
     }
-    let hex16 = |hex: &str| {
-        (hex.len() == 16)
-            .then(|| u64::from_str_radix(hex, 16).ok())
-            .flatten()
-    };
     if let Some(rest) = name.strip_prefix("checkpoint-") {
         if let Some(hex) = rest.strip_suffix(".tmp") {
             return hex16(hex).map(CheckpointFile::Tmp);
@@ -6165,5 +6166,30 @@ mod tests {
         let name = p.file_name().unwrap().to_str().unwrap();
         assert_eq!(parse_index_name(name), Some(0xcd));
         assert_eq!(parse_index_name("idx-cd.dat"), None);
+    }
+
+    /// Only the spelling the store writes is a store file name: a leading
+    /// `+` or upper-case hex is not (straum fuzzing finding F2).
+    #[test]
+    fn names_take_only_lower_case_hex_digits() {
+        assert_eq!(hex16("00000000000000ab"), Some(0xab));
+        for bad in [
+            "+000000000000002",
+            "00000000000000AB",
+            "-000000000000001",
+            "0x0000000000000a",
+        ] {
+            assert_eq!(hex16(bad), None, "{bad}");
+        }
+        assert_eq!(parse_segment_name("seg-00000000000000AB.dat"), None);
+        assert_eq!(parse_wal_name("wal-+000000000000000.log"), None);
+        assert_eq!(parse_index_name("idx-00000000000000CD.dat"), None);
+        assert!(parse_checkpoint_file("checkpoint-+000000000000002").is_none());
+        assert!(parse_checkpoint_file("checkpoint-000000000000000A.tmp").is_none());
+        assert_eq!(parse_quarantine_name("quarantine-000000000000000A"), None);
+        assert_eq!(
+            parse_quarantine_name("quarantine-000000000000000a.1"),
+            Some(10)
+        );
     }
 }
